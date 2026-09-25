@@ -1,0 +1,21 @@
+[workspace]
+release_always = false
+changelog_update = false
+dependencies_update = false
+git_release_enable = false
+git_tag_enable = false
+publish = false
+semver_check = false
+
+[[package]]
+name = "domyjob"
+changelog_path = "./CHANGELOG.md"
+changelog_update = true
+
+[[package]]
+name = "xtask"
+release = false
+
+[changelog]
+protect_breaking_commits = true
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
