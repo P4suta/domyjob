@@ -1,0 +1,86 @@
+doc-valid-idents = [
+  "..",
+  "GitHub",
+  "UTF-8",
+  "JSON",
+  "OpenSSH",
+  "PowerShell",
+  "ULID",
+  "macOS",
+  "TOML",
+]
+
+too-many-arguments-threshold = 4
+too-many-lines-threshold = 80
+cognitive-complexity-threshold = 18
+type-complexity-threshold = 250
+max-fn-params-bools = 1
+enum-variant-name-threshold = 2
+enum-variant-size-threshold = 256
+
+msrv = "1.98.0"
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+avoid-breaking-exported-api = false
+
+pass-by-value-size-limit = 128
+
+disallowed-methods = [
+  { path = "std::fs::write", reason = "write domyjob state through state_file, user files through user_files" },
+  { path = "std::fs::create_dir", reason = "create directories through state_file::private_dir" },
+  { path = "std::fs::create_dir_all", reason = "create directories through state_file::private_dir" },
+  { path = "std::fs::File::create", reason = "create files through state_file or user_files" },
+  { path = "std::fs::OpenOptions::new", reason = "open files for writing through state_file or user_files" },
+  { path = "std::fs::remove_file", reason = "remove files through state_file or user_files" },
+  { path = "std::fs::remove_dir_all", reason = "remove directories through state_file" },
+  { path = "std::fs::rename", reason = "replace files through state_file or user_files" },
+  { path = "std::fs::copy", reason = "copy files through user_files" },
+  { path = "std::fs::set_permissions", reason = "permissions are decided by state_file and workspace" },
+  { path = "std::process::Command::new", reason = "start processes through spawn::Invocation, which only accepts typed Arg values" },
+  { path = "windows_spawn::Command::new", reason = "start processes through spawn::Invocation, which only accepts typed Arg values", allow-invalid = true },
+  { path = "std::mem::forget", reason = "leaks destructors; use `ManuallyDrop` or explicit drop" },
+  { path = "std::env::set_var", reason = "races with other threads; wire the value through Options instead" },
+  { path = "std::env::remove_var", reason = "see std::env::set_var" },
+  { path = "std::process::exit", reason = "bypasses destructors; return an ExitCode from main" },
+  { path = "core::result::Result::ok", reason = "turns a failure into absence; match, inspect, or report the error instead" },
+  { path = "core::result::Result::unwrap_or", reason = "turns a failure into a stand-in; report the error instead" },
+  { path = "core::result::Result::unwrap_or_default", reason = "turns a failure into an empty value; report the error instead" },
+  { path = "core::result::Result::map_or", reason = "hides the error policy in a closure argument; use an exhaustive match" },
+  { path = "core::result::Result::map_or_else", reason = "hides the error policy in a closure argument; use an exhaustive match" },
+  { path = "core::result::Result::or", reason = "turns a failure into a stand-in; report the error instead" },
+  { path = "core::result::Result::or_else", reason = "turns a failure into another attempt with the first one unreported; match and say what happened to it" },
+  { path = "std::path::Path::exists", reason = "erases the difference between absent and unreadable; try the operation and match its error" },
+  { path = "std::path::Path::is_file", reason = "erases the difference between absent and unreadable; try the operation and match its error" },
+  { path = "std::path::Path::is_dir", reason = "erases the difference between absent and unreadable; try the operation and match its error" },
+  { path = "std::time::SystemTime::now", reason = "time decides nothing here; observe it only through clock::Timestamp" },
+  { path = "std::time::Instant::now", reason = "time decides nothing here; wait for the event itself" },
+  { path = "std::thread::sleep", reason = "sleeping guesses when something will be ready; block on the event itself" },
+  { path = "std::thread::park_timeout", reason = "a timeout guesses when something will be ready; block on the event itself" },
+  { path = "std::sync::Condvar::wait_timeout", reason = "a timeout guesses when something will be ready; block on the event itself" },
+  { path = "std::sync::Condvar::wait_timeout_while", reason = "a timeout guesses when something will be ready; block on the event itself" },
+  { path = "std::sync::mpsc::Receiver::recv_timeout", reason = "a timeout guesses when something will be ready; block on the event itself" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "a timeout guesses when something will be ready; bound connections by count instead" },
+  { path = "std::net::TcpStream::set_read_timeout", reason = "a timeout guesses when something will be ready; bound connections by count instead" },
+  { path = "std::net::TcpStream::set_write_timeout", reason = "a timeout guesses when something will be ready; bound connections by count instead" },
+  { path = "std::os::unix::net::UnixStream::set_read_timeout", reason = "a timeout guesses when something will be ready; block on the event itself", allow-invalid = true },
+  { path = "std::os::unix::net::UnixStream::set_write_timeout", reason = "a timeout guesses when something will be ready; block on the event itself", allow-invalid = true },
+  { path = "std::fs::Metadata::modified", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "std::fs::Metadata::accessed", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "std::fs::Metadata::created", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "cap_std::fs::Metadata::modified", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "cap_std::fs::Metadata::accessed", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "cap_std::fs::Metadata::created", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "flume::Receiver::recv_timeout", reason = "a timeout guesses when something will be ready; block on the event itself" },
+  { path = "flume::Receiver::recv_deadline", reason = "a deadline guesses when something will be ready; block on the event itself" },
+]
+
+disallowed-types = [
+  { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock" },
+  { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock" },
+  { path = "std::time::Instant", reason = "time decides nothing here; wait for the event itself" },
+  { path = "std::time::SystemTime", reason = "time decides nothing here; observe it only through clock::Timestamp" },
+  { path = "std::time::Duration", reason = "time decides nothing here; there is nothing to measure a wait against" },
+]

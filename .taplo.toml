@@ -1,0 +1,7 @@
+include = ["*.toml", ".config/*.toml", "crates/**/*.toml", "xtask/**/*.toml"]
+exclude = ["target/**"]
+
+[formatting]
+align_entries = false
+column_width = 100
+reorder_keys = false

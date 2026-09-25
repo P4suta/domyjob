@@ -1,0 +1,81 @@
+[tools]
+rust = "1.98.0"
+actionlint = "1.7.12"
+taplo = "0.10.0"
+typos = "1.50.1"
+lefthook = "2.1.9"
+"cargo:cargo-nextest" = "0.9.140"
+"cargo:cargo-deny" = "0.19.7"
+"cargo:cargo-audit" = "0.22.2"
+"cargo:committed" = "1.1.11"
+"aqua:axodotdev/cargo-dist" = "0.33.0"
+
+[tasks.bootstrap]
+description = "Fetch the locked dependency graph and install the git hooks"
+run = ["cargo fetch --locked", "lefthook install"]
+
+[tasks.fmt]
+description = "Format Rust and TOML"
+run = ["cargo fmt --all", "taplo fmt"]
+env = { RUST_LOG = "warn" }
+
+[tasks."fmt:check"]
+description = "Check Rust and TOML formatting without rewriting files"
+run = ["cargo fmt --all -- --check", "taplo fmt --check", "taplo lint"]
+env = { RUST_LOG = "warn" }
+
+[tasks.clippy]
+description = "Lint every target with warnings denied"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+
+[tasks.gates]
+description = "Enforce the rules Clippy cannot express: no comments, no #[allow], exact input, typed errors, no owned trait objects"
+run = "cargo xtask gates"
+
+[tasks.lint]
+description = "Formatting, Clippy, the repository gates, spelling, and workflows"
+depends = ["fmt:check", "clippy", "gates"]
+run = ["typos", "actionlint"]
+
+[tasks.test]
+description = "Run every test"
+run = [
+  "cargo nextest run --locked --workspace --all-targets --status-level fail",
+  "cargo test --locked --workspace --doc",
+]
+
+[tasks.deny]
+description = "Check licenses, bans, and sources"
+run = "cargo deny --locked check licenses bans sources"
+
+[tasks.audit]
+description = "Check the dependency graph against the RustSec advisory database"
+run = "cargo audit --deny warnings"
+
+[tasks.check]
+description = "Every gate a push waits for"
+run = ["mise run lint", "mise run test", "mise run deny", "mise run audit"]
+
+[tasks."check:fleet"]
+description = "Lint and test this tree on every machine domyjob knows, the other operating systems included"
+run = "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} --wait -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'"
+
+[tasks.fuzz]
+description = "Fuzz every input boundary for a fixed number of inputs"
+dir = "fuzz"
+run = [
+  "cargo +nightly fuzz run requests -- -runs=200000",
+  "cargo +nightly fuzz run orders -- -runs=200000",
+  "cargo +nightly fuzz run releases -- -runs=200000",
+  "cargo +nightly fuzz run terminal -- -runs=200000",
+]
+
+[tasks.kani]
+description = "Prove the Kani harnesses"
+dir = "crates/domyjob"
+run = "cargo kani --lib"
+
+[tasks.proverif]
+description = "Prove the symbolic models of the paired connection (needs proverif on PATH)"
+dir = "docs/security/proverif"
+run = ["proverif connect-x25519-broken.pv", "proverif connect-ml-kem-broken.pv"]

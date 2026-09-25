@@ -1,0 +1,29 @@
+pre-commit:
+  parallel: true
+  skip:
+    - rebase
+    - merge
+  commands:
+    rust-fmt:
+      glob: "*.rs"
+      run: cargo fmt --all
+      stage_fixed: true
+    gates:
+      glob: "*.rs"
+      run: cargo xtask gates
+    typos:
+      run: typos
+    taplo:
+      glob: "*.toml"
+      run: taplo fmt {staged_files}
+      stage_fixed: true
+
+commit-msg:
+  commands:
+    committed:
+      run: committed --commit-file {1}
+
+pre-push:
+  commands:
+    check:
+      run: mise run check

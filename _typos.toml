@@ -1,0 +1,8 @@
+[default]
+extend-ignore-identifiers-re = ["[A-Fa-f0-9]{7,}", "[0-9A-HJKMNP-TV-Z]{16}"]
+
+[default.extend-words]
+Yasunobu = "Yasunobu"
+
+[files]
+extend-exclude = ["target/", "*.lock"]
