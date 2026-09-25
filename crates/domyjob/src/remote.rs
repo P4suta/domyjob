@@ -33,6 +33,43 @@ pub fn forget_witness(dirs: &Dirs, machine: &MachineName) -> Result<(), RemoteEr
     ))?)
 }
 
+const SAID_LIMIT: u64 = 64 << 10;
+
+fn drain(errors: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let Some(mut errors) = errors else {
+            return String::new();
+        };
+        let mut kept = Vec::new();
+        let read = std::io::Read::read_to_end(
+            &mut std::io::Read::take(std::io::Read::by_ref(&mut errors), SAID_LIMIT),
+            &mut kept,
+        );
+        let rest = std::io::copy(&mut errors, &mut std::io::sink());
+        match (read, rest) {
+            (Ok(_) | Err(_), Ok(_) | Err(_)) => {}
+        }
+        String::from_utf8_lossy(&kept).into_owned()
+    })
+}
+
+fn said(errors: &str) -> String {
+    let lines: Vec<String> = errors
+        .lines()
+        .map(crate::terminal::clean)
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty() && !line.starts_with("Control socket connect("))
+        .collect();
+    let last = lines
+        .get(lines.len().saturating_sub(3)..)
+        .unwrap_or_default();
+    if last.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", last.join("; "))
+    }
+}
+
 static SHARED: std::sync::Mutex<
     std::collections::BTreeMap<MachineName, Option<std::process::Child>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -72,11 +109,12 @@ pub enum RemoteError {
         doing: &'static str,
         source: std::io::Error,
     },
-    #[error("{machine}: exited with {status} while {doing}")]
+    #[error("{machine}: exited with {status} while {doing}{said}")]
     Exited {
         machine: String,
         doing: &'static str,
         status: std::process::ExitStatus,
+        said: String,
     },
     #[error("{machine}: sent something that is not a reply ({detail}): {line:?}")]
     Garbled {
@@ -163,6 +201,10 @@ pub enum RemoteError {
         theirs: u32,
         cause: Box<crate::dist::DistError>,
     },
+    #[error(
+        "{machine} has no domyjob {VERSION}{was}, and this build has no signed release to fetch one from"
+    )]
+    Unbuilt { machine: String, was: String },
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
     #[error("{action} {path}: {source}")]
@@ -603,6 +645,16 @@ impl<'a> Link<'a> {
         }
         let deliverable = match crate::dist::binary_for(self.config, self.dirs, &os, &arch) {
             Ok(deliverable) => deliverable,
+            Err(crate::dist::DistError::NoTrustRoot) if outdated.is_none() => {
+                let was = match cached_facts(self.dirs, &self.machine) {
+                    Ok(Some(facts)) => format!(" (it last ran {})", facts.hello.version),
+                    Ok(None) | Err(_) => String::new(),
+                };
+                return Err(RemoteError::Unbuilt {
+                    machine: self.name(),
+                    was,
+                });
+            }
             Err(cause) => {
                 return Err(match outdated {
                     Some(speaker) => RemoteError::Outdated {
@@ -812,12 +864,13 @@ impl<'a> Link<'a> {
         }
         let uploaded = self.config.transport(&self.machine.transport)?.binary == Binary::Upload;
         if uploaded && self.placement == Placement::Managed {
-            let scrubbed = self.capture(&Remote::Scrub(self.family), &[])?.status;
-            if !scrubbed.success() {
+            let scrubbed = self.capture(&Remote::Scrub(self.family), &[])?;
+            if !scrubbed.status.success() {
                 return Err(RemoteError::Exited {
                     machine: self.name(),
                     doing: "removing its copy of domyjob",
-                    status: scrubbed,
+                    status: scrubbed.status,
+                    said: said(&scrubbed.errors),
                 });
             }
         }
@@ -893,15 +946,7 @@ impl<'a> Link<'a> {
     }
 
     fn spawn(&self, remote: &Remote) -> Result<std::process::Child, RemoteError> {
-        let errors = match remote {
-            Remote::Probe | Remote::Uninstall(..) | Remote::Scrub(_) => Stdio::piped(),
-            Remote::Node(..)
-            | Remote::WindowsArch
-            | Remote::Install(_)
-            | Remote::Staged(_)
-            | Remote::Promote(_) => Stdio::inherit(),
-        };
-        self.start(self.command(remote)?, errors)
+        self.start(self.command(remote)?, Stdio::piped())
     }
 
     fn start(
@@ -1035,14 +1080,13 @@ impl<'a> Link<'a> {
                 );
             }
         }
-        let status = self
-            .capture(&Remote::Install(self.family), &payload)?
-            .status;
-        if !status.success() {
+        let staged = self.capture(&Remote::Install(self.family), &payload)?;
+        if !staged.status.success() {
             return Err(RemoteError::Exited {
                 machine: self.name(),
                 doing: "staging",
-                status,
+                status: staged.status,
+                said: said(&staged.errors),
             });
         }
         let hello = self
@@ -1064,12 +1108,13 @@ impl<'a> Link<'a> {
                 reported: hello.binary,
             });
         }
-        let promoted = self.capture(&Remote::Promote(self.family), &[])?.status;
-        if !promoted.success() {
+        let promoted = self.capture(&Remote::Promote(self.family), &[])?;
+        if !promoted.status.success() {
             return Err(RemoteError::Exited {
                 machine: self.name(),
                 doing: "putting the verified binary in place",
-                status: promoted,
+                status: promoted.status,
+                said: said(&promoted.errors),
             });
         }
         self.placement = Placement::Managed;
@@ -1122,6 +1167,7 @@ impl<'a> Link<'a> {
                 "pipes were not set up",
             )));
         };
+        let errors = drain(child.stderr.take());
         let line = serde_json::to_vec(request).map_err(|e| pipe("encoding")(e.into()))?;
         let activity = crate::liveness::Activity::default();
         let stdin = crate::liveness::Counted::new(stdin, activity.clone());
@@ -1169,6 +1215,10 @@ impl<'a> Link<'a> {
                     machine: self.name(),
                     doing: "answering",
                     status,
+                    said: said(&match errors.join() {
+                        Ok(text) => text,
+                        Err(_panicked) => String::new(),
+                    }),
                 })
             }
             Err(other) => Err(other),
@@ -1312,6 +1362,19 @@ impl crate::ingress::Ingress for Facts {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_a_machine_said_is_its_last_lines_without_ssh_noise_or_escapes() {
+        assert_eq!(said(""), "");
+        assert_eq!(
+            said("Control socket connect(/k/s1-x): Connection refused\n\n"),
+            ""
+        );
+        assert_eq!(
+            said("one\ntwo\nControl socket connect(/k): refused\nthree\n\x1b[31mfour\x1b[0m\n"),
+            ": two; three; four"
+        );
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet() {

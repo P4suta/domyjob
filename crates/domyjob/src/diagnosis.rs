@@ -117,6 +117,10 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
             Kind::Protocol,
             "this machine has the older domyjob; `domyjob self update` here, or install the matching build, then try again",
         ),
+        RemoteError::Unbuilt { .. } => hinted(
+            Kind::Distribution,
+            "build this version on that machine and run `domyjob setup MACHINE --from PATH --insecure-unsigned`",
+        ),
         RemoteError::Outdated { .. } => hinted(
             Kind::Protocol,
             "build this version for that machine and run `domyjob setup MACHINE --from PATH --insecure-unsigned`, or install a signed release",
