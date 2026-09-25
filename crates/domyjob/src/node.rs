@@ -542,7 +542,9 @@ impl Node {
                 self.pause(paused)?;
                 Reply::Report(Box::new(self.report()))
             }
-            Request::Clean { apply, logs } => Reply::Cleaned(Box::new(self.clean((apply, logs))?)),
+            Request::Clean { apply, logs, idle } => {
+                Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
+            }
             Request::AuditAt { seq } => Reply::AuditAt {
                 hash: self.audit.hash_at(seq)?,
             },
@@ -808,6 +810,19 @@ impl Node {
         self.collect(Keep::Unfinished)
     }
 
+    fn stale(&self, workspace: &std::path::Path) -> bool {
+        let filled_by = crate::supervisor::filled_by_path(workspace);
+        let last = match crate::state_file::read_bytes(&filled_by) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return true,
+            Err(_unreadable) => return false,
+        };
+        match String::from_utf8_lossy(&last).trim().parse::<JobId>() {
+            Ok(id) => matches!(self.store.is_published(&id), Ok(false)),
+            Err(_foreign) => true,
+        }
+    }
+
     fn evict(
         &self,
         workspace: &std::path::Path,
@@ -837,10 +852,17 @@ impl Node {
         Ok(true)
     }
 
-    fn clean(&self, (apply, logs): (bool, bool)) -> Result<crate::protocol::Cleaned, NodeError> {
+    fn clean(
+        &self,
+        (apply, logs, idle): (bool, bool, bool),
+    ) -> Result<crate::protocol::Cleaned, NodeError> {
         let work = self.store.area("work");
         let mut items = Vec::new();
         for (workspace, lock) in self.idle_workspaces() {
+            let stale = self.stale(&workspace);
+            if !stale && !idle {
+                continue;
+            }
             let bytes = size_of(&workspace);
             if apply && !self.evict(&workspace, &lock)? {
                 continue;
@@ -850,7 +872,11 @@ impl Node {
                 Err(_elsewhere) => &workspace,
             };
             items.push(crate::protocol::Freeable {
-                what: RemoteText::new(format!("workspace {}", shown.display())),
+                what: RemoteText::new(format!(
+                    "{} workspace {}",
+                    if stale { "stale" } else { "idle" },
+                    shown.display()
+                )),
                 bytes,
             });
         }
@@ -1936,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn cleaning_lists_before_it_frees_and_frees_only_what_is_idle() {
+    fn cleaning_frees_stale_workspaces_and_on_request_every_idle_one_and_old_logs() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
@@ -1947,7 +1973,14 @@ mod tests {
                 .unwrap();
         }
         let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
-        let listed = node.clean((false, true)).unwrap();
+        let recent = project.join("3");
+        crate::state_file::write_bytes(&recent.join("out"), b"warm").unwrap();
+        crate::state_file::write_bytes(
+            &crate::supervisor::filled_by_path(&recent),
+            id.as_str().as_bytes(),
+        )
+        .unwrap();
+        let listed = node.clean((false, true, false)).unwrap();
         assert!(!listed.applied);
         assert!(
             listed.items.iter().any(|item| item.bytes == 5_000),
@@ -1956,13 +1989,15 @@ mod tests {
         assert!(project.join("0").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
 
-        let freed = node.clean((true, false)).unwrap();
+        let freed = node.clean((true, false, false)).unwrap();
         assert!(freed.applied);
         assert_eq!(freed.items.len(), 1, "{freed:?}");
+        assert!(recent.join("out").try_exists().unwrap());
         assert!(!project.join("0").try_exists().unwrap());
         assert!(project.join("1").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
-        node.clean((true, true)).unwrap();
+        node.clean((true, true, true)).unwrap();
+        assert!(!recent.join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
         busy.release().unwrap();
     }

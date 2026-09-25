@@ -111,8 +111,8 @@ enum Top {
     )]
     Pull(PullArgs),
     #[command(
-        about = "Free the disk space domyjob holds on machines: idle workspaces, and with --logs old logs",
-        long_about = "Free the disk space domyjob holds on machines.\n\nIdle workspaces go, which only costs the next build its head start; workspaces in use and every job record stay. With --logs, the output logs of finished jobs are discarded too."
+        about = "Free the disk space domyjob holds on machines: stale workspaces, and more on request",
+        long_about = "Free the disk space domyjob holds on machines.\n\nWorkspaces that no remembered job last used go; they only give a build its head start. With --all-idle every workspace not in use goes, and with --logs the output logs of finished jobs are discarded too. Workspaces in use and every job record stay."
     )]
     Clean(CleanArgs),
     #[command(
@@ -405,11 +405,22 @@ struct HistoryArgs {
 }
 
 #[derive(Debug, Args)]
+struct FreeMore {
+    #[arg(long, help = "Discard the output logs of finished jobs too")]
+    logs: bool,
+    #[arg(
+        long,
+        help = "Free every idle workspace, not only the stale ones no remembered job last used"
+    )]
+    all_idle: bool,
+}
+
+#[derive(Debug, Args)]
 struct CleanArgs {
     #[arg(value_name = "MACHINES", help = "Which machines, as for `domyjob run`")]
     targets: String,
-    #[arg(long, help = "Discard the output logs of finished jobs too")]
-    logs: bool,
+    #[command(flatten)]
+    more: FreeMore,
     #[arg(long, help = "Show what would be freed without freeing it")]
     dry_run: bool,
     #[arg(long, help = "Print machine-readable JSON")]
@@ -1882,7 +1893,13 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
                 let ctx = &ctx;
                 (
                     machine,
-                    scope.spawn(move || client::clean(ctx, machine, (!args.dry_run, args.logs))),
+                    scope.spawn(move || {
+                        client::clean(
+                            ctx,
+                            machine,
+                            (!args.dry_run, args.more.logs, args.more.all_idle),
+                        )
+                    }),
                 )
             })
             .collect();

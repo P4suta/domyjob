@@ -788,10 +788,10 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
 pub fn clean(
     ctx: &Context,
     machine: &Machine,
-    (apply, logs): (bool, bool),
+    (apply, logs, idle): (bool, bool, bool),
 ) -> Result<crate::protocol::Cleaned, RemoteError> {
     let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
-    link.call(&Request::Clean { apply, logs }, &[])?
+    link.call(&Request::Clean { apply, logs, idle }, &[])?
         .into_cleaned()
         .map_err(|other| link.unexpected("what was cleaned", *other))
 }

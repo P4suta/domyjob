@@ -87,6 +87,7 @@ pub enum Request {
     Clean {
         apply: bool,
         logs: bool,
+        idle: bool,
     },
     Pause {
         paused: bool,
