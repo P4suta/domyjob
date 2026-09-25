@@ -58,7 +58,7 @@ run = ["mise run lint", "mise run test", "mise run deny", "mise run audit"]
 
 [tasks."check:fleet"]
 description = "Lint and test this tree on every machine domyjob knows, the other operating systems included"
-run = "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} --wait --grep 'test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'"
+run = "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --wait --grep 'test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo test --locked --workspace'"
 
 [tasks.fuzz]
 description = "Fuzz every input boundary for a fixed number of inputs"
