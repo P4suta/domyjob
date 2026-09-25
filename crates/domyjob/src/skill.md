@@ -6,6 +6,7 @@ description: Run builds, tests, or any command on another machine or operating s
 # domyjob
 
 domyjob sends the current directory to other machines, runs a command there, and keeps it running whether or not you stay.
+Run these commands where you work: machines that only receive jobs need no `domyjob` on their PATH.
 You then ask for a digest or search the log instead of reading all of it.
 
 ## The loop
@@ -23,6 +24,19 @@ You then ask for a digest or search the log instead of reading all of it.
 When a result is needed right away and the job is short, `domyjob run win --wait --digest -- cargo test` waits and prints only the digest.
 To watch it live but only see what matters, `--wait --grep 'test result|panicked'` shows just the matching lines while the whole log stays on the machine.
 When it may be long, start it without waiting and use `domyjob wait tests` or `domyjob digest tests` later: stopping `wait`, or being cut off by a timeout of your own, never stops the job.
+
+## Jobs a project names
+
+A `domyjob.toml` at the project root names jobs so nobody retypes them:
+
+```toml
+[jobs.test]
+on = "@all"
+run = ["cargo", "test"]
+```
+
+`domyjob do test` runs it where `on` says, `--on win` runs it elsewhere, and `domyjob do test @main` sends that revision instead of the directory on disk.
+Each job may also set `runner`, `workspace` (`warm` or `fresh`), `dir`, and `env`.
 
 ## Looking at a machine, instead of ssh
 
@@ -44,7 +58,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## What differs on the other side
 
 - The command runs where the files landed: the same subdirectory you are in, inside a workspace that keeps build output between runs, so the second build is incremental.
-  `--fresh` starts from an empty workspace instead.
+  Every worktree of one repository shares that workspace on each machine, so a new worktree builds incrementally too; `--fresh` is only for when you need an empty directory.
 - Windows runs the command with PowerShell unless you pass `--shell`; write PowerShell there, not sh.
 - A single argument after `--` is a script for that shell; several arguments run as a program and its arguments without any shell.
 - Jobs keep the environment of the ssh session that started them, but anything that lived only in that session, such as a forwarded ssh agent, is gone once it closes.
@@ -77,6 +91,6 @@ Every job in `--json` output has the same shape, with `"schema": 2`:
 - `domyjob logs JOB -f` follows a running job's output; prefer `digest` and `--grep`, which cost far fewer tokens.
 - Add `--json` to `run`, `digest`, `status`, `wait`, `ls`, and `logs --grep` for machine-readable output.
 - `domyjob mcp` serves the same operations as MCP tools, if you prefer tools to commands.
-- `domyjob doctor` checks that every machine answers and runs a matching domyjob; `domyjob run --dry-run ...` shows what would be sent where without sending it.
+- `domyjob doctor` checks that every machine answers and runs a matching domyjob, and `domyjob setup MACHINES` installs the matching one where it does not; `domyjob run --dry-run ...` shows what would be sent where without sending it.
 - `domyjob machines remove NAME --wipe` removes everything domyjob placed on a machine (its jobs, workspaces, key, service, and copy of domyjob) and then forgets it; it refuses while jobs still run there unless `--kill-running` is given.
   `domyjob self uninstall` does the same for the machine you are on.
