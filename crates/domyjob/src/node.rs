@@ -133,6 +133,47 @@ enum Keep {
     Unfinished,
 }
 
+fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let asked = crate::spawn::Invocation::new(
+        crate::template::Arg::literal("ssh"),
+        vec![
+            crate::template::Arg::literal("-G"),
+            crate::template::Arg::literal("localhost"),
+        ],
+    )
+    .command()
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .output();
+    let printed = match asked {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(_) | Err(_) => return None,
+    };
+    let agent = identity_agent(&printed, home)?;
+    match std::fs::symlink_metadata(&agent) {
+        Ok(_) => Some(agent),
+        Err(_absent) => None,
+    }
+}
+
+fn identity_agent(printed: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let value = printed
+        .lines()
+        .find_map(|line| line.strip_prefix("identityagent "))?
+        .trim();
+    if value.eq_ignore_ascii_case("none") || value == "SSH_AUTH_SOCK" || value.starts_with('$') {
+        return None;
+    }
+    let path = match value.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(value),
+    };
+    path.is_absolute().then_some(path)
+}
+
 fn out_of_space(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(link) = current {
@@ -492,7 +533,8 @@ impl Node {
             submitted_by: principal.submitter(),
             submitted_at: Timestamp::observe(),
         };
-        let launch = crate::store::LaunchEnv::of_this_process();
+        let launch = crate::store::LaunchEnv::of_this_process()
+            .with_agent(configured_agent(&self.dirs.home));
         let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&spec.id))?;
         self.store.stage(&spec, (&submission.env, &launch))?;
         if submission.queue == crate::protocol::Queue::Now {
@@ -1305,6 +1347,30 @@ mod tests {
         crate::state_file::remove_file(&store.log_path(&id)).unwrap();
         assert!(refused(&ask(&node, &logs_of(&job))));
         assert!(refused(&ask(&node, &Request::Tail { job, lines: 3 })));
+    }
+
+    #[test]
+    fn the_agent_a_job_uses_is_the_one_the_machines_ssh_configuration_names() {
+        let home = std::path::Path::new("/home/me");
+        let printed = |agent: &str| format!("user me\nidentityagent {agent}\nport 22\n");
+        assert_eq!(
+            identity_agent(&printed("~/.agent/agent.sock"), home),
+            Some(home.join(".agent/agent.sock"))
+        );
+        assert_eq!(
+            identity_agent(&printed("/run/agent.sock"), home),
+            Some(PathBuf::from("/run/agent.sock"))
+        );
+        for unusable in ["none", "SSH_AUTH_SOCK", "$AGENT", "relative.sock"] {
+            assert_eq!(identity_agent(&printed(unusable), home), None, "{unusable}");
+        }
+        assert_eq!(identity_agent("user me\n", home), None);
+        let launch = LaunchEnv::default().with_agent(Some(PathBuf::from("/run/agent.sock")));
+        assert_eq!(
+            launch.vars.get("SSH_AUTH_SOCK").map(String::as_str),
+            Some("/run/agent.sock")
+        );
+        assert!(LaunchEnv::default().with_agent(None).vars.is_empty());
     }
 
     #[test]
