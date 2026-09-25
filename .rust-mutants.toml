@@ -330,3 +330,228 @@ original = "?"
 line = 243
 reason = "dropping the lock at the end of walk releases it too, and releasing a lock this process holds is not something the platform lock calls report as failing"
 outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "retire_old_binaries"
+rule = "negate-condition"
+original = "cfg!(test)"
+line = 192
+reason = "under test the executable is the test harness, whose directory must never be swept; outside tests the sweep is covered through user_files::sweep_retired"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "retire_old_binaries"
+rule = "condition-to-true"
+original = "cfg!(test)"
+line = 192
+reason = "under test the executable is the test harness, whose directory must never be swept; outside tests the sweep is covered through user_files::sweep_retired"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "retire_old_binaries"
+rule = "condition-to-false"
+original = "cfg!(test)"
+line = 192
+reason = "under test the executable is the test harness, whose directory must never be swept; outside tests the sweep is covered through user_files::sweep_retired"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "send"
+rule = "question-to-unwrap"
+original = "?"
+line = 218
+reason = "a Reply holds only strings, integers, and enums, none of which serde_json can fail to encode"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::accept"
+rule = "question-to-unwrap"
+original = "?"
+line = 473
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::make_room"
+rule = "question-to-unwrap"
+original = "?"
+line = 604
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::make_room"
+rule = "question-to-unwrap"
+original = "?"
+line = 618
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::idle_workspaces"
+rule = "return-default"
+original = "found"
+line = 629
+reason = "found is still empty at that return, which is exactly the default"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::retire"
+rule = "question-to-unwrap"
+original = "?"
+line = 703
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::collect"
+rule = "return-ok-default"
+original = "Ok(collecting.release()?)"
+line = 762
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::collect"
+rule = "question-to-unwrap"
+original = "?"
+line = 762
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::recover"
+rule = "return-ok-default"
+original = "Ok(alive.release()?)"
+line = 814
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::recover"
+rule = "question-to-unwrap"
+original = "?"
+line = 814
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::abandon_staging"
+rule = "question-to-unwrap"
+original = "?"
+line = 826
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::abandon_staging"
+rule = "question-to-unwrap"
+original = "?"
+line = 827
+reason = "releasing a lock this process holds is not something the platform lock calls report as failing, and dropping it releases it too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::abandon_staging"
+rule = "return-ok-default"
+original = "Ok(self.store.forget_staging_lock(id)?)"
+line = 828
+reason = "the sweep ignores this result either way, and a staging lock left behind is removed by the next sweep"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::logs"
+rule = "condition-to-false"
+original = "cursor.follow == Follow::UntilFinished"
+line = 889
+reason = "following needs a live supervisor on the other end of the control socket, which the end-to-end runs on real machines exercise and unit tests do not start"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::logs"
+rule = "question-to-unwrap"
+original = "?"
+line = 900
+reason = "the log was just opened as a regular file on local disk, where seeking, reading, and copying fail only if the disk itself does, which no test can arrange after a successful open"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::logs"
+rule = "question-to-unwrap"
+original = "?"
+line = 901
+reason = "the log was just opened as a regular file on local disk, where seeking, reading, and copying fail only if the disk itself does, which no test can arrange after a successful open"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::tail"
+rule = "question-to-unwrap"
+original = "?"
+line = 944
+reason = "the log was just opened as a regular file on local disk, where seeking, reading, and copying fail only if the disk itself does, which no test can arrange after a successful open"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::tail"
+rule = "question-to-unwrap"
+original = "?"
+line = 947
+reason = "the log was just opened as a regular file on local disk, where seeking, reading, and copying fail only if the disk itself does, which no test can arrange after a successful open"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::tail"
+rule = "question-to-unwrap"
+original = "?"
+line = 951
+reason = "the log was just opened as a regular file on local disk, where seeking, reading, and copying fail only if the disk itself does, which no test can arrange after a successful open"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::reply"
+rule = "question-to-unwrap"
+original = "?"
+line = 435
+reason = "waiting fails here only when the job's control socket exists but cannot be reached, and whether connecting to a broken socket path is refused or fails differs between Linux, macOS, and Windows, so no test can stand in for it everywhere"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::short_of_room"
+rule = "return-true"
+original = "match fs4::statvfs(self.store.area(\"jobs\")) {\n            Ok(stats) => short(stats.available_space(), stats.total_space()),\n            Err(_unmeasurable) => false,\n        }"
+line = 586
+reason = "this reads the free space of the real disk the tests run on; the decision itself is tested through short(), and make_room is tested with the answer supplied"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/node.rs"
+item = "Node::short_of_room"
+rule = "return-true"
+original = "short(stats.available_space(), stats.total_space())"
+line = 587
+reason = "this reads the free space of the real disk the tests run on; the decision itself is tested through short(), and make_room is tested with the answer supplied"
+outcome = "survived"
