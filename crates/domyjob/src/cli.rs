@@ -115,6 +115,10 @@ enum Top {
         long_about = "Free the disk space domyjob holds on machines.\n\nIdle workspaces go, which only costs the next build its head start; workspaces in use and every job record stay. With --logs, the output logs of finished jobs are discarded too."
     )]
     Clean(CleanArgs),
+    #[command(
+        about = "Show how each kind of job has gone lately: its recent outcomes, success rate, and typical duration"
+    )]
+    History(HistoryArgs),
     #[command(about = "List, add, or remove machines")]
     Machines(MachinesArgs),
     #[command(about = "Install or update domyjob on machines")]
@@ -388,6 +392,14 @@ struct GetArgs {
         help = "Write the file here instead of to standard output"
     )]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct HistoryArgs {
+    #[arg(help = "Which machines to ask [default: every machine domyjob knows]")]
+    machines: Option<String>,
+    #[arg(long, help = "Print machine-readable JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -747,7 +759,8 @@ const fn wants_json(command: &Top) -> bool {
         | Top::Doctor(DoctorArgs { json, .. })
         | Top::Logs(LogsArgs { json, .. })
         | Top::Pull(PullArgs { json, .. })
-        | Top::Clean(CleanArgs { json, .. }) => *json,
+        | Top::Clean(CleanArgs { json, .. })
+        | Top::History(HistoryArgs { json, .. }) => *json,
         Top::Get(_)
         | Top::Setup(_)
         | Top::Myself(_)
@@ -860,6 +873,7 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         Top::Get(args) => get(&args),
         Top::Pull(args) => pull(&args),
         Top::Clean(args) => clean(&args),
+        Top::History(args) => history(&args),
         Top::Machines(args) => match &args.action {
             None => machines(args.json),
             Some(MachinesAction::Add(add)) => machines_add(add),
@@ -1802,6 +1816,49 @@ fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> 
         }
     }
     Ok(if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED_JOB)
+    })
+}
+
+fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let machines = match &args.machines {
+        Some(selector) => ctx.select(selector)?,
+        None => client::known_machines(&ctx)?,
+    };
+    let (jobs, rejected) = client::list(&ctx, &machines, 500);
+    for item in &rejected {
+        crate::ui::report_error(
+            &item.error.to_string(),
+            None,
+            crate::diagnosis::of_remote(&item.error).hint,
+        );
+    }
+    let series = crate::history::series(&jobs);
+    if args.json {
+        let values: Vec<serde_json::Value> = series
+            .iter()
+            .map(|one| {
+                serde_json::json!({
+                    "machine": one.machine,
+                    "name": one.label,
+                    "runs": one.runs,
+                    "succeeded": one.succeeded,
+                    "recent": one.recent.iter().map(|state| state.as_str()).collect::<Vec<_>>(),
+                    "typical_millis": one.typical.map(crate::clock::Elapsed::millis),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "history": values})
+        );
+    } else {
+        show(crate::view::history(&series, Timestamp::observe()))?;
+    }
+    Ok(if rejected.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(FAILED_JOB)

@@ -13,6 +13,7 @@ pub mod dist;
 pub mod domain;
 pub mod faults;
 pub mod framed;
+pub mod history;
 pub mod hook;
 pub mod ingress;
 pub mod input;

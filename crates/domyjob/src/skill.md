@@ -96,6 +96,7 @@ Every job in `--json` output has the same shape, with `"schema": 2`:
 ## Other commands
 
 - `domyjob ls` lists jobs on every machine; `domyjob status JOB` shows one.
+- `domyjob history` shows each kind of job's recent outcomes, success rate, and typical duration, to tell a flaky job from a broken one.
 - `domyjob kill JOB` stops a job and everything it started, at once.
 - `domyjob logs JOB -f` follows a running job's output; prefer `digest` and `--grep`, which cost far fewer tokens.
 - Add `--json` to `run`, `digest`, `status`, `wait`, `ls`, and `logs --grep` for machine-readable output.

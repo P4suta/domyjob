@@ -354,6 +354,62 @@ pub fn cleaned(
     Ok(out)
 }
 
+pub fn history(
+    series: &[crate::history::Series],
+    now: Timestamp,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    if series.is_empty() {
+        writeln!(out, "{}", ui::paint(Tone::Dim, "No finished jobs yet."))?;
+        return Ok(out);
+    }
+    let machine_width = series
+        .iter()
+        .map(|one| one.machine.as_str().len())
+        .max()
+        .unwrap_or(0);
+    let labels: Vec<String> = series.iter().map(|one| ui::fit(&one.label, 28)).collect();
+    let label_width = labels
+        .iter()
+        .map(|label| unicode_width::UnicodeWidthStr::width(label.as_str()))
+        .max()
+        .unwrap_or(0);
+    for (one, label) in series.iter().zip(&labels) {
+        let marks: String = one
+            .recent
+            .iter()
+            .map(|state| {
+                let (mark, tone) = ui::state_look(*state);
+                ui::paint(tone, ui::symbol(mark))
+            })
+            .collect();
+        let rate = one
+            .succeeded
+            .saturating_mul(100)
+            .checked_div(one.runs)
+            .unwrap_or(0);
+        let mut facts = vec![format!("{rate}% of {}", one.runs)];
+        if let Some(typical) = one.typical {
+            facts.push(format!("typically {typical}"));
+        }
+        facts.push(ui::ago(one.last, now));
+        writeln!(
+            out,
+            "{}{}  {}{}  {}{}  {}",
+            ui::machine(&one.machine),
+            " ".repeat(machine_width.saturating_sub(one.machine.as_str().len())),
+            label,
+            " ".repeat(
+                label_width.saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()))
+            ),
+            marks,
+            " ".repeat(12usize.saturating_sub(one.recent.len())),
+            ui::paint(Tone::Dim, &facts.join(" · "))
+        )?;
+    }
+    Ok(out)
+}
+
 pub fn unreachable_card(
     machine: &MachineName,
     why: &str,
@@ -570,7 +626,7 @@ pub fn job_json(machine: &MachineName, job: &Job) -> serde_json::Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::protocol::{Command, Location, Phase, Spec, Supervisor};
 
@@ -701,7 +757,8 @@ mod tests {
         );
     }
 
-    fn sample() -> Job {
+    #[must_use]
+    pub fn sample() -> Job {
         Job {
             spec: Spec {
                 id: "0AAAAAAAAAAAAAAA".parse().unwrap(),
