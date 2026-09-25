@@ -166,6 +166,13 @@ fn size_of(path: &std::path::Path) -> u64 {
     total
 }
 
+fn disk_is_short(area: &std::path::Path) -> bool {
+    match fs4::statvfs(area) {
+        Ok(stats) => short(stats.available_space(), stats.total_space()),
+        Err(_unmeasurable) => false,
+    }
+}
+
 fn cores() -> u32 {
     let count = match std::thread::available_parallelism() {
         Ok(count) => count.get(),
@@ -272,6 +279,7 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
+    short: fn(&std::path::Path) -> bool,
 }
 
 #[must_use]
@@ -427,6 +435,7 @@ impl Node {
             store,
             cas,
             audit,
+            short: disk_is_short,
         })
     }
 
@@ -779,10 +788,7 @@ impl Node {
     }
 
     fn short_of_room(&self) -> bool {
-        match fs4::statvfs(self.store.area("jobs")) {
-            Ok(stats) => short(stats.available_space(), stats.total_space()),
-            Err(_unmeasurable) => false,
-        }
+        (self.short)(&self.store.area("jobs"))
     }
 
     fn make_room(&self, short: &impl Fn() -> bool) -> Result<(), NodeError> {
@@ -1011,7 +1017,11 @@ impl Node {
             };
             needed.push(spec);
         }
-        let reachable = self.reachable(&needed)?;
+        let mut reachable = self.reachable(&needed)?;
+        reachable.extend(spent.iter().filter_map(|spec| match &spec.location {
+            Location::Snapshot { source, .. } => Some(source.manifest.clone()),
+            Location::Home => None,
+        }));
         let doomed: Vec<BlobId> = match keep {
             Keep::Every => self.cas.stored()?,
             Keep::Unfinished => self.reachable(&spent)?.into_iter().collect(),
@@ -1440,7 +1450,10 @@ mod tests {
             .unwrap();
         crate::state_file::write_bytes(&store.log_path(&id), log).unwrap();
         (
-            Node::open(dirs(root)).unwrap(),
+            Node {
+                short: |_| false,
+                ..Node::open(dirs(root)).unwrap()
+            },
             id.as_str().parse().unwrap(),
         )
     }
@@ -2304,7 +2317,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let finished = sent(&node, &store, &first, br#"{"entries":{}}"#);
+        let (finished_manifest, finished_content) =
+            holding(&node, b"only a finished job used this");
+        let finished = sent(&node, &store, &first, &finished_manifest);
         let unfinished = sent(&node, &store, running, br#"{ "entries":{}}"#);
         let stray = BlobId::of(b"stray");
         node.cas.put(&stray, b"stray").unwrap();
@@ -2336,7 +2351,24 @@ mod tests {
         assert!(!kept.contains(&stray));
         node.collect(Keep::Unfinished).unwrap();
         let left = node.cas.stored().unwrap();
-        assert!(!left.contains(&finished) && left.contains(&unfinished));
+        assert!(left.contains(&finished) && left.contains(&unfinished));
+        assert!(!left.contains(&finished_content));
+    }
+
+    fn holding(node: &Node, content: &[u8]) -> (Vec<u8>, BlobId) {
+        let blob = BlobId::of(content);
+        node.cas.put(&blob, content).unwrap();
+        let manifest = crate::snapshot::Manifest {
+            entries: std::collections::BTreeMap::from([(
+                "a.txt".parse().unwrap(),
+                crate::snapshot::Entry::File {
+                    blob: blob.clone(),
+                    size: crate::domain::len_u64(content.len()),
+                    mode: crate::snapshot::Mode::Regular,
+                },
+            )]),
+        };
+        (serde_json::to_vec(&manifest).unwrap(), blob)
     }
 
     fn finished_like(store: &Store, first: &JobId, more: &[&str]) -> Vec<JobId> {
@@ -2405,7 +2437,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let spent = snapshot(small, br#"{ "entries": {} }"#);
+        let (spent_manifest, spent_content) = holding(&node, b"sent for a job that finished");
+        let spent = snapshot(small, &spent_manifest);
         let uploaded = BlobId::of(b"sent for a submission still on its way");
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
@@ -2416,8 +2449,8 @@ mod tests {
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), DISCARDED);
         assert!(project.join("1").join("file").try_exists().unwrap());
         let kept = node.cas.stored().unwrap();
-        assert!(kept.contains(&needed));
-        assert!(!kept.contains(&spent));
+        assert!(kept.contains(&needed) && kept.contains(&spent));
+        assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
         node.make_room(&|| false).unwrap();
         busy.release().unwrap();
