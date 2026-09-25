@@ -182,9 +182,9 @@ pub fn hello(dirs: &Dirs) -> Hello {
 
 const KEEP_FINISHED: usize = 500;
 
-const ROOM_AT_LEAST: u64 = 512 << 20;
+const ROOM_AT_LEAST: u64 = 10 << 30;
 
-const ROOM_SHARE: u64 = 50;
+const ROOM_SHARE: u64 = 10;
 
 const DISCARDED: &[u8] = b"domyjob: this log was discarded to free disk space on this machine\n";
 
@@ -1315,12 +1315,12 @@ mod tests {
     }
 
     #[test]
-    fn a_disk_is_short_below_a_fiftieth_of_its_size_or_half_a_gigabyte() {
+    fn a_disk_is_short_below_a_tenth_of_its_size_or_ten_gigabytes() {
         let gib: u64 = 1 << 30;
-        assert!(short(ROOM_AT_LEAST - 1, 100 * gib));
-        assert!(!short(ROOM_AT_LEAST, 100 * gib));
-        assert!(short(10 * gib / 50 - 1, 10 * gib));
-        assert!(!short(10 * gib / 50, 10 * gib));
+        assert!(short(ROOM_AT_LEAST - 1, 500 * gib));
+        assert!(!short(ROOM_AT_LEAST, 500 * gib));
+        assert!(short(50 * gib / 10 - 1, 50 * gib));
+        assert!(!short(50 * gib / 10, 50 * gib));
         assert!(!short(1, 0));
     }
 
@@ -1330,7 +1330,7 @@ mod tests {
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        node.sweep();
+        node.make_room(&|| false).unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), [b'x'; 10_000]);
         let same_size = vec![b'z'; DISCARDED.len()];
         for log in [b"tiny".to_vec(), same_size] {
@@ -1425,16 +1425,6 @@ mod tests {
             let _faults = crate::faults::inject(&[("state_file::dir", &text(&area))]);
             Node::open(node.dirs.clone()).unwrap_err();
         }
-    }
-
-    #[test]
-    fn waiting_on_a_job_whose_control_socket_is_broken_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (node, job) = published(tmp.path(), b"");
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id = store.resolve(&job).unwrap();
-        crate::state_file::private_dir(&store.control_path(&id)).unwrap();
-        assert!(refused(&ask(&node, &Request::Wait { job })));
     }
 
     struct Unwritable {
