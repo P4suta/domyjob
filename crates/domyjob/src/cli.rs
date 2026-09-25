@@ -31,8 +31,13 @@ struct Cli {
         help = "Color the output: auto follows the terminal, NO_COLOR, and CLICOLOR_FORCE"
     )]
     color: ColorWhen,
+    #[arg(
+        long,
+        help = "With no command, print the overview of every machine as machine-readable JSON"
+    )]
+    json: bool,
     #[command(subcommand)]
-    command: Top,
+    command: Option<Top>,
 }
 
 const AFTER_LONG_HELP: &str = "\
@@ -100,6 +105,11 @@ enum Top {
         long_about = "Bring the files a finished job changed back into this directory.\n\nOnly files the job added, altered, or removed come back, judged by the same ignore rules that decided what was sent. Nothing is written if any of those files changed here since the job was sent. Review, commit, sign, and push them here, where your keys are."
     )]
     Pull(PullArgs),
+    #[command(
+        about = "Free the disk space domyjob holds on machines: idle workspaces, and with --logs old logs",
+        long_about = "Free the disk space domyjob holds on machines.\n\nIdle workspaces go, which only costs the next build its head start; workspaces in use and every job record stay. With --logs, the output logs of finished jobs are discarded too."
+    )]
+    Clean(CleanArgs),
     #[command(about = "List, add, or remove machines")]
     Machines(MachinesArgs),
     #[command(about = "Install or update domyjob on machines")]
@@ -376,6 +386,18 @@ struct GetArgs {
 }
 
 #[derive(Debug, Args)]
+struct CleanArgs {
+    #[arg(value_name = "MACHINES", help = "Which machines, as for `domyjob run`")]
+    targets: String,
+    #[arg(long, help = "Discard the output logs of finished jobs too")]
+    logs: bool,
+    #[arg(long, help = "Show what would be freed without freeing it")]
+    dry_run: bool,
+    #[arg(long, help = "Print machine-readable JSON")]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
 struct PullArgs {
     #[arg(help = "A job id, a unique prefix of one, a name, or MACHINE:ID")]
     job: String,
@@ -410,6 +432,18 @@ enum MachinesAction {
         about = "Accept a machine's audit log again after you reset or reinstalled that machine yourself"
     )]
     Rewitness(RewitnessArgs),
+    #[command(
+        about = "Stop machines taking new jobs, for maintenance; running jobs and `on` carry on"
+    )]
+    Pause(PauseArgs),
+    #[command(about = "Let paused machines take jobs again")]
+    Resume(PauseArgs),
+}
+
+#[derive(Debug, Args)]
+struct PauseArgs {
+    #[arg(value_name = "MACHINES", help = "Which machines, as for `domyjob run`")]
+    targets: String,
 }
 
 #[derive(Debug, Args)]
@@ -707,7 +741,8 @@ const fn wants_json(command: &Top) -> bool {
         | Top::Machines(MachinesArgs { json, .. })
         | Top::Doctor(DoctorArgs { json, .. })
         | Top::Logs(LogsArgs { json, .. })
-        | Top::Pull(PullArgs { json, .. }) => *json,
+        | Top::Pull(PullArgs { json, .. })
+        | Top::Clean(CleanArgs { json, .. }) => *json,
         Top::Get(_)
         | Top::Setup(_)
         | Top::Myself(_)
@@ -769,8 +804,12 @@ pub fn main() -> ExitCode {
         ColorWhen::Always => anstream::ColorChoice::Always,
         ColorWhen::Never => anstream::ColorChoice::Never,
     });
-    let json = wants_json(&cli.command);
-    match dispatch(cli.command) {
+    let json = cli.command.as_ref().map_or(cli.json, wants_json);
+    let outcome = match cli.command {
+        Some(command) => dispatch(command),
+        None => overview(cli.json),
+    };
+    match outcome {
         Ok(code) => code,
         Err(CliError::Output(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
             ExitCode::SUCCESS
@@ -814,11 +853,14 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         Top::Wait(args) => wait(&args),
         Top::Get(args) => get(&args),
         Top::Pull(args) => pull(&args),
+        Top::Clean(args) => clean(&args),
         Top::Machines(args) => match &args.action {
             None => machines(args.json),
             Some(MachinesAction::Add(add)) => machines_add(add),
             Some(MachinesAction::Remove(remove)) => machines_remove(remove),
             Some(MachinesAction::Rewitness(rewitness)) => machines_rewitness(rewitness),
+            Some(MachinesAction::Pause(pause)) => machines_pause(pause, true),
+            Some(MachinesAction::Resume(resume)) => machines_pause(resume, false),
         },
         Top::Setup(args) => setup(&args),
         Top::Doctor(args) => doctor(&args),
@@ -1726,6 +1768,194 @@ fn job_command(
     let (machine, job) = client::job_request(&ctx, &args.job, request)?;
     print_job(&machine.name, &job, args.json)?;
     Ok((job, machine))
+}
+
+fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let machines = ctx.select(&args.targets)?;
+    let mut all_ok = true;
+    for machine in &machines {
+        match client::pause(&ctx, machine, paused) {
+            Ok(_) => eprintln!(
+                "domyjob: {}: {}",
+                machine.name,
+                if paused {
+                    "paused; running jobs carry on, new ones are refused until `domyjob machines resume`"
+                } else {
+                    "takes jobs again"
+                }
+            ),
+            Err(error) => {
+                all_ok = false;
+                crate::ui::report_error(
+                    &error.to_string(),
+                    None,
+                    crate::diagnosis::of_remote(&error).hint,
+                );
+            }
+        }
+    }
+    Ok(if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED_JOB)
+    })
+}
+
+fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let machines = ctx.select(&args.targets)?;
+    let mut all_ok = true;
+    let mut values = Vec::new();
+    std::thread::scope(|scope| -> Result<(), CliError> {
+        let handles: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                let ctx = &ctx;
+                (
+                    machine,
+                    scope.spawn(move || client::clean(ctx, machine, (!args.dry_run, args.logs))),
+                )
+            })
+            .collect();
+        for (machine, handle) in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(_panicked) => return Err(ClientError::Panicked.into()),
+            };
+            match result {
+                Ok(cleaned) if args.json => values.push(serde_json::json!({
+                    "machine": machine.name,
+                    "cleaned": cleaned,
+                })),
+                Ok(cleaned) => show(crate::view::cleaned(&machine.name, &cleaned))?,
+                Err(error) => {
+                    all_ok = false;
+                    crate::ui::report_error(
+                        &error.to_string(),
+                        None,
+                        crate::diagnosis::of_remote(&error).hint,
+                    );
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "machines": values})
+        );
+    }
+    Ok(if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED_JOB)
+    })
+}
+
+fn overview(json: bool) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let machines = ctx.config.configured();
+    if machines.is_empty() {
+        show(crate::view::first_run())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let now = Timestamp::observe();
+    let (answers, answered) = std::sync::mpsc::channel();
+    let mut reachable = true;
+    let mut values = Vec::new();
+    std::thread::scope(|scope| -> Result<(), CliError> {
+        for machine in &machines {
+            let answers = answers.clone();
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let survey = client::survey(ctx, machine);
+                match answers.send((machine.name.clone(), survey)) {
+                    Ok(()) | Err(_) => {}
+                }
+            });
+        }
+        drop(answers);
+        for (name, survey) in answered {
+            match survey {
+                Ok((report, jobs)) => {
+                    if json {
+                        values.push(overview_json(&name, &report, &jobs));
+                    } else {
+                        show(crate::view::machine_card(&name, &report, &jobs, now))?;
+                    }
+                }
+                Err(error) => {
+                    reachable = false;
+                    if json {
+                        values.push(serde_json::json!({
+                            "machine": name,
+                            "reachable": false,
+                            "error": {
+                                "message": error.to_string(),
+                                "hint": crate::diagnosis::of_remote(&error).hint,
+                            },
+                        }));
+                    } else {
+                        let why = error.to_string();
+                        let why = why
+                            .strip_prefix(&format!("{name}: "))
+                            .unwrap_or(&why)
+                            .to_owned();
+                        show(crate::view::unreachable_card(
+                            &name,
+                            &why,
+                            crate::diagnosis::of_remote(&error).hint,
+                        ))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if json {
+        values.sort_by(|a, b| {
+            a.get("machine")
+                .map(ToString::to_string)
+                .cmp(&b.get("machine").map(ToString::to_string))
+        });
+        println!(
+            "{}",
+            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "machines": values})
+        );
+    }
+    Ok(if reachable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(FAILED_JOB)
+    })
+}
+
+fn overview_json(
+    name: &MachineName,
+    report: &crate::protocol::Report,
+    jobs: &[Job],
+) -> serde_json::Value {
+    let summaries = |wanted: &dyn Fn(&Job) -> bool| -> Vec<serde_json::Value> {
+        jobs.iter()
+            .filter(|job| wanted(job))
+            .map(|job| crate::view::job_summary_json(name, job))
+            .collect()
+    };
+    serde_json::json!({
+        "machine": name,
+        "reachable": true,
+        "report": report,
+        "running": summaries(&|job| matches!(job.state(), crate::protocol::State::Running | crate::protocol::State::Preparing)),
+        "queued": summaries(&|job| job.state() == crate::protocol::State::Queued),
+        "recent": jobs
+            .iter()
+            .filter(|job| job.is_settled())
+            .take(5)
+            .map(|job| crate::view::job_summary_json(name, job))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn show(text: Result<String, std::fmt::Error>) -> Result<(), CliError> {

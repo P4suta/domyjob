@@ -26,6 +26,7 @@ cap-std.workspace = true
 comfy-table.workspace = true
 indicatif.workspace = true
 supports-unicode.workspace = true
+sysinfo.workspace = true
 terminal_size.workspace = true
 unicode-width.workspace = true
 vte.workspace = true

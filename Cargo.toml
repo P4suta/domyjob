@@ -98,6 +98,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
+sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 fs4 = { version = "1", default-features = false, features = ["sync"] }
 cap-std = "4"
 jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }

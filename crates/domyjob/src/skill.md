@@ -41,6 +41,12 @@ run = ["cargo", "test"]
 `domyjob do test` runs it where `on` says, `--on win` runs it elsewhere, and `domyjob do test @main` sends that revision instead of the directory on disk.
 Each job may also set `runner`, `workspace` (`warm` or `fresh`), `dir`, and `env`.
 
+## Looking at machines
+
+`domyjob` with no command asks every machine at once and prints one card each: its load, memory, and free disk, what runs and waits there, the last failure, and the one command that deals with whatever needs attention.
+`domyjob --json` gives the same as data.
+`domyjob clean MACHINES` frees the disk domyjob holds there (`--dry-run` first shows how much), and `domyjob machines pause MACHINES` stops them taking new jobs until `resume`.
+
 ## Looking at a machine, instead of ssh
 
 `domyjob on win -- Get-ChildItem Downloads` runs a command on a machine right now and prints only its output, with the command's own exit code.

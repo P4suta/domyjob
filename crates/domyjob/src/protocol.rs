@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-pub const PROTOCOL: u32 = 8;
+pub const PROTOCOL: u32 = 9;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +53,14 @@ pub enum Request {
     },
     Changes {
         job: JobRef,
+    },
+    Report,
+    Clean {
+        apply: bool,
+        logs: bool,
+    },
+    Pause {
+        paused: bool,
     },
     AuditAt {
         seq: u64,
@@ -99,10 +107,48 @@ pub enum Reply {
     AuditHead(crate::audit::Head),
     Digest(Box<Digest>),
     Found(Found),
+    Report(Box<Report>),
+    Cleaned(Box<Cleaned>),
     Refused(Refusal),
 }
 
 impl Reply {
+    pub fn into_report(self) -> Result<Report, Box<Self>> {
+        match self {
+            Self::Report(report) => Ok(*report),
+            other @ (Self::Hello(_)
+            | Self::Missing { .. }
+            | Self::Stored { .. }
+            | Self::Job(_)
+            | Self::Jobs { .. }
+            | Self::Stream
+            | Self::AuditAt { .. }
+            | Self::Digest(_)
+            | Self::Found(_)
+            | Self::AuditHead(_)
+            | Self::Cleaned(_)
+            | Self::Refused(_)) => Err(Box::new(other)),
+        }
+    }
+
+    pub fn into_cleaned(self) -> Result<Cleaned, Box<Self>> {
+        match self {
+            Self::Cleaned(cleaned) => Ok(*cleaned),
+            other @ (Self::Hello(_)
+            | Self::Missing { .. }
+            | Self::Stored { .. }
+            | Self::Job(_)
+            | Self::Jobs { .. }
+            | Self::Stream
+            | Self::AuditAt { .. }
+            | Self::Digest(_)
+            | Self::Found(_)
+            | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Refused(_)) => Err(Box::new(other)),
+        }
+    }
+
     pub fn into_hello(self) -> Result<Hello, Box<Self>> {
         match self {
             Self::Hello(hello) => Ok(hello),
@@ -115,6 +161,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -131,6 +179,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -147,6 +197,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -163,6 +215,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -179,6 +233,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -195,6 +251,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -211,6 +269,8 @@ impl Reply {
             | Self::Digest(_)
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -227,6 +287,8 @@ impl Reply {
             | Self::AuditAt { .. }
             | Self::Digest(_)
             | Self::Found(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -243,6 +305,8 @@ impl Reply {
             | Self::AuditAt { .. }
             | Self::Found(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -259,6 +323,8 @@ impl Reply {
             | Self::AuditAt { .. }
             | Self::Digest(_)
             | Self::AuditHead(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)
             | Self::Refused(_)) => Err(Box::new(other)),
         }
     }
@@ -317,6 +383,37 @@ pub enum RefusalCode {
     NoSuchPath,
     NotAFile,
     DiskFull,
+    Paused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cleaned {
+    pub applied: bool,
+    pub items: Vec<Freeable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Freeable {
+    pub what: RemoteText,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Report {
+    pub host: RemoteText,
+    pub os: RemoteText,
+    pub cores: u32,
+    pub load_hundredths: Option<[u32; 3]>,
+    pub memory_total: u64,
+    pub memory_available: u64,
+    pub disk_total: u64,
+    pub disk_available: u64,
+    pub disk_short: bool,
+    pub uptime_seconds: u64,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

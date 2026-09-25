@@ -104,6 +104,7 @@ pub const fn access(request: &Request) -> Access {
             Access::Needs(Capability::Submit)
         }
         Request::List { .. }
+        | Request::Report
         | Request::AuditAt { .. }
         | Request::AuditHead
         | Request::Digest { .. }
@@ -112,7 +113,9 @@ pub const fn access(request: &Request) -> Access {
         | Request::Wait { .. }
         | Request::Logs { .. }
         | Request::Tail { .. } => Access::Needs(Capability::Observe),
-        Request::Kill { .. } => Access::Needs(Capability::Kill),
+        Request::Kill { .. } | Request::Clean { .. } | Request::Pause { .. } => {
+            Access::Needs(Capability::Kill)
+        }
         Request::Get { .. } | Request::Changes { .. } => Access::Needs(Capability::Fetch),
     }
 }

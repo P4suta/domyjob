@@ -65,6 +65,10 @@ pub const fn of_refusal(code: RefusalCode) -> Diagnosis {
             Kind::Usage,
             "name one file inside the directory; get copies a single file",
         ),
+        RefusalCode::Paused => hinted(
+            Kind::Remote,
+            "the machine is paused for maintenance; `domyjob machines resume MACHINE` lets it take jobs again",
+        ),
         RefusalCode::DiskFull => hinted(
             Kind::Remote,
             "the machine's disk is full; domyjob clears its idle workspaces and old job logs there by itself, and if that is not enough, free space on it and try again",

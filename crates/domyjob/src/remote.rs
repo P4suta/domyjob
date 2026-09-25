@@ -893,6 +893,8 @@ impl<'a> Link<'a> {
             | Reply::AuditHead(_)
             | Reply::Digest(_)
             | Reply::Found(_)
+            | Reply::Report(_)
+            | Reply::Cleaned(_)
             | Reply::Stream) => RemoteError::Unexpected {
                 machine: self.name(),
                 expected,

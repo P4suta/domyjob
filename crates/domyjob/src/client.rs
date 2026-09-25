@@ -785,6 +785,44 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
     Ok(machines)
 }
 
+pub fn clean(
+    ctx: &Context,
+    machine: &Machine,
+    (apply, logs): (bool, bool),
+) -> Result<crate::protocol::Cleaned, RemoteError> {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    link.call(&Request::Clean { apply, logs }, &[])?
+        .into_cleaned()
+        .map_err(|other| link.unexpected("what was cleaned", *other))
+}
+
+pub fn pause(
+    ctx: &Context,
+    machine: &Machine,
+    paused: bool,
+) -> Result<crate::protocol::Report, RemoteError> {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    link.call(&Request::Pause { paused }, &[])?
+        .into_report()
+        .map_err(|other| link.unexpected("a report", *other))
+}
+
+pub fn survey(
+    ctx: &Context,
+    machine: &Machine,
+) -> Result<(crate::protocol::Report, Vec<Job>), RemoteError> {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    let report = link
+        .call(&Request::Report, &[])?
+        .into_report()
+        .map_err(|other| link.unexpected("a report", *other))?;
+    let (jobs, _unreadable) = link
+        .call(&Request::List { limit: 50 }, &[])?
+        .into_jobs()
+        .map_err(|other| link.unexpected("jobs", *other))?;
+    Ok((report, jobs))
+}
+
 #[must_use]
 pub fn list(
     ctx: &Context,

@@ -59,6 +59,8 @@ pub enum NodeError {
     Reused { job: JobId, by: String },
     #[error("job {0} has not finished; its changes can be pulled once it has")]
     Unfinished(JobId),
+    #[error("this machine is paused and takes no new jobs until it is resumed")]
+    Paused,
     #[error(transparent)]
     Workspace(#[from] crate::workspace::WorkspaceError),
     #[error(transparent)]
@@ -102,6 +104,7 @@ impl NodeError {
                 RefusalCode::NoSuchPath
             }
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
+            Self::Paused => RefusalCode::Paused,
             Self::Unfinished(_)
             | Self::Request(_)
             | Self::Invalid(_)
@@ -126,6 +129,51 @@ impl NodeError {
             | Self::Scan(crate::logscan::ScanError::Io(_))
             | Self::Lock(_) => RefusalCode::Storage,
         }
+    }
+}
+
+fn size_of(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&next) {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+fn cores() -> u32 {
+    let count = match std::thread::available_parallelism() {
+        Ok(count) => count.get(),
+        Err(_unknown) => return 0,
+    };
+    match u32::try_from(count) {
+        Ok(fits) => fits,
+        Err(_beyond_u32) => u32::MAX,
+    }
+}
+
+fn hundredths(value: f64) -> u32 {
+    let scaled = (value * 100.0).round();
+    if scaled.is_finite() && scaled >= 0.0 && scaled <= f64::from(u32::MAX) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::as_conversions,
+            reason = "the value was just checked to be a whole number within u32"
+        )]
+        let whole = scaled as u32;
+        whole
+    } else {
+        0
     }
 }
 
@@ -277,6 +325,9 @@ fn read_line<T: crate::ingress::Ingress>(input: &mut dyn BufRead) -> Result<T, N
 const fn action(request: &Request) -> &'static str {
     match request {
         Request::Hello => "hello",
+        Request::Report => "report",
+        Request::Clean { .. } => "clean",
+        Request::Pause { .. } => "pause",
         Request::Hold => "hold",
         Request::Missing { .. } => "missing",
         Request::Upload { .. } => "upload",
@@ -309,6 +360,9 @@ fn subject(request: &Request) -> Option<String> {
         Request::Get { job, path } => Some(format!("{job} {path}")),
         Request::Submit { submission } => Some(submission.command.display()),
         Request::Hello
+        | Request::Report
+        | Request::Clean { .. }
+        | Request::Pause { .. }
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -322,9 +376,12 @@ const fn audited(request: &Request) -> bool {
     match request {
         Request::Submit { .. }
         | Request::Kill { .. }
+        | Request::Clean { .. }
+        | Request::Pause { .. }
         | Request::Get { .. }
         | Request::Changes { .. } => true,
         Request::Hello
+        | Request::Report
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -417,6 +474,9 @@ impl Node {
             Request::Get { job, path } => self.get(&self.own(&principal, &job)?, &path, output),
             Request::Changes { job } => self.changes(&self.own(&principal, &job)?, output),
             single @ (Request::Hello
+            | Request::Report
+            | Request::Clean { .. }
+            | Request::Pause { .. }
             | Request::AuditAt { .. }
             | Request::AuditHead
             | Request::Digest { .. }
@@ -448,6 +508,12 @@ impl Node {
     ) -> Result<Reply, NodeError> {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
+            Request::Report => Reply::Report(Box::new(self.report())),
+            Request::Pause { paused } => {
+                self.pause(paused)?;
+                Reply::Report(Box::new(self.report()))
+            }
+            Request::Clean { apply, logs } => Reply::Cleaned(Box::new(self.clean((apply, logs))?)),
             Request::AuditAt { seq } => Reply::AuditAt {
                 hash: self.audit.hash_at(seq)?,
             },
@@ -521,6 +587,9 @@ impl Node {
     }
 
     fn accept(&self, principal: &Principal, submission: Submission) -> Result<Job, NodeError> {
+        if submission.queue == crate::protocol::Queue::Slot && self.paused() {
+            return Err(NodeError::Paused);
+        }
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
         let nonce_path = self.store.nonce_path(
             &crate::supervisor::scope_name(&principal.submitter()),
@@ -643,6 +712,51 @@ impl Node {
         }
     }
 
+    fn report(&self) -> crate::protocol::Report {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let load = sysinfo::System::load_average();
+        let load_hundredths =
+            (!cfg!(windows)).then(|| [load.one, load.five, load.fifteen].map(hundredths));
+        let (disk_total, disk_available) = match fs4::statvfs(self.store.area("jobs")) {
+            Ok(stats) => (stats.total_space(), stats.available_space()),
+            Err(_unmeasurable) => (0, 0),
+        };
+        crate::protocol::Report {
+            host: RemoteText::new(sysinfo::System::host_name().unwrap_or_default()),
+            os: RemoteText::new(sysinfo::System::long_os_version().unwrap_or_default()),
+            cores: cores(),
+            load_hundredths,
+            memory_total: system.total_memory(),
+            memory_available: system.available_memory(),
+            disk_total,
+            disk_available,
+            disk_short: short(disk_available, disk_total),
+            uptime_seconds: sysinfo::System::uptime(),
+            paused: self.paused(),
+        }
+    }
+
+    fn pause_path(&self) -> PathBuf {
+        self.store.area("paused")
+    }
+
+    fn paused(&self) -> bool {
+        matches!(
+            crate::state_file::read_bytes(&self.pause_path()),
+            Ok(Some(_))
+        )
+    }
+
+    fn pause(&self, paused: bool) -> Result<(), NodeError> {
+        if paused {
+            crate::state_file::write_bytes(&self.pause_path(), b"paused")?;
+        } else {
+            crate::state_file::remove_file(&self.pause_path())?;
+        }
+        Ok(())
+    }
+
     fn short_of_room(&self) -> bool {
         match fs4::statvfs(self.store.area("jobs")) {
             Ok(stats) => short(stats.available_space(), stats.total_space()),
@@ -655,33 +769,99 @@ impl Node {
             return Ok(());
         }
         for (workspace, lock) in self.idle_workspaces() {
-            if let Some(idle) = crate::lock::OsLock::try_exclusive(&lock)? {
-                let aside = self
-                    .store
-                    .area("trash")
-                    .join(format!("workspace-{}", JobId::generate()?));
-                crate::state_file::move_aside(&workspace, &aside)?;
-                crate::state_file::remove_tree_forcibly(&aside)?;
-                idle.release()?;
-                if !short() {
-                    return Ok(());
-                }
+            if self.evict(&workspace, &lock)? && !short() {
+                return Ok(());
             }
         }
         for id in self.finished_largest_log_first()? {
-            let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(&id))?
-            else {
-                continue;
-            };
-            let log = self.store.log_path(&id);
-            crate::state_file::cut_to(&log, 0)?;
-            crate::state_file::overwrite_in_place(&log, DISCARDED)?;
-            alive.release()?;
-            if !short() {
+            if self.discard_log(&id)? && !short() {
                 return Ok(());
             }
         }
         self.collect(Keep::Unfinished)
+    }
+
+    fn evict(
+        &self,
+        workspace: &std::path::Path,
+        lock: &std::path::Path,
+    ) -> Result<bool, NodeError> {
+        let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
+            return Ok(false);
+        };
+        let aside = self
+            .store
+            .area("trash")
+            .join(format!("workspace-{}", JobId::generate()?));
+        crate::state_file::move_aside(workspace, &aside)?;
+        crate::state_file::remove_tree_forcibly(&aside)?;
+        idle.release()?;
+        Ok(true)
+    }
+
+    fn discard_log(&self, id: &JobId) -> Result<bool, NodeError> {
+        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
+            return Ok(false);
+        };
+        let log = self.store.log_path(id);
+        crate::state_file::cut_to(&log, 0)?;
+        crate::state_file::overwrite_in_place(&log, DISCARDED)?;
+        alive.release()?;
+        Ok(true)
+    }
+
+    fn clean(&self, (apply, logs): (bool, bool)) -> Result<crate::protocol::Cleaned, NodeError> {
+        let work = self.store.area("work");
+        let mut items = Vec::new();
+        for (workspace, lock) in self.idle_workspaces() {
+            let bytes = size_of(&workspace);
+            if apply && !self.evict(&workspace, &lock)? {
+                continue;
+            }
+            let shown = match workspace.strip_prefix(&work) {
+                Ok(inside) => inside,
+                Err(_elsewhere) => &workspace,
+            };
+            items.push(crate::protocol::Freeable {
+                what: RemoteText::new(format!("workspace {}", shown.display())),
+                bytes,
+            });
+        }
+        if logs {
+            let finished = self.finished_largest_log_first()?;
+            let mut bytes = 0u64;
+            let mut count = 0u64;
+            for id in &finished {
+                let size = size_of(&self.store.log_path(id));
+                if apply && !self.discard_log(id)? {
+                    continue;
+                }
+                bytes = bytes
+                    .saturating_add(size.saturating_sub(crate::domain::len_u64(DISCARDED.len())));
+                count = count.saturating_add(1);
+            }
+            if count > 0 {
+                items.push(crate::protocol::Freeable {
+                    what: RemoteText::new(format!("the logs of {count} finished jobs")),
+                    bytes,
+                });
+            }
+        }
+        let trash = size_of(&self.store.area("trash"));
+        if trash > 0 {
+            items.push(crate::protocol::Freeable {
+                what: RemoteText::new("things set aside to remove".to_owned()),
+                bytes: trash,
+            });
+        }
+        if apply {
+            self.empty_trash();
+            self.collect(Keep::Every)?;
+        }
+        Ok(crate::protocol::Cleaned {
+            applied: apply,
+            items,
+        })
     }
 
     fn idle_workspaces(&self) -> Vec<(PathBuf, PathBuf)> {
@@ -1637,6 +1817,61 @@ mod tests {
             workspace: crate::protocol::Workspace::Warm,
         };
         crate::state_file::write_json(&store.job_dir(id).join("spec.json"), &spec).unwrap();
+    }
+
+    #[test]
+    fn a_report_describes_the_machine_and_a_paused_one_refuses_new_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let report = node.report();
+        assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
+        assert!(!report.paused);
+        let wire = ask(&node, &Request::Pause { paused: true });
+        let paused = crate::remote::receive("m", &mut wire.as_slice(), &mut Vec::new()).unwrap();
+        assert!(paused.into_report().unwrap().paused);
+        let nonce = crate::domain::Nonce::generate().unwrap();
+        let refused_while_paused = ask(&node, &submission(nonce, Location::Home));
+        let reply =
+            crate::remote::receive("m", &mut refused_while_paused.as_slice(), &mut Vec::new())
+                .unwrap();
+        assert!(
+            matches!(&reply, Reply::Refused(refusal) if refusal.code == RefusalCode::Paused),
+            "{reply:?}"
+        );
+        node.pause(false).unwrap();
+        assert!(!node.report().paused);
+    }
+
+    #[test]
+    fn cleaning_lists_before_it_frees_and_frees_only_what_is_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let project = store.area("work").join("owner").join("proj");
+        for slot in ["0", "1"] {
+            crate::state_file::write_bytes(&project.join(slot).join("out"), &[b'b'; 5_000])
+                .unwrap();
+        }
+        let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
+        let listed = node.clean((false, true)).unwrap();
+        assert!(!listed.applied);
+        assert!(
+            listed.items.iter().any(|item| item.bytes == 5_000),
+            "{listed:?}"
+        );
+        assert!(project.join("0").join("out").try_exists().unwrap());
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
+
+        let freed = node.clean((true, false)).unwrap();
+        assert!(freed.applied);
+        assert_eq!(freed.items.len(), 1, "{freed:?}");
+        assert!(!project.join("0").try_exists().unwrap());
+        assert!(project.join("1").join("out").try_exists().unwrap());
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
+        node.clean((true, true)).unwrap();
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
+        busy.release().unwrap();
     }
 
     #[test]
