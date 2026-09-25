@@ -1,0 +1,7 @@
+name: domyjob
+
+queries:
+  - uses: security-extended
+
+paths-ignore:
+  - "fuzz/**"
