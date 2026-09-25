@@ -20,6 +20,7 @@ pub fn wire() -> &'static str {
             "reply": schemars::schema_for!(Reply),
             "frame": schemars::schema_for!(Frame),
             "ending": schemars::schema_for!(crate::framed::Ending),
+            "survey": schemars::schema_for!(Survey),
             "framing": FRAMING,
         });
         let digest = blake3::hash(described.to_string().as_bytes()).to_hex();
@@ -82,6 +83,7 @@ pub enum Request {
         job: JobRef,
     },
     Report,
+    Watch,
     Clean {
         apply: bool,
         logs: bool,
@@ -412,6 +414,15 @@ pub enum RefusalCode {
     DiskFull,
     Paused,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Survey {
+    pub report: Report,
+    pub jobs: Vec<Job>,
+}
+
+impl crate::ingress::Ingress for Survey {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -807,6 +807,42 @@ pub fn pause(
         .map_err(|other| link.unexpected("a report", *other))
 }
 
+struct Surveys<'a> {
+    pending: Vec<u8>,
+    each: &'a mut dyn FnMut(crate::protocol::Survey),
+}
+
+impl Write for Surveys<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let survey = crate::ingress::json(&line).map_err(std::io::Error::other)?;
+            (self.each)(survey);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn watch(
+    ctx: &Context,
+    machine: &Machine,
+    each: &mut dyn FnMut(crate::protocol::Survey),
+) -> Result<(), RemoteError> {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    let mut surveys = Surveys {
+        pending: Vec::new(),
+        each,
+    };
+    link.stream(&Request::Watch, &mut surveys)?
+        .into_stream()
+        .map_err(|other| link.unexpected("a stream of surveys", *other))
+}
+
 pub fn survey(
     ctx: &Context,
     machine: &Machine,

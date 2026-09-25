@@ -36,6 +36,11 @@ struct Cli {
         help = "With no command, print the overview of every machine as machine-readable JSON"
     )]
     json: bool,
+    #[arg(
+        long,
+        help = "With no command, keep the overview on screen and redraw it as jobs start and finish"
+    )]
+    live: bool,
     #[command(subcommand)]
     command: Option<Top>,
 }
@@ -807,6 +812,7 @@ pub fn main() -> ExitCode {
     let json = cli.command.as_ref().map_or(cli.json, wants_json);
     let outcome = match cli.command {
         Some(command) => dispatch(command),
+        None if cli.live => live(cli.json),
         None => overview(cli.json),
     };
     match outcome {
@@ -1930,6 +1936,81 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
     } else {
         ExitCode::from(FAILED_JOB)
     })
+}
+
+fn live(json: bool) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let machines = ctx.config.configured();
+    if machines.is_empty() {
+        show(crate::view::first_run())?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let redraw = !json && crate::view::stdout_is_a_person();
+    let (updates, arrivals) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| -> Result<(), CliError> {
+        for machine in &machines {
+            let updates = updates.clone();
+            let ctx = &ctx;
+            scope.spawn(move || {
+                let name = machine.name.clone();
+                let mut each = |survey: crate::protocol::Survey| match updates
+                    .send((name.clone(), Ok(survey)))
+                {
+                    Ok(()) | Err(_) => {}
+                };
+                let ended = client::watch(ctx, machine, &mut each);
+                let why = match ended {
+                    Ok(()) => "stopped reporting".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                match updates.send((name, Err(why))) {
+                    Ok(()) | Err(_) => {}
+                }
+            });
+        }
+        drop(updates);
+        let mut cards: BTreeMap<MachineName, String> = BTreeMap::new();
+        let mut drawn = 0usize;
+        for (name, update) in arrivals {
+            if json {
+                let value = match &update {
+                    Ok(survey) => overview_json(&name, &survey.report, &survey.jobs),
+                    Err(why) => serde_json::json!({
+                        "machine": name,
+                        "reachable": false,
+                        "error": {"message": why},
+                    }),
+                };
+                println!("{value}");
+                continue;
+            }
+            let card = match update {
+                Ok(survey) => crate::view::machine_card(
+                    &name,
+                    &survey.report,
+                    &survey.jobs,
+                    Timestamp::observe(),
+                ),
+                Err(why) => crate::view::unreachable_card(&name, &why, None),
+            }
+            .map_err(|e| CliError::Output(std::io::Error::other(e)))?;
+            cards.insert(name, card);
+            let mut screen: String = cards.values().map(String::as_str).collect();
+            screen.push_str(&crate::ui::paint(
+                crate::ui::Tone::Dim,
+                "live: redrawn as jobs start and finish · Ctrl-C to stop\n",
+            ));
+            let mut out = anstream::stdout();
+            if redraw && drawn > 0 {
+                write!(out, "\x1b[{drawn}F\x1b[J").map_err(CliError::Output)?;
+            }
+            out.write_all(screen.as_bytes()).map_err(CliError::Output)?;
+            out.flush().map_err(CliError::Output)?;
+            drawn = screen.lines().count();
+        }
+        Ok(())
+    })?;
+    Ok(ExitCode::from(FAILED_JOB))
 }
 
 fn overview_json(

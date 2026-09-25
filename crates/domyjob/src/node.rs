@@ -132,6 +132,22 @@ impl NodeError {
     }
 }
 
+fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
+    path.parent() == Some(jobs)
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "phase.json" || name == "outcome")
+}
+
+fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
+    NodeError::Io {
+        action: "watching",
+        path: jobs.to_path_buf(),
+        source: std::io::Error::other(error.to_string()),
+    }
+}
+
 fn size_of(path: &std::path::Path) -> u64 {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
@@ -326,6 +342,7 @@ const fn action(request: &Request) -> &'static str {
     match request {
         Request::Hello => "hello",
         Request::Report => "report",
+        Request::Watch => "watch",
         Request::Clean { .. } => "clean",
         Request::Pause { .. } => "pause",
         Request::Hold => "hold",
@@ -361,6 +378,7 @@ fn subject(request: &Request) -> Option<String> {
         Request::Submit { submission } => Some(submission.command.display()),
         Request::Hello
         | Request::Report
+        | Request::Watch
         | Request::Clean { .. }
         | Request::Pause { .. }
         | Request::Hold
@@ -382,6 +400,7 @@ const fn audited(request: &Request) -> bool {
         | Request::Changes { .. } => true,
         Request::Hello
         | Request::Report
+        | Request::Watch
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -473,6 +492,7 @@ impl Node {
             Request::Tail { job, lines } => self.tail(&self.own(&principal, &job)?, lines, output),
             Request::Get { job, path } => self.get(&self.own(&principal, &job)?, &path, output),
             Request::Changes { job } => self.changes(&self.own(&principal, &job)?, output),
+            Request::Watch => self.watch(&principal, input, output),
             single @ (Request::Hello
             | Request::Report
             | Request::Clean { .. }
@@ -561,6 +581,7 @@ impl Node {
             | Request::Logs { .. }
             | Request::Tail { .. }
             | Request::Get { .. }
+            | Request::Watch
             | Request::Changes { .. } => {
                 return Err(NodeError::Misrouted(action(&request)));
             }
@@ -1271,6 +1292,64 @@ impl Node {
         })
     }
 
+    fn watch(
+        &self,
+        principal: &Principal,
+        mut input: impl Input,
+        output: &mut dyn Write,
+    ) -> Result<(), NodeError> {
+        let jobs = self.store.area("jobs");
+        let (wake, woken) = std::sync::mpsc::channel::<bool>();
+        let changed = wake.clone();
+        let area = jobs.clone();
+        let mut notifier =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event
+                    && event.paths.iter().any(|path| telling(&area, path))
+                {
+                    match changed.send(true) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+            })
+            .map_err(|error| watching(&jobs, &error))?;
+        notify::Watcher::watch(&mut notifier, &jobs, notify::RecursiveMode::Recursive)
+            .map_err(|error| watching(&jobs, &error))?;
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 256];
+            while let Ok(read) = input.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+            }
+            match wake.send(false) {
+                Ok(()) | Err(_) => {}
+            }
+        });
+        streamed(output, |framed| {
+            loop {
+                let (listed, _unreadable) = self.list(principal, 50)?;
+                let survey = crate::protocol::Survey {
+                    report: self.report(),
+                    jobs: listed,
+                };
+                let mut line =
+                    serde_json::to_vec(&survey).map_err(|e| NodeError::Output(e.into()))?;
+                line.push(b'\n');
+                framed.write_all(&line).map_err(NodeError::Output)?;
+                framed.flush().map_err(NodeError::Output)?;
+                match woken.recv() {
+                    Ok(true) => {
+                        if woken.try_iter().any(|job_changed| !job_changed) {
+                            return Ok(());
+                        }
+                    }
+                    Ok(false) | Err(_) => return Ok(()),
+                }
+            }
+        })
+    }
+
     fn workspace_of(
         &self,
         id: &JobId,
@@ -1873,6 +1952,63 @@ mod tests {
         node.clean((true, true)).unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
         busy.release().unwrap();
+    }
+
+    struct Tell(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl Write for Tell {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.0.send(bytes.to_vec()) {
+                Ok(()) | Err(_) => {}
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_watch_answers_at_once_again_on_every_job_change_and_ends_when_the_client_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut line = serde_json::to_vec(&Request::Watch).unwrap();
+        line.push(b'\n');
+        let input = std::io::BufReader::new(Read::chain(std::io::Cursor::new(line), reader));
+        let (told, heard) = std::sync::mpsc::channel();
+        let serving = std::thread::spawn(move || {
+            node.serve(&Principal::Owner, input, &mut Tell(told))
+                .unwrap();
+        });
+        let mut wire = Vec::new();
+        let mut surveys = 0;
+        while surveys < 2 {
+            let chunk = heard.recv().unwrap();
+            if chunk.windows(8).any(|w| w == b"\"report\"") {
+                surveys += 1;
+                if surveys == 1 {
+                    store.set_phase(&id, &Phase::Queued).unwrap();
+                }
+            }
+            wire.extend(chunk);
+        }
+        drop(writer);
+        serving.join().unwrap();
+        wire.extend(heard.try_iter().flatten());
+        let mut streamed = Vec::new();
+        let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut streamed).unwrap();
+        assert!(matches!(reply, Reply::Stream));
+        let lines: Vec<&[u8]> = streamed
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(lines.len() >= 2, "{}", String::from_utf8_lossy(&streamed));
+        let last: crate::protocol::Survey = crate::ingress::json(lines.last().unwrap()).unwrap();
+        assert_eq!(last.jobs.first().unwrap().phase, Phase::Queued);
     }
 
     #[test]

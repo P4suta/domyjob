@@ -107,6 +107,7 @@ pub const fn access(request: &Request) -> Access {
         }
         Request::List { .. }
         | Request::Report
+        | Request::Watch
         | Request::AuditAt { .. }
         | Request::AuditHead
         | Request::Digest { .. }
