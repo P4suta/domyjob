@@ -922,6 +922,7 @@ fn current_dir() -> Result<PathBuf, CliError> {
 fn on(args: &OnArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let order = Order {
+        queue: crate::protocol::Queue::Now,
         targets: args.targets.clone(),
         words: user_words(&args.input),
         runner: None,
@@ -953,6 +954,7 @@ enum Voice {
 fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let order = Order {
+        queue: crate::protocol::Queue::Slot,
         targets: args.targets.clone(),
         words: user_words(&args.input),
         runner: args.runner.clone(),
@@ -997,6 +999,7 @@ fn run_named(args: &DoArgs) -> Result<ExitCode, CliError> {
     };
 
     let order = Order {
+        queue: crate::protocol::Queue::Slot,
         targets: args.on.clone().unwrap_or_else(|| def.on.clone()),
         words: def
             .run

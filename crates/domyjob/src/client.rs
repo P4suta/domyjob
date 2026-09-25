@@ -274,6 +274,7 @@ pub struct Order {
     pub env: BTreeMap<EnvName, String>,
     pub shell: Option<String>,
     pub name: Option<JobName>,
+    pub queue: crate::protocol::Queue,
 }
 
 #[derive(Debug, Clone)]
@@ -521,7 +522,7 @@ pub enum Stage<'a> {
     Connected,
     Sending { files: u64, bytes: u64 },
     UpToDate,
-    Submitted(&'a JobId),
+    Submitted(&'a Job),
 }
 
 const SUBMIT_ATTEMPTS: u32 = 3;
@@ -554,6 +555,7 @@ impl Plan<'_> {
             env: self.order.env.clone(),
             shell: self.order.shell.clone().or_else(|| machine.shell.clone()),
             concurrency: machine.max_jobs,
+            queue: self.order.queue,
         }
     }
 
@@ -612,7 +614,7 @@ impl Plan<'_> {
                 machine.name, submitted.job.spec.id
             );
         }
-        report(Stage::Submitted(&submitted.job.spec.id));
+        report(Stage::Submitted(&submitted.job));
         Ok(submitted)
     }
 }
@@ -1036,6 +1038,7 @@ mod tests {
         )
         .unwrap();
         let order = |words: &[&str], runner: Option<&str>| Order {
+            queue: crate::protocol::Queue::Slot,
             targets: "local".into(),
             words: words
                 .iter()

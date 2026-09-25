@@ -174,6 +174,17 @@ impl Store {
         Ok(())
     }
 
+    pub fn skip_the_queue(&self, id: &JobId) -> Result<(), StoreError> {
+        Ok(crate::state_file::write_bytes(
+            &self.staged_dir(id).join("now"),
+            b"now",
+        )?)
+    }
+
+    pub fn skips_the_queue(&self, id: &JobId) -> Result<bool, StoreError> {
+        Ok(crate::state_file::read_bytes(&self.job_dir(id).join("now"))?.is_some())
+    }
+
     pub fn publish(&self, id: &JobId) -> Result<(), StoreError> {
         Ok(crate::state_file::publish_dir(
             &self.staged_dir(id),
@@ -721,6 +732,28 @@ mod tests {
                 "{staged:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_job_marked_to_skip_the_queue_keeps_the_mark_when_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let [now, queued]: [JobId; 2] =
+            ["0PPPPPPPPPPPPPPP", "0QQQQQQQQQQQQQQQ"].map(|id| id.parse().unwrap());
+        for (sequence, id) in (1..).zip([&now, &queued]) {
+            store
+                .stage(
+                    &spec(id, sequence),
+                    (&BTreeMap::new(), &LaunchEnv::default()),
+                )
+                .unwrap();
+        }
+        store.skip_the_queue(&now).unwrap();
+        for id in [&now, &queued] {
+            store.publish(id).unwrap();
+        }
+        assert!(store.skips_the_queue(&now).unwrap());
+        assert!(!store.skips_the_queue(&queued).unwrap());
     }
 
     #[test]
