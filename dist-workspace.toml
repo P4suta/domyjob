@@ -19,3 +19,4 @@ windows-archive = ".tar.gz"
 install-path = ["$XDG_BIN_HOME/", "~/.local/bin"]
 install-updater = false
 dispatch-releases = true
+allow-dirty = ["ci"]
