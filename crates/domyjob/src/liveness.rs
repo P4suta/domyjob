@@ -603,8 +603,8 @@ mod tests {
     #[test]
     fn a_talking_peer_is_never_silenced() {
         let limits = Limits {
-            first_word: Duration::from_millis(60),
-            silence: Duration::from_millis(60),
+            first_word: Duration::from_secs(1),
+            silence: Duration::from_secs(1),
         };
         let talking = Activity::default();
         let (dog, heard) = watch(&talking, limits);
