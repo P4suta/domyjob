@@ -1407,6 +1407,7 @@ mod tests {
         assert!(refused(&ask(&node, &Request::Tail { job, lines: 3 })));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_agent_a_job_uses_is_the_one_the_machines_ssh_configuration_names() {
         let home = std::path::Path::new("/home/me");

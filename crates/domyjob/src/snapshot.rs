@@ -398,15 +398,21 @@ pub fn detect<'a>(config: &'a Config, start: &Path) -> Result<Option<Detected<'a
     Ok(None)
 }
 
-fn run_template(source_name: &str, argv: &[Arg]) -> Result<Vec<u8>, SnapshotError> {
+fn run_template(
+    (source_name, source): (&str, &SourceConf),
+    argv: &[Arg],
+) -> Result<Vec<u8>, SnapshotError> {
     let Some(invocation) = crate::spawn::Invocation::from_words(argv.to_vec()) else {
         return Err(SnapshotError::Output {
             source_name: source_name.to_owned(),
             detail: "empty command".to_owned(),
         });
     };
-    let out = invocation
-        .command()
+    let mut command = invocation.command();
+    for name in source.unset.iter().flatten() {
+        command.env_remove(name);
+    }
+    let out = command
         .stdin(Stdio::null())
         .output()
         .map_err(|error| SnapshotError::Start {
@@ -488,7 +494,7 @@ pub fn identity(detected: &Detected<'_>) -> Option<PathBuf> {
         .identity
         .as_ref()?
         .render(&Bindings::new().with("root", Arg::path(&detected.root)));
-    let printed = match argv.map(|argv| run_template(detected.name, &argv)) {
+    let printed = match argv.map(|argv| run_template((detected.name, detected.source), &argv)) {
         Ok(Ok(printed)) => printed,
         Ok(Err(_)) | Err(_) => return None,
     };
@@ -508,7 +514,7 @@ pub fn from_revision(
     };
     let root = Arg::path(&detected.root);
     let resolved = run_template(
-        name,
+        (name, source),
         &source
             .resolve
             .render(
@@ -531,7 +537,10 @@ pub fn from_revision(
     let base = Bindings::new()
         .with("root", root)
         .with("commit", Arg::word(&commit));
-    let listing = run_template(name, &source.list.render(&base).map_err(template)?)?;
+    let listing = run_template(
+        (name, source),
+        &source.list.render(&base).map_err(template)?,
+    )?;
     let listed = parse_listing(name, source.separator, &listing)?;
     let contents = show_all(name, source, &base, &listed)?;
     let mut entries = BTreeMap::new();
@@ -590,7 +599,7 @@ fn show_all(
                                     source_name: name.to_owned(),
                                     source: e,
                                 })?;
-                            run_template(name, &argv)
+                            run_template((name, source), &argv)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -639,6 +648,11 @@ mod tests {
                 if cfg!(windows) { "NUL" } else { "/dev/null" },
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
             .output()
             .unwrap();
         assert!(
