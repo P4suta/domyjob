@@ -1,0 +1,174 @@
+[transports.local]
+binary = "self"
+run = ["{remote_argv...}"]
+
+[transports.paired]
+binary = "present"
+run = ["{self}", "tunnel", "{name}"]
+
+[transports.ssh]
+binary = "upload"
+run = [
+  "ssh",
+  "-T",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=4",
+  "-o",
+  "ControlMaster=no",
+  "-o",
+  "ControlPath={cache}/s{session}-%C",
+  "{host}",
+  "{remote}",
+]
+share = [
+  "ssh",
+  "-T",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=4",
+  "-o",
+  "ControlMaster=auto",
+  "-o",
+  "ControlPath={cache}/s{session}-%C",
+  "-o",
+  "ControlPersist=no",
+  "{host}",
+  "{remote}",
+]
+run_windows = [
+  "ssh",
+  "-T",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "ServerAliveInterval=15",
+  "-o",
+  "ServerAliveCountMax=4",
+  "{host}",
+  "{remote}",
+]
+
+[sources.jj]
+detect = ".jj"
+priority = 20
+separator = "nul"
+resolve = [
+  "jj",
+  "--no-pager",
+  "--color=never",
+  "-R",
+  "{root}",
+  "log",
+  "--no-graph",
+  "-r",
+  "{rev}",
+  "-T",
+  "commit_id",
+]
+list = [
+  "jj",
+  "--no-pager",
+  "--color=never",
+  "-R",
+  "{root}",
+  "file",
+  "list",
+  "-r",
+  "{commit}",
+  "-T",
+  'path ++ "\t" ++ file_type ++ "\t" ++ executable ++ "\0"',
+]
+show = [
+  "jj",
+  "--no-pager",
+  "--color=never",
+  "-R",
+  "{root}",
+  "file",
+  "show",
+  "-r",
+  "{commit}",
+  "root-file:{path|fileset}",
+]
+identity = ["jj", "--no-pager", "--color=never", "-R", "{root}", "config", "path", "--repo"]
+
+[sources.git]
+detect = ".git"
+priority = 10
+separator = "nul"
+resolve = ["git", "-C", "{root}", "rev-parse", "--verify", "--end-of-options", "{rev}^{{commit}}"]
+list = [
+  "git",
+  "-C",
+  "{root}",
+  "ls-tree",
+  "-r",
+  "-z",
+  "--full-tree",
+  "--format=%(path)%x09%(objecttype)%x09%(objectmode)",
+  "{commit}",
+]
+show = ["git", "-C", "{root}", "cat-file", "blob", "{commit}:{path}"]
+identity = ["git", "-C", "{root}", "rev-parse", "--path-format=absolute", "--git-common-dir"]
+
+[runners.shell]
+kind = "script"
+run = "{input}"
+
+[runners.exec]
+kind = "argv"
+run = ["{words...}"]
+
+[notifiers.ntfy]
+stdin = "text"
+run = [
+  "curl",
+  "--proto",
+  "=https",
+  "-fsS",
+  "-H",
+  "Title: domyjob",
+  "--data-binary",
+  "@-",
+  "--url",
+  "{target}",
+]
+
+[notifiers.desktop]
+stdin = "text"
+run = ["sh", "-c", "notify-send -- domyjob \"$(cat)\""]
+run_macos = [
+  "sh",
+  "-c",
+  "osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title \"domyjob\"' -e 'end run' -- \"$(cat)\"",
+]
+
+[distribution]
+manifest = "https://github.com/P4suta/domyjob/releases/download/v{version}/domyjob-manifest.json"
+latest = "https://github.com/P4suta/domyjob/releases/latest/download/domyjob-manifest.json"
+archive = "https://github.com/P4suta/domyjob/releases/download/v{version}/domyjob-{target}.tar.gz"
+fetch = [
+  "curl",
+  "--proto",
+  "=https",
+  "--tlsv1.2",
+  "-fsSL",
+  "--connect-timeout",
+  "30",
+  "--speed-limit",
+  "1024",
+  "--speed-time",
+  "60",
+  "-o",
+  "{output}",
+  "{url}",
+]
+unpack = ["tar", "-xzf", "{archive}", "-C", "{dir}"]
+binary = "domyjob-{target}/domyjob{exe}"

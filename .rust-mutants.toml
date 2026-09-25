@@ -1,0 +1,332 @@
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "send_frame"
+rule = "question-to-unwrap"
+original = "?"
+line = 91
+reason = "every frame is at most MAX_MESSAGE (65535) bytes: handshake messages are fixed sizes and Writer::seal splits data into MAX_PAYLOAD chunks, so the length always fits a u16"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "builder"
+rule = "question-to-unwrap"
+original = "?"
+line = 125
+reason = "Purpose::pattern returns one of two constant Noise pattern strings that snow parses"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "write_message"
+rule = "question-to-unwrap"
+original = "?"
+line = 159
+reason = "write_message is only called on our own turn, with an empty payload and a MAX_MESSAGE buffer, which holds any Noise handshake message"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "finish"
+rule = "question-to-unwrap"
+original = "?"
+line = 176
+count = 2
+reason = "finish runs only after IK or XX completed, and both patterns deliver the peer's 32-byte static key, so get_remote_static is Some and PublicKey::from_slice accepts it"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "finish"
+rule = "question-to-unwrap"
+original = "?"
+line = 181
+reason = "finish runs only after the handshake completed, the one state in which snow converts to transport mode"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "connect"
+rule = "question-to-unwrap"
+original = "?"
+line = 210
+reason = "builder only fails on an unparsable pattern, and the Connect pattern is a constant"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "connect"
+rule = "question-to-unwrap"
+original = "?"
+line = 214
+reason = "the PSK is a 32-byte agreement secret, the remote key a 32-byte PublicKey, and IKpsk2 takes both, so snow's builder has nothing to reject"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "accept"
+rule = "question-to-unwrap"
+original = "?"
+line = 227
+reason = "builder only fails on an unparsable pattern, and the Connect pattern is a constant"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "accept"
+rule = "question-to-unwrap"
+original = "?"
+line = 230
+reason = "the PSK is a 32-byte agreement secret and IKpsk2 as a responder needs nothing else, so snow's builder has nothing to reject"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "accept"
+rule = "question-to-unwrap"
+original = "?"
+line = 232
+count = 2
+reason = "the first IK message carries the initiator's static key and read_message succeeded, so get_remote_static is Some with 32 bytes and PublicKey::from_slice accepts it"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "pair"
+rule = "question-to-unwrap"
+original = "?"
+line = 333
+reason = "builder only fails on an unparsable pattern, and the Pair pattern is a constant"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "pair"
+rule = "question-to-unwrap"
+original = "?"
+line = 335
+reason = "the PSK is a 32-byte BLAKE3 output and XXpsk3 has a PSK at position 3, so snow's builder has nothing to reject"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "pair"
+rule = "question-to-unwrap"
+original = "?"
+line = 340
+reason = "the builder is complete with a key, a prologue, and the PSK, so building either side of XXpsk3 has nothing to reject"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/secure.rs"
+item = "Writer::seal"
+rule = "question-to-unwrap"
+original = "?"
+line = 531
+reason = "the plaintext is at most MAX_PAYLOAD + 1 bytes and the buffer is exactly TAG longer, the only condition under which ChaChaPoly sealing fails"
+outcome = "survived"
+
+[[mutation.skip]]
+path = "crates/domyjob/src/keystore.rs"
+lines = "111-111"
+reason = "the platform arm of KeyStore::load only hands Os to migrate, which is tested through a fake Vault; reaching the arm itself would read the user's real keychain"
+
+[[mutation.skip]]
+path = "crates/domyjob/src/keystore.rs"
+lines = "123-123"
+reason = "the platform arm of KeyStore::store only forwards to Os; reaching it would write to the user's real keychain"
+
+[[mutation.skip]]
+path = "crates/domyjob/src/keystore.rs"
+lines = "136-145"
+reason = "Os only forwards to the macOS keychain or Windows DPAPI; exercising it from a test writes to the user's real keychain, so migrate is tested through a fake Vault instead"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "Head::genesis"
+rule = "question-to-unwrap"
+original = "?"
+line = 69
+reason = "GENESIS is a constant 64-digit hex string, which ChainHash parses"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::record"
+rule = "question-to-unwrap"
+original = "?"
+line = 135
+reason = "Head::genesis only parses the constant GENESIS, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::repair"
+rule = "question-to-unwrap"
+original = "?"
+line = 191
+reason = "Head::genesis only parses the constant GENESIS, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::walk_repaired"
+rule = "question-to-unwrap"
+original = "?"
+line = 252
+reason = "Head::genesis only parses the constant GENESIS, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::record"
+rule = "question-to-unwrap"
+original = "?"
+line = 147
+reason = "Entry holds strings, integers, and unit enums, none of which serde_json can fail to encode"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::record"
+rule = "question-to-unwrap"
+original = "?"
+line = 160
+reason = "digest parses a BLAKE3 hex digest, always 64 lowercase hex digits, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::repair"
+rule = "question-to-unwrap"
+original = "?"
+line = 210
+reason = "digest parses a BLAKE3 hex digest, always 64 lowercase hex digits, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::walk_repaired"
+rule = "question-to-unwrap"
+original = "?"
+line = 288
+reason = "digest parses a BLAKE3 hex digest, always 64 lowercase hex digits, which ChainHash accepts"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::record"
+rule = "return-ok-default"
+line = 163
+original = """lock.release()
+            .map_err(|e| io("unlocking")(std::io::Error::other(e.to_string())))"""
+reason = "dropping the OsLock at the end of record releases it too, and no caller can observe the difference except through an unlock error, which the platform lock calls never report for a lock this process holds"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::repair"
+rule = "condition-to-true"
+original = "bytes.last().is_some_and(|b| *b != b'\\n')"
+line = 181
+reason = "when the log already ends in a newline, cutting it to its last newline cuts it to its own length, which changes nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::repair"
+rule = "condition-to-false"
+original = "crate::domain::len_u64(lines.len()) != head.seq.saturating_add(1)"
+line = 198
+reason = "the check below moves the head only to an entry numbered head+1 that chains to it, which in any other line count is either absent or sits among lines walk then rejects, so skipping the count check changes no verdict"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/liveness.rs"
+item = "<Pulsed as Write>::write"
+rule = "question-to-unwrap"
+original = "?"
+line = 48
+reason = "the reply lock is held only by write, flush, and the heartbeat, none of which can panic while holding it, so it is never poisoned"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/liveness.rs"
+item = "<Pulsed as Write>::flush"
+rule = "question-to-unwrap"
+original = "?"
+line = 68
+reason = "the reply lock is held only by write, flush, and the heartbeat, none of which can panic while holding it, so it is never poisoned"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/liveness.rs"
+item = "unless_abandoned"
+rule = "false-to-true"
+original = "false"
+line = 136
+reason = "a helper that was stopped at once was never added to the list, so removing its key afterwards removes nothing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/liveness.rs"
+item = "Watchdog::guard"
+rule = "ge-to-gt"
+original = ">="
+line = 338
+reason = "whether the peer is given up at exactly the limit or a moment after cannot be observed: the check only runs once per beat, never at the instant the limit is reached"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/store.rs"
+item = "Store::staged_ids"
+rule = "question-to-unwrap"
+original = "?"
+line = 223
+reason = "an entry of a directory that was listed can only fail to read if the file system fails between the listing and the entry, which no test can arrange"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/store.rs"
+item = "Store::ids"
+rule = "question-to-unwrap"
+original = "?"
+line = 400
+reason = "an entry of a directory that was listed can only fail to read if the file system fails between the listing and the entry, which no test can arrange"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/store.rs"
+item = "Store::phase"
+rule = "condition-to-false"
+original = "written.is_empty()"
+line = 294
+reason = "an empty reserved record fails to parse as a phase, and a record that does not parse leaves the written phase in place, which is what the early return does too"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/store.rs"
+item = "Store::record_outcome_in_place"
+rule = "question-to-unwrap"
+original = "?"
+line = 310
+reason = "a Phase holds only timestamps, integers, strings, and enums, none of which serde_json can fail to encode"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/store.rs"
+item = "Store::supervisor"
+rule = "question-to-unwrap"
+original = "?"
+line = 328
+reason = "dropping the lock releases it too, and releasing a lock this process holds is not something the platform lock calls report as failing"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/audit.rs"
+item = "AuditLog::walk"
+rule = "question-to-unwrap"
+original = "?"
+line = 243
+reason = "dropping the lock at the end of walk releases it too, and releasing a lock this process holds is not something the platform lock calls report as failing"
+outcome = "survived"

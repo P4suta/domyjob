@@ -1,0 +1,69 @@
+type key.
+type kemsk.
+type kempk.
+type nonce.
+
+free c: channel.
+
+const g: key [data].
+fun exp(key, key): key.
+equation forall x: key, y: key; exp(exp(g, x), y) = exp(exp(g, y), x).
+
+fun kempub(kemsk): kempk.
+fun kemenc(kempk, nonce): bitstring.
+fun kemkey(kempk, nonce): key.
+reduc forall sk: kemsk, r: nonce; kemdec(sk, kemenc(kempub(sk), r)) = kemkey(kempub(sk), r).
+
+fun transcript(kempk, bitstring): bitstring.
+type direction.
+const toward_client: direction [data].
+const toward_server: direction [data].
+fun kdf(key, key, key, bitstring, direction): key.
+
+fun enc(bitstring, key): bitstring.
+reduc forall m: bitstring, k: key; dec(enc(m, k), k) = m.
+
+free payload: bitstring [private].
+const ready: bitstring [data].
+
+event ClientSent(key, key).
+event ServerAccepted(key, key).
+
+query attacker(payload).
+
+query cpub: key, spub: key; event(ServerAccepted(cpub, spub)) ==> event(ClientSent(cpub, spub)).
+
+let client(cs: key, spub: key) =
+  new ksk: kemsk;
+  out(c, ksk);
+  let kpk = kempub(ksk) in
+  out(c, kpk);
+  in(c, ct: bitstring);
+  let shared = kemdec(ksk, ct) in
+  new e: key;
+  out(c, exp(g, e));
+  let down = kdf(exp(spub, e), exp(spub, cs), shared, transcript(kpk, ct), toward_client) in
+  let up = kdf(exp(spub, e), exp(spub, cs), shared, transcript(kpk, ct), toward_server) in
+  in(c, answer: bitstring);
+  if dec(answer, down) = ready then
+  event ClientSent(exp(g, cs), spub);
+  out(c, enc(payload, up)).
+
+let server(ss: key, admitted: key) =
+  in(c, kpk: kempk);
+  new r: nonce;
+  let ct = kemenc(kpk, r) in
+  out(c, ct);
+  in(c, epub: key);
+  let down = kdf(exp(epub, ss), exp(admitted, ss), kemkey(kpk, r), transcript(kpk, ct), toward_client) in
+  let up = kdf(exp(epub, ss), exp(admitted, ss), kemkey(kpk, r), transcript(kpk, ct), toward_server) in
+  out(c, enc(ready, down));
+  in(c, sealed: bitstring);
+  let m = dec(sealed, up) in
+  event ServerAccepted(admitted, exp(g, ss)).
+
+process
+  new cs: key;
+  new ss: key;
+  out(c, (exp(g, cs), exp(g, ss)));
+  ( !client(cs, exp(g, ss)) | !server(ss, exp(g, cs)) )

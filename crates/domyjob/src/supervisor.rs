@@ -1,0 +1,833 @@
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use crate::authz::Submitter;
+use crate::cas::{Applied, Cas};
+use crate::clock::Timestamp;
+use crate::control::Order;
+use crate::domain::JobId;
+use crate::local_socket::{Listener, Stream};
+use crate::lock::OsLock;
+use crate::node::NodeError;
+use crate::paths::Dirs;
+use crate::proc::{self, Group, Readiness};
+use crate::protocol::{Location, Outcome, Phase, Spec, Workspace};
+use crate::store::Store;
+use crate::terminal::RemoteText;
+
+#[derive(Debug)]
+enum Event {
+    Slot(OsLock),
+    NoSlot(crate::lock::LockError),
+    Kill,
+}
+
+const LOG_HEAD: u64 = 256 << 20;
+const LOG_TAIL: usize = 8 << 20;
+
+#[derive(Debug)]
+struct Log {
+    file: File,
+    len: u64,
+    closed: bool,
+    failure: Option<String>,
+    head: u64,
+    tail: std::collections::VecDeque<u8>,
+    tail_limit: usize,
+    left_out: u64,
+}
+
+impl Log {
+    const fn new(file: File, len: u64) -> Self {
+        Self {
+            file,
+            len,
+            closed: false,
+            failure: None,
+            head: LOG_HEAD,
+            tail: std::collections::VecDeque::new(),
+            tail_limit: LOG_TAIL,
+            left_out: 0,
+        }
+    }
+
+    fn take(&mut self, chunk: &[u8]) {
+        if self.failure.is_some() {
+            return;
+        }
+        let room = match usize::try_from(self.head.saturating_sub(self.len)) {
+            Ok(room) => room,
+            Err(_beyond_memory) => chunk.len(),
+        };
+        let (now, later) = chunk.split_at(room.min(chunk.len()));
+        if !now.is_empty() {
+            match self.file.write_all(now) {
+                Ok(()) => self.len = self.len.saturating_add(crate::domain::len_u64(now.len())),
+                Err(error) => {
+                    self.failure = Some(error.to_string());
+                    return;
+                }
+            }
+        }
+        self.tail.extend(later);
+        let over = self.tail.len().saturating_sub(self.tail_limit);
+        if over > 0 {
+            self.tail.drain(..over);
+            self.left_out = self.left_out.saturating_add(crate::domain::len_u64(over));
+        }
+    }
+
+    fn seal(&mut self) {
+        if self.failure.is_none() && (self.left_out > 0 || !self.tail.is_empty()) {
+            let mut rest = Vec::with_capacity(self.tail.len().saturating_add(160));
+            if self.left_out > 0 {
+                rest.extend_from_slice(
+                    format!(
+                        "\ndomyjob: {} bytes of output were left out here, to keep the log within bounds; the start and the end are kept\n",
+                        self.left_out
+                    )
+                    .as_bytes(),
+                );
+            }
+            rest.extend(self.tail.drain(..));
+            match self.file.write_all(&rest) {
+                Ok(()) => self.len = self.len.saturating_add(crate::domain::len_u64(rest.len())),
+                Err(error) => self.failure = Some(error.to_string()),
+            }
+        }
+        self.closed = true;
+    }
+}
+
+#[derive(Debug)]
+struct Shared {
+    log: Mutex<Log>,
+    grew: Condvar,
+    finished: Mutex<bool>,
+    ended: Condvar,
+    killed: AtomicBool,
+    group: OnceLock<Arc<Group>>,
+    events: Sender<Event>,
+    log_path: PathBuf,
+}
+
+impl Shared {
+    fn append(&self, chunk: &[u8]) {
+        let Ok(mut log) = self.log.lock() else {
+            return;
+        };
+        log.take(chunk);
+        drop(log);
+        self.grew.notify_all();
+    }
+
+    fn say(&self, line: &str) {
+        self.append(format!("domyjob: {line}\n").as_bytes());
+    }
+
+    fn close_log(&self) -> Option<String> {
+        let failure = match self.log.lock() {
+            Ok(mut log) => {
+                log.seal();
+                log.failure.clone()
+            }
+            Err(_poisoned) => Some("the log lock was poisoned".to_owned()),
+        };
+        self.grew.notify_all();
+        failure
+    }
+
+    fn finish(&self) {
+        if let Ok(mut finished) = self.finished.lock() {
+            *finished = true;
+        }
+        self.ended.notify_all();
+    }
+
+    fn until_finished(&self) {
+        let Ok(mut finished) = self.finished.lock() else {
+            return;
+        };
+        while !*finished {
+            finished = match self.ended.wait(finished) {
+                Ok(guard) => guard,
+                Err(_poisoned) => return,
+            };
+        }
+    }
+
+    fn kill(&self) -> Result<(), NodeError> {
+        self.killed.store(true, Ordering::SeqCst);
+        match self.events.send(Event::Kill) {
+            Ok(()) | Err(_) => {}
+        }
+        match self.group.get() {
+            Some(group) => Ok(group.kill()?),
+            None => Ok(()),
+        }
+    }
+
+    fn killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+
+    fn follow(&self, offset: u64, stream: &Stream) -> std::io::Result<()> {
+        let mut file = File::open(&self.log_path)?;
+        let mut position = file.seek(SeekFrom::Start(offset))?;
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut out = stream;
+        loop {
+            let read = file.read(&mut buffer)?;
+            if let Some(chunk) = buffer.get(..read).filter(|c| !c.is_empty()) {
+                out.write_all(chunk)?;
+                position = position.saturating_add(crate::domain::len_u64(chunk.len()));
+                continue;
+            }
+            let Ok(mut log) = self.log.lock() else {
+                return Ok(());
+            };
+            while log.len <= position && !log.closed {
+                log = match self.grew.wait(log) {
+                    Ok(guard) => guard,
+                    Err(_poisoned) => return Ok(()),
+                };
+            }
+            let finished = log.len <= position && log.closed;
+            drop(log);
+            if finished {
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn answer(shared: &Shared, stream: &Stream) {
+    let order = match crate::control::read_order(stream) {
+        Ok(order) => order,
+        Err(_malformed) => return,
+    };
+    match order {
+        Order::Kill => {
+            if let Err(error) = shared.kill() {
+                shared.say(&format!("stopping the job failed: {error}"));
+            }
+            shared.until_finished();
+        }
+        Order::Wait => shared.until_finished(),
+        Order::Follow { offset } => match shared.follow(offset, stream) {
+            Ok(()) | Err(_) => {}
+        },
+    }
+}
+
+#[derive(Debug, Default)]
+struct Connections {
+    open: Mutex<usize>,
+    ended: Condvar,
+}
+
+struct Open(Arc<Connections>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        if let Ok(mut open) = self.0.open.lock() {
+            *open = open.saturating_sub(1);
+        }
+        self.0.ended.notify_all();
+    }
+}
+
+trait Counting {
+    fn open(&self) -> Open;
+    fn wait_for_one_to_end(&self) -> bool;
+}
+
+impl Counting for Arc<Connections> {
+    fn open(&self) -> Open {
+        if let Ok(mut open) = self.open.lock() {
+            *open = open.saturating_add(1);
+        }
+        Open(Self::clone(self))
+    }
+
+    fn wait_for_one_to_end(&self) -> bool {
+        let Ok(open) = self.open.lock() else {
+            return false;
+        };
+        let before = *open;
+        if before == 0 {
+            return false;
+        }
+        self.ended.wait_while(open, |now| *now >= before).is_ok()
+    }
+}
+
+fn serve_control(listener: Listener, shared: Arc<Shared>) {
+    let connections = Arc::new(Connections::default());
+    std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    let shared = Arc::clone(&shared);
+                    let open = connections.open();
+                    std::thread::spawn(move || {
+                        answer(&shared, &stream);
+                        drop(open);
+                    });
+                }
+                Err(error) => {
+                    if !connections.wait_for_one_to_end() {
+                        shared.say(&format!("the control socket stopped accepting: {error}"));
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[must_use]
+pub fn scope_name(submitter: &Submitter) -> String {
+    match submitter {
+        Submitter::Owner => "owner".to_owned(),
+        Submitter::Peer { key, .. } => format!("peer-{}", key.fingerprint().replace('-', "")),
+    }
+}
+
+fn workspace_root(store: &Store, spec: &Spec, slot: usize) -> Option<PathBuf> {
+    match &spec.location {
+        Location::Snapshot {
+            source, workspace, ..
+        } => {
+            let base = store
+                .area("work")
+                .join(scope_name(&spec.submitted_by))
+                .join(source.project.as_str());
+            Some(match workspace {
+                Workspace::Warm => base.join(slot.to_string()),
+                Workspace::Fresh => base.join(format!("fresh-{}", spec.id)),
+            })
+        }
+        Location::Home => None,
+    }
+}
+
+#[must_use]
+pub fn fresh_root(store: &Store, spec: &Spec) -> Option<PathBuf> {
+    match &spec.location {
+        Location::Snapshot {
+            workspace: Workspace::Fresh,
+            ..
+        } => workspace_root(store, spec, 0),
+        Location::Snapshot {
+            workspace: Workspace::Warm,
+            ..
+        }
+        | Location::Home => None,
+    }
+}
+
+pub fn discard_workspace(root: &Path) -> Result<(), crate::state_file::StateError> {
+    crate::state_file::remove_dir_all(root)?;
+    crate::state_file::remove_file(&filled_by_path(root))?;
+    crate::state_file::remove_file(&applied_path(root))
+}
+
+fn applied_path(root: &Path) -> PathBuf {
+    beside(root, ".applied.json")
+}
+
+#[must_use]
+pub fn filled_by_path(root: &Path) -> PathBuf {
+    beside(root, ".filled-by")
+}
+
+fn beside(root: &Path, suffix: &str) -> PathBuf {
+    let mut state = root.as_os_str().to_owned();
+    state.push(suffix);
+    PathBuf::from(state)
+}
+
+#[derive(Debug)]
+struct Held {
+    slot: Option<OsLock>,
+    workspace: Option<OsLock>,
+}
+
+impl Held {
+    fn release(self) -> Result<(), NodeError> {
+        if let Some(workspace) = self.workspace {
+            workspace.release()?;
+        }
+        if let Some(slot) = self.slot {
+            slot.release()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Collecting {
+    thread: std::thread::JoinHandle<Result<(), proc::ProcError>>,
+    stopper: proc::Stopper,
+}
+
+impl Collecting {
+    fn finish(self) -> Result<(), NodeError> {
+        self.stopper.stop()?;
+        match self.thread.join() {
+            Ok(collected) => Ok(collected?),
+            Err(_panicked) => Err(NodeError::QueueClosed),
+        }
+    }
+}
+
+struct Supervisor {
+    dirs: Dirs,
+    store: Store,
+    cas: Cas,
+    spec: Spec,
+    launch: crate::store::LaunchEnv,
+    shared: Arc<Shared>,
+}
+
+pub fn supervise(dirs: Dirs, id: &JobId, readiness: Readiness) -> Result<(), NodeError> {
+    let store = Store::open(&dirs)?;
+    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, readiness) {
+        Ok(taken) => taken,
+        Err(error) => {
+            store.record_start_failure(id, &error.to_string())?;
+            return Err(error);
+        }
+    };
+    let finished = supervisor.conclude(&events);
+    let released = alive.release();
+    finished?;
+    Ok(released?)
+}
+
+fn take_charge(
+    dirs: Dirs,
+    store: Store,
+    id: &JobId,
+    readiness: Readiness,
+) -> Result<(Supervisor, OsLock, Receiver<Event>), NodeError> {
+    let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
+        return Err(NodeError::AlreadySupervised(id.clone()));
+    };
+    let control = store.control_path(id);
+    crate::state_file::remove_file(&control)?;
+    let listener = Listener::bind(&control).map_err(|source| NodeError::Io {
+        action: "listening on",
+        path: control.clone(),
+        source,
+    })?;
+    let cas = Cas::open(dirs.state.join("objects"))?;
+    if !store.is_published(id)? {
+        store.publish(id)?;
+    }
+    let spec = store.spec(id)?;
+    let launch = store.launch_env(id)?;
+    let log_path = store.log_path(id);
+    let file = crate::state_file::open_append(&log_path)?;
+    let len = file
+        .metadata()
+        .map_err(|source| NodeError::Io {
+            action: "measuring",
+            path: log_path.clone(),
+            source,
+        })?
+        .len();
+    let (events, received) = std::sync::mpsc::channel();
+    let shared = Arc::new(Shared {
+        log: Mutex::new(Log::new(file, len)),
+        grew: Condvar::new(),
+        finished: Mutex::new(false),
+        ended: Condvar::new(),
+        killed: AtomicBool::new(false),
+        group: OnceLock::new(),
+        events,
+        log_path,
+    });
+    serve_control(listener, Arc::clone(&shared));
+    if let Err(error) = readiness.announce() {
+        shared.say(&format!(
+            "the submitter left before the job started: {error}"
+        ));
+    }
+    let supervisor = Supervisor {
+        dirs,
+        store,
+        cas,
+        spec,
+        launch,
+        shared,
+    };
+    Ok((supervisor, alive, received))
+}
+
+impl Supervisor {
+    fn conclude(&self, events: &Receiver<Event>) -> Result<(), NodeError> {
+        let mut held = Held {
+            slot: None,
+            workspace: None,
+        };
+        let mut started = None;
+        let result = self.run(events, &mut held, &mut started);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.shared.say(&error.to_string());
+                Outcome::Errored {
+                    reason: RemoteText::new(error.to_string()),
+                }
+            }
+        };
+        if let Err(error) = self.cleanup() {
+            self.shared.say(&format!("cleaning up: {error}"));
+        }
+        let released = held.release();
+        let outcome = match (self.shared.close_log(), outcome) {
+            (Some(failure), Outcome::Succeeded | Outcome::Failed { .. }) => Outcome::Errored {
+                reason: RemoteText::new(format!("the log could not be written: {failure}")),
+            },
+            (Some(_) | None, outcome) => outcome,
+        };
+        let finished = Phase::Finished {
+            started_at: started,
+            finished_at: Timestamp::observe(),
+            outcome,
+        };
+        if let Err(error) = self.store.set_phase(&self.spec.id, &finished) {
+            self.store
+                .record_outcome_in_place(&self.spec.id, &finished)
+                .map_err(|_also| error)?;
+        }
+        self.shared.finish();
+        released
+    }
+
+    fn queue(&self, events: &Receiver<Event>) -> Result<Option<OsLock>, NodeError> {
+        let slots = self.store.area("slots");
+        let count = self.spec.concurrency.slots();
+        if count > 1 {
+            for index in (0..count).rev() {
+                if let Some(lock) = OsLock::try_exclusive(&slots.join(format!("{index}.lock")))? {
+                    return Ok(Some(lock));
+                }
+            }
+        }
+        let won = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..count {
+            let path = slots.join(format!("{index}.lock"));
+            let won = Arc::clone(&won);
+            let failed = Arc::clone(&failed);
+            let sender = self.shared.events.clone();
+            std::thread::spawn(move || {
+                let lock = match OsLock::exclusive(&path) {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        if failed.fetch_add(1, Ordering::SeqCst).saturating_add(1) == count {
+                            match sender.send(Event::NoSlot(error)) {
+                                Ok(()) | Err(_) => {}
+                            }
+                        }
+                        return;
+                    }
+                };
+                if won.swap(true, Ordering::SeqCst) {
+                    match lock.release() {
+                        Ok(()) | Err(_) => {}
+                    }
+                    return;
+                }
+                match sender.send(Event::Slot(lock)) {
+                    Ok(()) | Err(_) => {}
+                }
+            });
+        }
+        match events.recv() {
+            Ok(Event::Slot(lock)) => Ok(Some(lock)),
+            Ok(Event::NoSlot(error)) => Err(NodeError::Lock(error)),
+            Ok(Event::Kill) => Ok(None),
+            Err(_disconnected) => Err(NodeError::QueueClosed),
+        }
+    }
+
+    fn run(
+        &self,
+        events: &Receiver<Event>,
+        held: &mut Held,
+        started: &mut Option<Timestamp>,
+    ) -> Result<Outcome, NodeError> {
+        let Some(slot) = self.queue(events)? else {
+            self.shared.say("killed while queued");
+            return Ok(Outcome::Killed);
+        };
+        let holder = Store::slot_holder_path(slot.path());
+        match crate::state_file::write_bytes(&holder, self.spec.id.as_str().as_bytes()) {
+            Ok(()) | Err(_) => {}
+        }
+        held.slot = Some(slot);
+        let started_at = Timestamp::observe();
+        *started = Some(started_at);
+        self.store
+            .set_phase(&self.spec.id, &Phase::Preparing { started_at })?;
+        let (root, workspace_lock) = match self.prepare() {
+            Ok(prepared) => prepared,
+            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Stopped)) => {
+                self.shared.say("killed while preparing");
+                return Ok(Outcome::Killed);
+            }
+            Err(other) => return Err(other),
+        };
+        held.workspace = workspace_lock;
+        if self.shared.killed() {
+            self.shared.say("killed while preparing");
+            return Ok(Outcome::Killed);
+        }
+        let (group, collecting) = self.start(&root)?;
+        let group = Arc::new(group);
+        if self.shared.group.set(Arc::clone(&group)).is_err() {
+            match group.kill() {
+                Ok(()) | Err(_) => {}
+            }
+            return Err(NodeError::AlreadySupervised(self.spec.id.clone()));
+        }
+        if self.shared.killed()
+            && let Err(error) = group.kill()
+        {
+            self.shared
+                .say(&format!("stopping the job failed: {error}"));
+        }
+        let running = Phase::Running {
+            started_at,
+            pid: group.id(),
+            workspace: root.display().to_string(),
+        };
+        if let Err(error) = self.store.set_phase(&self.spec.id, &running) {
+            self.shared.say(&format!(
+                "recording that the job runs failed ({error}); it runs regardless"
+            ));
+        }
+        if let Err(error) = self.store.forget_launch_env(&self.spec.id) {
+            self.shared.say(&format!(
+                "removing the saved launch environment failed: {error}"
+            ));
+        }
+        Ok(self.watch(&group, collecting))
+    }
+
+    fn start(&self, root: &Path) -> Result<(Group, Collecting), NodeError> {
+        let cwd = match (&self.spec.location, root) {
+            (
+                Location::Snapshot {
+                    subdir: Some(sub), ..
+                },
+                root,
+            ) => sub.parts().fold(root.to_path_buf(), |p, part| p.join(part)),
+            (Location::Snapshot { subdir: None, .. } | Location::Home, root) => root.to_path_buf(),
+        };
+        let mut command =
+            crate::shell::process(&self.spec.command, self.spec.shell.as_deref()).command();
+        command
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&self.launch.vars);
+        for name in &self.launch.not_unicode {
+            self.shared.say(&format!(
+                "the environment variable {} was not passed on because it is not Unicode",
+                crate::terminal::neutralize(name)
+            ));
+        }
+        for (key, value) in self.store.env(&self.spec.id)? {
+            command.env(key.as_str(), value);
+        }
+        command
+            .env("DOMYJOB", "1")
+            .env("DOMYJOB_JOB_ID", self.spec.id.as_str());
+        let (collector, stopper, writer) = proc::output_pipe()?;
+        let group = Group::spawn(command, writer)?;
+        let shared = Arc::clone(&self.shared);
+        let thread = std::thread::spawn(move || {
+            let mut sink = |chunk: &[u8]| shared.append(chunk);
+            collector.run(&mut sink)
+        });
+        Ok((group, Collecting { thread, stopper }))
+    }
+
+    fn watch(&self, group: &Group, collecting: Collecting) -> Outcome {
+        let status = group.wait();
+        if let Err(error) = collecting.finish() {
+            self.shared.say(&format!("collecting output: {error}"));
+        }
+        match (status, self.shared.killed()) {
+            (Ok(_) | Err(_), true) => {
+                self.shared.say("killed");
+                Outcome::Killed
+            }
+            (Ok(status), false) => match proc::exit_code(status) {
+                0 => Outcome::Succeeded,
+                code => Outcome::Failed { exit_code: code },
+            },
+            (Err(error), false) => Outcome::Errored {
+                reason: RemoteText::new(error.to_string()),
+            },
+        }
+    }
+
+    fn prepare(&self) -> Result<(PathBuf, Option<OsLock>), NodeError> {
+        let (root, lock) = match &self.spec.location {
+            Location::Snapshot {
+                source, workspace, ..
+            } => {
+                let locks = self
+                    .store
+                    .area("work")
+                    .join(scope_name(&self.spec.submitted_by))
+                    .join(source.project.as_str())
+                    .join("locks");
+                let (slot, lock) = match workspace {
+                    Workspace::Warm => match OsLock::first_free(&locks, usize::MAX)? {
+                        Some((slot, lock)) => (slot, Some(lock)),
+                        None => (0, None),
+                    },
+                    Workspace::Fresh => (0, None),
+                };
+                let root = workspace_root(&self.store, &self.spec, slot)
+                    .unwrap_or_else(|| self.dirs.home.clone());
+                self.fill(&root, &source.manifest)?;
+                (root, lock)
+            }
+            Location::Home => (self.dirs.home.clone(), None),
+        };
+        crate::state_file::write_bytes(
+            &self.store.workspace_record(&self.spec.id),
+            root.display().to_string().as_bytes(),
+        )?;
+        Ok((root, lock))
+    }
+
+    fn fill(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
+        match self.fill_once(root, manifest_id) {
+            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Io {
+                action,
+                path,
+                source,
+            })) => {
+                self.shared.say(&format!(
+                    "the workspace could not be updated ({action} {}: {source}); moving it aside and filling it afresh",
+                    path.display()
+                ));
+                let aside = self.store.area("trash").join(self.spec.id.as_str());
+                crate::state_file::move_aside(root, &aside)?;
+                crate::state_file::remove_file(&applied_path(root))?;
+                crate::state_file::remove_file(&filled_by_path(root))?;
+                self.fill_once(root, manifest_id)
+            }
+            other => other,
+        }
+    }
+
+    fn fill_once(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
+        let manifest = self.cas.manifest(manifest_id)?;
+        let state = applied_path(root);
+        let previous: Applied = crate::state_file::read_json(&state)?.unwrap_or_default();
+        let mut intent = previous.clone();
+        for rel in manifest.entries.keys() {
+            intent.insert(rel.clone());
+        }
+        crate::state_file::remove_file(&filled_by_path(root))?;
+        crate::state_file::write_json(&state, &intent)?;
+        let workspace = crate::workspace::Workspace::open(root)?;
+        let plan = crate::workspace::Plan {
+            manifest: &manifest,
+            previous: &previous,
+        };
+        let (applied, changes) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
+        crate::state_file::write_json(&state, &applied)?;
+        crate::state_file::write_bytes(&filled_by_path(root), self.spec.id.as_str().as_bytes())?;
+        self.shared.say(&format!(
+            "workspace {} ({} written, {} unchanged, {} removed)",
+            root.display(),
+            changes.written,
+            changes.kept,
+            changes.removed
+        ));
+        Ok(())
+    }
+
+    fn cleanup(&self) -> Result<(), NodeError> {
+        let Location::Snapshot {
+            workspace: Workspace::Fresh,
+            ..
+        } = &self.spec.location
+        else {
+            return Ok(());
+        };
+        let Some(root) = workspace_root(&self.store, &self.spec, 0) else {
+            return Ok(());
+        };
+        crate::state_file::remove_dir_all(&root)?;
+        crate::state_file::remove_file(&filled_by_path(&root))?;
+        Ok(crate::state_file::remove_file(&applied_path(&root))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_endless_log_keeps_its_start_and_its_end_and_says_what_was_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private");
+        crate::state_file::private_dir(&dir).unwrap();
+        let path = dir.join("log");
+        let file = crate::state_file::open_append(&path).unwrap();
+        let mut log = Log::new(file, 0);
+        log.head = 10;
+        log.tail_limit = 6;
+        log.take(b"start-");
+        log.take(b"0123456789");
+        log.take(b"middle");
+        log.take(b"-end\n");
+        log.seal();
+        let text =
+            String::from_utf8(crate::state_file::read_bytes(&path).unwrap().unwrap()).unwrap();
+        assert!(text.starts_with("start-0123"), "{text}");
+        assert!(text.ends_with("\ne-end\n"), "{text}");
+        assert!(text.contains("bytes of output were left out"), "{text}");
+        assert_eq!(log.len, crate::domain::len_u64(text.len()));
+        assert!(log.closed);
+
+        let small = crate::state_file::open_append(&dir.join("small")).unwrap();
+        let mut within = Log::new(small, 0);
+        within.take(b"all of it\n");
+        within.seal();
+        assert_eq!(
+            crate::state_file::read_bytes(&dir.join("small"))
+                .unwrap()
+                .unwrap(),
+            b"all of it\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_accept_waits_for_a_connection_to_end_and_gives_up_when_none_are_open() {
+        let connections = Arc::new(Connections::default());
+        assert!(!connections.wait_for_one_to_end());
+        let first = connections.open();
+        let second = connections.open();
+        let ending = std::thread::spawn(move || drop(first));
+        assert!(connections.wait_for_one_to_end());
+        ending.join().unwrap();
+        drop(second);
+        assert!(!connections.wait_for_one_to_end());
+    }
+}
