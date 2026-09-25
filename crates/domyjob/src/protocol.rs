@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +473,14 @@ pub struct Submission {
     pub env: BTreeMap<EnvName, String>,
     pub shell: Option<String>,
     pub concurrency: Concurrency,
+    pub queue: Queue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Queue {
+    Slot,
+    Now,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -565,15 +565,17 @@ impl Supervisor {
         held: &mut Held,
         started: &mut Option<Timestamp>,
     ) -> Result<Outcome, NodeError> {
-        let Some(slot) = self.queue(events)? else {
-            self.shared.say("killed while queued");
-            return Ok(Outcome::Killed);
-        };
-        let holder = Store::slot_holder_path(slot.path());
-        match crate::state_file::write_bytes(&holder, self.spec.id.as_str().as_bytes()) {
-            Ok(()) | Err(_) => {}
+        if !self.store.skips_the_queue(&self.spec.id)? {
+            let Some(slot) = self.queue(events)? else {
+                self.shared.say("killed while queued");
+                return Ok(Outcome::Killed);
+            };
+            let holder = Store::slot_holder_path(slot.path());
+            match crate::state_file::write_bytes(&holder, self.spec.id.as_str().as_bytes()) {
+                Ok(()) | Err(_) => {}
+            }
+            held.slot = Some(slot);
         }
-        held.slot = Some(slot);
         let started_at = Timestamp::observe();
         *started = Some(started_at);
         self.store

@@ -495,6 +495,9 @@ impl Node {
         let launch = crate::store::LaunchEnv::of_this_process();
         let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&spec.id))?;
         self.store.stage(&spec, (&submission.env, &launch))?;
+        if submission.queue == crate::protocol::Queue::Now {
+            self.store.skip_the_queue(&spec.id)?;
+        }
         crate::state_file::write_bytes(&nonce_path, spec.id.as_str().as_bytes())?;
         collecting.release()?;
         let launched = self.launch_supervisor(&spec.id);
@@ -1114,15 +1117,6 @@ mod tests {
         ask(&node, &Request::List { limit: 5 });
         assert!(node.audit.tail(10).unwrap().is_empty());
         ask(&node, &Request::Kill { job: job.clone() });
-        let submission = Submission {
-            nonce: crate::domain::Nonce::generate().unwrap(),
-            name: None,
-            command: Command::Script("make it".into()),
-            location: Location::Home,
-            env: std::collections::BTreeMap::new(),
-            shell: None,
-            concurrency: Concurrency::DEFAULT,
-        };
         for request in [
             Request::Tail {
                 job: job.clone(),
@@ -1132,9 +1126,7 @@ mod tests {
                 job: job.clone(),
                 path: "out/a.txt".parse().unwrap(),
             },
-            Request::Submit {
-                submission: Box::new(submission),
-            },
+            submission(crate::domain::Nonce::generate().unwrap(), Location::Home),
             Request::List { limit: 5 },
         ] {
             let reply = ask_as(&node, &peer, &request);
@@ -1177,7 +1169,7 @@ mod tests {
                 (
                     peer_name.clone(),
                     "submit".to_owned(),
-                    Some("make it".to_owned()),
+                    Some("true".to_owned()),
                     denied
                 ),
                 (peer_name, "list".to_owned(), None, denied),
@@ -1195,6 +1187,7 @@ mod tests {
     fn submission(nonce: crate::domain::Nonce, location: Location) -> Request {
         Request::Submit {
             submission: Box::new(Submission {
+                queue: crate::protocol::Queue::Slot,
                 nonce,
                 name: None,
                 command: Command::Script("true".into()),
@@ -1887,6 +1880,7 @@ mod tests {
             .unwrap();
         let spec = store.spec(&id).unwrap();
         let submission = Submission {
+            queue: crate::protocol::Queue::Slot,
             nonce,
             name: None,
             command: spec.command,
