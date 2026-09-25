@@ -9,10 +9,37 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-pub const PROTOCOL: u32 = 9;
+const FRAMING: &str = "json lines; a stream is u32 big-endian lengths, 0 to end, u32::MAX to beat, then an ending line";
+
+#[must_use]
+pub fn wire() -> &'static str {
+    static WIRE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WIRE.get_or_init(|| {
+        let described = serde_json::json!({
+            "request": schemars::schema_for!(Request),
+            "reply": schemars::schema_for!(Reply),
+            "frame": schemars::schema_for!(Frame),
+            "ending": schemars::schema_for!(crate::framed::Ending),
+            "framing": FRAMING,
+        });
+        let digest = blake3::hash(described.to_string().as_bytes()).to_hex();
+        digest.as_str().get(..12).unwrap_or_default().to_owned()
+    })
+}
+
+#[must_use]
+pub fn is_newer(theirs: &str) -> bool {
+    match (
+        semver::Version::parse(theirs),
+        semver::Version::parse(VERSION),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs > ours,
+        (Ok(_) | Err(_), Ok(_) | Err(_)) => false,
+    }
+}
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "op")]
 pub enum Request {
     Hello,
@@ -78,14 +105,14 @@ pub enum Request {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Follow {
     UntilFinished,
     Snapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reply")]
 pub enum Reply {
     Hello(Hello),
@@ -330,7 +357,7 @@ impl Reply {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Digest {
     pub job: Job,
@@ -339,7 +366,7 @@ pub struct Digest {
     pub tail: Vec<RemoteText>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FoundLine {
     pub line: u64,
@@ -347,7 +374,7 @@ pub struct FoundLine {
     pub matched: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Found {
     pub hits: Vec<FoundLine>,
@@ -355,21 +382,21 @@ pub struct Found {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Frame {
     pub blob: BlobId,
     pub size: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
     pub code: RefusalCode,
     pub detail: RemoteText,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalCode {
     BadRequest,
@@ -386,21 +413,21 @@ pub enum RefusalCode {
     Paused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Cleaned {
     pub applied: bool,
     pub items: Vec<Freeable>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Freeable {
     pub what: RemoteText,
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
     pub host: RemoteText,
@@ -416,10 +443,10 @@ pub struct Report {
     pub paused: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Hello {
-    pub protocol: u32,
+    pub wire: RemoteText,
     pub version: RemoteText,
     pub os: RemoteText,
     pub arch: RemoteText,
@@ -429,7 +456,7 @@ pub struct Hello {
     pub binary: RemoteText,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Unreadable {
     pub id: JobId,
@@ -438,7 +465,7 @@ pub struct Unreadable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Speaker {
-    pub protocol: u32,
+    pub wire: RemoteText,
     pub version: RemoteText,
 }
 
@@ -446,7 +473,7 @@ impl Speaker {
     #[must_use]
     pub fn of(hello: &Hello) -> Self {
         Self {
-            protocol: hello.protocol,
+            wire: hello.wire.clone(),
             version: hello.version.clone(),
         }
     }
@@ -464,19 +491,16 @@ impl Speaker {
         if value.get("reply")?.as_str()? != "hello" {
             return None;
         }
-        let protocol = match u32::try_from(value.get("protocol")?.as_u64()?) {
-            Ok(protocol) => protocol,
-            Err(_beyond_u32) => return None,
-        };
+        let wire = value.get("wire")?.as_str()?.to_owned();
         let version = value.get("version")?.as_str()?.to_owned();
         Some(Self {
-            protocol,
+            wire: RemoteText::new(wire),
             version: RemoteText::new(version),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Command {
     Script(String),
@@ -509,14 +533,14 @@ impl Command {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Workspace {
     Warm,
     Fresh,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub enum Revision {
     WorkingDirectory,
@@ -544,7 +568,7 @@ impl Revision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub project: ProjectKey,
@@ -552,7 +576,7 @@ pub struct Source {
     pub revision: Revision,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Location {
     Snapshot {
@@ -563,7 +587,7 @@ pub enum Location {
     Home,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Submission {
     pub nonce: crate::domain::Nonce,
@@ -576,14 +600,14 @@ pub struct Submission {
     pub queue: Queue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Queue {
     Slot,
     Now,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub id: JobId,
@@ -608,7 +632,7 @@ impl Spec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 pub enum Phase {
     Queued,
@@ -627,7 +651,7 @@ pub enum Phase {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "outcome")]
 pub enum Outcome {
     Succeeded,
@@ -636,14 +660,14 @@ pub enum Outcome {
     Errored { reason: RemoteText },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Supervisor {
     Alive,
     Gone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub spec: Spec,
@@ -652,7 +676,7 @@ pub struct Job {
     pub behind: Vec<JobId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Queued,
@@ -802,30 +826,47 @@ mod tests {
     }
 
     #[test]
-    fn any_hello_shape_still_tells_its_protocol_and_version() {
-        let newer = br#"{"reply":"hello","protocol":9,"version":"9.0.0","novel":{"x":1}}"#;
+    fn any_hello_shape_still_tells_its_wire_and_version() {
+        let newer = br#"{"reply":"hello","wire":"0123456789ab","version":"9.0.0","novel":{"x":1}}"#;
         assert_eq!(
             Speaker::glimpse(newer),
             Some(Speaker {
-                protocol: 9,
+                wire: RemoteText::new("0123456789ab".into()),
                 version: RemoteText::new("9.0.0".into())
             })
         );
         assert_eq!(
-            Speaker::glimpse(br#"{"reply":"job","protocol":9,"version":"x"}"#),
+            Speaker::glimpse(br#"{"reply":"job","wire":"w","version":"x"}"#),
             None
         );
         assert_eq!(Speaker::glimpse(b"not json"), None);
         assert_eq!(
-            Speaker::glimpse(br#"{"reply":"hello","protocol":99999999999,"version":"x"}"#),
+            Speaker::glimpse(br#"{"reply":"hello","wire":9,"version":"x"}"#),
             None
         );
     }
 
     #[test]
+    fn the_wire_is_a_fixed_digest_of_every_message_shape() {
+        assert_eq!(wire().len(), 12);
+        assert!(wire().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(wire(), wire());
+        let request = serde_json::to_string(&schemars::schema_for!(Request)).unwrap();
+        assert!(request.contains("changes") && request.contains("report"));
+    }
+
+    #[test]
+    fn only_a_release_above_this_one_counts_as_newer() {
+        assert!(is_newer("999.0.0"));
+        assert!(!is_newer(VERSION));
+        assert!(!is_newer("0.0.0-alpha"));
+        assert!(!is_newer("not a version"));
+    }
+
+    #[test]
     fn the_hello_reply_keeps_its_shape_across_versions() {
         let hello = Hello {
-            protocol: 1,
+            wire: RemoteText::new("w".into()),
             version: RemoteText::new("v".into()),
             os: RemoteText::new("o".into()),
             arch: RemoteText::new("a".into()),
@@ -845,7 +886,7 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "arch", "binary", "home", "os", "protocol", "reply", "shell", "state", "version"
+                "arch", "binary", "home", "os", "reply", "shell", "state", "version", "wire"
             ]
         );
     }

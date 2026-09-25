@@ -13,8 +13,8 @@ use crate::lock::LockError;
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Follow, Frame, Hello, Job, Location, PROTOCOL, Phase, Refusal, RefusalCode, Reply, Request,
-    Spec, Submission, VERSION,
+    Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
+    Submission, VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::terminal::RemoteText;
@@ -261,7 +261,7 @@ pub struct Node {
 #[must_use]
 pub fn hello(dirs: &Dirs) -> Hello {
     Hello {
-        protocol: PROTOCOL,
+        wire: RemoteText::new(crate::protocol::wire().to_owned()),
         version: RemoteText::new(VERSION.to_owned()),
         os: RemoteText::new(std::env::consts::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),

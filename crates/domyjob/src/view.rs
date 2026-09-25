@@ -499,12 +499,13 @@ pub fn doctor_reached(
     let hello = &facts.hello;
     writeln!(
         out,
-        "  {} {}{}  {:<16}  {}  {}",
+        "  {} {}{}  {:<16}  {} {}  {}",
         ui::paint(Tone::Good, ui::symbol(Symbol::Succeeded)),
         ui::machine(name),
         " ".repeat(widest.saturating_sub(name.as_str().len())),
         format!("{}/{}", hello.os, hello.arch),
         hello.version,
+        ui::paint(Tone::Dim, &format!("wire {}", hello.wire)),
         ui::paint(Tone::Dim, hello.shell.as_raw_str())
     )?;
     Ok(out)

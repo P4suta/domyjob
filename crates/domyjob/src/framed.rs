@@ -7,7 +7,7 @@ use crate::protocol::Refusal;
 pub const MAX_CHUNK: usize = 1 << 20;
 const ENDING_LINE: u64 = 64 << 10;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "ending")]
 pub enum Ending {
     Complete { bytes: u64, blake3: String },
