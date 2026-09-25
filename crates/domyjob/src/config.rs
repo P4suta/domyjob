@@ -345,6 +345,7 @@ pub struct SourceConf {
     pub list: Argv,
     pub show: Argv,
     pub identity: Option<Argv>,
+    pub unset: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

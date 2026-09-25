@@ -117,6 +117,14 @@ list = [
 ]
 show = ["git", "-C", "{root}", "cat-file", "blob", "{commit}:{path}"]
 identity = ["git", "-C", "{root}", "rev-parse", "--path-format=absolute", "--git-common-dir"]
+unset = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_NAMESPACE",
+]
 
 [runners.shell]
 kind = "script"
