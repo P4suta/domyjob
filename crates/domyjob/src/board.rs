@@ -104,10 +104,20 @@ impl Board {
                 machine,
                 "has every file already",
             )),
-            Stage::Submitted(id) => {
-                let full = id.as_str();
+            Stage::Submitted(job) => {
+                let full = job.spec.id.as_str();
                 let text = full.get(..ui::SHORT_ID).unwrap_or(full).to_owned();
-                if self.waiting {
+                if let Some(behind) = queued_behind(job) {
+                    bar.set_message(row(
+                        Symbol::Queued,
+                        Tone::Waiting,
+                        machine,
+                        &format!("{} {behind}", ui::paint(Tone::Dim, &text)),
+                    ));
+                    if !self.waiting {
+                        bar.finish();
+                    }
+                } else if self.waiting {
                     bar.set_message(row(
                         Symbol::Running,
                         Tone::Busy,
@@ -205,6 +215,29 @@ impl Board {
     }
 }
 
+#[must_use]
+pub fn queued_behind(job: &crate::protocol::Job) -> Option<String> {
+    if job.behind.is_empty() {
+        return None;
+    }
+    let holders: Vec<&str> = job
+        .behind
+        .iter()
+        .map(|holder| {
+            holder
+                .as_str()
+                .get(..ui::SHORT_ID)
+                .unwrap_or(holder.as_str())
+        })
+        .collect();
+    Some(format!(
+        "queued behind {} running {}: {}",
+        holders.len(),
+        if holders.len() == 1 { "job" } else { "jobs" },
+        holders.join(", ")
+    ))
+}
+
 fn plain(machine: &MachineName, stage: Stage<'_>) {
     match stage {
         Stage::Connecting => eprintln!("domyjob: {machine}: connecting"),
@@ -216,10 +249,14 @@ fn plain(machine: &MachineName, stage: Stage<'_>) {
             );
         }
         Stage::UpToDate => eprintln!("domyjob: {machine}: already has every file"),
-        Stage::Submitted(id) => {
+        Stage::Submitted(job) => {
+            let id = &job.spec.id;
             eprintln!(
                 "domyjob: {machine}: submitted {machine}:{id}; it runs whether or not this command stays"
             );
+            if let Some(behind) = queued_behind(job) {
+                eprintln!("domyjob: {machine}: {behind}; it starts when one of them finishes");
+            }
         }
     }
 }

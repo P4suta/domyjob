@@ -297,6 +297,7 @@ fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
         None => None,
     };
     let order = Order {
+        queue: crate::protocol::Queue::Slot,
         targets: args.machines,
         words: args
             .command

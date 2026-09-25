@@ -368,6 +368,22 @@ mod tests {
         assert!(listed.starts_with("win  1 job\n"), "{listed}");
     }
 
+    #[test]
+    fn a_queued_job_says_how_many_it_waits_behind() {
+        let mut job = sample();
+        assert_eq!(crate::board::queued_behind(&job), None);
+        job.behind = vec!["0AAAAAAAAAAAAAAA".parse().unwrap()];
+        assert_eq!(
+            crate::board::queued_behind(&job).unwrap(),
+            "queued behind 1 running job: 0AAAAAAA"
+        );
+        job.behind.push("0BBBBBBBBBBBBBBB".parse().unwrap());
+        assert_eq!(
+            crate::board::queued_behind(&job).unwrap(),
+            "queued behind 2 running jobs: 0AAAAAAA, 0BBBBBBB"
+        );
+    }
+
     fn sample() -> Job {
         Job {
             spec: Spec {
