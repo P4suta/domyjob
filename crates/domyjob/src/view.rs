@@ -182,7 +182,17 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
     let mut facts = vec![ui::paint(Tone::Dim, report.os.as_raw_str())];
     let mut cores = format!("{} cores", report.cores);
     if let Some([one, ..]) = report.load_hundredths {
-        write!(cores, " load {}.{:02}", one / 100, one % 100)?;
+        let load = format!("load {}.{:02}", one / 100, one % 100);
+        let busy = u64::from(one) > u64::from(report.cores).saturating_mul(100);
+        write!(
+            cores,
+            " {}",
+            if busy {
+                ui::paint(Tone::Bad, &load)
+            } else {
+                load
+            }
+        )?;
     }
     facts.push(cores);
     facts.push(format!(
