@@ -29,6 +29,7 @@ pub mod pq;
 pub mod proc;
 pub mod project;
 pub mod protocol;
+pub mod pull;
 pub mod remote;
 pub mod secret;
 pub mod secure;

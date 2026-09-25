@@ -60,6 +60,13 @@ pub enum ClientError {
         reference: String,
         candidates: String,
     },
+    #[error("{machine}: the changes it sent back are malformed: {why}")]
+    Unpacked {
+        machine: MachineName,
+        why: Unpacking,
+    },
+    #[error("this directory is not the project job {job} was sent from")]
+    OtherProject { job: JobId },
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ClientError + use<> {
@@ -331,14 +338,30 @@ pub struct Prepared {
 }
 
 fn project_root(order: &Order, config: &Config) -> Result<PathBuf, ClientError> {
-    if let Some(root) = &order.root {
-        return Ok(root.clone());
+    root_of(&order.start, order.root.as_deref(), config)
+}
+
+fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBuf, ClientError> {
+    if let Some(given) = given {
+        return Ok(given.to_path_buf());
     }
-    if let Some(root) = project::find_root(&order.start) {
-        return Ok(root);
+    if let Some(found) = project::find_root(start) {
+        return Ok(found);
     }
-    Ok(snapshot::detect(config, &order.start)?
-        .map_or_else(|| order.start.clone(), |found| found.root))
+    Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
+}
+
+pub fn project_here(
+    ctx: &Context,
+    start: &Path,
+    root: Option<&Path>,
+) -> Result<(PathBuf, ProjectKey), ClientError> {
+    let start = std::fs::canonicalize(start).map_err(io("resolving", start))?;
+    let found = root_of(&start, root, &ctx.config)?;
+    let found = std::fs::canonicalize(&found).map_err(io("resolving", &found))?;
+    let (place, named) = repository_place(ctx, &found);
+    let key = project_key(&ctx.origin()?, &place, &named)?;
+    Ok((found, key))
 }
 
 fn project_key(
@@ -978,6 +1001,90 @@ pub fn get(
     Ok(machine)
 }
 
+#[derive(Debug)]
+pub struct Pulled {
+    pub machine: Machine,
+    pub job: Job,
+    pub changes: Vec<snapshot::Change>,
+    pub contents: BTreeMap<RelPath, Vec<u8>>,
+}
+
+pub fn changes(ctx: &Context, reference: &str) -> Result<Pulled, ClientError> {
+    let (machine, job_ref) = locate(ctx, reference)?;
+    let link = Link::open(&ctx.config, &ctx.dirs, &machine)?;
+    let job = link
+        .call(
+            &Request::Status {
+                job: job_ref.clone(),
+            },
+            &[],
+        )?
+        .into_job()
+        .map_err(|other| link.unexpected("a job", *other))?;
+    let mut payload = Vec::new();
+    link.stream(&Request::Changes { job: job_ref }, &mut payload)?
+        .into_stream()
+        .map_err(|other| link.unexpected("changes", *other))?;
+    let (changes, contents) = unpack(&payload).map_err(|why| ClientError::Unpacked {
+        machine: machine.name.clone(),
+        why,
+    })?;
+    Ok(Pulled {
+        machine,
+        job,
+        changes,
+        contents,
+    })
+}
+
+type Unpacked = (Vec<snapshot::Change>, BTreeMap<RelPath, Vec<u8>>);
+
+#[derive(Debug, thiserror::Error)]
+pub enum Unpacking {
+    #[error("the list of changes is missing")]
+    NoList,
+    #[error("the list of changes is not valid: {0}")]
+    List(serde_json::Error),
+    #[error("{0} is too large for this machine")]
+    TooLarge(RelPath),
+    #[error("{0} was cut short")]
+    Short(RelPath),
+    #[error("{0} does not match its digest")]
+    Damaged(RelPath),
+    #[error("more arrived than the list of changes describes")]
+    Extra,
+}
+
+fn unpack(payload: &[u8]) -> Result<Unpacked, Unpacking> {
+    let end = payload
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or(Unpacking::NoList)?;
+    let (list, rest) = payload.split_at(end);
+    let mut rest = rest.get(1..).unwrap_or_default();
+    let changes: Vec<snapshot::Change> = crate::ingress::json(list).map_err(Unpacking::List)?;
+    let mut contents = BTreeMap::new();
+    for change in &changes {
+        if let Some(Entry::File { blob, size, .. }) = &change.after {
+            let wanted = usize::try_from(*size)
+                .map_err(|_too_large| Unpacking::TooLarge(change.path.clone()))?;
+            let (bytes, next) = rest
+                .split_at_checked(wanted)
+                .ok_or_else(|| Unpacking::Short(change.path.clone()))?;
+            if BlobId::of(bytes) != *blob {
+                return Err(Unpacking::Damaged(change.path.clone()));
+            }
+            contents.insert(change.path.clone(), bytes.to_vec());
+            rest = next;
+        }
+    }
+    if rest.is_empty() {
+        Ok((changes, contents))
+    } else {
+        Err(Unpacking::Extra)
+    }
+}
+
 impl crate::ingress::Ingress for IndexEntry {}
 
 #[cfg(test)]
@@ -990,6 +1097,57 @@ mod tests {
         let text = format!("{good}\n{{\"job\":\"0BBB\n\nnot json\n{good}\n{{\"job\"");
         let entries = readable_lines(&text);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn changes_unpack_only_when_every_file_arrives_whole_and_as_described() {
+        let entry = |text: &[u8]| Entry::File {
+            blob: BlobId::of(text),
+            size: crate::domain::len_u64(text.len()),
+            mode: snapshot::Mode::Regular,
+        };
+        let changes = vec![
+            snapshot::Change {
+                path: "a.txt".parse().unwrap(),
+                before: None,
+                after: Some(entry(b"alpha")),
+            },
+            snapshot::Change {
+                path: "gone.txt".parse().unwrap(),
+                before: Some(entry(b"x")),
+                after: None,
+            },
+            snapshot::Change {
+                path: "b.txt".parse().unwrap(),
+                before: None,
+                after: Some(entry(b"beta")),
+            },
+        ];
+        let payload = |tail: &[u8]| {
+            let mut bytes = serde_json::to_vec(&changes).unwrap();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(tail);
+            bytes
+        };
+        let (listed, contents) = unpack(&payload(b"alphabeta")).unwrap();
+        assert_eq!(listed, changes);
+        assert_eq!(contents.get(&"b.txt".parse().unwrap()).unwrap(), b"beta");
+        assert_eq!(contents.len(), 2);
+        assert!(matches!(
+            unpack(&payload(b"alphabeta!")),
+            Err(Unpacking::Extra)
+        ));
+        assert!(matches!(
+            unpack(&payload(b"alphabet")),
+            Err(Unpacking::Short(_))
+        ));
+        assert!(matches!(
+            unpack(&payload(b"alphaBETA")),
+            Err(Unpacking::Damaged(_))
+        ));
+        assert!(matches!(unpack(b"[]"), Err(Unpacking::NoList)));
+        assert!(matches!(unpack(b"{\n"), Err(Unpacking::List(_))));
+        assert!(unpack(b"[]\n").unwrap().0.is_empty());
     }
 
     #[test]

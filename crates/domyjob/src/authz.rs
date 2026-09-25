@@ -113,7 +113,7 @@ pub const fn access(request: &Request) -> Access {
         | Request::Logs { .. }
         | Request::Tail { .. } => Access::Needs(Capability::Observe),
         Request::Kill { .. } => Access::Needs(Capability::Kill),
-        Request::Get { .. } => Access::Needs(Capability::Fetch),
+        Request::Get { .. } | Request::Changes { .. } => Access::Needs(Capability::Fetch),
     }
 }
 

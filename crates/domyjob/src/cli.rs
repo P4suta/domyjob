@@ -95,6 +95,11 @@ enum Top {
     Kill(JobArgs),
     #[command(about = "Copy a file out of a job's workspace")]
     Get(GetArgs),
+    #[command(
+        about = "Bring the files a finished job changed back into this directory",
+        long_about = "Bring the files a finished job changed back into this directory.\n\nOnly files the job added, altered, or removed come back, judged by the same ignore rules that decided what was sent. Nothing is written if any of those files changed here since the job was sent. Review, commit, sign, and push them here, where your keys are."
+    )]
+    Pull(PullArgs),
     #[command(about = "List, add, or remove machines")]
     Machines(MachinesArgs),
     #[command(about = "Install or update domyjob on machines")]
@@ -368,6 +373,21 @@ struct GetArgs {
         help = "Write the file here instead of to standard output"
     )]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PullArgs {
+    #[arg(help = "A job id, a unique prefix of one, a name, or MACHINE:ID")]
+    job: String,
+    #[arg(
+        long,
+        help = "The project directory the job was sent from [default: the one containing this directory]"
+    )]
+    root: Option<PathBuf>,
+    #[arg(long, help = "List the changes without writing anything")]
+    dry_run: bool,
+    #[arg(long, help = "Print machine-readable JSON")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -668,6 +688,8 @@ enum CliError {
     Declined(String),
     #[error("--grep: {0}")]
     Pattern(String),
+    #[error(transparent)]
+    Pull(#[from] crate::pull::PullError),
 }
 
 const FAILED_JOB: u8 = 1;
@@ -684,7 +706,8 @@ const fn wants_json(command: &Top) -> bool {
         | Top::Wait(WaitArgs { json, .. })
         | Top::Machines(MachinesArgs { json, .. })
         | Top::Doctor(DoctorArgs { json, .. })
-        | Top::Logs(LogsArgs { json, .. }) => *json,
+        | Top::Logs(LogsArgs { json, .. })
+        | Top::Pull(PullArgs { json, .. }) => *json,
         Top::Get(_)
         | Top::Setup(_)
         | Top::Myself(_)
@@ -721,7 +744,12 @@ const fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
             kind: Kind::Unreachable,
             hint: Some("each machine's own error is printed above it"),
         },
-        CliError::Node(_)
+        CliError::Pull(crate::pull::PullError::Diverged(_)) => Diagnosis {
+            kind: Kind::Usage,
+            hint: Some("commit or set aside your own edits to those files, then pull again"),
+        },
+        CliError::Pull(_)
+        | CliError::Node(_)
         | CliError::Output(_)
         | CliError::Mcp(_)
         | CliError::Serve(_)
@@ -785,6 +813,7 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         }
         Top::Wait(args) => wait(&args),
         Top::Get(args) => get(&args),
+        Top::Pull(args) => pull(&args),
         Top::Machines(args) => match &args.action {
             None => machines(args.json),
             Some(MachinesAction::Add(add)) => machines_add(add),
@@ -1770,6 +1799,78 @@ fn get(args: &GetArgs) -> Result<ExitCode, CliError> {
             client::get(&ctx, &args.job, args.path.clone(), &mut out)?;
             out.flush().map_err(CliError::Output)?;
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn pull(args: &PullArgs) -> Result<ExitCode, CliError> {
+    let ctx = Context::load()?;
+    let pulled = client::changes(&ctx, &args.job)?;
+    let (root, here) = client::project_here(&ctx, &current_dir()?, args.root.as_deref())?;
+    let sent_from = match &pulled.job.spec.location {
+        crate::protocol::Location::Snapshot { source, .. } => Some(&source.project),
+        crate::protocol::Location::Home => None,
+    };
+    if sent_from != Some(&here) {
+        return Err(ClientError::OtherProject {
+            job: pulled.job.spec.id,
+        }
+        .into());
+    }
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        let listed: Vec<serde_json::Value> = pulled
+            .changes
+            .iter()
+            .map(|change| {
+                serde_json::json!({
+                    "path": change.path,
+                    "change": match crate::pull::kind(change) {
+                        crate::pull::Kind::Added => "added",
+                        crate::pull::Kind::Modified => "modified",
+                        crate::pull::Kind::Removed => "removed",
+                    },
+                })
+            })
+            .collect();
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "schema": crate::view::JSON_SCHEMA,
+                "job": format!("{}:{}", pulled.machine.name, pulled.job.spec.id),
+                "applied": !args.dry_run,
+                "changes": listed,
+            })
+        )
+        .map_err(CliError::Output)?;
+    } else {
+        for change in &pulled.changes {
+            writeln!(
+                out,
+                "{} {}",
+                crate::pull::kind(change).letter(),
+                change.path
+            )
+            .map_err(CliError::Output)?;
+        }
+    }
+    drop(out);
+    let reference = format!("{}:{}", pulled.machine.name, pulled.job.spec.id);
+    if pulled.changes.is_empty() {
+        eprintln!("domyjob: {reference} changed no files");
+    } else if args.dry_run {
+        let diverged = crate::pull::diverged(&root, &pulled.changes)?;
+        if !diverged.is_empty() {
+            return Err(crate::pull::PullError::Diverged(diverged).into());
+        }
+    } else {
+        crate::pull::apply(&root, &pulled.changes, &pulled.contents)?;
+        eprintln!(
+            "domyjob: brought {} changed files back from {reference} into {}",
+            pulled.changes.len(),
+            root.display()
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

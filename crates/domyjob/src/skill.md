@@ -20,6 +20,9 @@ You then ask for a digest or search the log instead of reading all of it.
    `domyjob logs tests --grep 'panicked|error\[' --context 3`
 5. Fetch a result if you need one:
    `domyjob get tests target/report.json -o report.json`
+6. Bring back what it changed:
+   `domyjob pull tests` writes the files the job added, altered, or removed into this directory, and refuses if you edited any of them since sending.
+   Commit, sign, and push here: the other machines never need your keys.
 
 When a result is needed right away and the job is short, `domyjob run win --wait --digest -- cargo test` waits and prints only the digest.
 To watch it live but only see what matters, `--wait --grep 'test result|panicked'` shows just the matching lines while the whole log stays on the machine.

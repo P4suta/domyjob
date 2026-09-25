@@ -50,6 +50,17 @@ pub struct Staged {
     committed: bool,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "directories inside the user's own project, created as the user would"
+)]
+pub fn parents(path: &Path) -> Result<(), UserFileError> {
+    match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => std::fs::create_dir_all(parent).map_err(failed("creating", parent)),
+        None => Ok(()),
+    }
+}
+
 impl Staged {
     #[expect(
         clippy::disallowed_methods,

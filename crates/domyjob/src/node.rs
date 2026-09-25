@@ -57,8 +57,12 @@ pub enum NodeError {
         "job {job}'s workspace has since been filled by job {by}, so its files are gone; run it with --fresh to keep them apart"
     )]
     Reused { job: JobId, by: String },
+    #[error("job {0} has not finished; its changes can be pulled once it has")]
+    Unfinished(JobId),
     #[error(transparent)]
     Workspace(#[from] crate::workspace::WorkspaceError),
+    #[error(transparent)]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
     #[error("{action} {path}: {source}")]
     Io {
         action: &'static str,
@@ -98,7 +102,8 @@ impl NodeError {
                 RefusalCode::NoSuchPath
             }
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
-            Self::Request(_)
+            Self::Unfinished(_)
+            | Self::Request(_)
             | Self::Invalid(_)
             | Self::Input(_)
             | Self::TooMany(_)
@@ -109,6 +114,7 @@ impl NodeError {
             Self::Proc(_) | Self::AlreadySupervised(_) | Self::NotStarted(_) => RefusalCode::Spawn,
             Self::Store(_)
             | Self::Workspace(_)
+            | Self::Snapshot(_)
             | Self::QueueClosed
             | Self::Panicked(_)
             | Self::Control(_)
@@ -286,6 +292,7 @@ const fn action(request: &Request) -> &'static str {
         Request::Digest { .. } => "digest",
         Request::Search { .. } => "search",
         Request::Get { .. } => "get",
+        Request::Changes { .. } => "changes",
     }
 }
 
@@ -297,7 +304,8 @@ fn subject(request: &Request) -> Option<String> {
         | Request::Logs { job, .. }
         | Request::Tail { job, .. }
         | Request::Digest { job, .. }
-        | Request::Search { job, .. } => Some(job.to_string()),
+        | Request::Search { job, .. }
+        | Request::Changes { job } => Some(job.to_string()),
         Request::Get { job, path } => Some(format!("{job} {path}")),
         Request::Submit { submission } => Some(submission.command.display()),
         Request::Hello
@@ -312,7 +320,10 @@ fn subject(request: &Request) -> Option<String> {
 
 const fn audited(request: &Request) -> bool {
     match request {
-        Request::Submit { .. } | Request::Kill { .. } | Request::Get { .. } => true,
+        Request::Submit { .. }
+        | Request::Kill { .. }
+        | Request::Get { .. }
+        | Request::Changes { .. } => true,
         Request::Hello
         | Request::Hold
         | Request::AuditAt { .. }
@@ -404,6 +415,7 @@ impl Node {
             }
             Request::Tail { job, lines } => self.tail(&self.own(&principal, &job)?, lines, output),
             Request::Get { job, path } => self.get(&self.own(&principal, &job)?, &path, output),
+            Request::Changes { job } => self.changes(&self.own(&principal, &job)?, output),
             single @ (Request::Hello
             | Request::AuditAt { .. }
             | Request::AuditHead
@@ -479,7 +491,11 @@ impl Node {
                 Order::Kill,
                 input,
             )?)),
-            Request::Hold | Request::Logs { .. } | Request::Tail { .. } | Request::Get { .. } => {
+            Request::Hold
+            | Request::Logs { .. }
+            | Request::Tail { .. }
+            | Request::Get { .. }
+            | Request::Changes { .. } => {
                 return Err(NodeError::Misrouted(action(&request)));
             }
         })
@@ -1028,6 +1044,57 @@ impl Node {
         let Location::Snapshot { subdir, .. } = &job.spec.location else {
             return Err(NodeError::NoWorkspace(job.spec.id));
         };
+        let (_, workspace) = self.workspace_of(id)?;
+        let inside = match subdir {
+            Some(sub) => format!("{sub}/{path}").parse::<crate::domain::RelPath>()?,
+            None => path.clone(),
+        };
+        let mut file = workspace.open_file(&inside)?;
+        streamed(output, |framed| {
+            std::io::copy(&mut file, framed)
+                .map(drop)
+                .map_err(NodeError::Output)
+        })
+    }
+
+    fn changes(&self, id: &JobId, output: &mut dyn Write) -> Result<(), NodeError> {
+        let job = self.store.job(id)?;
+        let Location::Snapshot { source, .. } = &job.spec.location else {
+            return Err(NodeError::NoWorkspace(job.spec.id));
+        };
+        if !job.is_settled() {
+            return Err(NodeError::Unfinished(job.spec.id));
+        }
+        let sent = self.cas.manifest(&source.manifest)?;
+        let (root, workspace) = self.workspace_of(id)?;
+        let now = crate::snapshot::from_directory(&root)?.manifest;
+        let changes = crate::snapshot::changes(&sent, &now);
+        streamed(output, |framed| {
+            let mut listed =
+                serde_json::to_vec(&changes).map_err(|e| NodeError::Output(e.into()))?;
+            listed.push(b'\n');
+            framed.write_all(&listed).map_err(NodeError::Output)?;
+            for change in &changes {
+                if let Some(crate::snapshot::Entry::File { size, .. }) = &change.after {
+                    let file = workspace.open_file(&change.path)?;
+                    let copied =
+                        std::io::copy(&mut file.take(*size), framed).map_err(NodeError::Output)?;
+                    if copied != *size {
+                        return Err(NodeError::Output(std::io::Error::other(format!(
+                            "{} changed while it was being sent",
+                            change.path
+                        ))));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn workspace_of(
+        &self,
+        id: &JobId,
+    ) -> Result<(PathBuf, crate::workspace::Workspace), NodeError> {
         let recorded = self.store.workspace_record(id);
         let root = crate::state_file::read_bytes(&recorded)?
             .ok_or_else(|| NodeError::NoWorkspace(id.clone()))?;
@@ -1041,16 +1108,7 @@ impl Node {
         }
         let workspace = crate::workspace::Workspace::open_existing(&root)?
             .ok_or_else(|| NodeError::NoWorkspace(id.clone()))?;
-        let inside = match subdir {
-            Some(sub) => format!("{sub}/{path}").parse::<crate::domain::RelPath>()?,
-            None => path.clone(),
-        };
-        let mut file = workspace.open_file(&inside)?;
-        streamed(output, |framed| {
-            std::io::copy(&mut file, framed)
-                .map(drop)
-                .map_err(NodeError::Output)
-        })
+        Ok((root, workspace))
     }
 }
 
@@ -1520,6 +1578,65 @@ mod tests {
                 .unwrap_err();
             }
         }
+    }
+
+    #[test]
+    fn a_finished_job_sends_back_exactly_what_it_changed_and_an_unfinished_one_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let workspace = tmp.path().join("ws");
+        for (name, text) in [
+            ("keep.txt", "same"),
+            ("edit.txt", "old"),
+            ("drop.txt", "bye"),
+        ] {
+            crate::state_file::write_bytes(&workspace.join(name), text.as_bytes()).unwrap();
+        }
+        crate::state_file::write_bytes(&workspace.join(".gitignore"), b"target/\n").unwrap();
+        let sent = crate::snapshot::from_directory(&workspace).unwrap();
+        let (manifest, bytes) = sent.manifest.encode().unwrap();
+        node.cas.put(&manifest, &bytes).unwrap();
+        sent_manifest(&store, &id, &manifest);
+        crate::state_file::write_bytes(
+            &store.workspace_record(&id),
+            workspace.display().to_string().as_bytes(),
+        )
+        .unwrap();
+        crate::state_file::write_bytes(&workspace.join("edit.txt"), b"new").unwrap();
+        crate::state_file::remove_file(&workspace.join("drop.txt")).unwrap();
+        crate::state_file::write_bytes(&workspace.join("born.txt"), b"hi").unwrap();
+        crate::state_file::write_bytes(&workspace.join("target/out.bin"), b"built").unwrap();
+
+        let mut payload = Vec::new();
+        let wire = ask(&node, &Request::Changes { job: job.clone() });
+        let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut payload).unwrap();
+        assert!(matches!(reply, Reply::Stream), "{reply:?}");
+        let end = payload.iter().position(|b| *b == b'\n').unwrap();
+        let listed: Vec<crate::snapshot::Change> =
+            crate::ingress::json(payload.get(..end).unwrap()).unwrap();
+        let paths: Vec<String> = listed.iter().map(|c| c.path.to_string()).collect();
+        assert_eq!(paths, ["born.txt", "drop.txt", "edit.txt"]);
+        assert_eq!(payload.get(end + 1..).unwrap(), b"hinew");
+
+        store.set_phase(&id, &Phase::Queued).unwrap();
+        let _alive = crate::lock::OsLock::exclusive(&store.alive_path(&id)).unwrap();
+        assert!(refused(&ask(&node, &Request::Changes { job })));
+    }
+
+    fn sent_manifest(store: &Store, id: &JobId, manifest: &BlobId) {
+        let mut spec = store.spec(id).unwrap();
+        spec.location = Location::Snapshot {
+            source: crate::protocol::Source {
+                project: "proj".parse().unwrap(),
+                manifest: manifest.clone(),
+                revision: crate::protocol::Revision::WorkingDirectory,
+            },
+            subdir: None,
+            workspace: crate::protocol::Workspace::Warm,
+        };
+        crate::state_file::write_json(&store.job_dir(id).join("spec.json"), &spec).unwrap();
     }
 
     #[test]

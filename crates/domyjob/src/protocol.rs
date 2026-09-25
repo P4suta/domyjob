@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,9 @@ pub enum Request {
     Get {
         job: JobRef,
         path: RelPath,
+    },
+    Changes {
+        job: JobRef,
     },
     AuditAt {
         seq: u64,

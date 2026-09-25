@@ -78,6 +78,33 @@ pub enum Entry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Change {
+    pub path: RelPath,
+    pub before: Option<Entry>,
+    pub after: Option<Entry>,
+}
+
+impl crate::ingress::Ingress for Vec<Change> {}
+
+#[must_use]
+pub fn changes(before: &Manifest, after: &Manifest) -> Vec<Change> {
+    let paths: std::collections::BTreeSet<&RelPath> =
+        before.entries.keys().chain(after.entries.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let (was, now) = (before.entries.get(path), after.entries.get(path));
+            (was != now).then(|| Change {
+                path: path.clone(),
+                before: was.cloned(),
+                after: now.cloned(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub entries: BTreeMap<RelPath, Entry>,
 }
@@ -724,6 +751,53 @@ mod tests {
             std::fs::canonicalize(other_id).unwrap(),
             std::fs::canonicalize(main_id).unwrap()
         );
+    }
+
+    #[test]
+    fn changes_are_what_was_added_altered_or_removed_and_nothing_else() {
+        let file = |text: &[u8], mode| Entry::File {
+            blob: BlobId::of(text),
+            size: crate::domain::len_u64(text.len()),
+            mode,
+        };
+        let manifest = |entries: &[(&str, Entry)]| Manifest {
+            entries: entries
+                .iter()
+                .map(|(path, entry)| (path.parse().unwrap(), entry.clone()))
+                .collect(),
+        };
+        let sent = manifest(&[
+            ("same.txt", file(b"same", Mode::Regular)),
+            ("edited.txt", file(b"old", Mode::Regular)),
+            ("run.sh", file(b"echo", Mode::Regular)),
+            ("gone.txt", file(b"bye", Mode::Regular)),
+        ]);
+        let now = manifest(&[
+            ("same.txt", file(b"same", Mode::Regular)),
+            ("edited.txt", file(b"new", Mode::Regular)),
+            ("run.sh", file(b"echo", Mode::Executable)),
+            ("born.txt", file(b"hi", Mode::Regular)),
+        ]);
+        let found: Vec<(String, bool, bool)> = changes(&sent, &now)
+            .into_iter()
+            .map(|change| {
+                (
+                    change.path.to_string(),
+                    change.before.is_some(),
+                    change.after.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("born.txt".to_owned(), false, true),
+                ("edited.txt".to_owned(), true, true),
+                ("gone.txt".to_owned(), true, false),
+                ("run.sh".to_owned(), true, true),
+            ]
+        );
+        assert!(changes(&sent, &sent).is_empty());
     }
 
     #[test]

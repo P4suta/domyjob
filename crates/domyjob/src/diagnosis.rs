@@ -155,5 +155,13 @@ pub const fn of_client(error: &ClientError) -> Diagnosis {
         | ClientError::Index { .. }
         | ClientError::State(_) => plain(Kind::Local),
         ClientError::Panicked => plain(Kind::Internal),
+        ClientError::Unpacked { .. } => hinted(
+            Kind::Protocol,
+            "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",
+        ),
+        ClientError::OtherProject { .. } => hinted(
+            Kind::Usage,
+            "run it inside the project the job was sent from, or name that project with --root",
+        ),
     }
 }
