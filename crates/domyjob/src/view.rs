@@ -355,14 +355,16 @@ pub fn cleaned(
 }
 
 pub fn history(
-    series: &[crate::history::Series],
-    now: Timestamp,
+    all: &[crate::history::Series],
+    (now, everything): (Timestamp, bool),
 ) -> Result<String, std::fmt::Error> {
     let mut out = String::new();
-    if series.is_empty() {
+    if all.is_empty() {
         writeln!(out, "{}", ui::paint(Tone::Dim, "No finished jobs yet."))?;
         return Ok(out);
     }
+    let (series, once): (Vec<&crate::history::Series>, Vec<&crate::history::Series>) =
+        all.iter().partition(|one| everything || one.runs > 1);
     let machine_width = series
         .iter()
         .map(|one| one.machine.as_str().len())
@@ -374,7 +376,7 @@ pub fn history(
         .map(|label| unicode_width::UnicodeWidthStr::width(label.as_str()))
         .max()
         .unwrap_or(0);
-    for (one, label) in series.iter().zip(&labels) {
+    for (one, label) in series.iter().copied().zip(&labels) {
         let marks: String = one
             .recent
             .iter()
@@ -405,6 +407,25 @@ pub fn history(
             marks,
             " ".repeat(12usize.saturating_sub(one.recent.len())),
             ui::paint(Tone::Dim, &facts.join(" · "))
+        )?;
+    }
+    if !once.is_empty() {
+        let marks: String = once
+            .iter()
+            .filter_map(|one| one.recent.last())
+            .map(|state| {
+                let (mark, tone) = ui::state_look(*state);
+                ui::paint(tone, ui::symbol(mark))
+            })
+            .collect();
+        writeln!(
+            out,
+            "{} {marks}  {}",
+            ui::paint(
+                Tone::Dim,
+                &format!("and {} jobs that ran once:", once.len())
+            ),
+            ui::paint(Tone::Dim, "`--all` lists them")
         )?;
     }
     Ok(out)

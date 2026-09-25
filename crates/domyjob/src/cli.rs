@@ -398,6 +398,8 @@ struct GetArgs {
 struct HistoryArgs {
     #[arg(help = "Which machines to ask [default: every machine domyjob knows]")]
     machines: Option<String>,
+    #[arg(long, help = "List jobs that ran only once too, one line each")]
+    all: bool,
     #[arg(long, help = "Print machine-readable JSON")]
     json: bool,
 }
@@ -1856,7 +1858,10 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
             serde_json::json!({"schema": crate::view::JSON_SCHEMA, "history": values})
         );
     } else {
-        show(crate::view::history(&series, Timestamp::observe()))?;
+        show(crate::view::history(
+            &series,
+            (Timestamp::observe(), args.all),
+        ))?;
     }
     Ok(if rejected.is_empty() {
         ExitCode::SUCCESS
