@@ -906,9 +906,7 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         Top::Status(args) => job_command(&args, |job| Request::Status { job })
             .map(|(job, _)| exit(&[verdict_of(&job)])),
         Top::Digest(args) => digest(&args),
-        Top::Kill(args) => {
-            job_command(&args, |job| Request::Kill { job }).map(|_| ExitCode::SUCCESS)
-        }
+        Top::Kill(args) => kill(&args),
         Top::Wait(args) => wait(&args),
         Top::Get(args) => get(&args),
         Top::Pull(args) => pull(&args),
@@ -1001,20 +999,8 @@ fn node(args: &NodeArgs) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(unix)]
 fn readiness(args: &NodeArgs) -> Result<crate::proc::Readiness, CliError> {
-    match &args.ready_event {
-        None => Ok(crate::proc::Readiness::from_parent()),
-        Some(_) => Err(CliError::Readiness),
-    }
-}
-
-#[cfg(windows)]
-fn readiness(args: &NodeArgs) -> Result<crate::proc::Readiness, CliError> {
-    match &args.ready_event {
-        Some(token) => Ok(crate::proc::Readiness::from_parent(token.clone())),
-        None => Err(CliError::Readiness),
-    }
+    crate::proc::Readiness::from_parent(args.ready_event.as_ref()).ok_or(CliError::Readiness)
 }
 
 fn parse_env(pairs: &[String]) -> Result<BTreeMap<EnvName, String>, CliError> {
@@ -1930,6 +1916,20 @@ fn print_job(machine: &MachineName, job: &Job, json: bool) -> Result<(), CliErro
         )
     }
     .map_err(CliError::Output)
+}
+
+fn kill(args: &JobArgs) -> Result<ExitCode, CliError> {
+    let (job, machine) = job_command(args, |job| Request::Kill { job })?;
+    if job.state() == crate::protocol::State::Killed {
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!(
+        "domyjob: {}:{} had already {}; nothing was stopped",
+        machine.name,
+        job.spec.id,
+        job.state().as_str()
+    );
+    Ok(ExitCode::from(FAILED_JOB))
 }
 
 fn job_command(

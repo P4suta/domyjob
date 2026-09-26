@@ -147,6 +147,25 @@ pub fn lost(
     deliver(config, target, &text, &json)
 }
 
+fn invocation_for(
+    config: &Config,
+    target: &NotifyTarget,
+) -> Result<crate::spawn::Invocation, NotifyError> {
+    let name = target.notifier.as_str();
+    let argv = config
+        .notifier(name)?
+        .command()
+        .client()
+        .render(&Bindings::new().with("target", target.arg()))
+        .map_err(|source| NotifyError::Template {
+            notifier: name.to_owned(),
+            source,
+        })?;
+    crate::spawn::Invocation::from_words(argv).ok_or_else(|| NotifyError::Empty {
+        notifier: name.to_owned(),
+    })
+}
+
 fn deliver(
     config: &Config,
     target: &NotifyTarget,
@@ -155,19 +174,7 @@ fn deliver(
 ) -> Result<(), NotifyError> {
     let name = target.notifier.as_str();
     let notifier = config.notifier(name)?;
-    let argv = notifier
-        .command()
-        .client()
-        .render(&Bindings::new().with("target", target.arg()))
-        .map_err(|source| NotifyError::Template {
-            notifier: name.to_owned(),
-            source,
-        })?;
-    let Some(invocation) = crate::spawn::Invocation::from_words(argv) else {
-        return Err(NotifyError::Empty {
-            notifier: name.to_owned(),
-        });
-    };
+    let invocation = invocation_for(config, target)?;
     let program = invocation.display();
     let program = program.as_str();
     let payload = match notifier.stdin {
@@ -255,6 +262,16 @@ mod tests {
             summary(&machine, &finished(Outcome::Failed { exit_code: 101 })),
             "cargo test failed (exit 101) on linux in 12s"
         );
+    }
+
+    #[test]
+    fn an_ntfy_target_is_a_topic_on_ntfy_sh() {
+        let config = Config::layered("", "t").unwrap();
+        let target = NotifyTarget::from_user(&crate::input::UserText::from_cli(
+            "ntfy:my-topic".to_owned(),
+        ));
+        let shown = invocation_for(&config, &target).unwrap().display();
+        assert!(shown.contains("https://ntfy.sh/my-topic"), "{shown}");
     }
 
     #[test]

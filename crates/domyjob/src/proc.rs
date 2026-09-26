@@ -26,10 +26,10 @@ pub enum ProcError {
 pub use platform::Readiness;
 
 pub fn own_executable() -> std::io::Result<std::path::PathBuf> {
-    if cfg!(target_os = "linux") {
-        return Ok(std::path::PathBuf::from("/proc/self/exe"));
+    match crate::platform::RUNNING_EXECUTABLE {
+        Some(running) => Ok(std::path::PathBuf::from(running)),
+        None => std::env::current_exe(),
     }
-    std::env::current_exe()
 }
 
 pub fn launch(invocation: &crate::spawn::Invocation) -> Result<(), ProcError> {
@@ -222,14 +222,18 @@ mod platform {
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group};
 
     use super::{Next, ProcError};
+    use crate::domain::BlobId;
 
     #[derive(Debug)]
     pub struct Readiness(std::io::Stdout);
 
     impl Readiness {
         #[must_use]
-        pub fn from_parent() -> Self {
-            Self(std::io::stdout())
+        pub fn from_parent(event: Option<&BlobId>) -> Option<Self> {
+            match event {
+                None => Some(Self(std::io::stdout())),
+                Some(_) => None,
+            }
         }
 
         pub fn announce(self) -> Result<(), ProcError> {
@@ -529,8 +533,8 @@ mod platform {
 
     impl Readiness {
         #[must_use]
-        pub const fn from_parent(token: BlobId) -> Self {
-            Self(token)
+        pub fn from_parent(event: Option<&BlobId>) -> Option<Self> {
+            event.map(|token| Self(token.clone()))
         }
 
         pub fn announce(self) -> Result<(), ProcError> {
