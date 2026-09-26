@@ -113,6 +113,7 @@ struct Shared {
     group: OnceLock<Arc<Group>>,
     events: Sender<Event>,
     log_path: PathBuf,
+    notes_path: PathBuf,
 }
 
 impl Shared {
@@ -126,7 +127,11 @@ impl Shared {
     }
 
     fn say(&self, line: &str) {
-        self.append(format!("domyjob: {line}\n").as_bytes());
+        let noted = crate::state_file::open_append(&self.notes_path)
+            .map(|mut notes| notes.write_all(format!("{line}\n").as_bytes()));
+        match noted {
+            Ok(Ok(()) | Err(_)) | Err(_) => {}
+        }
     }
 
     fn close_log(&self) -> Option<String> {
@@ -471,6 +476,7 @@ fn take_charge(
         group: OnceLock::new(),
         events,
         log_path,
+        notes_path: store.notes_path(id),
     });
     serve_control(listener, Arc::clone(&shared));
     if let Err(error) = readiness.announce() {
@@ -676,10 +682,7 @@ impl Supervisor {
             self.shared.say(&format!("collecting output: {error}"));
         }
         match (status, self.shared.killed()) {
-            (Ok(_) | Err(_), true) => {
-                self.shared.say("killed");
-                Outcome::Killed
-            }
+            (Ok(_) | Err(_), true) => Outcome::Killed,
             (Ok(status), false) => match proc::exit_code(status) {
                 0 => Outcome::Succeeded,
                 code => Outcome::Failed { exit_code: code },
@@ -760,16 +763,9 @@ impl Supervisor {
             manifest: &manifest,
             previous: &previous,
         };
-        let (applied, changes) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
+        let (applied, _) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
         crate::state_file::write_json(&state, &applied)?;
         crate::state_file::write_bytes(&filled_by_path(root), self.spec.id.as_str().as_bytes())?;
-        self.shared.say(&format!(
-            "workspace {} ({} written, {} unchanged, {} removed)",
-            root.display(),
-            changes.written,
-            changes.kept,
-            changes.removed
-        ));
         Ok(())
     }
 

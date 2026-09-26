@@ -124,6 +124,7 @@ fn is_time_method(name: &str) -> bool {
 }
 
 const DECISION_FILES: &[&str] = &["authz.rs", "trust.rs", "audit.rs"];
+const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &["failure.rs", "xtask/src/lib.rs", "xtask/src/release.rs"];
 
 fn carries_io_source(fields: &syn::Fields) -> bool {
@@ -293,6 +294,12 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if method == "as_raw_str" && self.file_is(TERMINAL_FILES) {
+            self.flag(
+                call.method.span(),
+                "remote text reaches a terminal only through its Display, which neutralizes control characters",
+            );
+        }
         let exempt = self.file_is(CLOCK_FILES)
             || (self.file_is(LIVENESS_FILES) && LIVENESS_TIME.contains(&method.as_str()));
         if !exempt && is_time_method(&method) {
@@ -482,6 +489,13 @@ mod tests {
             os_branches("#[cfg(feature = \"x\")]\nfn a() {}").unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn remote_text_is_never_printed_raw() {
+        let source = "fn f(t: &RemoteText) -> String { t.as_raw_str().to_owned() }";
+        assert_eq!(check_file(source, "src/view.rs").unwrap().len(), 1);
+        assert!(check_file(source, "src/remote.rs").unwrap().is_empty());
     }
 
     #[test]

@@ -249,6 +249,7 @@ mod tests {
             },
             supervisor: Supervisor::Alive,
             behind: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
