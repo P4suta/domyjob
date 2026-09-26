@@ -78,7 +78,7 @@ impl Staged {
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        if !self.committed {
+        if !self.committed && crate::faults::at("durable::discard", &self.temporary).is_ok() {
             match std::fs::remove_file(&self.temporary) {
                 Ok(()) | Err(_) => {}
             }

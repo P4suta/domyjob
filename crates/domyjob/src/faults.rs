@@ -10,6 +10,8 @@ pub fn from_environment() -> Option<&'static mut fail::FailScenario<'static>> {
 const FULL: &str = "full:";
 
 pub fn at(site: &'static str, path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    crashing(path)?;
     let hit = fail::eval(site, |tag| {
         tag.map(|tag| {
             let (kind, wanted) = match tag.strip_prefix(FULL) {
@@ -25,6 +27,92 @@ pub fn at(site: &'static str, path: &Path) -> std::io::Result<()> {
             format!("a fault injected at {site} for {}", path.display()),
         )),
         Some(Some((_, false)) | None) | None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct Crash {
+    within: std::path::PathBuf,
+    survives: Option<usize>,
+    taken: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+static CRASH: std::sync::Mutex<Option<Crash>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn crashing(path: &Path) -> std::io::Result<()> {
+    let Ok(mut held) = CRASH.lock() else {
+        return Ok(());
+    };
+    let Some(crash) = held
+        .as_mut()
+        .filter(|crash| path.starts_with(&crash.within))
+    else {
+        return Ok(());
+    };
+    crash
+        .taken
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    match &mut crash.survives {
+        Some(0) => Err(std::io::Error::other(format!(
+            "the machine crashed before this step on {}",
+            path.display()
+        ))),
+        Some(left) => {
+            *left = left.saturating_sub(1);
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+pub struct Crashing {
+    _scenario: fail::FailScenario<'static>,
+    taken: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for Crashing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Crashing").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl Crashing {
+    #[must_use]
+    pub fn steps(&self) -> usize {
+        self.taken.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for Crashing {
+    fn drop(&mut self) {
+        if let Ok(mut held) = CRASH.lock() {
+            *held = None;
+        }
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+pub fn crash_after(within: &Path, survives: Option<usize>) -> Crashing {
+    let scenario = fail::FailScenario::setup();
+    let taken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if let Ok(mut held) = CRASH.lock() {
+        *held = Some(Crash {
+            within: within.to_path_buf(),
+            survives,
+            taken: std::sync::Arc::clone(&taken),
+        });
+    }
+    Crashing {
+        _scenario: scenario,
+        taken,
     }
 }
 

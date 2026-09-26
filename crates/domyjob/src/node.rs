@@ -1,5 +1,5 @@
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audit::{AuditLog, Verdict};
@@ -126,7 +126,7 @@ impl NodeError {
     }
 }
 
-fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
+fn telling(jobs: &Path, path: &Path) -> bool {
     path.parent() == Some(jobs)
         || path
             .file_name()
@@ -134,7 +134,7 @@ fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
             .is_some_and(|name| name == "phase.json" || name == "outcome")
 }
 
-fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
+fn watching(jobs: &Path, error: &notify::Error) -> NodeError {
     NodeError::Io(crate::failure::IoFailure {
         action: "watching",
         path: jobs.to_path_buf(),
@@ -142,7 +142,7 @@ fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
     })
 }
 
-fn size_of(path: &std::path::Path) -> u64 {
+fn size_of(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(next) = pending.pop() {
@@ -160,7 +160,7 @@ fn size_of(path: &std::path::Path) -> u64 {
     total
 }
 
-fn disk_is_short(area: &std::path::Path) -> bool {
+fn disk_is_short(area: &Path) -> bool {
     match fs4::statvfs(area) {
         Ok(stats) => short(stats.available_space(), stats.total_space()),
         Err(_unmeasurable) => false,
@@ -204,7 +204,7 @@ enum Keep {
     Unfinished,
 }
 
-fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
+fn configured_agent(home: &Path) -> Option<PathBuf> {
     if !crate::platform::FAMILY.agent_socket() {
         return None;
     }
@@ -230,7 +230,7 @@ fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-fn identity_agent(printed: &str, home: &std::path::Path) -> Option<PathBuf> {
+fn identity_agent(printed: &str, home: &Path) -> Option<PathBuf> {
     let value = printed
         .lines()
         .find_map(|line| line.strip_prefix("identityagent "))?
@@ -273,7 +273,7 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
-    short: fn(&std::path::Path) -> bool,
+    short: fn(&Path) -> bool,
 }
 
 #[must_use]
@@ -600,10 +600,9 @@ impl Node {
             &crate::supervisor::scope_name(&principal.submitter()),
             &submission.nonce,
         );
-        if let Some(earlier) = crate::state_file::read_bytes(&nonce_path)? {
+        if let Some(job) = self.earlier_attempt(&nonce_path)? {
             collecting.release()?;
-            let id: JobId = String::from_utf8_lossy(&earlier).trim().parse()?;
-            return Ok(self.store.job(&id)?);
+            return Ok(job);
         }
         if let Location::Snapshot { source, .. } = &submission.location {
             let manifest = self.cas.manifest(&source.manifest)?;
@@ -647,6 +646,24 @@ impl Node {
         staging.release()?;
         self.store.forget_staging_lock(&spec.id)?;
         Ok(self.store.job(&spec.id)?)
+    }
+
+    fn earlier_attempt(&self, nonce_path: &Path) -> Result<Option<Job>, NodeError> {
+        let Some(earlier) = crate::state_file::read_bytes(nonce_path)? else {
+            return Ok(None);
+        };
+        let id: JobId = String::from_utf8_lossy(&earlier).trim().parse()?;
+        let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&id))?;
+        let job = if self.store.is_published(&id)? {
+            Some(self.store.job(&id)?)
+        } else {
+            self.store.discard_staged(&id)?;
+            crate::state_file::remove_file(nonce_path)?;
+            None
+        };
+        staging.release()?;
+        self.store.forget_staging_lock(&id)?;
+        Ok(job)
     }
 
     fn launch_supervisor(&self, id: &JobId) -> Result<(), NodeError> {
@@ -785,7 +802,7 @@ impl Node {
         self.collect(Keep::Unfinished)
     }
 
-    fn stale(&self, workspace: &std::path::Path) -> bool {
+    fn stale(&self, workspace: &Path) -> bool {
         let filled_by = crate::supervisor::filled_by_path(workspace);
         let last = match crate::state_file::read_bytes(&filled_by) {
             Ok(Some(bytes)) => bytes,
@@ -798,11 +815,7 @@ impl Node {
         }
     }
 
-    fn evict(
-        &self,
-        workspace: &std::path::Path,
-        lock: &std::path::Path,
-    ) -> Result<bool, NodeError> {
+    fn evict(&self, workspace: &Path, lock: &Path) -> Result<bool, NodeError> {
         let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
             return Ok(false);
         };
@@ -1432,7 +1445,7 @@ mod tests {
     use crate::protocol::{Command, Location, Spec};
     use crate::store::LaunchEnv;
 
-    fn dirs(root: &std::path::Path) -> Dirs {
+    fn dirs(root: &Path) -> Dirs {
         Dirs {
             home: root.into(),
             state: root.join("state"),
@@ -1442,7 +1455,7 @@ mod tests {
         }
     }
 
-    fn published(root: &std::path::Path, log: &[u8]) -> (Node, JobRef) {
+    fn published(root: &Path, log: &[u8]) -> (Node, JobRef) {
         let store = Store::open(&dirs(root)).unwrap();
         let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         let spec = Spec {
@@ -1603,7 +1616,7 @@ mod tests {
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
         let unknown: JobRef = "0ZZZZZZZZZZZZZZZ".parse().unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         let nonce = crate::domain::Nonce::generate().unwrap();
         let snapshot = Location::Snapshot {
             source: crate::protocol::Source {
@@ -1670,7 +1683,7 @@ mod tests {
         }
     }
 
-    fn state_of(root: &std::path::Path) -> std::collections::BTreeMap<String, Option<BlobId>> {
+    fn state_of(root: &Path) -> std::collections::BTreeMap<String, Option<BlobId>> {
         let mut found = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
         while let Some(dir) = pending.pop() {
@@ -1820,7 +1833,7 @@ mod tests {
         );
     }
 
-    fn holds_anywhere(root: &std::path::Path, needle: &[u8]) -> Vec<String> {
+    fn holds_anywhere(root: &Path, needle: &[u8]) -> Vec<String> {
         state_of(root)
             .keys()
             .map(|name| root.join(name))
@@ -1950,7 +1963,7 @@ mod tests {
         if !crate::platform::FAMILY.agent_socket() {
             return;
         }
-        let home = std::path::Path::new("/home/me");
+        let home = Path::new("/home/me");
         let printed = |agent: &str| format!("user me\nidentityagent {agent}\nport 22\n");
         assert_eq!(
             identity_agent(&printed("~/.agent/agent.sock"), home),
@@ -2012,7 +2025,7 @@ mod tests {
         let nonce = crate::domain::Nonce::generate().unwrap();
         let nonce_path = store.nonce_path("owner", &nonce);
         crate::state_file::write_bytes(&nonce_path, first.as_str().as_bytes()).unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             ("store::list", text(&store.area("jobs"))),
             ("state_file::lock", text(&store.alive_path(&first))),
@@ -2044,7 +2057,7 @@ mod tests {
         let staged: JobId = "0GGGGGGGGGGGGGGG".parse().unwrap();
         let mut spec = store.spec(&id).unwrap();
         spec.id = staged.clone();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             ("state_file::lock", text(&store.alive_path(&open))),
             (
@@ -2403,6 +2416,170 @@ mod tests {
         assert!(visible.is_empty() && hidden.is_empty());
     }
 
+    const RETRIED: &str = "0123456789abcdef0123456789abcdef";
+
+    fn reply_to(node: &Node, bytes: Vec<u8>) -> Reply {
+        let mut out = Vec::new();
+        node.serve(&Principal::Owner, std::io::Cursor::new(bytes), &mut out)
+            .unwrap();
+        crate::remote::receive("m", &mut out.as_slice(), &mut Vec::new()).unwrap()
+    }
+
+    fn line_of(message: &impl serde::Serialize) -> Vec<u8> {
+        let mut line = serde_json::to_vec(message).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn uploaded(node: &Node, contents: &[u8]) -> Reply {
+        let mut bytes = line_of(&Request::Upload { count: 1 });
+        bytes.extend(line_of(&Frame {
+            blob: BlobId::of(contents),
+            size: crate::domain::len_u64(contents.len()),
+        }));
+        bytes.extend_from_slice(contents);
+        reply_to(node, bytes)
+    }
+
+    fn sound_after_a_crash(root: &Path, step: usize) {
+        let at = |what: &str| format!("after a crash before step {step}: {what}");
+        let node = Node::open(dirs(root)).unwrap_or_else(|e| panic!("{}", at(&e.to_string())));
+        node.upkeep(&Commanded(()));
+        node.audit
+            .verify()
+            .unwrap_or_else(|e| panic!("{}", at(&format!("the audit log: {e}"))));
+        let listed = reply_to(&node, line_of(&Request::List { limit: 100 }));
+        assert!(
+            matches!(&listed, Reply::Jobs { unreadable, .. } if unreadable.is_empty()),
+            "{}",
+            at(&format!("listing answered {listed:?}"))
+        );
+        for blob in node.cas.stored().unwrap() {
+            node.cas
+                .get(&blob)
+                .unwrap_or_else(|e| panic!("{}", at(&format!("blob {blob}: {e}"))));
+        }
+        assert!(
+            node.store.staged_ids().unwrap().is_empty(),
+            "{}",
+            at("staging was left behind")
+        );
+        node.configure(Change::default())
+            .unwrap_or_else(|e| panic!("{}", at(&format!("configuring: {e}"))));
+        for nonce in [
+            RETRIED.parse().unwrap(),
+            crate::domain::Nonce::generate().unwrap(),
+        ] {
+            let reply = reply_to(&node, line_of(&submission(nonce, Location::Home)));
+            assert!(
+                matches!(&reply, Reply::Job(_))
+                    || matches!(&reply, Reply::Refused(refusal) if refusal.code == RefusalCode::Spawn),
+                "{}",
+                at(&format!("a submission answered {reply:?}"))
+            );
+        }
+    }
+
+    fn crash_everywhere(setup: fn(&Path), act: fn(&Node)) {
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            setup(tmp.path());
+            let node = Node::open(dirs(tmp.path())).unwrap();
+            let counting = crate::faults::crash_after(tmp.path(), None);
+            act(&node);
+            counting.steps()
+        };
+        assert!(steps > 0);
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            setup(tmp.path());
+            {
+                let node = Node::open(dirs(tmp.path())).unwrap();
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                act(&node);
+            }
+            sound_after_a_crash(tmp.path(), step);
+        }
+    }
+
+    fn nothing_yet(_root: &Path) {}
+
+    fn one_running_job(root: &Path) {
+        let (_, job) = published(root, b"log");
+        let store = Store::open(&dirs(root)).unwrap();
+        let id = store.resolve(&job).unwrap();
+        store
+            .set_phase(
+                &id,
+                &Phase::Running {
+                    started_at: Timestamp::at_millis(1),
+                    pid: 1,
+                    workspace: "w".into(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_a_submission_leaves_a_machine_that_takes_it_again() {
+        crash_everywhere(nothing_yet, |node| {
+            let reply = reply_to(
+                node,
+                line_of(&submission(RETRIED.parse().unwrap(), Location::Home)),
+            );
+            assert!(
+                matches!(reply, Reply::Job(_) | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_an_upload_leaves_only_whole_blobs() {
+        crash_everywhere(nothing_yet, |node| {
+            let reply = uploaded(node, b"contents");
+            assert!(
+                matches!(reply, Reply::Stored { .. } | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_settling_the_machine_leaves_it_answering() {
+        crash_everywhere(nothing_yet, |node| {
+            match node.configure(Change {
+                paused: Some(true),
+                max_jobs: Some(Concurrency::try_from(2).unwrap()),
+            }) {
+                Ok(()) | Err(_) => {}
+            }
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_recovering_a_lost_job_is_recovered_from_next_time() {
+        crash_everywhere(one_running_job, |node| node.upkeep(&Commanded(())));
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_cleaning_leaves_a_machine_that_answers() {
+        crash_everywhere(one_running_job, |node| {
+            let reply = reply_to(
+                node,
+                line_of(&Request::Clean {
+                    apply: true,
+                    logs: true,
+                    idle: true,
+                }),
+            );
+            assert!(
+                matches!(reply, Reply::Cleaned(_) | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
     #[test]
     fn a_job_whose_supervisor_vanished_while_running_is_closed_not_rerun() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2577,7 +2754,7 @@ mod tests {
         crate::state_file::write_bytes(&log, &[b'x'; 10_000]).unwrap();
         let project = store.area("work").join("owner").join("proj");
         crate::state_file::write_bytes(&project.join("0").join("file"), b"built").unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             (
                 "state_file::lock",
@@ -2623,7 +2800,7 @@ mod tests {
         let stray = BlobId::of(b"stray");
         node.cas.put(&stray, b"stray").unwrap();
         let blob_tag = |blob: &BlobId| blob.split().1.to_owned();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (keep, site, tag) in [
             (
                 Keep::Every,
