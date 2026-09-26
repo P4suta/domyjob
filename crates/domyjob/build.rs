@@ -1,6 +1,17 @@
 use std::path::{Path, PathBuf};
 
-fn inputs(dir: &Path, root: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn portable(path: &Path) -> String {
+    let mut portable = String::new();
+    for component in path.components() {
+        if !portable.is_empty() {
+            portable.push('/');
+        }
+        portable.push_str(&component.as_os_str().to_string_lossy());
+    }
+    portable
+}
+
+fn inputs(dir: &Path, root: &Path, found: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -26,7 +37,7 @@ fn inputs(dir: &Path, root: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<
                     root.display()
                 ))
             })?;
-            found.push(relative.to_path_buf());
+            found.push((portable(relative), relative.to_path_buf()));
         }
     }
     Ok(())
@@ -47,12 +58,12 @@ fn main() -> std::io::Result<()> {
     };
     let mut found = Vec::new();
     inputs(root, root, &mut found)?;
-    found.sort();
+    found.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = blake3::Hasher::new();
-    for relative in found {
+    for (portable, relative) in found {
         let path = root.join(&relative);
         println!("cargo:rerun-if-changed={}", path.display());
-        digest.update(relative.as_os_str().to_string_lossy().as_bytes());
+        digest.update(portable.as_bytes());
         digest.update(&[0]);
         digest.update(&std::fs::read(path)?);
         digest.update(&[0]);

@@ -882,9 +882,9 @@ host = "builder-0"
 binary = "upload"
 run = ["kubectl", "exec", "-i", "{host}", "--", "{remote_argv...}"]
 
-[runners.claude]
+[runners.agent]
 kind = "argv"
-run = ["claude", "-p", "{input}"]
+run = ["agent", "run", "{input}"]
 
 [groups]
 heavy = ["box", "win"]

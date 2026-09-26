@@ -40,7 +40,9 @@ Add a host your ssh config knows with `domyjob machines add NAME`, or reach it d
 
 ## For agents
 
-`domyjob skill install` teaches Claude Code to use it, `domyjob mcp` serves the same operations as MCP tools, and `--json` gives one stable shape.
+`domyjob skill` prints a portable Agent Skill, and `domyjob skill install --to path/to/agent/skills/domyjob` writes it to any skills directory you choose.
+The same file works with Codex, Claude Code, OpenCode, and other agents that read Agent Skills; domyjob does not choose or require one of them.
+`domyjob mcp` serves the same operations as MCP tools, and `--json` gives one stable shape.
 
 `domyjob --help` and `domyjob COMMAND --help` explain the rest; `domyjob man` prints the manual page.
 

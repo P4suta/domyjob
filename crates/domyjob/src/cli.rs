@@ -84,7 +84,7 @@ ENVIRONMENT:
   NO_COLOR, CLICOLOR_FORCE                      turn color off or on
 
 AGENTS:
-  domyjob skill install teaches Claude Code to use domyjob; domyjob mcp serves the same commands as MCP tools; --json prints machine-readable output.";
+  domyjob skill prints portable agent instructions and installs them wherever you choose; domyjob mcp serves the same commands as MCP tools; --json prints machine-readable output.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ColorWhen {
@@ -207,8 +207,8 @@ enum ToolCommand {
     )]
     Man,
     #[command(
-        about = "Print the skill that teaches an AI agent to use domyjob, or install it for Claude Code",
-        after_help = "Examples:\n  domyjob skill                     print it\n  domyjob skill install             for every project, in ~/.claude/skills/domyjob\n  domyjob skill install --project . for this project only"
+        about = "Print or install the portable skill that teaches any AI agent to use domyjob",
+        after_help = "Examples:\n  domyjob skill\n  domyjob skill install --to path/to/agent/skills/domyjob\n  domyjob skill install --to first/skills/domyjob --to another/skills/domyjob"
     )]
     Skill(SkillArgs),
 }
@@ -772,14 +772,15 @@ struct SkillArgs {
 
 #[derive(Debug, Subcommand)]
 enum SkillAction {
-    #[command(about = "Write the skill where Claude Code finds it")]
+    #[command(about = "Write SKILL.md into one or more agent skill directories")]
     Install {
         #[arg(
             long,
             value_name = "DIR",
-            help = "Install it for the project in DIR instead of for every project"
+            required = true,
+            help = "Write SKILL.md into DIR; repeat --to for another agent or scope"
         )]
-        project: Option<PathBuf>,
+        to: Vec<PathBuf>,
     },
 }
 
@@ -3181,24 +3182,18 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
 }
 
 fn skill(args: &SkillArgs) -> Result<ExitCode, CliError> {
-    let Some(SkillAction::Install { project }) = &args.action else {
+    let Some(SkillAction::Install { to }) = &args.action else {
         std::io::stdout()
             .write_all(SKILL.as_bytes())
             .map_err(CliError::Output)?;
         return Ok(ExitCode::SUCCESS);
     };
-    let base = match project {
-        Some(dir) => dir.clone(),
-        None => Dirs::from_env().home,
-    };
-    let path = base
-        .join(".claude")
-        .join("skills")
-        .join("domyjob")
-        .join("SKILL.md");
-    crate::user_files::write(&path, SKILL.as_bytes())
-        .map_err(|e| CliError::Output(std::io::Error::other(e.to_string())))?;
-    println!("installed the domyjob skill at {}", path.display());
+    for directory in to {
+        let path = directory.join("SKILL.md");
+        crate::user_files::write(&path, SKILL.as_bytes())
+            .map_err(|e| CliError::Output(std::io::Error::other(e.to_string())))?;
+        println!("installed the domyjob skill at {}", path.display());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3283,6 +3278,34 @@ fn note_watch(ctx: &Context, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_install_accepts_any_number_of_explicit_agent_directories() {
+        let cli = Cli::try_parse_from([
+            "domyjob",
+            "skill",
+            "install",
+            "--to",
+            "first/skills/domyjob",
+            "--to",
+            "another/skills/domyjob",
+        ])
+        .unwrap();
+        let Some(Top::Tools(ToolCommand::Skill(SkillArgs {
+            action: Some(SkillAction::Install { to }),
+        }))) = cli.command
+        else {
+            panic!("skill install did not parse as an install action");
+        };
+        assert_eq!(
+            to,
+            [
+                PathBuf::from("first/skills/domyjob"),
+                PathBuf::from("another/skills/domyjob")
+            ]
+        );
+        Cli::try_parse_from(["domyjob", "skill", "install"]).unwrap_err();
+    }
 
     #[test]
     fn only_every_machine_running_and_succeeding_exits_zero() {
