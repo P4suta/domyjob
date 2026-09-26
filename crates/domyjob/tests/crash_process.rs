@@ -7,7 +7,7 @@ use std::process::{Output, Stdio};
 
 use domyjob::authz::Submitter;
 use domyjob::clock::Timestamp;
-use domyjob::domain::{Concurrency, JobId};
+use domyjob::domain::{BlobId, Concurrency, JobId};
 use domyjob::paths::{Dirs, Family};
 use domyjob::protocol::{Change, Command, Location, Outcome, Phase, Request, Spec};
 use domyjob::spawn::Invocation;
@@ -130,23 +130,25 @@ fn a_real_supervisor_killed_after_starting_is_recovered_without_rerunning() {
     watcher
         .watch(&store.area(""), notify::RecursiveMode::Recursive)
         .unwrap();
-    let mut supervisor = command(
-        &dirs,
-        vec![
-            Arg::literal("node"),
-            Arg::literal("--supervise"),
-            Arg::word(&id),
-            Arg::literal("--state-dir"),
-            Arg::path(&dirs.state),
-            Arg::literal("--home-dir"),
-            Arg::path(&dirs.home),
-        ],
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+    let mut args = vec![
+        Arg::literal("node"),
+        Arg::literal("--supervise"),
+        Arg::word(&id),
+        Arg::literal("--state-dir"),
+        Arg::path(&dirs.state),
+        Arg::literal("--home-dir"),
+        Arg::path(&dirs.home),
+    ];
+    if domyjob::platform::FAMILY == Family::Windows {
+        args.push(Arg::literal("--ready-event"));
+        args.push(Arg::word(&BlobId::of(b"unwatched test supervisor")));
+    }
+    let mut supervisor = command(&dirs, args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     loop {
         change_rx.recv().unwrap();
         match store.phase(&id) {
