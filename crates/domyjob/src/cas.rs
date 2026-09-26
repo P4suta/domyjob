@@ -111,14 +111,14 @@ impl Cas {
         match (copied, &actual == blob) {
             (Ok(()), true) => Ok(staged.commit()?),
             (Ok(()), false) => {
-                staged.discard()?;
+                staged.discard();
                 Err(CasError::Corrupt {
                     expected: blob.clone(),
                     actual,
                 })
             }
             (Err(error), _) => {
-                staged.discard()?;
+                staged.discard();
                 Err(io("receiving", &path)(error))
             }
         }

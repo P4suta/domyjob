@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("{action} {path}: {source}")]
@@ -29,6 +27,8 @@ pub enum StateError {
     Exposed { path: PathBuf, mode: u32 },
     #[error("{path} belongs to another user; refusing to trust it")]
     Foreign { path: PathBuf },
+    #[error(transparent)]
+    Durable(#[from] crate::durable::DurableError),
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> StateError + use<> {
@@ -94,24 +94,14 @@ pub fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, S
     }
 }
 
-fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    private_options().write(true).create_new(true).open(path)
-}
-
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     crate::faults::at("state_file::write", path).map_err(io("writing", path))?;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    private_dir(dir)?;
-    let mut name = path.file_name().unwrap_or_default().to_owned();
-    let unique = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    name.push(format!(".{}.{unique}.tmp", std::process::id()));
-    let staged = dir.join(name);
-    let mut file = create_private_file(&staged).map_err(io("creating", &staged))?;
-    file.write_all(bytes).map_err(io("writing", &staged))?;
-    file.sync_all().map_err(io("syncing", &staged))?;
-    drop(file);
-    std::fs::rename(&staged, path).map_err(io("replacing", path))?;
-    sync_dir(dir)
+    private_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    Ok(crate::durable::write(
+        path,
+        bytes,
+        crate::durable::Access::Private,
+    )?)
 }
 
 fn sync_dir(dir: &Path) -> Result<(), StateError> {
@@ -194,52 +184,32 @@ pub fn create_empty(path: &Path) -> Result<(), StateError> {
 
 #[derive(Debug)]
 pub struct Staged {
-    file: std::fs::File,
-    incoming: PathBuf,
+    staged: crate::durable::Staged,
     target: PathBuf,
 }
 
 pub fn stage(target: &Path) -> Result<Staged, StateError> {
     crate::faults::at("state_file::stage", target).map_err(io("staging", target))?;
     prepared_parent(target)?;
-    let mut name = target.as_os_str().to_owned();
-    name.push(format!(
-        ".{}.{}.incoming",
-        std::process::id(),
-        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let staged = PathBuf::from(name);
-    let file = private_options()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(io("creating", &staged))?;
     Ok(Staged {
-        file,
-        incoming: staged,
+        staged: crate::durable::Staged::beside(target, crate::durable::Access::Private)?,
         target: target.to_path_buf(),
     })
 }
 
 impl Staged {
     pub fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        self.file.write_all(bytes)
+        self.staged.file().write_all(bytes)
     }
 
     pub fn commit(self) -> Result<(), StateError> {
         crate::faults::at("state_file::commit", &self.target)
             .map_err(io("storing", &self.target))?;
-        self.file
-            .sync_all()
-            .map_err(io("syncing", &self.incoming))?;
-        drop(self.file);
-        std::fs::rename(&self.incoming, &self.target).map_err(io("storing", &self.target))
+        self.staged.commit().map(drop).map_err(StateError::from)
     }
 
-    pub fn discard(self) -> Result<(), StateError> {
-        drop(self.file);
-        remove_file(&self.incoming)
+    pub fn discard(self) {
+        drop(self.staged);
     }
 }
 

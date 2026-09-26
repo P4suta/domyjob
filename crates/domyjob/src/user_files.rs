@@ -8,6 +8,16 @@ pub struct UserFileError {
     source: std::io::Error,
 }
 
+impl From<crate::durable::DurableError> for UserFileError {
+    fn from(error: crate::durable::DurableError) -> Self {
+        Self {
+            action: error.action,
+            path: error.path,
+            source: error.source,
+        }
+    }
+}
+
 fn failed(
     action: &'static str,
     path: &Path,
@@ -28,35 +38,17 @@ pub fn present(path: &Path) -> Result<bool, UserFileError> {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "files the user named on the command line or owns in their configuration"
-)]
 pub fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(failed("creating", parent))?;
-    }
-    std::fs::write(path, bytes).map_err(failed("writing", path))
-}
-
-fn unique_beside(path: &Path, tag: &str) -> Result<PathBuf, UserFileError> {
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random)
-        .map_err(|e| failed("naming a file beside", path)(std::io::Error::other(e.to_string())))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok(path.with_file_name(format!(".{name}.{tag}-{}", crate::trust::hex(&random))))
+    parents(path)?;
+    Ok(crate::durable::write(
+        path,
+        bytes,
+        crate::durable::Access::Shared,
+    )?)
 }
 
 #[derive(Debug)]
-pub struct Staged {
-    file: std::fs::File,
-    temporary: PathBuf,
-    destination: PathBuf,
-    committed: bool,
-}
+pub struct Staged(crate::durable::Staged);
 
 #[expect(
     clippy::disallowed_methods,
@@ -70,63 +62,20 @@ pub fn parents(path: &Path) -> Result<(), UserFileError> {
 }
 
 impl Staged {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "files the user named on the command line, written beside them first"
-    )]
     pub fn beside(destination: &Path) -> Result<Self, UserFileError> {
-        if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(failed("creating", parent))?;
-        }
-        let temporary = unique_beside(destination, "part")?;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(failed("creating", &temporary))?;
-        Ok(Self {
-            file,
-            temporary,
-            destination: destination.to_path_buf(),
-            committed: false,
-        })
+        parents(destination)?;
+        Ok(Self(crate::durable::Staged::beside(
+            destination,
+            crate::durable::Access::Shared,
+        )?))
     }
 
     pub const fn file(&mut self) -> &mut std::fs::File {
-        &mut self.file
+        self.0.file()
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "putting a fully received file where the user asked for it"
-    )]
-    pub fn commit(mut self) -> Result<u64, UserFileError> {
-        self.file
-            .sync_all()
-            .map_err(failed("syncing", &self.temporary))?;
-        let bytes = self
-            .file
-            .metadata()
-            .map_err(failed("measuring", &self.temporary))?
-            .len();
-        std::fs::rename(&self.temporary, &self.destination)
-            .map_err(failed("writing", &self.destination))?;
-        self.committed = true;
-        Ok(bytes)
-    }
-}
-
-impl Drop for Staged {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "removing the partial file of a transfer that did not finish"
-    )]
-    fn drop(&mut self) {
-        if !self.committed {
-            match std::fs::remove_file(&self.temporary) {
-                Ok(()) | Err(_) => {}
-            }
-        }
+    pub fn commit(self) -> Result<u64, UserFileError> {
+        Ok(self.0.commit()?)
     }
 }
 
@@ -147,10 +96,10 @@ pub fn remove(path: &Path) -> Result<(), UserFileError> {
     reason = "swapping the running executable for a verified update"
 )]
 pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), UserFileError> {
-    let staged = unique_beside(current, "new")?;
+    let staged = crate::durable::beside(current, "new")?;
     std::fs::copy(fresh, &staged).map_err(failed("staging", &staged))?;
     if !crate::platform::FAMILY.replaces_running_executables() {
-        let retired = unique_beside(current, "old")?;
+        let retired = crate::durable::beside(current, "old")?;
         std::fs::rename(current, &retired).map_err(failed("retiring", current))?;
         if let Err(error) = std::fs::rename(&staged, current) {
             match std::fs::rename(&retired, current) {
