@@ -26,6 +26,47 @@ enum Event {
     Kill,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Asked,
+    Ended,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    Concluded(Outcome),
+    Returned,
+}
+
+impl Stop {
+    fn before_start(self, when: &str) -> (Ending, String) {
+        match self {
+            Self::Asked => (
+                Ending::Concluded(Outcome::Killed),
+                format!("killed while {when}"),
+            ),
+            Self::Ended => (
+                Ending::Returned,
+                format!(
+                    "the machine told domyjob to stop while the job was {when}; it starts again when the machine is next given a command, such as a new job"
+                ),
+            ),
+        }
+    }
+
+    fn while_running(self) -> Outcome {
+        match self {
+            Self::Asked => Outcome::Killed,
+            Self::Ended => Outcome::Errored {
+                reason: RemoteText::new(
+                    "the machine told domyjob to stop while the job ran, as it does when it shuts down; it was not run again because it may already have had effects"
+                        .to_owned(),
+                ),
+            },
+        }
+    }
+}
+
 const LOG_HEAD: u64 = 256 << 20;
 const LOG_TAIL: usize = 8 << 20;
 
@@ -110,6 +151,7 @@ struct Shared {
     finished: Mutex<bool>,
     ended: Condvar,
     killed: AtomicBool,
+    stop: OnceLock<Stop>,
     group: OnceLock<Arc<Group>>,
     events: Sender<Event>,
     log_path: PathBuf,
@@ -165,7 +207,10 @@ impl Shared {
         }
     }
 
-    fn kill(&self) -> Result<(), NodeError> {
+    fn kill(&self, stop: Stop) -> Result<(), NodeError> {
+        match self.stop.set(stop) {
+            Ok(()) | Err(_) => {}
+        }
         self.killed.store(true, Ordering::SeqCst);
         match self.events.send(Event::Kill) {
             Ok(()) | Err(_) => {}
@@ -178,6 +223,19 @@ impl Shared {
 
     fn killed(&self) -> bool {
         self.killed.load(Ordering::SeqCst)
+    }
+
+    fn stopped(&self) -> Stop {
+        match self.stop.get() {
+            Some(stop) => *stop,
+            None => Stop::Asked,
+        }
+    }
+
+    fn before_start(&self, when: &str) -> Ending {
+        let (ending, note) = self.stopped().before_start(when);
+        self.say(&note);
+        ending
     }
 
     fn follow(&self, offset: u64, stream: &Stream) -> std::io::Result<()> {
@@ -217,7 +275,7 @@ fn answer(shared: &Shared, stream: &Stream) {
     };
     match order {
         Order::Kill => {
-            if let Err(error) = shared.kill() {
+            if let Err(error) = shared.kill(Stop::Asked) {
                 shared.say(&format!("stopping the job failed: {error}"));
             }
             shared.until_finished();
@@ -473,12 +531,23 @@ fn take_charge(
         finished: Mutex::new(false),
         ended: Condvar::new(),
         killed: AtomicBool::new(false),
+        stop: OnceLock::new(),
         group: OnceLock::new(),
         events,
         log_path,
         notes_path: store.notes_path(id),
     });
     serve_control(listener, Arc::clone(&shared));
+    let told = Arc::clone(&shared);
+    if let Err(error) = ctrlc::set_handler(move || {
+        if let Err(error) = told.kill(Stop::Ended) {
+            told.say(&format!("stopping the job failed: {error}"));
+        }
+    }) {
+        shared.say(&format!(
+            "a shutdown will read as a vanished supervisor, because the machine's requests to stop cannot be heard: {error}"
+        ));
+    }
     if let Err(error) = readiness.announce() {
         shared.say(&format!(
             "the submitter left before the job started: {error}"
@@ -503,7 +572,8 @@ impl Supervisor {
         let mut started = None;
         let result = self.run(events, &mut held, &mut started);
         let outcome = match result {
-            Ok(outcome) => outcome,
+            Ok(Ending::Concluded(outcome)) => outcome,
+            Ok(Ending::Returned) => return self.step_back(held),
             Err(error) => {
                 self.shared.say(&error.to_string());
                 Outcome::Errored {
@@ -535,6 +605,18 @@ impl Supervisor {
             self.store
                 .record_outcome_in_place(&self.spec.id, &finished)
                 .map_err(|_also| error)?;
+        }
+        self.shared.finish();
+        released
+    }
+
+    fn step_back(&self, held: Held) -> Result<(), NodeError> {
+        if let Err(error) = self.cleanup() {
+            self.shared.say(&format!("cleaning up: {error}"));
+        }
+        let released = held.release();
+        match self.shared.close_log() {
+            Some(_) | None => {}
         }
         self.shared.finish();
         released
@@ -593,11 +675,10 @@ impl Supervisor {
         events: &Receiver<Event>,
         held: &mut Held,
         started: &mut Option<Timestamp>,
-    ) -> Result<Outcome, NodeError> {
+    ) -> Result<Ending, NodeError> {
         if !self.store.skips_the_queue(&self.spec.id)? {
             let Some(slot) = self.queue(events)? else {
-                self.shared.say("killed while queued");
-                return Ok(Outcome::Killed);
+                return Ok(self.shared.before_start("queued"));
             };
             let holder = Store::slot_holder_path(slot.path());
             match crate::state_file::write_bytes(&holder, self.spec.id.as_str().as_bytes()) {
@@ -612,15 +693,13 @@ impl Supervisor {
         let (root, workspace_lock) = match self.prepare() {
             Ok(prepared) => prepared,
             Err(NodeError::Workspace(crate::workspace::WorkspaceError::Stopped)) => {
-                self.shared.say("killed while preparing");
-                return Ok(Outcome::Killed);
+                return Ok(self.shared.before_start("preparing"));
             }
             Err(other) => return Err(other),
         };
         held.workspace = workspace_lock;
         if self.shared.killed() {
-            self.shared.say("killed while preparing");
-            return Ok(Outcome::Killed);
+            return Ok(self.shared.before_start("preparing"));
         }
         let (group, collecting) = self.start(&root)?;
         let group = Arc::new(group);
@@ -646,7 +725,7 @@ impl Supervisor {
                 "recording that the job runs failed ({error}); it runs regardless"
             ));
         }
-        Ok(self.watch(&group, collecting))
+        Ok(Ending::Concluded(self.watch(&group, collecting)))
     }
 
     fn start(&self, root: &Path) -> Result<(Group, Collecting), NodeError> {
@@ -687,7 +766,7 @@ impl Supervisor {
             self.shared.say(&format!("collecting output: {error}"));
         }
         match (status, self.shared.killed()) {
-            (Ok(_) | Err(_), true) => Outcome::Killed,
+            (Ok(_) | Err(_), true) => self.shared.stopped().while_running(),
             (Ok(status), false) => match proc::exit_code(status) {
                 0 => Outcome::Succeeded,
                 code => Outcome::Failed { exit_code: code },
@@ -823,6 +902,24 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_the_machine_stops_before_it_starts_is_returned_and_one_it_stops_while_running_is_closed()
+     {
+        assert_eq!(
+            Stop::Asked.before_start("queued").0,
+            Ending::Concluded(Outcome::Killed)
+        );
+        let (ending, note) = Stop::Ended.before_start("preparing");
+        assert_eq!(ending, Ending::Returned);
+        assert!(note.contains("while the job was preparing") && note.contains("starts again"));
+        assert_eq!(Stop::Asked.while_running(), Outcome::Killed);
+        let ended = Stop::Ended.while_running();
+        assert!(
+            matches!(&ended, Outcome::Errored { reason } if reason.as_raw_str().contains("told domyjob to stop")),
+            "{ended:?}"
+        );
+    }
 
     #[test]
     fn an_endless_log_keeps_its_start_and_its_end_and_says_what_was_left_out() {

@@ -26,6 +26,7 @@ cap-std.workspace = true
 comfy-table.workspace = true
 indicatif.workspace = true
 supports-unicode.workspace = true
+ctrlc.workspace = true
 sysinfo.workspace = true
 notify.workspace = true
 schemars.workspace = true
