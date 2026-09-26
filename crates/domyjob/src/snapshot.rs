@@ -439,29 +439,40 @@ fn parse_listing(
     separator: Separator,
     bytes: &[u8],
 ) -> Result<Vec<Listed>, SnapshotError> {
-    let text = String::from_utf8_lossy(bytes);
     let split = match separator {
-        Separator::Nul => '\0',
-        Separator::Newline => '\n',
+        Separator::Nul => b'\0',
+        Separator::Newline => b'\n',
     };
     let bad = |detail: String| SnapshotError::Output {
         source_name: source_name.to_owned(),
         detail,
     };
     let mut out = Vec::new();
-    for record in text
-        .split(split)
-        .map(|r| r.trim_matches(['\n', '\r']))
-        .filter(|r| !r.is_empty())
-    {
-        let fields: Vec<&str> = record.split('\t').collect();
-        let (path, kind, mode) = match fields.as_slice() {
-            [path] => (*path, "file", ""),
-            [path, kind] => (*path, *kind, ""),
-            [path, kind, mode] => (*path, *kind, *mode),
-            _ => return Err(bad(format!("cannot read listing record {record:?}"))),
+    for record in bytes.split(|byte| *byte == split) {
+        let record = match separator {
+            Separator::Nul => record,
+            Separator::Newline => record.strip_suffix(b"\r").unwrap_or(record),
         };
-        let symlink = kind == "symlink" || mode == "120000";
+        if record.is_empty() {
+            continue;
+        }
+        let record = std::str::from_utf8(record).map_err(|_not_utf8| {
+            SnapshotError::Unportable(PathBuf::from(String::from_utf8_lossy(record).into_owned()))
+        })?;
+        let (words, path) = match record.split_once('\t') {
+            Some((words, path)) => (words, path),
+            None => ("", record),
+        };
+        let mut words = words.split(' ');
+        let (mode, kind) = match (words.next(), words.next()) {
+            (Some(mode), Some(kind)) => (mode, kind),
+            (Some(""), None) | (None, _) => ("", "file"),
+            (Some(other), None) => {
+                return Err(bad(format!(
+                    "cannot read listing record {other:?} {path:?}"
+                )));
+            }
+        };
         match kind {
             "file" | "blob" | "symlink" => {}
             "tree" | "commit" | "git-submodule" | "submodule" => continue,
@@ -470,11 +481,10 @@ fn parse_listing(
         let rel = path
             .parse::<RelPath>()
             .map_err(|_invalid| SnapshotError::Unportable(PathBuf::from(path)))?;
-        let executable = mode == "true" || mode.ends_with("755");
         out.push(Listed {
             rel,
-            symlink,
-            mode: if executable {
+            symlink: kind == "symlink" || mode == "120000",
+            mode: if mode == "true" || mode.ends_with("755") {
                 Mode::Executable
             } else {
                 Mode::Regular
@@ -695,6 +705,34 @@ mod tests {
     }
 
     #[test]
+    fn a_clean_commit_sends_exactly_what_its_checkout_sends_whatever_the_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, "git", &["init", "-q"]);
+        for (name, text) in [
+            ("src/\u{fc}nits/mod.rs", "nfc"),
+            ("with space.txt", "space"),
+            ("\u{65e5}\u{672c}\u{8a9e}/\u{6587}\u{66f8}.md", "cjk"),
+            ("run.sh", "echo"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        crate::platform::set_mode(&root.join("run.sh"), Mode::Executable).unwrap();
+        if crate::platform::LINKS {
+            crate::platform::make_link("with space.txt", &root.join("link")).unwrap();
+        }
+        run(root, "git", &["add", "."]);
+        run(root, "git", &["commit", "-qm", "names"]);
+        let config = Config::builtin().unwrap();
+        let detected = detect(&config, root).unwrap().unwrap();
+        let committed = from_revision(&detected, &"HEAD".parse().unwrap()).unwrap();
+        let checked_out = from_directory(root).unwrap();
+        assert_eq!(committed.manifest, checked_out.manifest);
+    }
+
+    #[test]
     fn revisions_come_from_any_configured_source() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -785,16 +823,23 @@ mod tests {
 
     #[test]
     fn listings_are_parsed_strictly() {
-        let text = b"a.txt\tfile\tfalse\0bin/x\tfile\ttrue\0sub\tgit-submodule\tfalse\0";
-        let listed = parse_listing("jj", Separator::Nul, text).unwrap();
-        assert_eq!(listed.len(), 2);
+        let text = "false file\ta.txt\x00true file\tbin/x\x00false git-submodule\tsub\x00100644 blob e25f\tsp ace.txt\x00";
+        let listed = parse_listing("jj", Separator::Nul, text.as_bytes()).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.get(1).map(|l| l.mode), Some(Mode::Executable));
         assert!(matches!(
-            parse_listing("jj", Separator::Nul, b"x\tconflict\tfalse"),
+            parse_listing("jj", Separator::Nul, b"false conflict\tx"),
             Err(SnapshotError::Output { .. })
         ));
         assert!(matches!(
-            parse_listing("jj", Separator::Nul, b"../x\tfile"),
+            parse_listing("jj", Separator::Nul, b"false file\t../x"),
             Err(SnapshotError::Unportable(_))
         ));
+        assert!(matches!(
+            parse_listing("git", Separator::Nul, b"100644 blob e25f\t\xff.txt"),
+            Err(SnapshotError::Unportable(_))
+        ));
+        let lines = parse_listing("hg", Separator::Newline, b"a.txt\r\nb.txt\n").unwrap();
+        assert_eq!(lines.len(), 2);
     }
 }
