@@ -105,6 +105,47 @@ static SHARED: std::sync::Mutex<
     std::collections::BTreeMap<MachineName, Option<std::process::Child>>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+struct PendingShare(MachineName);
+
+impl PendingShare {
+    fn claim(machine: &MachineName) -> Result<Option<Self>, RemoteError> {
+        let mut shared = shared_lock(machine)?;
+        if shared.contains_key(machine) {
+            return Ok(None);
+        }
+        shared.insert(machine.clone(), None);
+        drop(shared);
+        Ok(Some(Self(machine.clone())))
+    }
+}
+
+impl Drop for PendingShare {
+    fn drop(&mut self) {
+        let mut shared = SHARED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(shared.get(&self.0), Some(None)) {
+            shared.remove(&self.0);
+        }
+    }
+}
+
+fn shared_lock(
+    machine: &MachineName,
+) -> Result<
+    std::sync::MutexGuard<
+        'static,
+        std::collections::BTreeMap<MachineName, Option<std::process::Child>>,
+    >,
+    RemoteError,
+> {
+    SHARED.lock().map_err(|_poisoned| RemoteError::Pipe {
+        machine: machine.to_string(),
+        doing: "sharing a connection",
+        source: std::io::Error::other("the shared connection registry is poisoned"),
+    })
+}
+
 static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn session() -> &'static str {
@@ -873,13 +914,9 @@ impl<'a> Link<'a> {
         let Some(template) = transport.sharing() else {
             return Ok(None);
         };
-        let claimed = match SHARED.lock() {
-            Ok(mut shared) => shared.insert(self.machine.name.clone(), None).is_none(),
-            Err(_poisoned) => false,
-        };
-        if !claimed {
+        let Some(_pending) = PendingShare::claim(&self.machine.name)? else {
             return Ok(None);
-        }
+        };
         let remote = Remote::Node(self.family, self.placement);
         let mut child = self.start(self.command_from(template, &remote)?, Stdio::null())?;
         let activity = crate::liveness::Activity::default();
@@ -888,27 +925,41 @@ impl<'a> Link<'a> {
             crate::liveness::Watchdog::guard(&activity, crate::liveness::LIMITS, move || {
                 crate::proc::terminate(pid);
             });
-        let held = hold(&mut child, &activity);
+        let held = hold(&mut child, &activity, &self.name());
         let silenced = watchdog.silenced();
         drop(watchdog);
         if silenced {
             match child.wait() {
                 Ok(_) | Err(_) => {}
             }
-            if let Ok(mut shared) = SHARED.lock() {
-                shared.remove(&self.machine.name);
-            }
             return Err(self.silent("connecting"));
         }
-        let Some(hello) = held else {
-            match child.kill().and_then(|()| child.wait()) {
-                Ok(_) | Err(_) => {}
+        let hello = match held {
+            Ok(hello) => hello,
+            Err(error) => {
+                match child.kill() {
+                    Ok(()) | Err(_) => {}
+                }
+                match child.wait() {
+                    Ok(_) | Err(_) => {}
+                }
+                return Err(error);
             }
-            return Ok(None);
         };
-        if let Ok(mut shared) = SHARED.lock() {
-            shared.insert(self.machine.name.clone(), Some(child));
-        }
+        let mut shared = match shared_lock(&self.machine.name) {
+            Ok(shared) => shared,
+            Err(error) => {
+                match child.kill() {
+                    Ok(()) | Err(_) => {}
+                }
+                match child.wait() {
+                    Ok(_) | Err(_) => {}
+                }
+                return Err(error);
+            }
+        };
+        shared.insert(self.machine.name.clone(), Some(child));
+        drop(shared);
         Ok(Some(hello))
     }
 
@@ -1388,28 +1439,46 @@ impl<'a> Link<'a> {
     }
 }
 
-fn hold(child: &mut std::process::Child, activity: &crate::liveness::Activity) -> Option<Hello> {
+fn hold(
+    child: &mut std::process::Child,
+    activity: &crate::liveness::Activity,
+    machine: &str,
+) -> Result<Hello, RemoteError> {
     let (Some(stdin), Some(stdout)) = (child.stdin.as_mut(), child.stdout.take()) else {
-        return None;
+        return Err(RemoteError::Pipe {
+            machine: machine.to_owned(),
+            doing: "opening the shared connection",
+            source: std::io::ErrorKind::BrokenPipe.into(),
+        });
     };
-    let mut line = match serde_json::to_vec(&Request::Hold) {
-        Ok(line) => line,
-        Err(_unencodable) => return None,
-    };
+    let mut line = serde_json::to_vec(&Request::Hold).map_err(|source| RemoteError::Pipe {
+        machine: machine.to_owned(),
+        doing: "encoding the shared connection request",
+        source: std::io::Error::other(source),
+    })?;
     line.push(b'\n');
-    if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
-        return None;
-    }
+    stdin
+        .write_all(&line)
+        .and_then(|()| stdin.flush())
+        .map_err(|source| RemoteError::Pipe {
+            machine: machine.to_owned(),
+            doing: "requesting the shared connection",
+            source,
+        })?;
     activity.sent();
     let mut reader = BufReader::new(crate::liveness::Counted::new(stdout, activity.clone()));
-    let raw = match reply_line(&mut reader) {
-        Ok(raw) => raw,
-        Err(_unreadable) => return None,
-    };
-    match crate::ingress::json::<Reply>(&raw).map(Reply::into_hello) {
-        Ok(Ok(hello)) => Some(hello),
-        Ok(Err(_)) | Err(_) => None,
+    let reply = receive(machine, &mut reader, &mut std::io::sink())?;
+    if let Reply::Refused(refusal) = reply {
+        return Err(RemoteError::Refused {
+            machine: machine.to_owned(),
+            refusal,
+        });
     }
+    reply.into_hello().map_err(|other| RemoteError::Unexpected {
+        machine: machine.to_owned(),
+        expected: "hello",
+        got: other,
+    })
 }
 
 fn reply_line(reader: &mut dyn std::io::BufRead) -> std::io::Result<Vec<u8>> {
@@ -1509,6 +1578,17 @@ impl crate::ingress::Ingress for Facts {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_share_releases_its_claim_without_replacing_an_existing_one() {
+        let machine: MachineName = "pending-share-regression".parse().unwrap();
+        let pending = PendingShare::claim(&machine).unwrap().unwrap();
+        assert!(PendingShare::claim(&machine).unwrap().is_none());
+        drop(pending);
+        let retried = PendingShare::claim(&machine).unwrap().unwrap();
+        assert!(PendingShare::claim(&machine).unwrap().is_none());
+        drop(retried);
+    }
 
     #[test]
     fn a_broken_audit_witness_is_not_reported_as_no_witness() {

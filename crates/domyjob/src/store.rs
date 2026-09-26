@@ -35,6 +35,8 @@ pub enum StoreError {
     Exists(JobId),
     #[error("{path} does not name a job occupying the slot")]
     InvalidHolder { path: PathBuf },
+    #[error("{path} does not hold a finished job outcome")]
+    InvalidOutcome { path: PathBuf },
     #[error(transparent)]
     Invalid(#[from] Invalid),
 }
@@ -349,18 +351,25 @@ impl Store {
         if matches!(phase, Phase::Finished { .. }) {
             return Ok(phase);
         }
-        let reserved = crate::state_file::read_bytes(&self.job_dir(id).join("outcome"))?;
+        let path = self.job_dir(id).join("outcome");
+        let reserved = crate::state_file::read_bytes(&path)?;
         let written = reserved.as_deref().map_or(&[][..], <[u8]>::trim_ascii);
         if written.is_empty() {
             return Ok(phase);
         }
         match crate::ingress::json::<Phase>(written) {
             Ok(finished @ Phase::Finished { .. }) => Ok(finished),
-            Ok(_) | Err(_) => Ok(phase),
+            Ok(_) => Err(StoreError::InvalidOutcome { path }),
+            Err(source) => Err(StoreError::Json { path, source }),
         }
     }
 
     pub fn record_outcome_in_place(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
+        if !matches!(phase, Phase::Finished { .. }) {
+            return Err(StoreError::InvalidOutcome {
+                path: self.job_dir(id).join("outcome"),
+            });
+        }
         let mut bytes = serde_json::to_vec(phase).map_err(|e| {
             StoreError::from(crate::state_file::StateError::Io(
                 crate::failure::IoFailure {
@@ -596,6 +605,30 @@ mod tests {
         };
         store.record_outcome_in_place(&id, &too_long).unwrap_err();
         assert_eq!(store.phase(&id).unwrap(), finished);
+    }
+
+    #[test]
+    fn an_uncertain_outcome_cannot_be_read_as_a_queued_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0CCCCCCCCCCCCCCC".parse().unwrap();
+        store
+            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
+            .unwrap();
+        store.publish(&id).unwrap();
+        let path = store.job_dir(&id).join("outcome");
+        assert!(matches!(
+            store.record_outcome_in_place(&id, &Phase::Queued),
+            Err(StoreError::InvalidOutcome { .. })
+        ));
+        crate::state_file::write_bytes(&path, b"{incomplete").unwrap();
+        assert!(matches!(store.phase(&id), Err(StoreError::Json { .. })));
+        assert!(matches!(store.job(&id), Err(StoreError::Json { .. })));
+        crate::state_file::write_json(&path, &Phase::Queued).unwrap();
+        assert!(matches!(
+            store.phase(&id),
+            Err(StoreError::InvalidOutcome { .. })
+        ));
     }
 
     fn staged(store: &Store, id: &JobId, sequence: u64) {

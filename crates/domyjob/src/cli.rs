@@ -2622,7 +2622,7 @@ fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
     }
     let exposure = match &args.expose {
         Some(text) => crate::serve::Exposure::parse(text).map_err(ClientError::from)?,
-        None => crate::serve::Exposure::default_for_this_machine(),
+        None => crate::serve::Exposure::default_for_this_machine()?,
     };
     let mut capabilities = std::collections::BTreeSet::from([crate::authz::Capability::Observe]);
     for grant in args.grants.iter().flat_map(|g| g.split(',')) {

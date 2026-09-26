@@ -67,6 +67,8 @@ pub enum ServeError {
     NoTailnet,
     #[error("no private LAN address was found on this machine")]
     NoLan,
+    #[error("the network interfaces could not be listed: {0}")]
+    Interfaces(std::io::Error),
     #[error(
         "refusing to serve as root; run as an ordinary user, or pass --allow-root if you have isolated this account"
     )]
@@ -98,22 +100,21 @@ impl Exposure {
         }
     }
 
-    #[must_use]
-    pub fn default_for_this_machine() -> Self {
-        if tailnet_address().is_some() {
-            Self::Tailnet
+    pub fn default_for_this_machine() -> Result<Self, ServeError> {
+        if tailnet_address()?.is_some() {
+            Ok(Self::Tailnet)
         } else {
-            Self::Loopback
+            Ok(Self::Loopback)
         }
     }
 
     pub fn resolve(self, port: u16) -> Result<SocketAddr, ServeError> {
         match self {
             Self::Loopback => Ok(SocketAddr::from(([127, 0, 0, 1], port))),
-            Self::Tailnet => tailnet_address()
+            Self::Tailnet => tailnet_address()?
                 .map(|ip| SocketAddr::new(ip, port))
                 .ok_or(ServeError::NoTailnet),
-            Self::Lan => lan_address()
+            Self::Lan => lan_address()?
                 .map(|ip| SocketAddr::new(ip, port))
                 .ok_or(ServeError::NoLan),
             Self::Explicit(address) => Ok(address),
@@ -139,28 +140,31 @@ fn is_tailnet(ip: IpAddr) -> bool {
     }
 }
 
-fn addresses() -> Vec<IpAddr> {
-    match if_addrs::get_if_addrs() {
-        Ok(interfaces) => interfaces
-            .into_iter()
-            .filter(|i| !i.is_loopback())
-            .map(|i| i.ip())
-            .collect(),
-        Err(_unavailable) => Vec::new(),
-    }
-}
-
-fn tailnet_address() -> Option<IpAddr> {
-    addresses()
+fn addresses() -> Result<Vec<IpAddr>, ServeError> {
+    crate::faults::at(
+        "serve::interfaces",
+        std::path::Path::new("network-interfaces"),
+    )
+    .map_err(ServeError::Interfaces)?;
+    Ok(if_addrs::get_if_addrs()
+        .map_err(ServeError::Interfaces)?
         .into_iter()
-        .find(|ip| is_tailnet(*ip) && ip.is_ipv4())
+        .filter(|i| !i.is_loopback())
+        .map(|i| i.ip())
+        .collect())
 }
 
-fn lan_address() -> Option<IpAddr> {
-    addresses().into_iter().find(|ip| match ip {
+fn tailnet_address() -> Result<Option<IpAddr>, ServeError> {
+    Ok(addresses()?
+        .into_iter()
+        .find(|ip| is_tailnet(*ip) && ip.is_ipv4()))
+}
+
+fn lan_address() -> Result<Option<IpAddr>, ServeError> {
+    Ok(addresses()?.into_iter().find(|ip| match ip {
         IpAddr::V4(v4) => v4.is_private() && !is_tailnet(*ip),
         IpAddr::V6(_) => false,
-    })
+    }))
 }
 
 pub fn refuse_root(allowed: bool) -> Result<(), ServeError> {
@@ -912,6 +916,24 @@ mod tests {
         assert!(!Exposure::Tailnet.announces());
         assert_eq!(with_port("box"), format!("box:{DEFAULT_PORT}"));
         host_name().parse::<MachineName>().unwrap();
+    }
+
+    #[test]
+    fn unavailable_interfaces_are_not_reported_as_no_tailnet_or_lan() {
+        let _faults = crate::faults::inject(&[("serve::interfaces", "network-interfaces")]);
+        assert!(matches!(
+            Exposure::default_for_this_machine(),
+            Err(ServeError::Interfaces(_))
+        ));
+        assert!(matches!(
+            Exposure::Tailnet.resolve(DEFAULT_PORT),
+            Err(ServeError::Interfaces(_))
+        ));
+        assert!(matches!(
+            Exposure::Lan.resolve(DEFAULT_PORT),
+            Err(ServeError::Interfaces(_))
+        ));
+        Exposure::Loopback.resolve(DEFAULT_PORT).unwrap();
     }
 
     #[test]
