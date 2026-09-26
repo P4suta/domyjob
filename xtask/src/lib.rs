@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod comments;
+pub mod proverif;
 pub mod release;
 pub mod syntax;
 

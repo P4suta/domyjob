@@ -132,7 +132,12 @@ const DECISION_FILES: &[&str] = &[
     "store.rs",
 ];
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
-const FAILURE_FILES: &[&str] = &["failure.rs", "xtask/src/lib.rs", "xtask/src/release.rs"];
+const FAILURE_FILES: &[&str] = &[
+    "failure.rs",
+    "xtask/src/lib.rs",
+    "xtask/src/proverif.rs",
+    "xtask/src/release.rs",
+];
 
 fn carries_io_source(fields: &syn::Fields) -> bool {
     let has_path = fields

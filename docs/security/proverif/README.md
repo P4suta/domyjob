@@ -3,6 +3,7 @@
 The models in this directory describe domyjob's paired connection: a fresh ML-KEM-768 exchange whose shared secret keys a Noise IKpsk2 handshake, with the exchange's transcript bound into the prologue.
 Each model gives the attacker the network: it reads, drops, replays, and forges every message, the ML-KEM messages included.
 Run them with ProVerif 2.05 or later: `proverif connect-x25519-broken.pv` and `proverif connect-ml-kem-broken.pv`.
+From the repository root, `mise run proverif` also checks that all three expected results are present and true.
 
 | Model | What the attacker also gets | What is proved |
 | --- | --- | --- |

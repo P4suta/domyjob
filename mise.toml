@@ -81,6 +81,5 @@ dir = "crates/domyjob"
 run = "cargo kani --lib"
 
 [tasks.proverif]
-description = "Prove the symbolic models of the paired connection (needs proverif on PATH)"
-dir = "docs/security/proverif"
-run = ["proverif connect-x25519-broken.pv", "proverif connect-ml-kem-broken.pv"]
+description = "Prove the symbolic models and require every expected claim to hold (needs proverif on PATH)"
+run = "cargo xtask proverif"
