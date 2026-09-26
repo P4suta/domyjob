@@ -319,7 +319,7 @@ fn build_unix() -> Arg {
     Arg::joined(&[
         "set -e; PATH=\"$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH\"; ",
         "c=\"$HOME/.cache/domyjob\"; s=\"$c/source-$$\"; rm -rf \"$s\"; mkdir -p \"$s\"; ",
-        "tar -x -C \"$s\"; cd \"$s\"; ",
+        "tar -x -m -C \"$s\"; cd \"$s\"; ",
         "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null' EXIT; ",
         "cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
         "d=\"$c/bin/",
@@ -339,7 +339,7 @@ fn build_windows_script() -> Arg {
         session(),
         ".b64'; $t = \"$s.tar\"; ",
         "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String(((Get-Content -Raw $b) -replace '\\s', ''))); Remove-Item -Force $b; ",
-        "tar -xf $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
+        "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
         "$cargo = Start-Process cargo -ArgumentList 'build','--release','--locked','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -PassThru; ",
         "while (-not $cargo.WaitForExit(5000)) { [Console]::Error.Write('.') }; $built = $cargo.ExitCode; ",
         "if ($built) { exit $built }; ",
