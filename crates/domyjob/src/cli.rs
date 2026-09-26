@@ -663,6 +663,25 @@ struct SetupArgs {
         help = "Acknowledge that the binary from --from is not signed and will run as you on those machines"
     )]
     insecure_unsigned: bool,
+    #[arg(
+        long,
+        conflicts_with = "from",
+        help = "Build this project's domyjob on each machine from the source here, and install that"
+    )]
+    build: bool,
+    #[arg(
+        long,
+        value_name = "@REV",
+        requires = "build",
+        help = "Build this revision instead of the working tree"
+    )]
+    rev: Option<String>,
+    #[arg(
+        long,
+        requires = "build",
+        help = "Build only where no domyjob that speaks with this one is installed yet"
+    )]
+    if_missing: bool,
 }
 
 #[derive(Debug, Args)]
@@ -795,7 +814,7 @@ const fn wants_json(command: &Top) -> bool {
     }
 }
 
-const fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
+fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
     use crate::diagnosis::{Diagnosis, Kind};
     match error {
         CliError::Client(client) => crate::diagnosis::of_client(client),
@@ -811,7 +830,7 @@ const fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
         },
         CliError::NothingSubmitted => Diagnosis {
             kind: Kind::Unreachable,
-            hint: Some("each machine's own error is printed above it"),
+            hint: Some("each machine's own error is printed above it".to_owned()),
         },
         CliError::Pull(error) => crate::diagnosis::of_pull(error),
         CliError::Node(_)
@@ -855,7 +874,7 @@ pub fn main() -> ExitCode {
                 }});
                 println!("{value}");
             } else {
-                crate::ui::report_error(&error.to_string(), None, diagnosis.hint);
+                crate::ui::report_error(&error.to_string(), None, diagnosis.hint.as_deref());
             }
             ExitCode::from(DOMYJOB_ERROR)
         }
@@ -1152,7 +1171,7 @@ fn follow_through_as(
         board.refused(
             &item.machine,
             &item.error.to_string(),
-            crate::diagnosis::of_remote(&item.error).hint,
+            crate::diagnosis::of_remote(&item.error).hint.as_deref(),
         );
     }
     if submitted.is_empty() {
@@ -1840,7 +1859,7 @@ fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> 
                 crate::ui::report_error(
                     &error.to_string(),
                     None,
-                    crate::diagnosis::of_remote(&error).hint,
+                    crate::diagnosis::of_remote(&error).hint.as_deref(),
                 );
             }
         }
@@ -1863,7 +1882,7 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
         crate::ui::report_error(
             &item.error.to_string(),
             None,
-            crate::diagnosis::of_remote(&item.error).hint,
+            crate::diagnosis::of_remote(&item.error).hint.as_deref(),
         );
     }
     let series = crate::history::series(&jobs);
@@ -1936,7 +1955,7 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
                     crate::ui::report_error(
                         &error.to_string(),
                         None,
-                        crate::diagnosis::of_remote(&error).hint,
+                        crate::diagnosis::of_remote(&error).hint.as_deref(),
                     );
                 }
             }
@@ -2008,7 +2027,7 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
                         show(crate::view::unreachable_card(
                             &name,
                             &why,
-                            crate::diagnosis::of_remote(&error).hint,
+                            crate::diagnosis::of_remote(&error).hint.as_deref(),
                         ))?;
                     }
                 }
@@ -2740,16 +2759,33 @@ fn machines(json: bool) -> Result<ExitCode, CliError> {
 fn setup(args: &SetupArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let machines = ctx.select(&args.targets)?;
+    let source = if args.build {
+        let rev = parse_rev(args.rev.as_ref())?;
+        let archive = client::source_archive(&ctx, &current_dir()?, rev.as_ref())?;
+        Some(crate::dist::Deliverable::Source {
+            archive: std::sync::Arc::from(archive),
+            acknowledgement: crate::dist::InsecureUnsigned::acknowledged_on_the_command_line(),
+        })
+    } else {
+        None
+    };
     let install = |machine: &Machine| -> Result<crate::protocol::Hello, ClientError> {
-        let chosen = match (&args.from, args.insecure_unsigned) {
-            (Some(path), true) => Some(
+        if args.if_missing
+            && crate::remote::Link::open(&ctx.config, &ctx.dirs, machine).is_ok()
+            && let Some(facts) = crate::remote::cached_facts(&ctx.dirs, machine)?
+        {
+            return Ok(facts.hello);
+        }
+        let chosen = match (&args.from, args.insecure_unsigned, &source) {
+            (_, _, Some(built)) => Some(built.clone()),
+            (Some(path), true, None) => Some(
                 crate::dist::unsigned(
                     path,
                     crate::dist::InsecureUnsigned::acknowledged_on_the_command_line(),
                 )
                 .map_err(|e| ClientError::from(crate::remote::RemoteError::from(e)))?,
             ),
-            (Some(_) | None, false) | (None, true) => None,
+            (Some(_) | None, false, None) | (None, true, None) => None,
         };
         Ok(
             crate::remote::Link::provision(&ctx.config, &ctx.dirs, machine, chosen)
@@ -2805,7 +2841,7 @@ enum Checked {
         machine: MachineName,
         kind: crate::diagnosis::Kind,
         error: String,
-        hint: Option<&'static str>,
+        hint: Option<String>,
     },
 }
 
@@ -2902,7 +2938,7 @@ fn doctor_live(
                     show(crate::view::doctor_failed(
                         &machine.name,
                         &error.to_string(),
-                        hint,
+                        hint.as_deref(),
                         widest,
                     ))?;
                 }

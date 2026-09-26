@@ -172,14 +172,19 @@ pub enum Deliverable {
         binary: Binary,
         acknowledgement: InsecureUnsigned,
     },
+    Source {
+        archive: std::sync::Arc<[u8]>,
+        acknowledgement: InsecureUnsigned,
+    },
 }
 
 impl Deliverable {
     #[must_use]
-    pub const fn binary(&self) -> &Binary {
+    pub const fn binary(&self) -> Option<&Binary> {
         match self {
-            Self::Verified(verified) => verified.get(),
-            Self::Unsigned { binary, .. } => binary,
+            Self::Verified(verified) => Some(verified.get()),
+            Self::Unsigned { binary, .. } => Some(binary),
+            Self::Source { .. } => None,
         }
     }
 }

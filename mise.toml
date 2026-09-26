@@ -58,8 +58,11 @@ description = "Every gate a push waits for"
 run = ["mise run lint", "mise run test", "mise run deny", "mise run audit"]
 
 [tasks."check:fleet"]
-description = "Lint and test this tree on every machine domyjob knows, the other operating systems included"
-run = "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --wait --grep 'Summary|FAIL|TIMEOUT|test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo nextest run --locked --workspace --all-targets && cargo test --locked --workspace --doc'"
+description = "Lint and test the commit being pushed on every machine domyjob knows, the other operating systems included"
+run = [
+  "cargo run --quiet --package domyjob -- setup ${DOMYJOB_CHECK_ON:-@all} --build --rev @HEAD --if-missing",
+  "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --wait --grep 'Summary|FAIL|TIMEOUT|test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo nextest run --locked --workspace --all-targets && cargo test --locked --workspace --doc'",
+]
 
 [tasks.fuzz]
 description = "Fuzz every input boundary for a fixed number of inputs"

@@ -54,6 +54,8 @@ pub enum SnapshotError {
     State(#[from] crate::state_file::StateError),
     #[error("encoding the manifest: {0}")]
     Encode(serde_json::Error),
+    #[error("packing the source: {0}")]
+    Archive(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -61,6 +63,48 @@ pub enum SnapshotError {
 pub enum Mode {
     Regular,
     Executable,
+}
+
+impl Mode {
+    #[must_use]
+    pub const fn unix_bits(self) -> u32 {
+        match self {
+            Self::Regular => 0o644,
+            Self::Executable => 0o755,
+        }
+    }
+}
+
+pub fn archive(snapshot: &Snapshot) -> Result<Vec<u8>, SnapshotError> {
+    let failed = |source: std::io::Error| SnapshotError::Archive(source.to_string());
+    let mut builder = tar::Builder::new(Vec::new());
+    for (rel, entry) in &snapshot.manifest.entries {
+        let mut header = tar::Header::new_gnu();
+        match entry {
+            Entry::File { blob, mode, .. } => {
+                let bytes = snapshot
+                    .origins
+                    .get(blob)
+                    .ok_or_else(|| SnapshotError::Archive(format!("{rel} has no content")))?
+                    .read()?;
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(mode.unix_bits());
+                header.set_size(crate::domain::len_u64(bytes.len()));
+                builder
+                    .append_data(&mut header, rel.as_str(), bytes.as_slice())
+                    .map_err(failed)?;
+            }
+            Entry::Symlink { target } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                header.set_size(0);
+                builder
+                    .append_link(&mut header, rel.as_str(), target)
+                    .map_err(failed)?;
+            }
+        }
+    }
+    builder.into_inner().map_err(failed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
