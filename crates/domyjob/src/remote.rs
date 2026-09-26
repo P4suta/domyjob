@@ -336,8 +336,12 @@ fn build_unix() -> Arg {
         "set -e; PATH=\"$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH\"; ",
         "c=\"$HOME/.cache/domyjob\"; s=\"$c/source-$$\"; rm -rf \"$s\"; mkdir -p \"$s\"; ",
         "tar -x -m -C \"$s\"; cd \"$s\"; ",
+        "MISE_TRUSTED_CONFIG_PATHS=\"$s\"; export MISE_TRUSTED_CONFIG_PATHS; ",
         "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null' EXIT; ",
-        "cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
+        "cargo clean -p domyjob --target-dir \"$c/build\" >&2; ",
+        "DOMYJOB_EXPECTED_BUILD_STAMP=",
+        crate::protocol::BUILD_STAMP,
+        " cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
         "d=\"$c/bin/",
         build_key(),
         "\"; mkdir -p \"$d\"; cp \"$c/build/release/domyjob\" \"$d/domyjob.$$\"; ",
@@ -356,6 +360,12 @@ fn build_windows_script() -> Arg {
         ".b64'; $t = \"$s.tar\"; ",
         "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String(((Get-Content -Raw $b) -replace '\\s', ''))); Remove-Item -Force $b; ",
         "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
+        "$env:MISE_TRUSTED_CONFIG_PATHS = $s; ",
+        "$clean = Start-Process cargo -ArgumentList 'clean','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -Wait -PassThru; ",
+        "if ($clean.ExitCode) { exit $clean.ExitCode }; ",
+        "$env:DOMYJOB_EXPECTED_BUILD_STAMP = '",
+        crate::protocol::BUILD_STAMP,
+        "'; ",
         "$cargo = Start-Process cargo -ArgumentList 'build','--release','--locked','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -PassThru; ",
         "while (-not $cargo.WaitForExit(5000)) { [Console]::Error.Write('.') }; $built = $cargo.ExitCode; ",
         "if ($built) { exit $built }; ",
@@ -1641,6 +1651,26 @@ mod tests {
         );
         assert!(text(Remote::Install(Family::Windows)).starts_with("cmd /c \"mkdir %USERPROFILE%"));
         assert!(text(Remote::Install(Family::Windows)).contains("domyjob.incoming.exe"));
+        assert!(text(Remote::Build(Family::Unix)).contains(&format!(
+            "DOMYJOB_EXPECTED_BUILD_STAMP={}",
+            crate::protocol::BUILD_STAMP
+        )));
+        assert!(text(Remote::Build(Family::Unix)).contains("cargo clean -p domyjob"));
+        assert!(text(Remote::Build(Family::Unix)).contains("MISE_TRUSTED_CONFIG_PATHS=\"$s\""));
+        assert!(
+            build_windows_script()
+                .as_arg_str()
+                .contains("'clean','-p','domyjob'")
+        );
+        assert!(
+            build_windows_script()
+                .as_arg_str()
+                .contains("MISE_TRUSTED_CONFIG_PATHS = $s")
+        );
+        assert!(build_windows_script().as_arg_str().contains(&format!(
+            "DOMYJOB_EXPECTED_BUILD_STAMP = '{}'",
+            crate::protocol::BUILD_STAMP
+        )));
         assert!(
             text(Remote::Promote(Family::Windows)).contains("move /y domyjob.exe domyjob.old-")
         );

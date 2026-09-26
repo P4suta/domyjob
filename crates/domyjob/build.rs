@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+const EXPECTED_BUILD_STAMP: &str = "DOMYJOB_EXPECTED_BUILD_STAMP";
+
 fn portable(path: &Path) -> String {
     let mut portable = String::new();
     for component in path.components() {
@@ -44,6 +46,7 @@ fn inputs(dir: &Path, root: &Path, found: &mut Vec<(String, PathBuf)>) -> std::i
 }
 
 fn main() -> std::io::Result<()> {
+    println!("cargo:rerun-if-env-changed={EXPECTED_BUILD_STAMP}");
     let target = std::env::var("TARGET")
         .map_err(|error| std::io::Error::other(format!("TARGET is unavailable: {error}")))?;
     println!("cargo:rustc-env=DOMYJOB_TARGET={target}");
@@ -74,6 +77,13 @@ fn main() -> std::io::Result<()> {
             "the build digest was shorter than 16 ASCII characters",
         ));
     };
+    if let Ok(expected) = std::env::var(EXPECTED_BUILD_STAMP)
+        && expected != stamp
+    {
+        return Err(std::io::Error::other(format!(
+            "the source build stamp is {stamp}, not the expected {expected}"
+        )));
+    }
     println!("cargo:rustc-env=DOMYJOB_BUILD_STAMP={stamp}");
     Ok(())
 }
