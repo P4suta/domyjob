@@ -338,6 +338,11 @@ impl RelPath {
     pub fn parts(&self) -> std::str::Split<'_, char> {
         self.0.split('/')
     }
+
+    #[must_use]
+    pub fn to_local(&self) -> std::path::PathBuf {
+        self.parts().collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

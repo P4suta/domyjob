@@ -98,11 +98,9 @@ impl NodeError {
             Self::Cas(CasError::Missing(_)) | Self::Incomplete(_) => RefusalCode::MissingContent,
             Self::Denied(_) => RefusalCode::Forbidden,
             Self::Workspace(crate::workspace::WorkspaceError::NotAFile(_)) => RefusalCode::NotAFile,
-            Self::Workspace(crate::workspace::WorkspaceError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                RefusalCode::NoSuchPath
-            }
+            Self::Workspace(crate::workspace::WorkspaceError::Tree(
+                crate::tree::TreeError::Io { source, .. },
+            )) if source.kind() == std::io::ErrorKind::NotFound => RefusalCode::NoSuchPath,
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
             Self::Paused => RefusalCode::Paused,
             Self::Unfinished(_)

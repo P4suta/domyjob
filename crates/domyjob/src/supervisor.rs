@@ -720,11 +720,13 @@ impl Supervisor {
 
     fn fill(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
         match self.fill_once(root, manifest_id) {
-            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Io {
-                action,
-                path,
-                source,
-            })) => {
+            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Tree(
+                crate::tree::TreeError::Io {
+                    action,
+                    path,
+                    source,
+                },
+            ))) => {
                 self.shared.say(&format!(
                     "the workspace could not be updated ({action} {}: {source}); moving it aside and filling it afresh",
                     path.display()

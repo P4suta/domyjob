@@ -45,6 +45,7 @@ pub mod store;
 pub mod supervisor;
 pub mod template;
 pub mod terminal;
+pub mod tree;
 pub mod trust;
 pub mod ui;
 pub mod user_files;

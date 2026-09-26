@@ -1,14 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::collections::BTreeMap;
+use std::io::{ErrorKind, Write as _};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{BlobId, RelPath};
 use crate::lock::OsLock;
-use crate::snapshot::{Entry, Left, Manifest, Mode};
+use crate::snapshot::{Entry, Left, Manifest};
+use crate::tree::{Blockers, Contents, Placed, Removed, Rooted, TreeError};
 
 const KEPT_PULLS: usize = 32;
 
@@ -18,8 +18,6 @@ pub enum PullError {
     Diverged(Vec<RelPath>),
     #[error("{} changed here since they were pulled: {}", .0.len(), list(.0))]
     Edited(Vec<RelPath>),
-    #[error("symbolic links cannot be made here: {}", list(.0))]
-    Unplaceable(Vec<RelPath>),
     #[error("{0} is gone, so there is nowhere to put the changes")]
     Gone(PathBuf),
     #[error("nothing from {0} was pulled on this machine")]
@@ -38,6 +36,8 @@ pub enum PullError {
     Lock(#[from] crate::lock::LockError),
     #[error(transparent)]
     Malformed(#[from] Malformed),
+    #[error(transparent)]
+    Tree(#[from] TreeError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -234,18 +234,7 @@ impl<Towards: Direction> Plan<Towards> {
     }
 
     pub fn check(self, tree: &Tree) -> Result<Checked<Towards>, PullError> {
-        let unplaceable: Vec<RelPath> = self
-            .steps
-            .iter()
-            .filter(|step| {
-                !crate::platform::LINKS && matches!(step.after, Some(Entry::Symlink { .. }))
-            })
-            .map(|step| step.path.clone())
-            .collect();
-        if !unplaceable.is_empty() {
-            return Err(PullError::Unplaceable(unplaceable));
-        }
-        let removed: BTreeSet<RelPath> = self
+        let removed: Removed = self
             .steps
             .iter()
             .filter(|step| step.after.is_none())
@@ -255,7 +244,7 @@ impl<Towards: Direction> Plan<Towards> {
         let mut pending = Vec::new();
         let mut already = 0usize;
         for step in self.steps {
-            if tree.holds(&step.path, step.after.as_ref(), &BTreeSet::new())? {
+            if tree.holds(&step.path, step.after.as_ref(), &Removed::new())? {
                 already = already.saturating_add(1);
             } else if tree.holds(&step.path, step.before.as_ref(), &removed)?
                 && (step.after.is_none() || tree.placeable(&step.path, &removed)?)
@@ -293,7 +282,7 @@ impl Checked<Forward> {
         journal.record(tree, &self.pending.steps)?;
         for step in &self.pending.steps {
             if let Some(entry @ Entry::File { blob, .. }) = &step.before
-                && tree.holds(&step.path, Some(entry), &BTreeSet::new())?
+                && tree.holds(&step.path, Some(entry), &Removed::new())?
             {
                 journal.keep(blob, &tree.read(&step.path)?, &step.path)?;
             }
@@ -352,7 +341,7 @@ fn apply<Towards: Direction>(
         already: checked.already,
     };
     for step in ordered(plan) {
-        let none = BTreeSet::new();
+        let none = Removed::new();
         if tree.holds(&step.path, step.after.as_ref(), &none)? {
             applied.already = applied.already.saturating_add(1);
             continue;
@@ -362,13 +351,13 @@ fn apply<Towards: Direction>(
         };
         let to = match &step.after {
             None => To::Absent,
-            Some(Entry::File { blob, mode, .. }) => To::File(
+            Some(Entry::File { blob, mode, .. }) => To::Present(Placed::File(
                 plan.contents
                     .get(blob)
                     .ok_or_else(|| PullError::NotKept(step.path.clone()))?,
                 *mode,
-            ),
-            Some(Entry::Symlink { target }) => To::Symlink(target),
+            )),
+            Some(Entry::Symlink { target }) => To::Present(Placed::Link(target)),
         };
         tree.swap(seen, to, journal)?;
         applied.changed = applied.changed.saturating_add(1);
@@ -378,10 +367,7 @@ fn apply<Towards: Direction>(
 }
 
 #[derive(Debug)]
-pub struct Tree {
-    dir: Dir,
-    root: PathBuf,
-}
+pub struct Tree(Rooted);
 
 #[derive(Debug)]
 pub struct Seen<'tree> {
@@ -392,301 +378,77 @@ pub struct Seen<'tree> {
 #[derive(Debug, Clone, Copy)]
 enum To<'a> {
     Absent,
-    File(&'a [u8], Mode),
-    Symlink(&'a str),
+    Present(Placed<'a>),
 }
 
-#[derive(Debug)]
-enum Found {
-    Nothing,
-    Directory,
-    Entry(cap_std::fs::Metadata),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Parents {
-    Directories,
-    Missing,
-    Blocked,
-}
-
-fn local(rel: &RelPath) -> PathBuf {
-    rel.parts().collect()
-}
-
-fn child_of(rel: &RelPath, name: &std::ffi::OsStr) -> Option<RelPath> {
-    match format!("{rel}/{}", name.to_str()?).parse() {
-        Ok(child) => Some(child),
-        Err(_unportable_or_metadata) => None,
+fn diverged(error: TreeError) -> PullError {
+    match error {
+        TreeError::Blocked(path) | TreeError::Occupied(path) => PullError::Diverged(vec![path]),
+        other @ (TreeError::Io { .. } | TreeError::Unportable(_)) => PullError::Tree(other),
     }
-}
-
-fn ancestors(rel: &RelPath) -> Vec<RelPath> {
-    let parts: Vec<&str> = rel.parts().collect();
-    (1..parts.len())
-        .filter_map(|count| match parts.get(..count)?.join("/").parse() {
-            Ok(prefix) => Some(prefix),
-            Err(_never_for_a_prefix_of_a_valid_path) => None,
-        })
-        .collect()
 }
 
 impl Tree {
     pub fn open(root: &Path) -> Result<Self, PullError> {
-        match Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
-            Ok(dir) => Ok(Self {
-                dir,
-                root: root.to_path_buf(),
-            }),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                Err(PullError::Gone(root.to_path_buf()))
-            }
-            Err(error) => Err(io("opening", root)(error)),
-        }
+        Rooted::open(root)?
+            .map(Self)
+            .ok_or_else(|| PullError::Gone(root.to_path_buf()))
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn shown(&self, rel: &RelPath) -> PathBuf {
-        self.root.join(local(rel))
-    }
-
-    fn lstat(&self, rel: &RelPath) -> Result<Option<cap_std::fs::Metadata>, PullError> {
-        match self.dir.symlink_metadata(local(rel)) {
-            Ok(meta) => Ok(Some(meta)),
-            Err(error)
-                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(io("checking", &self.shown(rel))(error)),
-        }
-    }
-
-    fn parents(&self, rel: &RelPath, removed: &BTreeSet<RelPath>) -> Result<Parents, PullError> {
-        for ancestor in ancestors(rel) {
-            match self.lstat(&ancestor)? {
-                None => return Ok(Parents::Missing),
-                Some(meta) if meta.is_dir() => {}
-                Some(_) if removed.contains(&ancestor) => return Ok(Parents::Missing),
-                Some(_) => return Ok(Parents::Blocked),
-            }
-        }
-        Ok(Parents::Directories)
-    }
-
-    fn found(&self, rel: &RelPath, removed: &BTreeSet<RelPath>) -> Result<Found, PullError> {
-        Ok(match self.parents(rel, removed)? {
-            Parents::Blocked | Parents::Missing => Found::Nothing,
-            Parents::Directories => match self.lstat(rel)? {
-                None => Found::Nothing,
-                Some(meta) if meta.is_dir() => Found::Directory,
-                Some(meta) => Found::Entry(meta),
-            },
-        })
+        self.0.root()
     }
 
     fn holds(
         &self,
         rel: &RelPath,
         expected: Option<&Entry>,
-        removed: &BTreeSet<RelPath>,
+        removed: &Removed,
     ) -> Result<bool, PullError> {
-        Ok(match (self.found(rel, removed)?, expected) {
-            (Found::Nothing | Found::Directory, Some(_)) | (Found::Entry(_), None) => false,
-            (Found::Nothing | Found::Directory, None) => true,
-            (Found::Entry(meta), Some(Entry::File { blob, size, mode })) => {
-                meta.is_file()
-                    && meta.len() == *size
-                    && same_mode(&meta, *mode)
-                    && BlobId::of(&self.read(rel)?) == *blob
-            }
-            (Found::Entry(meta), Some(Entry::Symlink { target })) => {
-                meta.is_symlink() && self.link(rel)? == *target
-            }
-        })
+        Ok(self.0.holds(rel, expected, removed)?)
     }
 
-    fn placeable(&self, rel: &RelPath, removed: &BTreeSet<RelPath>) -> Result<bool, PullError> {
-        if self.parents(rel, removed)? == Parents::Blocked {
-            return Ok(false);
-        }
-        match self.found(rel, removed)? {
-            Found::Directory => self.emptied(rel, removed),
-            Found::Nothing | Found::Entry(_) => Ok(true),
-        }
+    fn placeable(&self, rel: &RelPath, removed: &Removed) -> Result<bool, PullError> {
+        Ok(self.0.placeable(rel, removed)?)
     }
 
     fn see(&self, rel: &RelPath, expected: Option<&Entry>) -> Result<Option<Seen<'_>>, PullError> {
-        Ok(self.holds(rel, expected, &BTreeSet::new())?.then(|| Seen {
+        Ok(self.holds(rel, expected, &Removed::new())?.then(|| Seen {
             path: rel.clone(),
             tree: PhantomData,
         }))
     }
 
-    fn emptied(&self, rel: &RelPath, removed: &BTreeSet<RelPath>) -> Result<bool, PullError> {
-        let listing = self
-            .dir
-            .read_dir(local(rel))
-            .map_err(io("listing", &self.shown(rel)))?;
-        for item in listing {
-            let item = item.map_err(io("listing", &self.shown(rel)))?;
-            let name = item.file_name();
-            let Some(child) = child_of(rel, &name) else {
-                return Ok(false);
-            };
-            let meta = item
-                .metadata()
-                .map_err(io("checking", &self.shown(&child)))?;
-            let gone = if meta.is_dir() && !meta.is_symlink() {
-                self.emptied(&child, removed)?
-            } else {
-                removed.contains(&child)
-            };
-            if !gone {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn read(&self, rel: &RelPath) -> Result<Vec<u8>, PullError> {
-        let mut bytes = Vec::new();
-        self.dir
-            .open(local(rel))
-            .and_then(|mut file| file.read_to_end(&mut bytes))
-            .map_err(io("reading", &self.shown(rel)))?;
-        Ok(bytes)
-    }
-
-    fn link(&self, rel: &RelPath) -> Result<String, PullError> {
-        let target = self
-            .dir
-            .read_link_contents(local(rel))
-            .map_err(io("reading", &self.shown(rel)))?;
-        Ok(target.to_string_lossy().into_owned())
+        Ok(self.0.read(rel)?)
     }
 
     fn swap(&self, seen: Seen<'_>, to: To<'_>, journal: &Journal) -> Result<(), PullError> {
         let rel = seen.path;
-        let shown = self.shown(&rel);
+        let shown = self.0.shown(&rel);
         crate::faults::at("pull::swap", &shown).map_err(io("changing", &shown))?;
         match to {
             To::Absent => {
-                self.clear(&rel)?;
-                self.prune(&rel);
+                self.0
+                    .clear(&rel, Contents::EmptyDirectoriesOnly)
+                    .map_err(diverged)?;
+                self.0.prune(&rel);
                 Ok(())
             }
-            To::File(bytes, mode) => {
-                self.make_parents(&rel)?;
-                self.clear_directory(&rel)?;
+            To::Present(placed) => {
+                self.0
+                    .make_parents(&rel, Blockers::Refuse)
+                    .map_err(diverged)?;
+                self.0
+                    .clear_directory(&rel, Contents::EmptyDirectoriesOnly)
+                    .map_err(diverged)?;
                 let staging = journal.staging(&rel)?;
-                self.write_new(&staging, bytes, mode)?;
-                self.replace(&staging, &rel)
-            }
-            To::Symlink(target) => {
-                self.make_parents(&rel)?;
-                self.clear_directory(&rel)?;
-                let staging = journal.staging(&rel)?;
-                self.symlink(target, &staging)?;
-                self.replace(&staging, &rel)
+                self.0.create(&staging, placed)?;
+                Ok(self.0.rename(&staging, &rel)?)
             }
         }
     }
-
-    fn make_parents(&self, rel: &RelPath) -> Result<(), PullError> {
-        for ancestor in ancestors(rel) {
-            match self.lstat(&ancestor)? {
-                Some(meta) if meta.is_dir() => {}
-                Some(_) => {
-                    return Err(PullError::Diverged(vec![ancestor]));
-                }
-                None => self
-                    .dir
-                    .create_dir(local(&ancestor))
-                    .map_err(io("creating", &self.shown(&ancestor)))?,
-            }
-        }
-        Ok(())
-    }
-
-    fn clear(&self, rel: &RelPath) -> Result<(), PullError> {
-        match self.lstat(rel)? {
-            None => Ok(()),
-            Some(meta) if meta.is_dir() => self.remove_empty_tree(rel),
-            Some(_) => self
-                .dir
-                .remove_file(local(rel))
-                .map_err(io("removing", &self.shown(rel))),
-        }
-    }
-
-    fn clear_directory(&self, rel: &RelPath) -> Result<(), PullError> {
-        match self.lstat(rel)? {
-            Some(meta) if meta.is_dir() => self.remove_empty_tree(rel),
-            Some(_) | None => Ok(()),
-        }
-    }
-
-    fn remove_empty_tree(&self, rel: &RelPath) -> Result<(), PullError> {
-        let listing = self
-            .dir
-            .read_dir(local(rel))
-            .map_err(io("listing", &self.shown(rel)))?;
-        for item in listing {
-            let item = item.map_err(io("listing", &self.shown(rel)))?;
-            let kind = item.file_type().map_err(io("checking", &self.shown(rel)))?;
-            match child_of(rel, &item.file_name()) {
-                Some(child) if kind.is_dir() => {
-                    self.remove_empty_tree(&child)?;
-                }
-                Some(_) | None => {
-                    return Err(PullError::Diverged(vec![rel.clone()]));
-                }
-            }
-        }
-        self.dir
-            .remove_dir(local(rel))
-            .map_err(io("removing", &self.shown(rel)))
-    }
-
-    fn prune(&self, rel: &RelPath) {
-        for ancestor in ancestors(rel).iter().rev() {
-            if self.dir.remove_dir(local(ancestor)).is_err() {
-                break;
-            }
-        }
-    }
-
-    fn write_new(&self, staging: &Path, bytes: &[u8], mode: Mode) -> Result<(), PullError> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        crate::platform::create_as(&mut options, mode);
-        let mut file = self
-            .dir
-            .open_with(staging, &options)
-            .map_err(io("creating", &self.root.join(staging)))?;
-        file.write_all(bytes)
-            .map_err(io("writing", &self.root.join(staging)))
-    }
-
-    fn symlink(&self, target: &str, staging: &Path) -> Result<(), PullError> {
-        crate::platform::link(&self.dir, target, staging)
-            .map_err(io("linking", &self.root.join(staging)))
-    }
-
-    fn replace(&self, staging: &Path, rel: &RelPath) -> Result<(), PullError> {
-        self.dir
-            .rename(staging, &self.dir, local(rel))
-            .map_err(io("replacing", &self.shown(rel)))
-    }
-}
-
-fn same_mode(meta: &cap_std::fs::Metadata, mode: Mode) -> bool {
-    !crate::platform::MODES || crate::platform::Moded::mode(meta) == mode
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,7 +553,7 @@ impl Journal {
         Ok(crate::state_file::write_json(
             &path,
             &Record {
-                root: tree.root.clone(),
+                root: tree.root().to_path_buf(),
                 steps: steps.into_values().collect(),
             },
         )?)
@@ -807,15 +569,22 @@ impl Journal {
         )?)
     }
 
-    fn staging(&self, rel: &RelPath) -> Result<PathBuf, PullError> {
+    fn staging(&self, rel: &RelPath) -> Result<RelPath, PullError> {
         let nonce = crate::domain::Nonce::generate().map_err(|error| {
             io("naming a file beside", &self.dir)(std::io::Error::other(error.to_string()))
         })?;
         let name = rel.parts().next_back().unwrap_or_default();
         let unique = nonce.as_str().get(..12).unwrap_or_default();
-        let mut staging = local(rel);
-        staging.set_file_name(format!(".{name}.{unique}.domyjob-pull"));
-        let mut line = staging.to_string_lossy().into_owned().into_bytes();
+        let beside = format!(".{name}.{unique}.domyjob-pull");
+        let staging: RelPath = match crate::tree::ancestors(rel).last() {
+            Some(parent) => format!("{parent}/{beside}"),
+            None => beside,
+        }
+        .parse()
+        .map_err(|error: crate::domain::Invalid| {
+            io("naming a file beside", &self.dir)(std::io::Error::other(error.to_string()))
+        })?;
+        let mut line = staging.to_string().into_bytes();
         line.push(b'\n');
         let path = self.dir.join("staging");
         crate::state_file::open_append(&path)?
@@ -830,11 +599,8 @@ impl Journal {
             return Ok(());
         };
         for line in String::from_utf8_lossy(&bytes).lines() {
-            let staging = Path::new(line);
-            match tree.dir.remove_file(staging) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(io("removing", &tree.root.join(staging))(error)),
+            if let Ok(staging) = line.parse::<RelPath>() {
+                tree.0.remove_file(&staging)?;
             }
         }
         Ok(crate::state_file::remove_file(&path)?)
@@ -876,7 +642,9 @@ impl Journal {
 )]
 mod tests {
     use super::*;
+    use crate::snapshot::Mode;
     use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     const PATHS: &[&str] = &["a", "b", "d", "d/x", "d/y", "e/f/g", "l", "l/x"];
     const CONTENTS: &[&[u8]] = &[b"", b"one", b"two", b"three"];
@@ -909,7 +677,7 @@ mod tests {
                 .collect();
             all.iter()
                 .filter(|(path, _)| {
-                    ancestors(path)
+                    crate::tree::ancestors(path)
                         .iter()
                         .all(|ancestor| !all.contains_key(ancestor))
                 })
@@ -941,7 +709,7 @@ mod tests {
     fn lay_out(root: &Path, layout: &Layout) {
         std::fs::create_dir_all(root).unwrap();
         for (path, node) in layout {
-            let at = root.join(local(path));
+            let at = root.join(path.to_local());
             std::fs::create_dir_all(at.parent().unwrap()).unwrap();
             match node {
                 Node::File(content, executable) => {

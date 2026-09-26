@@ -194,16 +194,18 @@ pub const fn of_pull(error: &crate::pull::PullError) -> Diagnosis {
             Kind::Usage,
             Some("put the directory back where the job was sent from"),
         ),
-        PullError::NeverPulled(_) | PullError::Unplaceable(_) => (Kind::Usage, None),
+        PullError::NeverPulled(_) => (Kind::Usage, None),
         PullError::Malformed(_) => (
             Kind::Protocol,
             Some(
                 "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",
             ),
         ),
-        PullError::NotKept(_) | PullError::Io { .. } | PullError::State(_) | PullError::Lock(_) => {
-            (Kind::Local, None)
-        }
+        PullError::NotKept(_)
+        | PullError::Io { .. }
+        | PullError::State(_)
+        | PullError::Lock(_)
+        | PullError::Tree(_) => (Kind::Local, None),
     };
     Diagnosis { kind, hint }
 }
