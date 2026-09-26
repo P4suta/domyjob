@@ -1187,12 +1187,10 @@ impl Node {
                 reason: RemoteText::new(reason),
             },
         };
-        self.store.set_phase(id, &finished)?;
-        if let Ok(spec) = self.store.spec(id)
-            && let Some(root) = crate::supervisor::fresh_root(&self.store, &spec)
-        {
+        if let Some(root) = crate::supervisor::fresh_root(&self.store, &self.store.spec(id)?) {
             crate::supervisor::discard_workspace(&root)?;
         }
+        self.store.set_phase(id, &finished)?;
         Ok(alive.release()?)
     }
 
@@ -2857,6 +2855,28 @@ mod tests {
         }
         assert_eq!(store.phase(&id).unwrap(), running);
         node.upkeep(&Commanded(()));
+        assert!(matches!(store.phase(&id).unwrap(), Phase::Finished { .. }));
+    }
+
+    #[test]
+    fn a_sweep_that_cannot_read_a_spec_leaves_the_job_open_for_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let running = Phase::Running {
+            started_at: Timestamp::at_millis(1),
+            pid: 1,
+            workspace: String::new(),
+        };
+        store.set_phase(&id, &running).unwrap();
+        let spec_file = store.job_dir(&id).join("spec.json").display().to_string();
+        {
+            let _faults = crate::faults::inject(&[("state_file::read", &spec_file)]);
+            assert!(matches!(node.recover(&id), Err(NodeError::Store(_))));
+        }
+        assert_eq!(store.phase(&id).unwrap(), running);
+        node.recover(&id).unwrap();
         assert!(matches!(store.phase(&id).unwrap(), Phase::Finished { .. }));
     }
 

@@ -592,6 +592,16 @@ impl State {
 }
 
 impl Job {
+    const fn outcome(&self) -> Option<&Outcome> {
+        match &self.phase {
+            Phase::Finished { outcome, .. } => Some(outcome),
+            Phase::Queued
+            | Phase::Preparing { .. }
+            | Phase::Starting { .. }
+            | Phase::Running { .. } => None,
+        }
+    }
+
     #[must_use]
     pub const fn state(&self) -> State {
         match (&self.phase, self.supervisor) {
@@ -623,20 +633,10 @@ impl Job {
 
     #[must_use]
     pub const fn exit_code(&self) -> Option<i32> {
-        match &self.phase {
-            Phase::Finished {
-                outcome: Outcome::Succeeded,
-                ..
-            } => Some(0),
-            Phase::Finished {
-                outcome: Outcome::Failed { exit_code },
-                ..
-            } => Some(*exit_code),
-            Phase::Finished { .. }
-            | Phase::Queued
-            | Phase::Preparing { .. }
-            | Phase::Starting { .. }
-            | Phase::Running { .. } => None,
+        match self.outcome() {
+            Some(Outcome::Succeeded) => Some(0),
+            Some(Outcome::Failed { exit_code }) => Some(*exit_code),
+            Some(Outcome::Killed | Outcome::Errored { .. }) | None => None,
         }
     }
 
@@ -660,16 +660,9 @@ impl Job {
 
     #[must_use]
     pub const fn reason(&self) -> Option<&RemoteText> {
-        match &self.phase {
-            Phase::Finished {
-                outcome: Outcome::Errored { reason },
-                ..
-            } => Some(reason),
-            Phase::Finished { .. }
-            | Phase::Queued
-            | Phase::Preparing { .. }
-            | Phase::Starting { .. }
-            | Phase::Running { .. } => None,
+        match self.outcome() {
+            Some(Outcome::Errored { reason }) => Some(reason),
+            Some(Outcome::Succeeded | Outcome::Failed { .. } | Outcome::Killed) | None => None,
         }
     }
 

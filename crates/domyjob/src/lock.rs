@@ -30,6 +30,23 @@ pub enum Probe {
     Held,
 }
 
+enum Availability {
+    Free,
+    Held,
+}
+
+fn availability(file: &File, path: &Path) -> Result<Availability, LockError> {
+    match file.try_lock() {
+        Ok(()) => Ok(Availability::Free),
+        Err(TryLockError::WouldBlock) => Ok(Availability::Held),
+        Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
+            action: "locking",
+            path: path.to_path_buf(),
+            source,
+        })),
+    }
+}
+
 impl OsLock {
     pub fn probe(path: &Path) -> Result<Probe, LockError> {
         let opened = crate::state_file::open_existing_lock(path).map_err(|error| {
@@ -42,30 +59,20 @@ impl OsLock {
         let Some(file) = opened else {
             return Ok(Probe::Absent);
         };
-        match file.try_lock() {
-            Ok(()) => Ok(Probe::Free),
-            Err(TryLockError::WouldBlock) => Ok(Probe::Held),
-            Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
-                action: "locking",
-                path: path.to_path_buf(),
-                source,
-            })),
+        match availability(&file, path)? {
+            Availability::Free => Ok(Probe::Free),
+            Availability::Held => Ok(Probe::Held),
         }
     }
 
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, LockError> {
         let file = open(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self {
+        match availability(&file, path)? {
+            Availability::Free => Ok(Some(Self {
                 file,
                 path: path.to_path_buf(),
             })),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
-                action: "locking",
-                path: path.to_path_buf(),
-                source,
-            })),
+            Availability::Held => Ok(None),
         }
     }
 

@@ -223,11 +223,10 @@ fn newest<'a>(
 }
 
 pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientError> {
-    let here = match std::env::current_dir().and_then(std::fs::canonicalize) {
-        Ok(start) => Some(root_of(&start, None, &ctx.config)?),
-        Err(_no_directory) => None,
-    };
-    let (machine, reference) = resolve(&index(ctx)?, here.as_deref(), text)?;
+    let start = std::env::current_dir().map_err(io("finding current directory", Path::new(".")))?;
+    let start = std::fs::canonicalize(&start).map_err(io("resolving", &start))?;
+    let here = root_of(&start, None, &ctx.config)?;
+    let (machine, reference) = resolve(&index(ctx)?, Some(&here), text)?;
     Ok((ctx.config.machine(&machine)?, reference))
 }
 

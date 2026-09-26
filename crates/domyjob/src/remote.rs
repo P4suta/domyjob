@@ -92,6 +92,23 @@ fn drain(errors: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<S
     })
 }
 
+fn pipe_error(machine: String, doing: &'static str) -> impl FnOnce(std::io::Error) -> RemoteError {
+    move |source| RemoteError::Pipe {
+        machine,
+        doing,
+        source,
+    }
+}
+
+fn reap_after_failure(child: &mut std::process::Child) {
+    match child.kill() {
+        Ok(()) | Err(_) => {}
+    }
+    match child.wait() {
+        Ok(_) | Err(_) => {}
+    }
+}
+
 fn said(errors: &str) -> String {
     let lines: Vec<String> = errors
         .lines()
@@ -349,7 +366,7 @@ pub fn cached_facts(dirs: &Dirs, machine: &Machine) -> Result<Option<Facts>, Rem
 }
 
 fn save_facts(dirs: &Dirs, machine: &Machine, facts: &Facts) -> Result<(), RemoteError> {
-    if matches!(cached_facts(dirs, machine), Ok(Some(known)) if known == *facts) {
+    if matches!(cached_facts(dirs, machine)?, Some(known) if known == *facts) {
         return Ok(());
     }
     Ok(crate::state_file::write_json(
@@ -789,7 +806,8 @@ impl<'a> Link<'a> {
             Err(crate::dist::DistError::NoTrustRoot) if outdated.is_none() => {
                 let was = match cached_facts(self.dirs, &self.machine) {
                     Ok(Some(facts)) => format!(" (it last ran {})", facts.hello.version),
-                    Ok(None) | Err(_) => String::new(),
+                    Ok(None) => String::new(),
+                    Err(error) => return Err(error),
                 };
                 return Err(RemoteError::Unbuilt {
                     machine: self.name(),
@@ -969,24 +987,14 @@ impl<'a> Link<'a> {
         let hello = match held {
             Ok(hello) => hello,
             Err(error) => {
-                match child.kill() {
-                    Ok(()) | Err(_) => {}
-                }
-                match child.wait() {
-                    Ok(_) | Err(_) => {}
-                }
+                reap_after_failure(&mut child);
                 return Err(error);
             }
         };
         let mut shared = match shared_lock(&self.machine.name) {
             Ok(shared) => shared,
             Err(error) => {
-                match child.kill() {
-                    Ok(()) | Err(_) => {}
-                }
-                match child.wait() {
-                    Ok(_) | Err(_) => {}
-                }
+                reap_after_failure(&mut child);
                 return Err(error);
             }
         };
@@ -1136,14 +1144,7 @@ impl<'a> Link<'a> {
     ) -> Result<Captured, RemoteError> {
         use std::io::{BufRead as _, Read as _};
         let mut child = self.spawn(remote)?;
-        let pipe = |doing| {
-            let machine = self.name();
-            move |source| RemoteError::Pipe {
-                machine,
-                doing,
-                source,
-            }
-        };
+        let pipe = |doing| pipe_error(self.name(), doing);
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -1393,14 +1394,7 @@ impl<'a> Link<'a> {
         (blobs, sink): (&[(&BlobId, &Origin)], &mut dyn Write),
     ) -> Result<Reply, RemoteError> {
         let mut child = self.spawn(remote)?;
-        let pipe = |doing| {
-            let machine = self.name();
-            move |source| RemoteError::Pipe {
-                machine,
-                doing,
-                source,
-            }
-        };
+        let pipe = |doing| pipe_error(self.name(), doing);
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(pipe("connecting")(std::io::Error::other(
                 "pipes were not set up",

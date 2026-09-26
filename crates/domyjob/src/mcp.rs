@@ -44,6 +44,19 @@ fn answer<T: serde::Serialize>(body: &T) -> Result<Value, ToolError> {
     crate::output::value(body).map_err(ToolError::Encode)
 }
 
+fn jobs_answer<T: serde::Serialize>(
+    jobs: Vec<T>,
+    rejected: &[client::Rejected],
+) -> Result<Value, ToolError> {
+    answer(&crate::output::Jobs {
+        jobs,
+        unreachable: rejected
+            .iter()
+            .map(|item| crate::output::MachineError::of(&item.machine, &item.error))
+            .collect(),
+    })
+}
+
 fn part<T: serde::Serialize>(body: &T) -> Value {
     match serde_json::to_value(body) {
         Ok(value) => value,
@@ -458,13 +471,7 @@ fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
             })
             .collect()
     });
-    answer(&crate::output::Jobs {
-        jobs,
-        unreachable: rejected
-            .iter()
-            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
-            .collect(),
-    })
+    jobs_answer(jobs, &rejected)
 }
 
 fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
@@ -473,16 +480,12 @@ fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
         None => client::known_machines(ctx)?,
     };
     let (jobs, rejected) = client::list(ctx, &machines, args.limit.map_or(20, ResultLimit::get));
-    answer(&crate::output::Jobs {
-        jobs: jobs
-            .iter()
+    jobs_answer(
+        jobs.iter()
             .map(|(machine, job)| crate::output::JobView::summary(machine, job))
             .collect(),
-        unreachable: rejected
-            .iter()
-            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
-            .collect(),
-    })
+        &rejected,
+    )
 }
 
 fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
