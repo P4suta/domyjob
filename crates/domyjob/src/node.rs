@@ -1996,6 +1996,9 @@ mod tests {
 
     #[test]
     fn the_agent_a_job_uses_is_the_one_the_machines_ssh_configuration_names() {
+        if !crate::platform::FAMILY.agent_socket() {
+            return;
+        }
         let home = std::path::Path::new("/home/me");
         let printed = |agent: &str| format!("user me\nidentityagent {agent}\nport 22\n");
         assert_eq!(

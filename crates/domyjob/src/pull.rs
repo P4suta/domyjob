@@ -662,11 +662,7 @@ mod tests {
         let file = (0..CONTENTS.len(), any::<bool>()).prop_map(|(content, executable)| {
             Node::File(content, crate::platform::MODES && executable)
         });
-        if crate::platform::LINKS {
-            prop_oneof![3 => file, 1 => (0..TARGETS.len()).prop_map(Node::Link)].boxed()
-        } else {
-            file.boxed()
-        }
+        prop_oneof![3 => file, 1 => (0..TARGETS.len()).prop_map(Node::Link)]
     }
 
     fn layout() -> impl Strategy<Value = Layout> {
@@ -721,9 +717,10 @@ mod tests {
                     };
                     crate::platform::set_mode(&at, mode).unwrap();
                 }
-                Node::Link(target) => {
+                Node::Link(target) if crate::platform::LINKS => {
                     crate::platform::make_link(TARGETS.get(*target).unwrap(), &at).unwrap();
                 }
+                Node::Link(target) => std::fs::write(&at, TARGETS.get(*target).unwrap()).unwrap(),
             }
         }
     }
@@ -774,7 +771,12 @@ mod tests {
                     Node::File(content, executable) => {
                         Found::File(CONTENTS.get(*content).unwrap().to_vec(), *executable)
                     }
-                    Node::Link(target) => Found::Link((*TARGETS.get(*target).unwrap()).to_owned()),
+                    Node::Link(target) if crate::platform::LINKS => {
+                        Found::Link((*TARGETS.get(*target).unwrap()).to_owned())
+                    }
+                    Node::Link(target) => {
+                        Found::File(TARGETS.get(*target).unwrap().as_bytes().to_vec(), false)
+                    }
                 };
                 (path.to_string(), found)
             })
@@ -900,9 +902,7 @@ mod tests {
         let file = |content: usize| Node::File(content, false);
         let sent: Layout = [("a".parse().unwrap(), file(1))].into();
         let mut local = sent.clone();
-        if crate::platform::LINKS {
-            local.insert("l".parse().unwrap(), Node::Link(0));
-        }
+        local.insert("l".parse().unwrap(), Node::Link(0));
         lay_out(&root, &local);
         let tree = Tree::open(&root).unwrap();
         let through_link: Layout = [
