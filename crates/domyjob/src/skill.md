@@ -73,6 +73,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 - Jobs keep the environment of the ssh session that started them, but anything that lived only in that session, such as a forwarded ssh agent, is gone once it closes.
   Clone private repositories with credentials the machine itself holds.
 - `.gitignore`, `.ignore`, and `.domyjobignore` decide what is sent; everything else goes, whether or not it is committed.
+- Tools that ask before trusting a directory, such as mise or direnv, see each workspace as a new one: trust domyjob's work area once in that machine's own settings.
 
 ## Exit codes
 
