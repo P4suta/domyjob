@@ -1,8 +1,6 @@
 use std::io::Write;
 use std::process::Stdio;
 
-use serde::Serialize;
-
 use crate::config::{Config, ConfigError};
 use crate::domain::MachineName;
 use crate::protocol::{Job, Phase, State};
@@ -25,14 +23,6 @@ pub enum NotifyError {
         program: String,
         detail: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Event<'a> {
-    pub machine: &'a MachineName,
-    pub state: &'static str,
-    pub exit_code: Option<i32>,
-    pub job: &'a Job,
 }
 
 #[must_use]
@@ -112,18 +102,12 @@ pub fn send(
     machine: &MachineName,
     job: &Job,
 ) -> Result<(), NotifyError> {
-    let state = job.state();
     let text = format!(
         "domyjob: {}\n",
         crate::terminal::neutralize(&summary(machine, job))
     );
-    let json = serde_json::to_value(Event {
-        machine,
-        state: state.as_str(),
-        exit_code: job.exit_code(),
-        job,
-    })
-    .map_err(|e| failed(target.notifier.as_str(), "encoding", &e.to_string()))?;
+    let json = crate::output::value(&crate::output::JobView::full(machine, job))
+        .map_err(|e| failed(target.notifier.as_str(), "encoding", &e.to_string()))?;
     deliver(config, target, &text, &json)
 }
 
@@ -147,12 +131,19 @@ pub fn lost(
         "domyjob: lost track of {reference} on {machine} ({}); it may still be running there\n",
         crate::terminal::neutralize(why)
     );
-    let json = serde_json::json!({
-        "machine": machine,
-        "state": "lost",
-        "job": reference,
-        "why": why,
-    });
+    let json = crate::output::value(&crate::output::Unsettled {
+        job: reference.to_owned(),
+        machine: machine.clone(),
+        state: State::Lost.as_str(),
+        error: crate::output::ErrorView::new(
+            why.to_owned(),
+            crate::diagnosis::Diagnosis {
+                kind: crate::diagnosis::Kind::Unreachable,
+                hint: None,
+            },
+        ),
+    })
+    .map_err(|e| failed(target.notifier.as_str(), "encoding", &e.to_string()))?;
     deliver(config, target, &text, &json)
 }
 

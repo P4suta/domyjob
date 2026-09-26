@@ -616,39 +616,6 @@ pub fn doctor_failed(
     Ok(out)
 }
 
-pub const JSON_SCHEMA: u32 = 2;
-
-#[must_use]
-pub fn job_summary_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    serde_json::json!({
-        "schema": JSON_SCHEMA,
-        "job": format!("{machine}:{}", job.spec.id),
-        "machine": machine,
-        "state": job.state().as_str(),
-        "exit_code": job.exit_code(),
-        "name": job.spec.name,
-        "command": job.spec.command.display(),
-        "reason": job.reason(),
-        "notes": job.notes,
-        "behind": job.behind.iter().map(|holder| format!("{machine}:{holder}")).collect::<Vec<_>>(),
-    })
-}
-
-#[must_use]
-pub fn job_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    let mut value = job_summary_json(machine, job);
-    if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "detail".to_owned(),
-            match serde_json::to_value(job) {
-                Ok(detail) => detail,
-                Err(_unencodable) => serde_json::Value::Null,
-            },
-        );
-    }
-    value
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -803,38 +770,5 @@ pub mod tests {
             behind: Vec::new(),
             notes: Vec::new(),
         }
-    }
-
-    #[test]
-    fn the_job_json_keeps_its_shape_for_scripts_and_agents() {
-        let job = sample();
-        let machine: MachineName = "linux".parse().unwrap();
-        let mut keys: Vec<String> = job_json(&machine, &job)
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "behind",
-                "command",
-                "detail",
-                "exit_code",
-                "job",
-                "machine",
-                "name",
-                "notes",
-                "reason",
-                "schema",
-                "state"
-            ]
-        );
-        assert_eq!(
-            job_summary_json(&machine, &job).get("job").unwrap(),
-            "linux:0AAAAAAAAAAAAAAA"
-        );
     }
 }

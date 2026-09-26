@@ -141,6 +141,8 @@ fn carries_io_source(fields: &syn::Fields) -> bool {
         })
 }
 const WIRE_FILES: &[&str] = &["protocol.rs"];
+const JSON_RULE: &str = "an ad hoc JSON shape drifts from the others; give it a type in output.rs and print it through output";
+const JSON_FILES: &[&str] = &["mcp.rs", "protocol.rs"];
 const LOCAL_ONLY_TYPES: &[&str] = &["ConfigText", "UserText", "Arg", "Rendered", "Secret"];
 
 impl Gate {
@@ -266,6 +268,17 @@ impl Gate {
 }
 
 impl<'ast> Visit<'ast> for Gate {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if self.test_depth == 0
+            && !self.file_is(JSON_FILES)
+            && let Some(last) = mac.path.segments.last()
+            && last.ident == "json"
+        {
+            self.flag(last.ident.span(), JSON_RULE);
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let test = is_test_module(&item.attrs);
         if test {
@@ -577,6 +590,23 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn json_is_shaped_by_a_type_not_by_hand() {
+        for source in [
+            "fn f() { let _v = serde_json::json!({\"a\": 1}); }",
+            "fn f() { let _v = json!([]); }",
+        ] {
+            assert_eq!(rules(source), [JSON_RULE], "{source}");
+        }
+        assert!(
+            check_file("fn f() { let _v = json!({}); }", "src/mcp.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(rules("#[cfg(test)] mod tests { fn f() { let _v = json!(1); } }").is_empty());
+        assert!(rules("fn f() { let _v = serde_json::to_value(&x); }").is_empty());
     }
 
     #[test]

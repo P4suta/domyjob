@@ -93,9 +93,11 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 
 ## JSON for scripts and agents
 
-Every job in `--json` output has the same shape, with `"schema": 2`:
-`job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), `notes` (what domyjob itself had to say about the job, kept out of its log), and `detail` (everything else).
-`digest --json` adds `lines`, `bytes`, and `tail`; errors arrive as `{"schema": 2, "error": {kind, message, hint}}`.
+Every line of `--json` output, and every MCP answer, is one document with `"schema": 3`.
+A job has `job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), `notes` (what domyjob itself had to say about the job, kept out of its log), and from the command line `detail` (everything else).
+`digest` adds `lines`, `bytes`, and `tail` to the job.
+`ls --json` answers `{"jobs": [...], "unreachable": [...]}`, as the MCP `list_jobs` does.
+Wherever machines are listed, one that could not answer is `{"machine": ..., "error": {kind, message, hint}}`, and a command that failed answers `{"error": {kind, message, hint}}`.
 
 ## Other commands
 

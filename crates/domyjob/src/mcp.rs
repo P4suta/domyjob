@@ -35,6 +35,19 @@ enum ToolError {
     Revision(String),
     #[error("writing {0}: {1}")]
     Destination(String, String),
+    #[error("encoding the answer: {0}")]
+    Encode(serde_json::Error),
+}
+
+fn answer<T: serde::Serialize>(body: &T) -> Result<Value, ToolError> {
+    crate::output::value(body).map_err(ToolError::Encode)
+}
+
+fn part<T: serde::Serialize>(body: &T) -> Value {
+    match serde_json::to_value(body) {
+        Ok(value) => value,
+        Err(error) => Value::String(format!("encoding the answer: {error}")),
+    }
 }
 
 const fn tool_name(tool: McpTool) -> &'static str {
@@ -246,20 +259,11 @@ fn parse<T: crate::ingress::Ingress>(arguments: &Value) -> Result<T, ToolError> 
     crate::ingress::json_value(arguments).map_err(ToolError::Arguments)
 }
 
-const DIGEST_TAIL: u32 = 40;
+use crate::output::DIGEST_TAIL;
 
 fn digested(ctx: &Context, reference: &str, tail: u32) -> Result<Value, ToolError> {
     let (machine, digest) = client::digest(ctx, reference, tail)?;
-    let job = &digest.job;
-    Ok(json!({
-        "job": format!("{}:{}", machine.name, job.spec.id),
-        "state": job.state().as_str(),
-        "exit_code": job.exit_code(),
-        "command": job.spec.command.display(),
-        "log_lines": digest.lines,
-        "log_bytes": digest.bytes,
-        "log_tail": digest.tail.iter().map(ToString::to_string).collect::<Vec<_>>(),
-    }))
+    Ok(part(&crate::output::DigestView::of(&machine.name, &digest)))
 }
 
 fn inside_allowed(ctx: &Context, destination: &str) -> Result<PathBuf, ToolError> {
@@ -285,6 +289,36 @@ fn tail(ctx: &Context, job: &str, lines: u32) -> Result<String, ToolError> {
     let mut buffer = Vec::new();
     client::logs(ctx, job, Output::Tail(lines), &mut buffer)?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn ran(ctx: &Context, item: &client::Submitted, waiting: bool) -> Value {
+    if !waiting {
+        return part(&crate::output::JobView::summary(
+            &item.machine.name,
+            &item.job,
+        ));
+    }
+    let reference = format!("{}:{}", item.machine.name, item.job.spec.id);
+    match client::wait(ctx, &reference)
+        .map_err(ToolError::from)
+        .and_then(|_| digested(ctx, &reference, DIGEST_TAIL))
+    {
+        Ok(digest) => digest,
+        Err(error) => part(&crate::output::Unsettled {
+            job: reference,
+            machine: item.machine.name.clone(),
+            state: crate::protocol::State::Lost.as_str(),
+            error: crate::output::ErrorView::new(
+                error.to_string(),
+                crate::diagnosis::Diagnosis {
+                    kind: crate::diagnosis::Kind::Unreachable,
+                    hint: Some(
+                        "it may still be running; job_status or wait_job asks again".to_owned(),
+                    ),
+                },
+            ),
+        }),
+    }
 }
 
 fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
@@ -327,41 +361,23 @@ fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
         )]
         let handles: Vec<_> = submitted
             .iter()
-            .map(|item| {
-                let reference = format!("{}:{}", item.machine.name, item.job.spec.id);
-                let state = item.job.state().as_str();
-                scope.spawn(move || {
-                    if !waiting {
-                        return json!({"job": reference, "state": state});
-                    }
-                    match client::wait(ctx, &reference)
-                        .map_err(ToolError::from)
-                        .and_then(|_| digested(ctx, &reference, DIGEST_TAIL))
-                    {
-                        Ok(digest) => digest,
-                        Err(error) => json!({
-                            "job": reference,
-                            "state": "unknown",
-                            "error": error.to_string(),
-                            "hint": "it may still be running; job_status or wait_job asks again"
-                        }),
-                    }
-                })
-            })
+            .map(|item| scope.spawn(move || ran(ctx, item, waiting)))
             .collect();
         handles
             .into_iter()
             .map(|handle| match handle.join() {
                 Ok(entry) => entry,
-                Err(_panicked) => json!({"state": "unknown", "error": "a worker panicked"}),
+                Err(_panicked) => Value::String("a worker panicked".to_owned()),
             })
             .collect()
     });
-    let refused: Vec<Value> = rejected
-        .iter()
-        .map(|r| json!({"machine": r.machine, "error": r.error.to_string()}))
-        .collect();
-    Ok(json!({"jobs": jobs, "refused": refused}))
+    answer(&crate::output::Jobs {
+        jobs,
+        unreachable: rejected
+            .iter()
+            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
+            .collect(),
+    })
 }
 
 fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
@@ -370,15 +386,16 @@ fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
         None => client::known_machines(ctx)?,
     };
     let (jobs, rejected) = client::list(ctx, &machines, args.limit.unwrap_or(20));
-    let jobs: Vec<Value> = jobs
-        .iter()
-        .map(|(machine, job)| crate::view::job_summary_json(machine, job))
-        .collect();
-    let refused: Vec<Value> = rejected
-        .iter()
-        .map(|r| json!({"machine": r.machine, "error": r.error.to_string()}))
-        .collect();
-    Ok(json!({"jobs": jobs, "unreachable": refused}))
+    answer(&crate::output::Jobs {
+        jobs: jobs
+            .iter()
+            .map(|(machine, job)| crate::output::JobView::summary(machine, job))
+            .collect(),
+        unreachable: rejected
+            .iter()
+            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
+            .collect(),
+    })
 }
 
 fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
@@ -388,14 +405,7 @@ fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
         limit: args.limit.unwrap_or(100),
     };
     let (machine, found) = client::search(ctx, &args.job, query)?;
-    let hits: Vec<Value> = found
-        .hits
-        .iter()
-        .map(|hit| json!({"line": hit.line, "text": hit.text.to_string(), "matched": hit.matched}))
-        .collect();
-    Ok(
-        json!({"machine": machine.name, "matched": found.matched, "truncated": found.truncated, "hits": hits}),
-    )
+    answer(&crate::output::FoundView::of(&machine.name, &found))
 }
 
 fn get_file(ctx: &Context, args: &FileArgs) -> Result<Value, ToolError> {
@@ -406,7 +416,12 @@ fn get_file(ctx: &Context, args: &FileArgs) -> Result<Value, ToolError> {
     let mut staged = crate::user_files::Staged::beside(&destination).map_err(local)?;
     let machine = client::get(ctx, &args.job, args.path.clone(), staged.file())?;
     let bytes = staged.commit().map_err(local)?;
-    Ok(json!({"machine": machine.name, "path": args.path, "written": destination, "bytes": bytes}))
+    answer(&crate::output::Fetched {
+        machine: &machine.name,
+        path: &args.path,
+        written: &destination,
+        bytes,
+    })
 }
 
 fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError> {
@@ -421,40 +436,51 @@ fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError
             let args: JobArgs = parse(arguments)?;
             let (machine, job) =
                 client::job_request(ctx, &args.job, |job| Request::Status { job })?;
-            Ok(crate::view::job_summary_json(&machine.name, &job))
+            answer(&crate::output::JobView::summary(&machine.name, &job))
         }
         McpTool::JobLogs => {
             let args: LogArgs = parse(arguments)?;
-            Ok(json!({"log": tail(ctx, &args.job, args.lines.unwrap_or(200))?}))
+            answer(&crate::output::Log {
+                log: tail(ctx, &args.job, args.lines.unwrap_or(200))?,
+            })
         }
         McpTool::WaitJob => {
             let args: JobArgs = parse(arguments)?;
             let (machine, job) = client::wait(ctx, &args.job)?;
-            digested(
+            let (machine, digest) = client::digest(
                 ctx,
                 &format!("{}:{}", machine.name, job.spec.id),
                 DIGEST_TAIL,
-            )
+            )?;
+            answer(&crate::output::DigestView::of(&machine.name, &digest))
         }
         McpTool::JobDigest => {
             let args: DigestArgs = parse(arguments)?;
-            digested(ctx, &args.job, args.tail.unwrap_or(DIGEST_TAIL))
+            let (machine, digest) =
+                client::digest(ctx, &args.job, args.tail.unwrap_or(DIGEST_TAIL))?;
+            answer(&crate::output::DigestView::of(&machine.name, &digest))
         }
         McpTool::SearchLogs => search_logs(ctx, parse(arguments)?),
         McpTool::GetFile => get_file(ctx, &parse(arguments)?),
         McpTool::KillJob => {
             let args: JobArgs = parse(arguments)?;
             let (machine, job) = client::job_request(ctx, &args.job, |job| Request::Kill { job })?;
-            Ok(crate::view::job_summary_json(&machine.name, &job))
+            answer(&crate::output::JobView::summary(&machine.name, &job))
         }
         McpTool::Machines => {
-            let listed: Vec<Value> = ctx
-                .config
-                .configured()
-                .iter()
-                .map(|m| json!({"name": m.name, "host": m.host, "transport": m.transport, "labels": m.labels}))
-                .collect();
-            Ok(json!({"machines": listed}))
+            let configured = ctx.config.configured();
+            let mut machines = Vec::with_capacity(configured.len());
+            for machine in &configured {
+                machines.push(crate::output::Configured {
+                    machine: &machine.name,
+                    host: &machine.host,
+                    transport: &machine.transport,
+                    labels: &machine.labels,
+                    facts: crate::remote::cached_facts(&ctx.dirs, machine)
+                        .map_err(ClientError::from)?,
+                });
+            }
+            answer(&crate::output::Machines { machines })
         }
     }
 }
