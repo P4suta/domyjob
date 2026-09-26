@@ -1,0 +1,8 @@
+{
+  "path": ["crates/domyjob/src", "crates/domyjob/tests", "xtask/src"],
+  "format": ["rust"],
+  "minTokens": 40,
+  "reporters": ["console"],
+  "gitignore": true,
+  "threshold": 2.71
+}

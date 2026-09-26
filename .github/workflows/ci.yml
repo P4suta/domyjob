@@ -27,6 +27,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo xtask gates
+      - run: npx --yes jscpd@5.3.2 --config .jscpd.json --silent
       - uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
   deny:
