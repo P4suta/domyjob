@@ -15,12 +15,8 @@ const GENESIS: &str = "000000000000000000000000000000000000000000000000000000000
 pub enum AuditError {
     #[error(transparent)]
     State(#[from] StateError),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error(
         "the audit log {path} is broken at entry {line}: {why}; it has been altered or truncated"
     )]
@@ -118,10 +114,12 @@ impl AuditLog {
         } = event;
         let io = |step| {
             let path = self.path.clone();
-            move |source| AuditError::Io {
-                action: step,
-                path,
-                source,
+            move |source| {
+                AuditError::Io(crate::failure::IoFailure {
+                    action: step,
+                    path,
+                    source,
+                })
             }
         };
         let lock = self.lock()?;
@@ -167,10 +165,12 @@ impl AuditLog {
     fn lock(&self) -> Result<OsLock, AuditError> {
         let mut lock_path = self.path.as_os_str().to_owned();
         lock_path.push(".lock");
-        OsLock::exclusive(Path::new(&lock_path)).map_err(|e| AuditError::Io {
-            action: "locking",
-            path: self.path.clone(),
-            source: std::io::Error::other(e.to_string()),
+        OsLock::exclusive(Path::new(&lock_path)).map_err(|e| {
+            AuditError::Io(crate::failure::IoFailure {
+                action: "locking",
+                path: self.path.clone(),
+                source: std::io::Error::other(e.to_string()),
+            })
         })
     }
 
@@ -236,10 +236,12 @@ impl AuditLog {
             None => None,
         };
         let walked = self.walk_repaired(stop_at, unrecorded.as_ref());
-        lock.release().map_err(|e| AuditError::Io {
-            action: "unlocking",
-            path: self.path.clone(),
-            source: std::io::Error::other(e.to_string()),
+        lock.release().map_err(|e| {
+            AuditError::Io(crate::failure::IoFailure {
+                action: "unlocking",
+                path: self.path.clone(),
+                source: std::io::Error::other(e.to_string()),
+            })
         })?;
         walked
     }
@@ -479,10 +481,10 @@ mod tests {
         std::fs::create_dir_all(Path::new(&lock)).unwrap();
         assert!(matches!(
             unlockable.record(event("submit")),
-            Err(AuditError::Io {
+            Err(AuditError::Io(crate::failure::IoFailure {
                 action: "locking",
                 ..
-            })
+            }))
         ));
     }
 

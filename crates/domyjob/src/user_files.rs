@@ -1,50 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-#[derive(Debug, thiserror::Error)]
-#[error("{action} {path}: {source}")]
-pub struct UserFileError {
-    action: &'static str,
-    path: PathBuf,
-    source: std::io::Error,
-}
-
-impl From<crate::durable::DurableError> for UserFileError {
-    fn from(error: crate::durable::DurableError) -> Self {
-        Self {
-            action: error.action,
-            path: error.path,
-            source: error.source,
-        }
-    }
-}
-
-fn failed(
-    action: &'static str,
-    path: &Path,
-) -> impl FnOnce(std::io::Error) -> UserFileError + use<> {
-    let path = path.to_path_buf();
-    move |source| UserFileError {
-        action,
-        path,
-        source,
-    }
-}
-
-pub fn present(path: &Path) -> Result<bool, UserFileError> {
+pub fn present(path: &Path) -> Result<bool, crate::failure::IoFailure> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(failed("checking", path)(error)),
+        Err(error) => Err(crate::failure::io("checking", path)(error)),
     }
 }
 
-pub fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
+pub fn write(path: &Path, bytes: &[u8]) -> Result<(), crate::failure::IoFailure> {
     parents(path)?;
-    Ok(crate::durable::write(
-        path,
-        bytes,
-        crate::durable::Access::Shared,
-    )?)
+    crate::durable::write(path, bytes, crate::durable::Access::Shared)
 }
 
 #[derive(Debug)]
@@ -54,15 +20,17 @@ pub struct Staged(crate::durable::Staged);
     clippy::disallowed_methods,
     reason = "directories inside the user's own project, created as the user would"
 )]
-pub fn parents(path: &Path) -> Result<(), UserFileError> {
+pub fn parents(path: &Path) -> Result<(), crate::failure::IoFailure> {
     match path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(parent) => std::fs::create_dir_all(parent).map_err(failed("creating", parent)),
+        Some(parent) => {
+            std::fs::create_dir_all(parent).map_err(crate::failure::io("creating", parent))
+        }
         None => Ok(()),
     }
 }
 
 impl Staged {
-    pub fn beside(destination: &Path) -> Result<Self, UserFileError> {
+    pub fn beside(destination: &Path) -> Result<Self, crate::failure::IoFailure> {
         parents(destination)?;
         Ok(Self(crate::durable::Staged::beside(
             destination,
@@ -74,8 +42,8 @@ impl Staged {
         self.0.file()
     }
 
-    pub fn commit(self) -> Result<u64, UserFileError> {
-        Ok(self.0.commit()?)
+    pub fn commit(self) -> Result<u64, crate::failure::IoFailure> {
+        self.0.commit()
     }
 }
 
@@ -83,11 +51,11 @@ impl Staged {
     clippy::disallowed_methods,
     reason = "removing a file the user asked to uninstall"
 )]
-pub fn remove(path: &Path) -> Result<(), UserFileError> {
+pub fn remove(path: &Path) -> Result<(), crate::failure::IoFailure> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(failed("removing", path)(e)),
+        Err(e) => Err(crate::failure::io("removing", path)(e)),
     }
 }
 
@@ -95,22 +63,22 @@ pub fn remove(path: &Path) -> Result<(), UserFileError> {
     clippy::disallowed_methods,
     reason = "swapping the running executable for a verified update"
 )]
-pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), UserFileError> {
+pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), crate::failure::IoFailure> {
     let staged = crate::durable::beside(current, "new")?;
-    std::fs::copy(fresh, &staged).map_err(failed("staging", &staged))?;
+    std::fs::copy(fresh, &staged).map_err(crate::failure::io("staging", &staged))?;
     if !crate::platform::FAMILY.replaces_running_executables() {
         let retired = crate::durable::beside(current, "old")?;
-        std::fs::rename(current, &retired).map_err(failed("retiring", current))?;
+        std::fs::rename(current, &retired).map_err(crate::failure::io("retiring", current))?;
         if let Err(error) = std::fs::rename(&staged, current) {
             match std::fs::rename(&retired, current) {
                 Ok(()) | Err(_) => {}
             }
-            return Err(failed("installing", current)(error));
+            return Err(crate::failure::io("installing", current)(error));
         }
         sweep_retired(current);
         return Ok(());
     }
-    std::fs::rename(&staged, current).map_err(failed("installing", current))
+    std::fs::rename(&staged, current).map_err(crate::failure::io("installing", current))
 }
 
 #[expect(

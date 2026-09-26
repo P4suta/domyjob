@@ -437,10 +437,12 @@ fn take_charge(
     };
     let control = store.control_path(id);
     crate::state_file::remove_file(&control)?;
-    let listener = Listener::bind(&control).map_err(|source| NodeError::Io {
-        action: "listening on",
-        path: control.clone(),
-        source,
+    let listener = Listener::bind(&control).map_err(|source| {
+        NodeError::Io(crate::failure::IoFailure {
+            action: "listening on",
+            path: control.clone(),
+            source,
+        })
     })?;
     let cas = Cas::open(dirs.state.join("objects"))?;
     if !store.is_published(id)? {
@@ -451,10 +453,12 @@ fn take_charge(
     let file = crate::state_file::open_append(&log_path)?;
     let len = file
         .metadata()
-        .map_err(|source| NodeError::Io {
-            action: "measuring",
-            path: log_path.clone(),
-            source,
+        .map_err(|source| {
+            NodeError::Io(crate::failure::IoFailure {
+                action: "measuring",
+                path: log_path.clone(),
+                source,
+            })
         })?
         .len();
     let (events, received) = std::sync::mpsc::channel();
@@ -721,11 +725,11 @@ impl Supervisor {
     fn fill(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
         match self.fill_once(root, manifest_id) {
             Err(NodeError::Workspace(crate::workspace::WorkspaceError::Tree(
-                crate::tree::TreeError::Io {
+                crate::tree::TreeError::Io(crate::failure::IoFailure {
                     action,
                     path,
                     source,
-                },
+                }),
             ))) => {
                 self.shared.say(&format!(
                     "the workspace could not be updated ({action} {}: {source}); moving it aside and filling it afresh",

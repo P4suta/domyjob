@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,12 +37,8 @@ pub enum ClientError {
     },
     #[error("nothing to run: give a command after --")]
     NoInput,
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{path} holds a malformed record: {source}")]
     Index {
         path: PathBuf,
@@ -67,15 +64,6 @@ pub enum ClientError {
     },
     #[error("this machine has no note of a directory sent with {job}")]
     NotSent { job: JobId },
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ClientError + use<> {
-    let path = path.to_path_buf();
-    move |source| ClientError::Io {
-        action,
-        path,
-        source,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -618,10 +606,12 @@ impl Plan<'_> {
     fn one(&self, machine: &Machine) -> Result<Submitted, RemoteError> {
         let report = |stage: Stage<'_>| (self.report)(&machine.name, stage);
         report(Stage::Connecting);
-        let nonce = crate::domain::Nonce::generate().map_err(|e| RemoteError::Io {
-            action: "choosing a nonce for",
-            path: PathBuf::from(machine.name.as_str()),
-            source: std::io::Error::other(e.to_string()),
+        let nonce = crate::domain::Nonce::generate().map_err(|e| {
+            RemoteError::Io(crate::failure::IoFailure {
+                action: "choosing a nonce for",
+                path: PathBuf::from(machine.name.as_str()),
+                source: std::io::Error::other(e.to_string()),
+            })
         })?;
         let mut link = Link::open(&self.ctx.config, &self.ctx.dirs, machine)?;
         report(Stage::Connected);

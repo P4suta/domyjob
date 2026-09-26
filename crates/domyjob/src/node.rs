@@ -65,12 +65,8 @@ pub enum NodeError {
     Workspace(#[from] crate::workspace::WorkspaceError),
     #[error(transparent)]
     Snapshot(#[from] crate::snapshot::SnapshotError),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error(transparent)]
     Scan(#[from] crate::logscan::ScanError),
     #[error("the {0} request streams its answer and cannot be answered in one reply")]
@@ -99,7 +95,7 @@ impl NodeError {
             Self::Denied(_) => RefusalCode::Forbidden,
             Self::Workspace(crate::workspace::WorkspaceError::NotAFile(_)) => RefusalCode::NotAFile,
             Self::Workspace(crate::workspace::WorkspaceError::Tree(
-                crate::tree::TreeError::Io { source, .. },
+                crate::tree::TreeError::Io(crate::failure::IoFailure { source, .. }),
             )) if source.kind() == std::io::ErrorKind::NotFound => RefusalCode::NoSuchPath,
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
             Self::Paused => RefusalCode::Paused,
@@ -139,11 +135,11 @@ fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
 }
 
 fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
-    NodeError::Io {
+    NodeError::Io(crate::failure::IoFailure {
         action: "watching",
         path: jobs.to_path_buf(),
         source: std::io::Error::other(error.to_string()),
-    }
+    })
 }
 
 fn size_of(path: &std::path::Path) -> u64 {
@@ -723,10 +719,12 @@ impl Node {
     }
 
     fn launch_supervisor(&self, id: &JobId) -> Result<(), NodeError> {
-        let exe = proc::own_executable().map_err(|source| NodeError::Io {
-            action: "locating",
-            path: PathBuf::from("domyjob"),
-            source,
+        let exe = proc::own_executable().map_err(|source| {
+            NodeError::Io(crate::failure::IoFailure {
+                action: "locating",
+                path: PathBuf::from("domyjob"),
+                source,
+            })
         })?;
         let invocation = crate::spawn::Invocation::new(
             crate::template::Arg::path(&exe),
@@ -1215,10 +1213,12 @@ impl Node {
 
     fn open_log(&self, id: &JobId) -> Result<std::fs::File, NodeError> {
         let path = self.store.log_path(id);
-        std::fs::File::open(&path).map_err(|source| NodeError::Io {
-            action: "opening",
-            path,
-            source,
+        std::fs::File::open(&path).map_err(|source| {
+            NodeError::Io(crate::failure::IoFailure {
+                action: "opening",
+                path,
+                source,
+            })
         })
     }
 
@@ -2562,11 +2562,13 @@ mod tests {
     #[test]
     fn a_full_disk_is_named_as_such_however_deep_it_is_wrapped() {
         let failing = |kind: std::io::ErrorKind| {
-            NodeError::Store(StoreError::State(crate::state_file::StateError::Io {
-                action: "writing",
-                path: "/state/x".into(),
-                source: kind.into(),
-            }))
+            NodeError::Store(StoreError::State(crate::state_file::StateError::Io(
+                crate::failure::IoFailure {
+                    action: "writing",
+                    path: "/state/x".into(),
+                    source: kind.into(),
+                },
+            )))
         };
         assert_eq!(
             failing(std::io::ErrorKind::StorageFull).code(),

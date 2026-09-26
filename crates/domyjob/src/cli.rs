@@ -1340,10 +1340,12 @@ impl Watching<'_> {
                 .and_then(|()| {
                     sink.flush()
                         .and_then(|()| sink.into_inner().finish())
-                        .map_err(|source| ClientError::Io {
-                            action: "writing",
-                            path: PathBuf::from("stdout"),
-                            source,
+                        .map_err(|source| {
+                            ClientError::Io(crate::failure::IoFailure {
+                                action: "writing",
+                                path: PathBuf::from("stdout"),
+                                source,
+                            })
                         })
                 });
             if let Err(error) = followed {
@@ -2183,7 +2185,7 @@ fn get(args: &GetArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     match &args.output {
         Some(path) => {
-            let local = |e: crate::user_files::UserFileError| {
+            let local = |e: crate::failure::IoFailure| {
                 CliError::Output(std::io::Error::other(e.to_string()))
             };
             let mut staged = crate::user_files::Staged::beside(path).map_err(local)?;

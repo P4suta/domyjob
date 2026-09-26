@@ -400,7 +400,7 @@ fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
 
 fn get_file(ctx: &Context, args: &FileArgs) -> Result<Value, ToolError> {
     let destination = inside_allowed(ctx, &args.destination)?;
-    let local = |e: crate::user_files::UserFileError| {
+    let local = |e: crate::failure::IoFailure| {
         ToolError::Destination(args.destination.clone(), e.to_string())
     };
     let mut staged = crate::user_files::Staged::beside(&destination).map_err(local)?;

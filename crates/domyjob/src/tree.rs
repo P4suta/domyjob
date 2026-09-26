@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -11,27 +12,14 @@ use crate::snapshot::{Entry, Mode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TreeError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{0} stands where a directory is needed")]
     Blocked(RelPath),
     #[error("{0} still holds files")]
     Occupied(RelPath),
     #[error("{0} links to a target that cannot travel between systems")]
     Unportable(PathBuf),
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + use<> {
-    let path = path.to_path_buf();
-    move |source| TreeError::Io {
-        action,
-        path,
-        source,
-    }
 }
 
 #[derive(Debug)]
@@ -106,7 +94,7 @@ impl Rooted {
                 family,
             })),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(io("opening", root)(error)),
+            Err(error) => Err(io("opening", root)(error).into()),
         }
     }
 
@@ -128,7 +116,7 @@ impl Rooted {
             {
                 Ok(None)
             }
-            Err(error) => Err(io("checking", &self.shown(rel))(error)),
+            Err(error) => Err(io("checking", &self.shown(rel))(error).into()),
         }
     }
 
@@ -312,6 +300,7 @@ impl Rooted {
         self.dir
             .create_dir(rel.to_local())
             .map_err(io("creating", &self.shown(rel)))
+            .map_err(Into::into)
     }
 
     pub fn clear(&self, rel: &RelPath, contents: Contents) -> Result<(), TreeError> {
@@ -327,7 +316,8 @@ impl Rooted {
             (Some(meta), Contents::Anything) if meta.is_dir() => self
                 .dir
                 .remove_dir_all(rel.to_local())
-                .map_err(io("removing", &self.shown(rel))),
+                .map_err(io("removing", &self.shown(rel)))
+                .map_err(Into::into),
             (Some(meta), Contents::EmptyDirectoriesOnly) if meta.is_dir() => {
                 self.remove_empty_tree(rel)
             }
@@ -351,13 +341,14 @@ impl Rooted {
         self.dir
             .remove_dir(rel.to_local())
             .map_err(io("removing", &self.shown(rel)))
+            .map_err(Into::into)
     }
 
     pub fn remove_file(&self, rel: &RelPath) -> Result<(), TreeError> {
         match self.dir.remove_file(rel.to_local()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(io("removing", &self.shown(rel))(error)),
+            Err(error) => Err(io("removing", &self.shown(rel))(error).into()),
         }
     }
 
@@ -374,6 +365,7 @@ impl Rooted {
             Placed::Link(target) if self.family.links() => {
                 crate::platform::link(&self.dir, target, &rel.to_local())
                     .map_err(io("linking", &self.shown(rel)))
+                    .map_err(Into::into)
             }
             Placed::Link(target) => self.write_new(rel, target.as_bytes(), Mode::Regular),
             Placed::File(bytes, mode) => self.write_new(rel, bytes, mode),
@@ -395,11 +387,13 @@ impl Rooted {
             .map_err(io("creating", &self.shown(rel)))?;
         file.write_all(bytes)
             .map_err(io("writing", &self.shown(rel)))
+            .map_err(Into::into)
     }
 
     pub fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), TreeError> {
         self.dir
             .rename(from.to_local(), &self.dir, to.to_local())
             .map_err(io("replacing", &self.shown(to)))
+            .map_err(Into::into)
     }
 }

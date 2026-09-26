@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -15,12 +16,8 @@ const OUTCOME_RESERVED: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{path} holds malformed JSON: {source}")]
     Json {
         path: PathBuf,
@@ -40,18 +37,9 @@ pub enum StoreError {
     Invalid(#[from] Invalid),
 }
 
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + use<> {
-    let path = path.to_path_buf();
-    move |source| StoreError::Io {
-        action,
-        path,
-        source,
-    }
-}
-
 fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<T, StoreError> {
     crate::state_file::read_json(path)?
-        .ok_or_else(|| io("reading", path)(ErrorKind::NotFound.into()))
+        .ok_or_else(|| io("reading", path)(ErrorKind::NotFound.into()).into())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +185,7 @@ impl Store {
             match std::fs::symlink_metadata(taken) {
                 Ok(_) => return Err(StoreError::Exists(spec.id.clone())),
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(io("checking", taken)(e)),
+                Err(e) => return Err(io("checking", taken)(e).into()),
             }
         }
         crate::state_file::private_dir(&dir)?;
@@ -263,7 +251,7 @@ impl Store {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io("listing", &dir)(e)),
+            Err(e) => return Err(io("listing", &dir)(e).into()),
         };
         let mut ids = Vec::new();
         for entry in entries {
@@ -362,18 +350,22 @@ impl Store {
 
     pub fn record_outcome_in_place(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
         let mut bytes = serde_json::to_vec(phase).map_err(|e| {
-            StoreError::from(crate::state_file::StateError::Io {
-                action: "encoding the outcome of",
-                path: self.job_dir(id),
-                source: std::io::Error::other(e),
-            })
+            StoreError::from(crate::state_file::StateError::Io(
+                crate::failure::IoFailure {
+                    action: "encoding the outcome of",
+                    path: self.job_dir(id),
+                    source: std::io::Error::other(e),
+                },
+            ))
         })?;
         if bytes.len() > OUTCOME_RESERVED {
-            return Err(StoreError::from(crate::state_file::StateError::Io {
-                action: "fitting the outcome into the space reserved for it in",
-                path: self.job_dir(id),
-                source: std::io::Error::other("the outcome is longer than its reserved space"),
-            }));
+            return Err(StoreError::from(crate::state_file::StateError::Io(
+                crate::failure::IoFailure {
+                    action: "fitting the outcome into the space reserved for it in",
+                    path: self.job_dir(id),
+                    source: std::io::Error::other("the outcome is longer than its reserved space"),
+                },
+            )));
         }
         bytes.resize(OUTCOME_RESERVED, b' ');
         crate::state_file::overwrite_in_place(&self.job_dir(id).join("outcome"), &bytes)?;
@@ -768,10 +760,10 @@ mod tests {
             assert!(
                 matches!(
                     staged,
-                    Err(StoreError::Io {
+                    Err(StoreError::Io(crate::failure::IoFailure {
                         action: "checking",
                         ..
-                    })
+                    }))
                 ),
                 "{staged:?}"
             );
