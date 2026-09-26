@@ -501,6 +501,7 @@ pub struct Job {
     pub phase: Phase,
     pub supervisor: Supervisor,
     pub behind: Vec<JobId>,
+    pub notes: Vec<RemoteText>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

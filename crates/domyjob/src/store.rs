@@ -78,6 +78,7 @@ impl LaunchEnv {
 }
 
 const ENV: &str = "env.json";
+const NOTES_KEPT: usize = 20;
 const LAUNCH_ENV: &str = "launch-env.json";
 
 pub struct Launch {
@@ -151,6 +152,15 @@ impl Store {
     #[must_use]
     pub fn workspace_record(&self, id: &JobId) -> PathBuf {
         self.job_dir(id).join("workspace")
+    }
+
+    #[must_use]
+    pub fn left_path(&self, id: &JobId) -> PathBuf {
+        self.job_dir(id).join("left.json")
+    }
+
+    pub fn left(&self, id: &JobId) -> Result<Option<Vec<crate::snapshot::Left>>, StoreError> {
+        Ok(crate::state_file::read_json(&self.left_path(id))?)
     }
 
     #[must_use]
@@ -392,7 +402,27 @@ impl Store {
             phase,
             supervisor,
             behind,
+            notes: self.notes(id)?,
         })
+    }
+
+    #[must_use]
+    pub fn notes_path(&self, id: &JobId) -> PathBuf {
+        self.job_dir(id).join("notes")
+    }
+
+    fn notes(&self, id: &JobId) -> Result<Vec<crate::terminal::RemoteText>, StoreError> {
+        let Some(bytes) = crate::state_file::read_bytes(&self.notes_path(id))? else {
+            return Ok(Vec::new());
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        Ok(lines
+            .get(lines.len().saturating_sub(NOTES_KEPT)..)
+            .unwrap_or_default()
+            .iter()
+            .map(|line| crate::terminal::RemoteText::new((*line).to_owned()))
+            .collect())
     }
 
     #[must_use]
@@ -478,6 +508,30 @@ impl crate::ingress::Ingress for LaunchEnv {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_keeps_its_last_notes_apart_from_its_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
+        store
+            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
+            .unwrap();
+        store.publish(&id).unwrap();
+        let mut notes = crate::state_file::open_append(&store.notes_path(&id)).unwrap();
+        for n in 0..30 {
+            std::io::Write::write_all(&mut notes, format!("note {n}\n").as_bytes()).unwrap();
+        }
+        let job = store.job(&id).unwrap();
+        assert_eq!(job.notes.len(), NOTES_KEPT);
+        assert_eq!(job.notes.last().unwrap().to_string(), "note 29");
+        assert!(
+            crate::state_file::read_bytes(&store.log_path(&id))
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
     use crate::domain::Concurrency;
     use crate::protocol::{Command, Location};
 

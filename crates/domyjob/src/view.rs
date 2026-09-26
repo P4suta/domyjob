@@ -54,7 +54,7 @@ fn job_header(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Erro
     let command = job.spec.command.display();
     writeln!(out, "  {}", ui::paint(Tone::Dim, &command))?;
     if let Some(reason) = job.reason() {
-        writeln!(out, "  {}", ui::paint(Tone::Bad, reason.as_raw_str()))?;
+        writeln!(out, "  {}", ui::paint(Tone::Bad, &reason.to_string()))?;
     }
     Ok(out)
 }
@@ -141,7 +141,14 @@ pub fn final_line(machine: &MachineName, job: &Job) -> Result<String, std::fmt::
     let id = job.spec.id.as_str();
     let mut out = ui::job_line(machine, job, (&[id], ui::Columns::default()), None);
     if let Some(reason) = job.reason() {
-        write!(out, "\n  {}", ui::paint(Tone::Bad, reason.as_raw_str()))?;
+        write!(out, "\n  {}", ui::paint(Tone::Bad, &reason.to_string()))?;
+    }
+    for note in &job.notes {
+        write!(
+            out,
+            "\n  {}",
+            ui::paint(Tone::Dim, &format!("note: {note}"))
+        )?;
     }
     if let Some(step) = next_step(machine, job).filter(|_| !job.succeeded()) {
         write!(
@@ -179,7 +186,7 @@ pub fn machine_card(
 }
 
 fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::Error> {
-    let mut facts = vec![ui::paint(Tone::Dim, report.os.as_raw_str())];
+    let mut facts = vec![ui::paint(Tone::Dim, &report.os.to_string())];
     let mut cores = format!("{} cores", report.cores);
     if let Some([one, ..]) = report.load_hundredths {
         let load = format!("load {}.{:02}", one / 100, one % 100);
@@ -338,7 +345,7 @@ pub fn cleaned(
             out,
             "  {:>9}  {}",
             ui::bytes(item.bytes),
-            ui::paint(Tone::Dim, item.what.as_raw_str())
+            ui::paint(Tone::Dim, &item.what.to_string())
         )?;
     }
     if items.len() > 8 {
@@ -505,16 +512,16 @@ pub fn machines(rows: &[Seen<'_>]) -> Result<String, std::fmt::Error> {
                 )
             },
             |facts| {
-                let version = facts.hello.version.as_raw_str();
+                let version = facts.hello.version.to_string();
                 let shown = if version == crate::protocol::VERSION {
-                    version.to_owned()
+                    version
                 } else {
                     stale.push(row.name.clone());
                     ui::paint(Tone::Busy, &format!("{version} !"))
                 };
                 (
-                    facts.hello.os.as_raw_str().to_owned(),
-                    facts.hello.arch.as_raw_str().to_owned(),
+                    facts.hello.os.to_string(),
+                    facts.hello.arch.to_string(),
                     shown,
                 )
             },
@@ -583,7 +590,7 @@ pub fn doctor_reached(
         format!("{}/{}", hello.os, hello.arch),
         hello.version,
         ui::paint(Tone::Dim, &format!("wire {}", hello.wire)),
-        ui::paint(Tone::Dim, hello.shell.as_raw_str())
+        ui::paint(Tone::Dim, &hello.shell.to_string())
     )?;
     Ok(out)
 }
@@ -626,7 +633,8 @@ pub fn job_summary_json(machine: &MachineName, job: &Job) -> serde_json::Value {
         "exit_code": job.exit_code(),
         "name": job.spec.name,
         "command": job.spec.command.display(),
-        "reason": job.reason().map(|reason| reason.as_raw_str().to_owned()),
+        "reason": job.reason(),
+        "notes": job.notes,
         "behind": job.behind.iter().map(|holder| format!("{machine}:{holder}")).collect::<Vec<_>>(),
     })
 }
@@ -796,6 +804,7 @@ pub mod tests {
             phase: Phase::Queued,
             supervisor: Supervisor::Alive,
             behind: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -820,6 +829,7 @@ pub mod tests {
                 "job",
                 "machine",
                 "name",
+                "notes",
                 "reason",
                 "schema",
                 "state"

@@ -54,7 +54,7 @@ pub enum NodeError {
     #[error("job {0} has no workspace to fetch from")]
     NoWorkspace(JobId),
     #[error(
-        "job {job}'s workspace has since been filled by job {by}, so its files are gone; run it with --fresh to keep them apart"
+        "job {job}'s workspace has since been filled by job {by}, so only what {job} changed is kept; `domyjob pull` still brings that back"
     )]
     Reused { job: JobId, by: String },
     #[error("job {0} has not finished; its changes can be pulled once it has")]
@@ -1045,6 +1045,11 @@ impl Node {
                     Err(CasError::Missing(_) | CasError::Damaged(_)) => {}
                     Err(other) => return Err(other.into()),
                 }
+                for left in self.store.left(&spec.id)?.unwrap_or_default() {
+                    if let Some(crate::snapshot::Entry::File { blob, .. }) = left.now {
+                        reachable.insert(blob);
+                    }
+                }
             }
         }
         Ok(reachable)
@@ -1280,26 +1285,41 @@ impl Node {
             return Err(NodeError::Unfinished(job.spec.id));
         }
         let raw = self.cas.get(&source.manifest)?;
-        let sent = self.cas.manifest(&source.manifest)?;
-        let (_, workspace) = self.workspace_of(id)?;
+        let (left, workspace) = match self.store.left(id)? {
+            Some(left) => (left, None),
+            None => {
+                let sent = self.cas.manifest(&source.manifest)?;
+                let (_, workspace) = self.workspace_of(id)?;
+                (workspace.left(&sent)?, Some(workspace))
+            }
+        };
         let header = crate::snapshot::Changed {
             sent: crate::domain::len_u64(raw.len()),
-            left: workspace.left(&sent)?,
+            left,
         };
         streamed(output, |framed| {
             let mut line = serde_json::to_vec(&header).map_err(|e| NodeError::Output(e.into()))?;
             line.push(b'\n');
             framed.write_all(&line).map_err(NodeError::Output)?;
             framed.write_all(&raw).map_err(NodeError::Output)?;
-            for left in &header.left {
-                if let Some(crate::snapshot::Entry::File { size, .. }) = &left.now {
-                    let file = workspace.open_file(&left.path)?;
-                    let copied =
-                        std::io::copy(&mut file.take(*size), framed).map_err(NodeError::Output)?;
+            for item in &header.left {
+                if let Some(crate::snapshot::Entry::File { blob, size, .. }) = &item.now {
+                    let copied = match &workspace {
+                        Some(workspace) => {
+                            let file = workspace.open_file(&item.path)?;
+                            std::io::copy(&mut file.take(*size), framed)
+                                .map_err(NodeError::Output)?
+                        }
+                        None => {
+                            let bytes = self.cas.get(blob)?;
+                            framed.write_all(&bytes).map_err(NodeError::Output)?;
+                            crate::domain::len_u64(bytes.len())
+                        }
+                    };
                     if copied != *size {
                         return Err(NodeError::Output(std::io::Error::other(format!(
                             "{} changed while it was being sent",
-                            left.path
+                            item.path
                         ))));
                     }
                 }
@@ -2144,6 +2164,24 @@ mod tests {
         let (raw, files) = rest.split_at(usize::try_from(changed.sent).unwrap());
         assert_eq!(BlobId::of(raw), manifest);
         assert_eq!(files, b"hinew");
+
+        let recorded = crate::workspace::Workspace::open_existing(&workspace)
+            .unwrap()
+            .unwrap()
+            .left(&sent.manifest)
+            .unwrap();
+        for item in &recorded {
+            if let Some(crate::snapshot::Entry::File { blob, .. }) = &item.now {
+                let content = std::fs::read(workspace.join(item.path.as_str())).unwrap();
+                node.cas.put(blob, &content).unwrap();
+            }
+        }
+        crate::state_file::write_json(&store.left_path(&id), &recorded).unwrap();
+        crate::state_file::remove_dir_all(&workspace).unwrap();
+        let mut kept = Vec::new();
+        let again = ask(&node, &Request::Changes { job: job.clone() });
+        crate::remote::receive("m", &mut again.as_slice(), &mut kept).unwrap();
+        assert_eq!(kept, payload, "a job's changes outlive its workspace");
 
         store.set_phase(&id, &Phase::Queued).unwrap();
         let _alive = crate::lock::OsLock::exclusive(&store.alive_path(&id)).unwrap();

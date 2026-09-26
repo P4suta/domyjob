@@ -244,7 +244,7 @@ text_newtype!(
     JobName,
     |s| (1..=64).contains(&s.len())
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
     JobName
 );
 
