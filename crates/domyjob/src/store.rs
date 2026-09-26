@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{EnvName, Invalid, JobId, JobRef};
 use crate::lock::{LockError, OsLock};
 use crate::paths::Dirs;
-use crate::protocol::{Job, Phase, Spec, Supervisor};
+use crate::protocol::{Job, Phase, Settings, Spec, Supervisor};
 
 const SCHEMA: &str = "v3";
 
@@ -61,25 +61,69 @@ impl LaunchEnv {
 
     #[must_use]
     pub fn of_this_process() -> Self {
+        Self::from_vars(std::env::vars_os())
+    }
+
+    fn from_vars(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Self {
         let mut launch = Self::default();
-        for (key, value) in std::env::vars_os() {
+        for (key, value) in vars {
             match (key.into_string(), value.into_string()) {
-                (Ok(key), Ok(value)) => {
+                (Ok(key), Ok(value)) if allowed_launch_variable(&key) => {
                     launch.vars.insert(key, value);
                 }
-                (Ok(key), Err(_)) => launch.not_unicode.push(key),
-                (Err(key), Ok(_) | Err(_)) => {
-                    launch.not_unicode.push(key.to_string_lossy().into_owned());
+                (Ok(key), Err(_)) if allowed_launch_variable(&key) => {
+                    launch.not_unicode.push(key);
                 }
+                (Ok(_) | Err(_), Ok(_) | Err(_)) => {}
             }
         }
         launch
     }
 }
 
+fn allowed_launch_variable(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("LC_")
+        || matches!(
+            upper.as_str(),
+            "PATH"
+                | "HOME"
+                | "USER"
+                | "USERNAME"
+                | "USERPROFILE"
+                | "LOGNAME"
+                | "SHELL"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "SYSTEMROOT"
+                | "WINDIR"
+                | "COMSPEC"
+                | "PATHEXT"
+                | "HOMEDRIVE"
+                | "HOMEPATH"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+                | "PROGRAMDATA"
+                | "PROGRAMFILES"
+                | "PROGRAMFILES(X86)"
+                | "PROGRAMW6432"
+                | "COMMONPROGRAMFILES"
+                | "COMMONPROGRAMFILES(X86)"
+                | "COMMONPROGRAMW6432"
+                | "LANG"
+                | "LANGUAGE"
+                | "TZ"
+                | "TERM"
+                | "COLORTERM"
+                | "NO_COLOR"
+        )
+}
+
 const ENV: &str = "env.json";
 const NOTES_KEPT: usize = 20;
 const LAUNCH_ENV: &str = "launch-env.json";
+const SUPERVISOR_BOOT: &str = "supervisor-boot";
 
 pub struct Launch {
     vars: BTreeMap<String, zeroize::Zeroizing<String>>,
@@ -124,6 +168,7 @@ impl Store {
             root.join("jobs"),
             root.join("staging"),
             root.join("live"),
+            root.join("slots"),
         ] {
             crate::state_file::private_dir(&dir)?;
         }
@@ -133,6 +178,32 @@ impl Store {
     #[must_use]
     pub fn area(&self, name: &str) -> PathBuf {
         self.root.join(name)
+    }
+
+    #[must_use]
+    pub fn settings_path(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
+    pub fn settings(&self) -> Result<Settings, StoreError> {
+        Ok(crate::state_file::read_json(&self.settings_path())?.unwrap_or_default())
+    }
+
+    #[must_use]
+    pub fn admission_lock_path(&self) -> PathBuf {
+        self.root.join("queue.lock")
+    }
+
+    #[must_use]
+    pub fn queue_changed_path(&self) -> PathBuf {
+        self.root.join("queue.changed")
+    }
+
+    pub fn signal_queue(&self) -> Result<(), StoreError> {
+        Ok(crate::state_file::write_bytes(
+            &self.queue_changed_path(),
+            b"changed",
+        )?)
     }
 
     #[must_use]
@@ -245,6 +316,25 @@ impl Store {
         )?)
     }
 
+    pub fn record_supervisor_boot(&self, id: &JobId) -> Result<(), StoreError> {
+        match crate::platform::boot_identity() {
+            Some(identity) => Ok(crate::state_file::write_bytes(
+                &self.job_dir(id).join(SUPERVISOR_BOOT),
+                identity.as_bytes(),
+            )?),
+            None => Ok(crate::state_file::remove_file(
+                &self.job_dir(id).join(SUPERVISOR_BOOT),
+            )?),
+        }
+    }
+
+    pub fn supervisor_boot(&self, id: &JobId) -> Result<Option<String>, StoreError> {
+        Ok(
+            crate::state_file::read_bytes(&self.job_dir(id).join(SUPERVISOR_BOOT))?
+                .map(|bytes| String::from_utf8_lossy(bytes.trim_ascii()).into_owned()),
+        )
+    }
+
     pub fn start_failure(&self, id: &JobId) -> Result<Option<String>, StoreError> {
         Ok(crate::state_file::read_bytes(&self.failure_path(id)?)?
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
@@ -338,7 +428,10 @@ impl Store {
         crate::state_file::write_json(&self.job_dir(id).join("phase.json"), phase)?;
         match phase {
             Phase::Finished { .. } => self.purge_secrets(id),
-            Phase::Queued | Phase::Preparing { .. } | Phase::Running { .. } => Ok(()),
+            Phase::Queued
+            | Phase::Preparing { .. }
+            | Phase::Starting { .. }
+            | Phase::Running { .. } => Ok(()),
         }
     }
 
@@ -387,6 +480,25 @@ impl Store {
             crate::lock::Probe::Held => Ok(Supervisor::Alive),
             crate::lock::Probe::Absent | crate::lock::Probe::Free => Ok(Supervisor::Gone),
         }
+    }
+
+    pub fn earlier_waiters(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
+        let mut earlier = Vec::new();
+        for id in self.ids()? {
+            if id == waiting.id || self.skips_the_queue(&id)? {
+                continue;
+            }
+            let spec = self.spec(&id)?;
+            if spec.sequence >= waiting.sequence
+                || !matches!(self.phase(&id)?, Phase::Queued)
+                || !matches!(self.supervisor(&id)?, Supervisor::Alive)
+            {
+                continue;
+            }
+            earlier.push((spec.sequence, id));
+        }
+        earlier.sort_by_key(|(sequence, _)| *sequence);
+        Ok(earlier.into_iter().map(|(_, id)| id).collect())
     }
 
     pub fn job(&self, id: &JobId) -> Result<Job, StoreError> {
@@ -446,7 +558,8 @@ impl Store {
             let Ok(index) = index.parse::<usize>() else {
                 continue;
             };
-            if index >= waiting.concurrency.slots() {
+            let lock = slots.join(format!("{index}.lock"));
+            if !matches!(OsLock::probe(&lock), Ok(crate::lock::Probe::Held)) {
                 continue;
             }
             let Ok(Some(bytes)) = crate::state_file::read_bytes(&slots.join(&name)) else {
@@ -535,6 +648,37 @@ mod tests {
     use crate::domain::Concurrency;
     use crate::protocol::{Command, Location};
 
+    #[test]
+    fn a_job_inherits_only_the_explicit_base_environment_allowlist() {
+        let launch = LaunchEnv::from_vars([
+            ("PATH".into(), "/bin".into()),
+            ("LC_ALL".into(), "C".into()),
+            ("ProgramFiles(x86)".into(), "C:/Program Files (x86)".into()),
+            ("USERPROFILE".into(), "C:/Users/me".into()),
+            ("DOMYJOB_CI_CANARY".into(), "must-not-leak".into()),
+            ("SSH_CONNECTION".into(), "secret-session-detail".into()),
+        ]);
+        assert_eq!(launch.vars.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(launch.vars.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(
+            launch.vars.get("ProgramFiles(x86)").map(String::as_str),
+            Some("C:/Program Files (x86)")
+        );
+        assert_eq!(
+            launch.vars.get("USERPROFILE").map(String::as_str),
+            Some("C:/Users/me")
+        );
+        assert!(!launch.vars.contains_key("DOMYJOB_CI_CANARY"));
+        assert!(!launch.vars.contains_key("SSH_CONNECTION"));
+        if std::env::var_os("DOMYJOB_CI_CANARY").is_some() {
+            assert!(
+                !LaunchEnv::of_this_process()
+                    .vars
+                    .contains_key("DOMYJOB_CI_CANARY")
+            );
+        }
+    }
+
     fn spec(id: &JobId, sequence: u64) -> Spec {
         Spec {
             id: id.clone(),
@@ -551,13 +695,7 @@ mod tests {
     }
 
     fn dirs(root: &Path) -> Dirs {
-        Dirs {
-            home: root.into(),
-            state: root.join("state"),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        }
+        Dirs::for_test(root)
     }
 
     #[test]
@@ -905,11 +1043,13 @@ mod tests {
         .unwrap();
         holder("4.holder", outside.as_str().as_bytes());
         holder("x.holder", outside.as_str().as_bytes());
+        let slot = OsLock::exclusive(&slots.join("3.lock")).unwrap();
         assert_eq!(
             store.job(&waiting).unwrap().behind,
             std::slice::from_ref(&holding)
         );
         assert!(store.job(&holding).unwrap().behind.is_empty());
+        slot.release().unwrap();
 
         for lock in alive {
             lock.release().unwrap();

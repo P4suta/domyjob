@@ -1,5 +1,5 @@
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audit::{AuditLog, Verdict};
@@ -13,8 +13,8 @@ use crate::lock::LockError;
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request,
-    Settings, Spec, Submission, VERSION,
+    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
+    Submission, VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::terminal::RemoteText;
@@ -75,6 +75,10 @@ pub enum NodeError {
     NotStarted(RemoteText),
     #[error("job {0} already has a supervisor")]
     AlreadySupervised(JobId),
+    #[error(
+        "job {0} may already have run, so it cannot be retried automatically; submit a new job only after checking its effects"
+    )]
+    UnsafeRetry(JobId),
     #[error("the queue lost every slot it was waiting for")]
     QueueClosed,
     #[error("the {0} thread panicked")]
@@ -107,7 +111,8 @@ impl NodeError {
             | Self::Scan(
                 crate::logscan::ScanError::Pattern(..) | crate::logscan::ScanError::PatternTooLong,
             )
-            | Self::Misrouted(_) => RefusalCode::BadRequest,
+            | Self::Misrouted(_)
+            | Self::UnsafeRetry(_) => RefusalCode::BadRequest,
             Self::Proc(_) | Self::AlreadySupervised(_) | Self::NotStarted(_) => RefusalCode::Spawn,
             Self::Store(_)
             | Self::Workspace(_)
@@ -126,7 +131,7 @@ impl NodeError {
     }
 }
 
-fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
+fn telling(jobs: &Path, path: &Path) -> bool {
     path.parent() == Some(jobs)
         || path
             .file_name()
@@ -134,7 +139,7 @@ fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
             .is_some_and(|name| name == "phase.json" || name == "outcome")
 }
 
-fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
+pub(crate) fn watching(jobs: &Path, error: &notify::Error) -> NodeError {
     NodeError::Io(crate::failure::IoFailure {
         action: "watching",
         path: jobs.to_path_buf(),
@@ -142,7 +147,7 @@ fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
     })
 }
 
-fn size_of(path: &std::path::Path) -> u64 {
+fn size_of(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(next) = pending.pop() {
@@ -160,7 +165,7 @@ fn size_of(path: &std::path::Path) -> u64 {
     total
 }
 
-fn disk_is_short(area: &std::path::Path) -> bool {
+fn disk_is_short(area: &Path) -> bool {
     match fs4::statvfs(area) {
         Ok(stats) => short(stats.available_space(), stats.total_space()),
         Err(_unmeasurable) => false,
@@ -204,7 +209,7 @@ enum Keep {
     Unfinished,
 }
 
-fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
+fn configured_agent(home: &Path) -> Option<PathBuf> {
     if !crate::platform::FAMILY.agent_socket() {
         return None;
     }
@@ -230,7 +235,7 @@ fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-fn identity_agent(printed: &str, home: &std::path::Path) -> Option<PathBuf> {
+fn identity_agent(printed: &str, home: &Path) -> Option<PathBuf> {
     let value = printed
         .lines()
         .find_map(|line| line.strip_prefix("identityagent "))?
@@ -273,7 +278,7 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
-    short: fn(&std::path::Path) -> bool,
+    short: fn(&Path) -> bool,
 }
 
 #[must_use]
@@ -281,6 +286,7 @@ pub fn hello(dirs: &Dirs) -> Hello {
     Hello {
         wire: RemoteText::new(crate::protocol::wire().to_owned()),
         version: RemoteText::new(VERSION.to_owned()),
+        build: RemoteText::new(crate::protocol::BUILD_STAMP.to_owned()),
         os: RemoteText::new(crate::platform::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),
         home: RemoteText::new(dirs.home.display().to_string()),
@@ -301,12 +307,48 @@ const ROOM_SHARE: u64 = 10;
 
 const DISCARDED: &[u8] = b"domyjob: this log was discarded to free disk space on this machine\n";
 
-fn retire_old_binaries() {
-    if cfg!(test) {
-        return;
-    }
+const KEPT_BINARIES: usize = 3;
+
+fn retire_old_binaries(dirs: &Dirs) {
     if let Ok(exe) = std::env::current_exe() {
         crate::user_files::sweep_retired(&exe);
+    }
+    retire_cached_binaries(dirs, crate::protocol::build_key());
+}
+
+fn retire_cached_binaries(dirs: &Dirs, current: &str) {
+    let bin = dirs.cache.join("bin");
+    let Ok(entries) = std::fs::read_dir(&bin) else {
+        return;
+    };
+    let mut versions = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if kind.is_dir() && !kind.is_symlink() {
+            versions.push((name, entry.path()));
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut kept_others = 0usize;
+    for (name, path) in versions {
+        if name == current {
+            continue;
+        }
+        if kept_others < KEPT_BINARIES.saturating_sub(1) {
+            kept_others = kept_others.saturating_add(1);
+            continue;
+        }
+        match crate::state_file::remove_dir_all(&path) {
+            Ok(()) | Err(_) => {}
+        }
     }
 }
 
@@ -345,6 +387,7 @@ fn subject(request: &Request) -> Option<String> {
         Request::Kill { job }
         | Request::Status { job }
         | Request::Wait { job, .. }
+        | Request::Retry { job }
         | Request::Logs { job, .. }
         | Request::Tail { job, .. }
         | Request::Digest { job, .. }
@@ -447,6 +490,11 @@ impl Node {
         let (principal, request) = authorized.into_parts();
         let request = match route(request) {
             Routed::Query(request) => request,
+            Routed::Command(Request::Configure { change }, commanded) => {
+                self.configure(change)?;
+                self.upkeep(&commanded);
+                return send(output, &Reply::Report(Box::new(self.report()?)));
+            }
             Routed::Command(request, commanded) => {
                 self.upkeep(&commanded);
                 if let Request::Submit { submission } = request {
@@ -484,6 +532,7 @@ impl Node {
             | Request::List { .. }
             | Request::Status { .. }
             | Request::Wait { .. }
+            | Request::Retry { .. }
             | Request::Kill { .. }) => {
                 let reply = self.reply(&principal, single, input)?;
                 send(output, &reply)
@@ -505,16 +554,16 @@ impl Node {
     ) -> Result<Reply, NodeError> {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
-            Request::Report => Reply::Report(Box::new(self.report())),
+            Request::Report => Reply::Report(Box::new(self.report()?)),
             Request::Configure { change } => {
                 self.configure(change)?;
-                Reply::Report(Box::new(self.report()))
+                Reply::Report(Box::new(self.report()?))
             }
             Request::Clean { apply, logs, idle } => {
                 Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
             }
-            Request::AuditAt { seq } => Reply::AuditAt {
-                hash: self.audit.hash_at(seq)?,
+            Request::AuditAt { epoch, seq } => Reply::AuditAt {
+                hash: self.audit.hash_at(epoch, seq)?,
             },
             Request::AuditHead => Reply::AuditHead(self.audit.head()?),
             Request::Digest { job, tail } => {
@@ -548,6 +597,11 @@ impl Node {
                 Order::Wait,
                 input,
             )?)),
+            Request::Retry { job } => {
+                let id = self.own(principal, &job)?;
+                self.retry(&id)?;
+                Reply::Job(Box::new(self.settle(&id, Order::Wait, input)?))
+            }
             Request::Kill { job } => Reply::Job(Box::new(self.settle(
                 &self.own(principal, &job)?,
                 Order::Kill,
@@ -590,7 +644,7 @@ impl Node {
         submission: Submission,
         commanded: &Commanded,
     ) -> Result<Job, NodeError> {
-        let settings = self.settings();
+        let settings = self.store.settings()?;
         if submission.queue == crate::protocol::Queue::Slot && settings.paused {
             return Err(NodeError::Paused);
         }
@@ -600,10 +654,9 @@ impl Node {
             &crate::supervisor::scope_name(&principal.submitter()),
             &submission.nonce,
         );
-        if let Some(earlier) = crate::state_file::read_bytes(&nonce_path)? {
+        if let Some(job) = self.earlier_attempt(&nonce_path)? {
             collecting.release()?;
-            let id: JobId = String::from_utf8_lossy(&earlier).trim().parse()?;
-            return Ok(self.store.job(&id)?);
+            return Ok(job);
         }
         if let Location::Snapshot { source, .. } = &submission.location {
             let manifest = self.cas.manifest(&source.manifest)?;
@@ -647,6 +700,24 @@ impl Node {
         staging.release()?;
         self.store.forget_staging_lock(&spec.id)?;
         Ok(self.store.job(&spec.id)?)
+    }
+
+    fn earlier_attempt(&self, nonce_path: &Path) -> Result<Option<Job>, NodeError> {
+        let Some(earlier) = crate::state_file::read_bytes(nonce_path)? else {
+            return Ok(None);
+        };
+        let id: JobId = String::from_utf8_lossy(&earlier).trim().parse()?;
+        let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&id))?;
+        let job = if self.store.is_published(&id)? {
+            Some(self.store.job(&id)?)
+        } else {
+            self.store.discard_staged(&id)?;
+            crate::state_file::remove_file(nonce_path)?;
+            None
+        };
+        staging.release()?;
+        self.store.forget_staging_lock(&id)?;
+        Ok(job)
     }
 
     fn launch_supervisor(&self, id: &JobId) -> Result<(), NodeError> {
@@ -712,11 +783,11 @@ impl Node {
             Ok(()) | Err(_) => {}
         }
         self.empty_trash();
-        retire_old_binaries();
+        retire_old_binaries(&self.dirs);
     }
 
-    fn report(&self) -> crate::protocol::Report {
-        let settings = self.settings();
+    fn report(&self) -> Result<crate::protocol::Report, NodeError> {
+        let settings = self.store.settings()?;
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let load = sysinfo::System::load_average();
@@ -727,7 +798,7 @@ impl Node {
             Ok(stats) => (stats.total_space(), stats.available_space()),
             Err(_unmeasurable) => (0, 0),
         };
-        crate::protocol::Report {
+        Ok(crate::protocol::Report {
             host: RemoteText::new(sysinfo::System::host_name().unwrap_or_default()),
             os: RemoteText::new(sysinfo::System::long_os_version().unwrap_or_default()),
             cores: cores(),
@@ -740,24 +811,17 @@ impl Node {
             uptime_seconds: sysinfo::System::uptime(),
             paused: settings.paused,
             max_jobs: settings.max_jobs,
-        }
-    }
-
-    fn settings_path(&self) -> PathBuf {
-        self.store.area("settings.json")
-    }
-
-    fn settings(&self) -> Settings {
-        match crate::state_file::read_json(&self.settings_path()) {
-            Ok(Some(settings)) => settings,
-            Ok(None) | Err(_) => Settings::default(),
-        }
+        })
     }
 
     fn configure(&self, change: Change) -> Result<(), NodeError> {
-        let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
-        crate::state_file::write_json(&self.settings_path(), &self.settings().with(change))?;
-        Ok(collecting.release()?)
+        let admission = crate::lock::OsLock::exclusive(&self.store.admission_lock_path())?;
+        crate::state_file::write_json(
+            &self.store.settings_path(),
+            &self.store.settings()?.with(change),
+        )?;
+        self.store.signal_queue()?;
+        Ok(admission.release()?)
     }
 
     fn short_of_room(&self) -> bool {
@@ -785,7 +849,7 @@ impl Node {
         self.collect(Keep::Unfinished)
     }
 
-    fn stale(&self, workspace: &std::path::Path) -> bool {
+    fn stale(&self, workspace: &Path) -> bool {
         let filled_by = crate::supervisor::filled_by_path(workspace);
         let last = match crate::state_file::read_bytes(&filled_by) {
             Ok(Some(bytes)) => bytes,
@@ -798,11 +862,7 @@ impl Node {
         }
     }
 
-    fn evict(
-        &self,
-        workspace: &std::path::Path,
-        lock: &std::path::Path,
-    ) -> Result<bool, NodeError> {
+    fn evict(&self, workspace: &Path, lock: &Path) -> Result<bool, NodeError> {
         let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
             return Ok(false);
         };
@@ -1057,7 +1117,7 @@ impl Node {
 
     fn recover(&self, id: &JobId) -> Result<(), NodeError> {
         let phase = self.store.phase(id)?;
-        if matches!(phase, Phase::Finished { .. }) {
+        if matches!(&phase, Phase::Finished { .. }) {
             return Ok(());
         }
         let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
@@ -1066,14 +1126,23 @@ impl Node {
         let failure = self.store.start_failure(id)?;
         let (started_at, reason) = match (&phase, failure) {
             (_, Some(why)) => (None, format!("the job could not start: {why}")),
-            (Phase::Queued | Phase::Preparing { .. }, None) => {
-                alive.release()?;
-                return self.launch_supervisor(id);
+            (Phase::Queued | Phase::Preparing { .. }, None) => return Ok(alive.release()?),
+            (Phase::Starting { started_at, .. } | Phase::Running { started_at, .. }, None) => {
+                let rebooted = match (
+                    self.store.supervisor_boot(id)?,
+                    crate::platform::boot_identity(),
+                ) {
+                    (Some(before), Some(now)) if before != now => " when the machine restarted",
+                    (Some(_), Some(_)) => " without the machine restarting",
+                    (Some(_) | None, Some(_) | None) => "",
+                };
+                (
+                    Some(*started_at),
+                    format!(
+                        "its supervisor vanished{rebooted} after the command may have started; it was not run again because it may already have had effects"
+                    ),
+                )
             }
-            (Phase::Running { started_at, .. }, None) => (
-                Some(*started_at),
-                "its supervisor vanished while it ran (the machine may have restarted); it was not run again because it may already have had effects".to_owned(),
-            ),
             (Phase::Finished { .. }, None) => return Ok(()),
         };
         let finished = Phase::Finished {
@@ -1090,6 +1159,28 @@ impl Node {
             crate::supervisor::discard_workspace(&root)?;
         }
         Ok(alive.release()?)
+    }
+
+    fn retry(&self, id: &JobId) -> Result<(), NodeError> {
+        let phase = self.store.phase(id)?;
+        if matches!(phase, Phase::Finished { .. }) {
+            return Ok(());
+        }
+        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
+            return Ok(());
+        };
+        match phase {
+            Phase::Queued | Phase::Preparing { .. } => {
+                alive.release()?;
+                self.launch_supervisor(id)?;
+                Ok(())
+            }
+            Phase::Starting { .. } | Phase::Running { .. } => {
+                alive.release()?;
+                Err(NodeError::UnsafeRetry(id.clone()))
+            }
+            Phase::Finished { .. } => Ok(()),
+        }
     }
 
     fn abandon_staging(&self, id: &JobId) -> Result<(), NodeError> {
@@ -1366,7 +1457,7 @@ impl Node {
             loop {
                 let (listed, _unreadable) = self.list(principal, 50)?;
                 let survey = crate::protocol::Survey {
-                    report: self.report(),
+                    report: self.report()?,
                     jobs: listed,
                 };
                 let mut line =
@@ -1428,27 +1519,20 @@ fn abandon_when_the_client_leaves(mut input: impl Input, session: Session) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Concurrency;
+    use crate::domain::{Concurrency, Nonce as RetryNonce};
     use crate::protocol::{Command, Location, Spec};
     use crate::store::LaunchEnv;
 
-    fn dirs(root: &std::path::Path) -> Dirs {
-        Dirs {
-            home: root.into(),
-            state: root.join("state"),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        }
+    fn dirs(root: &Path) -> Dirs {
+        Dirs::for_test(root)
     }
 
-    fn published(root: &std::path::Path, log: &[u8]) -> (Node, JobRef) {
+    fn staged(root: &Path, id: &JobId, script: &str) -> Store {
         let store = Store::open(&dirs(root)).unwrap();
-        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         let spec = Spec {
             id: id.clone(),
             name: None,
-            command: Command::Script("true".into()),
+            command: Command::Script(script.into()),
             location: Location::Home,
             env_names: std::collections::BTreeSet::new(),
             shell: None,
@@ -1463,6 +1547,12 @@ mod tests {
                 (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
             )
             .unwrap();
+        store
+    }
+
+    fn published(root: &Path, log: &[u8]) -> (Node, JobRef) {
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let store = staged(root, &id, "true");
         store.publish(&id).unwrap();
         store
             .set_phase(
@@ -1603,7 +1693,7 @@ mod tests {
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
         let unknown: JobRef = "0ZZZZZZZZZZZZZZZ".parse().unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         let nonce = crate::domain::Nonce::generate().unwrap();
         let snapshot = Location::Snapshot {
             source: crate::protocol::Source {
@@ -1670,7 +1760,7 @@ mod tests {
         }
     }
 
-    fn state_of(root: &std::path::Path) -> std::collections::BTreeMap<String, Option<BlobId>> {
+    fn state_of(root: &Path) -> std::collections::BTreeMap<String, Option<BlobId>> {
         let mut found = std::collections::BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
         while let Some(dir) = pending.pop() {
@@ -1700,6 +1790,7 @@ mod tests {
             Request::List { limit: 10 },
             Request::Status { job: job.clone() },
             Request::Wait { job: job.clone() },
+            Request::Retry { job: job.clone() },
             Request::Kill { job: job.clone() },
             logs_of(job),
             Request::Tail {
@@ -1721,7 +1812,7 @@ mod tests {
             Request::Configure {
                 change: Change::default(),
             },
-            Request::AuditAt { seq: 0 },
+            Request::AuditAt { epoch: 0, seq: 0 },
             Request::AuditHead,
             Request::Digest {
                 job: job.clone(),
@@ -1820,7 +1911,7 @@ mod tests {
         );
     }
 
-    fn holds_anywhere(root: &std::path::Path, needle: &[u8]) -> Vec<String> {
+    fn holds_anywhere(root: &Path, needle: &[u8]) -> Vec<String> {
         state_of(root)
             .keys()
             .map(|name| root.join(name))
@@ -1950,7 +2041,7 @@ mod tests {
         if !crate::platform::FAMILY.agent_socket() {
             return;
         }
-        let home = std::path::Path::new("/home/me");
+        let home = Path::new("/home/me");
         let printed = |agent: &str| format!("user me\nidentityagent {agent}\nport 22\n");
         assert_eq!(
             identity_agent(&printed("~/.agent/agent.sock"), home),
@@ -1983,6 +2074,23 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_and_two_other_binary_builds_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs(tmp.path());
+        let bin = dirs.cache.join("bin");
+        for name in ["current", "100", "200", "300", "400"] {
+            crate::state_file::private_dir(&bin.join(name)).unwrap();
+        }
+        retire_cached_binaries(&dirs, "current");
+        let mut kept: Vec<String> = std::fs::read_dir(bin)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["300", "400", "current"]);
+    }
+
+    #[test]
     fn a_roomy_disk_keeps_every_log_and_small_ones_are_never_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
@@ -2012,7 +2120,7 @@ mod tests {
         let nonce = crate::domain::Nonce::generate().unwrap();
         let nonce_path = store.nonce_path("owner", &nonce);
         crate::state_file::write_bytes(&nonce_path, first.as_str().as_bytes()).unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             ("store::list", text(&store.area("jobs"))),
             ("state_file::lock", text(&store.alive_path(&first))),
@@ -2044,7 +2152,7 @@ mod tests {
         let staged: JobId = "0GGGGGGGGGGGGGGG".parse().unwrap();
         let mut spec = store.spec(&id).unwrap();
         spec.id = staged.clone();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             ("state_file::lock", text(&store.alive_path(&open))),
             (
@@ -2207,7 +2315,7 @@ mod tests {
     fn a_report_describes_the_machine_and_a_paused_one_refuses_new_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, _) = published(tmp.path(), b"");
-        let report = node.report();
+        let report = node.report().unwrap();
         assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
         assert!(!report.paused);
         let pause = |paused| Request::Configure {
@@ -2234,7 +2342,7 @@ mod tests {
             max_jobs: Some(five),
         })
         .unwrap();
-        let resumed = node.report();
+        let resumed = node.report().unwrap();
         assert!(!resumed.paused && resumed.max_jobs == five);
     }
 
@@ -2403,11 +2511,101 @@ mod tests {
         assert!(visible.is_empty() && hidden.is_empty());
     }
 
-    #[test]
-    fn a_job_whose_supervisor_vanished_while_running_is_closed_not_rerun() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (node, job) = published(tmp.path(), b"");
-        let store = Store::open(&dirs(tmp.path())).unwrap();
+    fn reply_to(node: &Node, bytes: Vec<u8>) -> Reply {
+        let mut out = Vec::new();
+        node.serve(&Principal::Owner, std::io::Cursor::new(bytes), &mut out)
+            .unwrap();
+        crate::remote::receive("m", &mut out.as_slice(), &mut Vec::new()).unwrap()
+    }
+
+    fn line_of(message: &impl serde::Serialize) -> Vec<u8> {
+        let mut line = serde_json::to_vec(message).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    fn uploaded(node: &Node, contents: &[u8]) -> Reply {
+        let mut bytes = line_of(&Request::Upload { count: 1 });
+        bytes.extend(line_of(&Frame {
+            blob: BlobId::of(contents),
+            size: crate::domain::len_u64(contents.len()),
+        }));
+        bytes.extend_from_slice(contents);
+        reply_to(node, bytes)
+    }
+
+    fn sound_after_a_crash(root: &Path, step: usize, retried: &RetryNonce) {
+        let at = |what: &str| format!("after a crash before step {step}: {what}");
+        let node = Node::open(dirs(root)).unwrap_or_else(|e| panic!("{}", at(&e.to_string())));
+        node.upkeep(&Commanded(()));
+        node.audit
+            .verify()
+            .unwrap_or_else(|e| panic!("{}", at(&format!("the audit log: {e}"))));
+        let listed = reply_to(&node, line_of(&Request::List { limit: 100 }));
+        assert!(
+            matches!(&listed, Reply::Jobs { unreadable, .. } if unreadable.is_empty()),
+            "{}",
+            at(&format!("listing answered {listed:?}"))
+        );
+        for blob in node.cas.stored().unwrap() {
+            node.cas
+                .get(&blob)
+                .unwrap_or_else(|e| panic!("{}", at(&format!("blob {blob}: {e}"))));
+        }
+        assert!(
+            node.store.staged_ids().unwrap().is_empty(),
+            "{}",
+            at("staging was left behind")
+        );
+        for id in node.store.ids().unwrap() {
+            let phase = node.store.phase(&id);
+            assert!(
+                !matches!(phase, Ok(Phase::Running { .. })),
+                "{}",
+                at(&format!("{id} still reads as running: {phase:?}"))
+            );
+        }
+        node.configure(Change::default())
+            .unwrap_or_else(|e| panic!("{}", at(&format!("configuring: {e}"))));
+        for nonce in [retried.clone(), RetryNonce::generate().unwrap()] {
+            let reply = reply_to(&node, line_of(&submission(nonce, Location::Home)));
+            assert!(
+                matches!(&reply, Reply::Job(_))
+                    || matches!(&reply, Reply::Refused(refusal) if matches!(refusal.code, RefusalCode::Spawn | RefusalCode::Paused)),
+                "{}",
+                at(&format!("a submission answered {reply:?}"))
+            );
+        }
+    }
+
+    fn crash_everywhere(setup: fn(&Path), act: impl Fn(&Node, &RetryNonce)) {
+        let retried = RetryNonce::generate().unwrap();
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            setup(tmp.path());
+            let node = Node::open(dirs(tmp.path())).unwrap();
+            let counting = crate::faults::crash_after(tmp.path(), None);
+            act(&node, &retried);
+            counting.steps()
+        };
+        assert!(steps > 0);
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            setup(tmp.path());
+            {
+                let node = Node::open(dirs(tmp.path())).unwrap();
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                act(&node, &retried);
+            }
+            sound_after_a_crash(tmp.path(), step, &retried);
+        }
+    }
+
+    fn nothing_yet(_root: &Path) {}
+
+    fn one_running_job(root: &Path) {
+        let (_, job) = published(root, b"log");
+        let store = Store::open(&dirs(root)).unwrap();
         let id = store.resolve(&job).unwrap();
         store
             .set_phase(
@@ -2419,6 +2617,110 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_a_submission_leaves_a_machine_that_takes_it_again() {
+        crash_everywhere(nothing_yet, |node, retried| {
+            let reply = reply_to(node, line_of(&submission(retried.clone(), Location::Home)));
+            assert!(
+                matches!(reply, Reply::Job(_) | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_an_upload_leaves_only_whole_blobs() {
+        crash_everywhere(nothing_yet, |node, _retried| {
+            let reply = uploaded(node, b"contents");
+            assert!(
+                matches!(reply, Reply::Stored { .. } | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_settling_the_machine_leaves_it_answering() {
+        crash_everywhere(nothing_yet, |node, _retried| {
+            match node.configure(Change {
+                paused: Some(true),
+                max_jobs: Some(Concurrency::try_from(2).unwrap()),
+            }) {
+                Ok(()) | Err(_) => {}
+            }
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_recovering_a_lost_job_is_recovered_from_next_time() {
+        crash_everywhere(one_running_job, |node, _retried| {
+            node.upkeep(&Commanded(()));
+        });
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_cleaning_leaves_a_machine_that_answers() {
+        crash_everywhere(one_running_job, |node, _retried| {
+            let reply = reply_to(
+                node,
+                line_of(&Request::Clean {
+                    apply: true,
+                    logs: true,
+                    idle: true,
+                }),
+            );
+            assert!(
+                matches!(reply, Reply::Cleaned(_) | Reply::Refused(_)),
+                "{reply:?}"
+            );
+        });
+    }
+
+    const SUPERVISED: &str = "0BBBBBBBBBBBBBBB";
+
+    fn one_queued_job(root: &Path) {
+        staged(root, &SUPERVISED.parse().unwrap(), "exit 0");
+    }
+
+    fn supervise_the_queued_job(node: &Node) {
+        let supervised = crate::supervisor::supervise(
+            node.dirs.clone(),
+            &SUPERVISED.parse().unwrap(),
+            proc::Readiness::unwatched(),
+            crate::supervisor::Stops::Unheard,
+        );
+        match supervised {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_supervising_a_job_leaves_it_closed_or_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        one_queued_job(tmp.path());
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        supervise_the_queued_job(&node);
+        assert_eq!(
+            node.store
+                .job(&SUPERVISED.parse().unwrap())
+                .unwrap()
+                .state(),
+            crate::protocol::State::Succeeded
+        );
+        crash_everywhere(one_queued_job, |supervising, _retried| {
+            supervise_the_queued_job(supervising);
+        });
+    }
+
+    #[test]
+    fn a_job_whose_supervisor_vanished_while_running_is_closed_not_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        one_running_job(tmp.path());
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         node.upkeep(&Commanded(()));
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
@@ -2577,7 +2879,7 @@ mod tests {
         crate::state_file::write_bytes(&log, &[b'x'; 10_000]).unwrap();
         let project = store.area("work").join("owner").join("proj");
         crate::state_file::write_bytes(&project.join("0").join("file"), b"built").unwrap();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             (
                 "state_file::lock",
@@ -2623,7 +2925,7 @@ mod tests {
         let stray = BlobId::of(b"stray");
         node.cas.put(&stray, b"stray").unwrap();
         let blob_tag = |blob: &BlobId| blob.split().1.to_owned();
-        let text = |path: &std::path::Path| path.display().to_string();
+        let text = |path: &Path| path.display().to_string();
         for (keep, site, tag) in [
             (
                 Keep::Every,

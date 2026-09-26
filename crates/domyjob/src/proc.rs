@@ -236,6 +236,12 @@ mod platform {
             }
         }
 
+        #[cfg(test)]
+        #[must_use]
+        pub fn unwatched() -> Self {
+            Self(std::io::stdout())
+        }
+
         pub fn announce(self) -> Result<(), ProcError> {
             let mut out = self.0.lock();
             out.write_all(b"R")
@@ -538,6 +544,12 @@ mod platform {
             Some(Self(token.clone()))
         }
 
+        #[cfg(test)]
+        #[must_use]
+        pub fn unwatched() -> Self {
+            Self(BlobId::of(b"nobody waits for this supervisor"))
+        }
+
         pub fn announce(self) -> Result<(), ProcError> {
             let name = wide(&event_name(&self.0));
             let event = Owned::new(unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) })
@@ -618,9 +630,7 @@ mod platform {
             .stdin(Nothing::null())
             .stdout(Nothing::null())
             .stderr(Nothing::null());
-        let flags = CreationFlags::DETACHED_PROCESS
-            | CreationFlags::NEW_PROCESS_GROUP
-            | CreationFlags::BREAKAWAY_FROM_JOB;
+        let flags = CreationFlags::NEW_PROCESS_GROUP | CreationFlags::BREAKAWAY_FROM_JOB;
         let child = command
             .spawn_with(SpawnOptions::new().creation_flags(flags))
             .map_err(spawn_error)?;

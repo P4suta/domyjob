@@ -4,5 +4,5 @@
   "minTokens": 40,
   "reporters": ["console"],
   "gitignore": true,
-  "threshold": 1.58
+  "threshold": 1
 }

@@ -20,6 +20,7 @@ use crate::template::Arg;
     version,
     about = "Send your work to any machine you can reach, run it there, and walk away",
     long_about = "Send your work to any machine you can reach, run it there, and walk away.\n\nThe directory is sent as it is, uncommitted edits included, and the command keeps running on the machine whether or not you stay. Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as ssh:HOST; domyjob installs itself there the first time.",
+    help_template = "{before-help}{about-with-newline}\n{usage-heading} {usage}\n\n{options}{after-help}",
     after_long_help = AFTER_LONG_HELP
 )]
 struct Cli {
@@ -46,7 +47,23 @@ struct Cli {
 }
 
 const AFTER_LONG_HELP: &str = "\
+JOBS:
+  run, on, do                    start work
+  ls, status, digest, logs       inspect work
+  wait, retry, kill              control work
+  get, pull, clean, history      retrieve and maintain work
+
 MACHINES:
+  machines, setup, doctor, self  configure, install, and check
+
+PAIRED MACHINES:
+  serve, pair, trust, audit      connect without ssh and review access
+
+AUTOMATION AND REFERENCE:
+  trigger, hook, mcp             integrate repositories and agents
+  man, skill, help               read or install reference material
+
+MACHINE SELECTORS:
   A name from your configuration, ssh:HOST for an ssh destination not added yet, a label such as gpu, a fact such as os=windows, @GROUP, or @all. Join labels and facts with +, and separate terms with commas.
 
 IF A MACHINE OR THE NETWORK FAILS:
@@ -59,12 +76,15 @@ EXIT STATUS:
   3  an outcome is unknown: a machine did not answer, or a job was lost track of
   run --wait on one machine exits with the job's own code.
 
+PIPELINES:
+  domyjob reports its own exit status even when its output is piped. In shells that otherwise report only the last command, use `set -o pipefail`, for example `set -o pipefail; domyjob run linux --wait -- make check | tee check.log`.
+
 ENVIRONMENT:
   DOMYJOB_CONFIG, DOMYJOB_STATE, DOMYJOB_CACHE  directories for configuration, jobs, and downloads
   NO_COLOR, CLICOLOR_FORCE                      turn color off or on
 
 AGENTS:
-  domyjob skill install teaches Claude Code to use domyjob; domyjob mcp serves the same commands as MCP tools; --json prints machine-readable output.";
+  domyjob skill prints portable agent instructions and installs them wherever you choose; domyjob mcp serves the same commands as MCP tools; --json prints machine-readable output.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum ColorWhen {
@@ -75,6 +95,24 @@ enum ColorWhen {
 
 #[derive(Debug, Subcommand)]
 enum Top {
+    #[command(flatten, next_help_heading = "JOBS")]
+    Jobs(JobCommand),
+    #[command(flatten, next_help_heading = "MACHINES")]
+    Machines(MachineCommand),
+    #[command(flatten, next_help_heading = "PAIRED MACHINES")]
+    Peers(PeerCommand),
+    #[command(flatten, next_help_heading = "AUTOMATION AND REFERENCE")]
+    Tools(ToolCommand),
+    #[command(hide = true)]
+    Tunnel(TunnelArgs),
+    #[command(hide = true)]
+    Node(NodeArgs),
+    #[command(hide = true)]
+    Watch(WatchArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum JobCommand {
     #[command(
         about = "Send this directory to machines and run a command there",
         long_about = "Send this directory to machines and run a command there.\n\nThe directory is sent as it is on disk, uncommitted changes included, minus what .gitignore, .ignore, and .domyjobignore exclude. Build output stays between runs, so later builds are incremental. The command runs in the same subdirectory you are in and keeps running after you disconnect.",
@@ -102,6 +140,8 @@ enum Top {
     Digest(DigestArgs),
     #[command(about = "Wait until jobs finish; exits non-zero if any of them failed")]
     Wait(WaitArgs),
+    #[command(about = "Restart jobs that are known not to have started")]
+    Retry(WaitArgs),
     #[command(about = "Stop a job and every process it started, at once")]
     Kill(JobArgs),
     #[command(about = "Copy a file out of a job's workspace")]
@@ -120,6 +160,10 @@ enum Top {
         about = "Show how each kind of job has gone lately: its recent outcomes, success rate, and typical duration"
     )]
     History(HistoryArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MachineCommand {
     #[command(about = "List, add, or remove machines")]
     Machines(MachinesArgs),
     #[command(about = "Install or update domyjob on machines")]
@@ -130,6 +174,10 @@ enum Top {
     Doctor(DoctorArgs),
     #[command(name = "self", about = "Manage this copy of domyjob")]
     Myself(SelfArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PeerCommand {
     #[command(
         about = "Accept jobs from paired machines over the network, without ssh",
         long_about = "Accept jobs from paired machines over the network, without ssh.\n\nConnections are end-to-end encrypted and authenticated with keys exchanged when pairing. By default the server listens on this machine's Tailscale address, or on loopback when there is none."
@@ -144,8 +192,10 @@ enum Top {
         long_about = "Pair with a machine running `domyjob serve --pair`.\n\nBoth machines then show the same confirmation words; compare them, and confirm on the serving machine."
     )]
     Pair(PairArgs),
-    #[command(hide = true)]
-    Tunnel(TunnelArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolCommand {
     #[command(about = "Start the jobs a repository event calls for (used by hook scripts)")]
     Trigger(crate::hook::Event),
     #[command(about = "Print a hook script that calls `domyjob trigger`")]
@@ -157,14 +207,10 @@ enum Top {
     )]
     Man,
     #[command(
-        about = "Print the skill that teaches an AI agent to use domyjob, or install it for Claude Code",
-        after_help = "Examples:\n  domyjob skill                     print it\n  domyjob skill install             for every project, in ~/.claude/skills/domyjob\n  domyjob skill install --project . for this project only"
+        about = "Print or install the portable skill that teaches any AI agent to use domyjob",
+        after_help = "Examples:\n  domyjob skill\n  domyjob skill install --to path/to/agent/skills/domyjob\n  domyjob skill install --to first/skills/domyjob --to another/skills/domyjob"
     )]
     Skill(SkillArgs),
-    #[command(hide = true)]
-    Node(NodeArgs),
-    #[command(hide = true)]
-    Watch(WatchArgs),
 }
 
 #[derive(Debug, Args)]
@@ -188,14 +234,27 @@ struct Common {
         help = "With --wait, show only the output lines matching REGEX; the whole log stays on the machine"
     )]
     grep: Option<String>,
-    #[arg(long, help = "Print machine-readable JSON")]
-    json: bool,
+    #[command(flatten)]
+    display: DisplayArgs,
     #[arg(
         long = "notify",
         value_name = "NOTIFIER[:TARGET]",
         help = "Notify when the jobs finish, for example desktop or ntfy:my-topic; repeatable"
     )]
     notify: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct DisplayArgs {
+    #[arg(long, help = "Print machine-readable JSON")]
+    json: bool,
+    #[arg(
+        short,
+        long,
+        conflicts_with = "json",
+        help = "Hide progress and successful completion messages; command output and failures remain"
+    )]
+    quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -713,14 +772,15 @@ struct SkillArgs {
 
 #[derive(Debug, Subcommand)]
 enum SkillAction {
-    #[command(about = "Write the skill where Claude Code finds it")]
+    #[command(about = "Write SKILL.md into one or more agent skill directories")]
     Install {
         #[arg(
             long,
             value_name = "DIR",
-            help = "Install it for the project in DIR instead of for every project"
+            required = true,
+            help = "Write SKILL.md into DIR; repeat --to for another agent or scope"
         )]
-        project: Option<PathBuf>,
+        to: Vec<PathBuf>,
     },
 }
 
@@ -797,32 +857,31 @@ const UNKNOWN: u8 = 3;
 
 const fn wants_json(command: &Top) -> bool {
     match command {
-        Top::Run(RunArgs { common, .. }) | Top::Do(DoArgs { common, .. }) => common.json,
-        Top::On(OnArgs { json, .. })
-        | Top::Ls(LsArgs { json, .. })
-        | Top::Digest(DigestArgs { json, .. })
-        | Top::Status(JobArgs { json, .. })
-        | Top::Kill(JobArgs { json, .. })
-        | Top::Wait(WaitArgs { json, .. })
-        | Top::Machines(MachinesArgs { json, .. })
-        | Top::Doctor(DoctorArgs { json, .. })
-        | Top::Logs(LogsArgs { json, .. })
-        | Top::Pull(PullArgs { json, .. })
-        | Top::Clean(CleanArgs { json, .. })
-        | Top::History(HistoryArgs { json, .. }) => *json,
-        Top::Get(_)
-        | Top::Setup(_)
-        | Top::Myself(_)
-        | Top::Serve(_)
-        | Top::Trust(_)
-        | Top::Audit(_)
-        | Top::Pair(_)
+        Top::Jobs(
+            JobCommand::Run(RunArgs { common, .. }) | JobCommand::Do(DoArgs { common, .. }),
+        ) => common.display.json,
+        Top::Jobs(
+            JobCommand::On(OnArgs { json, .. })
+            | JobCommand::Ls(LsArgs { json, .. })
+            | JobCommand::Digest(DigestArgs { json, .. })
+            | JobCommand::Status(JobArgs { json, .. })
+            | JobCommand::Kill(JobArgs { json, .. })
+            | JobCommand::Wait(WaitArgs { json, .. })
+            | JobCommand::Retry(WaitArgs { json, .. })
+            | JobCommand::Logs(LogsArgs { json, .. })
+            | JobCommand::Pull(PullArgs { json, .. })
+            | JobCommand::Clean(CleanArgs { json, .. })
+            | JobCommand::History(HistoryArgs { json, .. }),
+        )
+        | Top::Machines(
+            MachineCommand::Machines(MachinesArgs { json, .. })
+            | MachineCommand::Doctor(DoctorArgs { json, .. }),
+        ) => *json,
+        Top::Jobs(JobCommand::Get(_))
+        | Top::Machines(MachineCommand::Setup(_) | MachineCommand::Myself(_))
+        | Top::Peers(_)
+        | Top::Tools(_)
         | Top::Tunnel(_)
-        | Top::Trigger(_)
-        | Top::Hook(_)
-        | Top::Mcp
-        | Top::Man
-        | Top::Skill(_)
         | Top::Node(_)
         | Top::Watch(_) => false,
     }
@@ -898,21 +957,41 @@ pub fn main() -> ExitCode {
 fn dispatch(command: Top) -> Result<ExitCode, CliError> {
     match command {
         Top::Node(args) => node(&args),
-        Top::Run(args) => run(&args),
-        Top::On(args) => on(&args),
-        Top::Do(args) => run_named(&args),
-        Top::Ls(args) => ls(&args),
-        Top::Logs(args) => logs(&args),
-        Top::Status(args) => job_command(&args, |job| Request::Status { job })
+        Top::Jobs(command) => dispatch_job(command),
+        Top::Machines(command) => dispatch_machine(command),
+        Top::Peers(command) => dispatch_peer(command),
+        Top::Tunnel(args) => {
+            crate::serve::tunnel(&Dirs::from_env(), &args.machine)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Top::Tools(command) => dispatch_tool(command),
+        Top::Watch(args) => watch(&args),
+    }
+}
+
+fn dispatch_job(command: JobCommand) -> Result<ExitCode, CliError> {
+    match command {
+        JobCommand::Run(args) => run(&args),
+        JobCommand::On(args) => on(&args),
+        JobCommand::Do(args) => run_named(&args),
+        JobCommand::Ls(args) => ls(&args),
+        JobCommand::Logs(args) => logs(&args),
+        JobCommand::Status(args) => job_command(&args, |job| Request::Status { job })
             .map(|(job, _)| exit(&[verdict_of(&job)])),
-        Top::Digest(args) => digest(&args),
-        Top::Kill(args) => kill(&args),
-        Top::Wait(args) => wait(&args),
-        Top::Get(args) => get(&args),
-        Top::Pull(args) => pull(&args),
-        Top::Clean(args) => clean(&args),
-        Top::History(args) => history(&args),
-        Top::Machines(args) => match &args.action {
+        JobCommand::Digest(args) => digest(&args),
+        JobCommand::Kill(args) => kill(&args),
+        JobCommand::Wait(args) => wait(&args),
+        JobCommand::Retry(args) => retry(&args),
+        JobCommand::Get(args) => get(&args),
+        JobCommand::Pull(args) => pull(&args),
+        JobCommand::Clean(args) => clean(&args),
+        JobCommand::History(args) => history(&args),
+    }
+}
+
+fn dispatch_machine(command: MachineCommand) -> Result<ExitCode, CliError> {
+    match command {
+        MachineCommand::Machines(args) => match &args.action {
             None => machines(args.json),
             Some(MachinesAction::Add(add)) => machines_add(add),
             Some(MachinesAction::Remove(remove)) => machines_remove(remove),
@@ -942,37 +1021,42 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
                 &format!("runs at most {} jobs at once", limit.jobs),
             ),
         },
-        Top::Setup(args) => setup(&args),
-        Top::Doctor(args) => doctor(&args),
-        Top::Myself(SelfArgs {
+        MachineCommand::Setup(args) => setup(&args),
+        MachineCommand::Doctor(args) => doctor(&args),
+        MachineCommand::Myself(SelfArgs {
             action: SelfAction::Update { allow_downgrade },
         }) => self_update(allow_downgrade),
-        Top::Myself(SelfArgs {
+        MachineCommand::Myself(SelfArgs {
             action: SelfAction::Uninstall { yes, kill_running },
         }) => self_uninstall(Uninstalling {
             confirmed: yes,
             kill_running,
         }),
-        Top::Serve(args) => serve(&args),
-        Top::Trust(args) => trust(&args),
-        Top::Audit(args) => audit(&args),
-        Top::Pair(args) => pair(&args),
-        Top::Tunnel(args) => {
-            crate::serve::tunnel(&Dirs::from_env(), &args.machine)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Top::Trigger(event) => crate::hook::trigger(&event).map_err(Into::into),
-        Top::Hook(args) => hook(&args),
-        Top::Mcp => Ok(crate::mcp::serve().map(|()| ExitCode::SUCCESS)?),
-        Top::Man => {
+    }
+}
+
+fn dispatch_peer(command: PeerCommand) -> Result<ExitCode, CliError> {
+    match command {
+        PeerCommand::Serve(args) => serve(&args),
+        PeerCommand::Trust(args) => trust(&args),
+        PeerCommand::Audit(args) => audit(&args),
+        PeerCommand::Pair(args) => pair(&args),
+    }
+}
+
+fn dispatch_tool(command: ToolCommand) -> Result<ExitCode, CliError> {
+    match command {
+        ToolCommand::Trigger(event) => crate::hook::trigger(&event).map_err(Into::into),
+        ToolCommand::Hook(args) => hook(&args),
+        ToolCommand::Mcp => Ok(crate::mcp::serve().map(|()| ExitCode::SUCCESS)?),
+        ToolCommand::Man => {
             use clap::CommandFactory as _;
             clap_mangen::Man::new(Cli::command())
                 .render(&mut std::io::stdout())
                 .map_err(CliError::Output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Top::Skill(args) => skill(&args),
-        Top::Watch(args) => watch(&args),
+        ToolCommand::Skill(args) => skill(&args),
     }
 }
 
@@ -989,7 +1073,7 @@ fn node(args: &NodeArgs) -> Result<ExitCode, CliError> {
         if let Some(home) = &args.home_dir {
             dirs.home.clone_from(home);
         }
-        crate::supervisor::supervise(dirs, id, readiness(args)?)?;
+        crate::supervisor::supervise(dirs, id, readiness(args)?, crate::supervisor::Stops::Heard)?;
         return Ok(ExitCode::SUCCESS);
     }
     let node = crate::node::Node::open(dirs)?;
@@ -1078,7 +1162,10 @@ fn on(args: &OnArgs) -> Result<ExitCode, CliError> {
         wait: true,
         digest: false,
         grep: None,
-        json: args.json,
+        display: DisplayArgs {
+            json: args.json,
+            quiet: false,
+        },
         notify: Vec::new(),
     };
     follow_through_as(&ctx, &order, &common, Voice::Quiet)
@@ -1115,7 +1202,7 @@ fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
         name: args.name.clone(),
     };
     if args.dry_run {
-        return show_preview(&client::preview(&ctx, &order)?, args.common.json);
+        return show_preview(&client::preview(&ctx, &order)?, args.common.display.json);
     }
     follow_through(&ctx, &order, &args.common)
 }
@@ -1163,7 +1250,16 @@ fn run_named(args: &DoArgs) -> Result<ExitCode, CliError> {
 }
 
 fn follow_through(ctx: &Context, order: &Order, common: &Common) -> Result<ExitCode, CliError> {
-    follow_through_as(ctx, order, common, Voice::Full)
+    follow_through_as(
+        ctx,
+        order,
+        common,
+        if common.display.quiet {
+            Voice::Quiet
+        } else {
+            Voice::Full
+        },
+    )
 }
 
 fn follow_through_as(
@@ -1179,7 +1275,7 @@ fn follow_through_as(
         None => None,
     };
     let board = match voice {
-        Voice::Full => crate::board::Board::new(common.wait && !common.json),
+        Voice::Full => crate::board::Board::new(common.wait && !common.display.json),
         Voice::Quiet => crate::board::Board::silent(),
     };
     let (submitted, rejected) =
@@ -1206,7 +1302,9 @@ fn follow_through_as(
         board.clear();
         return code;
     }
-    announce(&submitted, common.json)?;
+    if !common.display.quiet {
+        announce(&submitted, common.display.json)?;
+    }
     if !notify.is_empty() {
         spawn_watch(&submitted, &common.notify)?;
     }
@@ -1416,7 +1514,7 @@ const fn verdict_of(job: &Job) -> Verdict {
         crate::protocol::State::Failed
         | crate::protocol::State::Killed
         | crate::protocol::State::Errored => Verdict::Failed(job.exit_code()),
-        crate::protocol::State::Lost => Verdict::Unknown,
+        crate::protocol::State::RestartPending | crate::protocol::State::Lost => Verdict::Unknown,
     }
 }
 
@@ -1456,7 +1554,7 @@ fn settle(
     item: &Submitted,
     outcome: Result<Job, ClientError>,
 ) -> Result<Verdict, CliError> {
-    let json = common.json;
+    let json = common.display.json;
     let job = match outcome {
         Ok(job) => job,
         Err(error) => {
@@ -1497,7 +1595,7 @@ fn finish(
     let stdout = std::sync::Mutex::new(std::io::stdout());
     let watching = Watching {
         ctx,
-        stream: !common.json && !common.digest,
+        stream: !common.display.json && !common.digest,
         many: submitted.len() > 1,
         widest: submitted
             .iter()
@@ -1543,7 +1641,7 @@ fn finish(
                 .filter(|(_, waiting)| **waiting)
                 .map(|(other, _)| other.machine.name.to_string())
                 .collect();
-            if !common.json && !board.is_live() && !board.is_quiet() && !still.is_empty() {
+            if !common.display.json && !board.is_live() && !board.is_quiet() && !still.is_empty() {
                 eprintln!("domyjob: still waiting for {}", still.join(", "));
             }
         }
@@ -1713,9 +1811,9 @@ fn age(job: &Job, now: Timestamp) -> (String, String) {
             finished_at,
             ..
         } => start.until(*finished_at).to_string(),
-        Phase::Running { started_at, .. } | Phase::Preparing { started_at } => {
-            started_at.until(now).to_string()
-        }
+        Phase::Running { started_at, .. }
+        | Phase::Starting { started_at, .. }
+        | Phase::Preparing { started_at } => started_at.until(now).to_string(),
         Phase::Queued
         | Phase::Finished {
             started_at: None, ..
@@ -1736,7 +1834,7 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
     if !args.json && !person {
         writeln!(
             out,
-            "{:<16}  {:<12}  {:<9}  {:>4}  {:>7}  {:>7}  COMMAND",
+            "{:<16}  {:<12}  {:<15}  {:>4}  {:>7}  {:>7}  COMMAND",
             "ID", "MACHINE", "STATE", "EXIT", "AGE", "TOOK"
         )
         .map_err(CliError::Output)?;
@@ -1848,7 +1946,7 @@ fn list_rows(
             .map_or_else(|| job.spec.command.display(), ToString::to_string);
         writeln!(
             out,
-            "{:<16}  {:<12}  {:<9}  {exit:>4}  {age:>7}  {took:>7}  {label}",
+            "{:<16}  {:<12}  {:<15}  {exit:>4}  {age:>7}  {took:>7}  {label}",
             job.spec.id,
             machine.as_str(),
             job.state().as_str()
@@ -2172,7 +2270,6 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
         }
         drop(updates);
         let mut cards: BTreeMap<MachineName, String> = BTreeMap::new();
-        let mut drawn = 0usize;
         for (name, update) in arrivals {
             if json {
                 print_update(&name, &update).map_err(CliError::Output)?;
@@ -2190,19 +2287,21 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
                 }
             }
             .map_err(|e| CliError::Output(std::io::Error::other(e)))?;
-            cards.insert(name, card);
-            let mut screen: String = cards.values().map(String::as_str).collect();
-            screen.push_str(&crate::ui::paint(
-                crate::ui::Tone::Dim,
-                "live: redrawn as jobs start and finish · Ctrl-C to stop\n",
-            ));
             let mut out = anstream::stdout();
-            if redraw && drawn > 0 {
-                write!(out, "\x1b[{drawn}F\x1b[J").map_err(CliError::Output)?;
+            if redraw {
+                cards.insert(name, card);
+                let mut screen: String = cards.values().map(String::as_str).collect();
+                screen.push_str(&crate::ui::paint(
+                    crate::ui::Tone::Dim,
+                    "live: redrawn as jobs start and finish · Ctrl-C to stop\n",
+                ));
+                out.write_all(b"\x1b[H\x1b[2J").map_err(CliError::Output)?;
+                out.write_all(screen.as_bytes()).map_err(CliError::Output)?;
+            } else if cards.get(&name) != Some(&card) {
+                out.write_all(card.as_bytes()).map_err(CliError::Output)?;
+                cards.insert(name, card);
             }
-            out.write_all(screen.as_bytes()).map_err(CliError::Output)?;
             out.flush().map_err(CliError::Output)?;
-            drawn = screen.lines().count();
         }
         Ok(())
     })?;
@@ -2230,18 +2329,18 @@ fn show(text: Result<String, std::fmt::Error>) -> Result<(), CliError> {
         .map_err(CliError::Output)
 }
 
-fn wait(args: &WaitArgs) -> Result<ExitCode, CliError> {
+type JobQuery = fn(&Context, &str) -> Result<(Machine, Job), ClientError>;
+
+fn jobs_command(args: &WaitArgs, ask: JobQuery) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let mut verdicts = Vec::new();
     std::thread::scope(|scope| -> Result<(), CliError> {
         let (done, finished) = std::sync::mpsc::channel();
         for reference in &args.jobs {
             let (ctx, done) = (&ctx, done.clone());
-            scope.spawn(
-                move || match done.send((reference, client::wait(ctx, reference))) {
-                    Ok(()) | Err(_) => {}
-                },
-            );
+            scope.spawn(move || match done.send((reference, ask(ctx, reference))) {
+                Ok(()) | Err(_) => {}
+            });
         }
         drop(done);
         for (reference, outcome) in finished {
@@ -2259,6 +2358,14 @@ fn wait(args: &WaitArgs) -> Result<ExitCode, CliError> {
         Ok(())
     })?;
     Ok(exit(&verdicts))
+}
+
+fn wait(args: &WaitArgs) -> Result<ExitCode, CliError> {
+    jobs_command(args, client::wait)
+}
+
+fn retry(args: &WaitArgs) -> Result<ExitCode, CliError> {
+    jobs_command(args, client::retry)
 }
 
 fn wanted_path(text: &str) -> Result<RelPath, crate::domain::Invalid> {
@@ -2628,6 +2735,11 @@ fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
             .ok_or_else(|| CliError::Grant(grant.to_owned()))?;
         capabilities.insert(capability);
     }
+    if args.pair && capabilities.contains(&crate::authz::Capability::Submit) {
+        eprintln!(
+            "domyjob: warning: granting submit lets this peer run commands as your account on this machine"
+        );
+    }
     let options = crate::serve::Options {
         exposure,
         port: args.port,
@@ -2895,7 +3007,7 @@ fn setup(args: &SetupArgs) -> Result<ExitCode, CliError> {
 
 const SKILL: &str = include_str!("skill.md");
 
-const JOB_ENVIRONMENT: &str = "jobs keep the environment of the session that started them, but not what lived only in it: a forwarded ssh agent is gone once the session closes, so clone private repositories with credentials the machine holds";
+const JOB_ENVIRONMENT: &str = "jobs receive a small base environment allowlist plus variables passed with --env; session variables and forwarded credentials are not inherited, so clone private repositories with credentials the machine holds";
 
 #[derive(Debug, serde::Serialize)]
 struct Reached {
@@ -2903,6 +3015,7 @@ struct Reached {
     os: String,
     arch: String,
     version: String,
+    build: String,
     shell: String,
     placement: crate::remote::Placement,
 }
@@ -2919,6 +3032,7 @@ fn checked(
             os: facts.hello.os.to_string(),
             arch: facts.hello.arch.to_string(),
             version: facts.hello.version.to_string(),
+            build: facts.hello.build.to_string(),
             shell: facts.hello.shell.to_string(),
             placement: facts.placement,
         }),
@@ -2933,11 +3047,12 @@ fn print_checked(out: &mut dyn Write, row: &Checked) -> std::io::Result<()> {
             os,
             arch,
             version,
+            build,
             shell,
             ..
         }) => writeln!(
             out,
-            "ok     {machine}: {os}/{arch} domyjob {version} shell {shell}"
+            "ok     {machine}: {os}/{arch} domyjob {version} build {build} shell {shell}"
         ),
         Checked::Unreachable(failed) => {
             writeln!(out, "FAIL   {}: {}", failed.machine, failed.error.message())?;
@@ -3067,24 +3182,18 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
 }
 
 fn skill(args: &SkillArgs) -> Result<ExitCode, CliError> {
-    let Some(SkillAction::Install { project }) = &args.action else {
+    let Some(SkillAction::Install { to }) = &args.action else {
         std::io::stdout()
             .write_all(SKILL.as_bytes())
             .map_err(CliError::Output)?;
         return Ok(ExitCode::SUCCESS);
     };
-    let base = match project {
-        Some(dir) => dir.clone(),
-        None => Dirs::from_env().home,
-    };
-    let path = base
-        .join(".claude")
-        .join("skills")
-        .join("domyjob")
-        .join("SKILL.md");
-    crate::user_files::write(&path, SKILL.as_bytes())
-        .map_err(|e| CliError::Output(std::io::Error::other(e.to_string())))?;
-    println!("installed the domyjob skill at {}", path.display());
+    for directory in to {
+        let path = directory.join("SKILL.md");
+        crate::user_files::write(&path, SKILL.as_bytes())
+            .map_err(|e| CliError::Output(std::io::Error::other(e.to_string())))?;
+        println!("installed the domyjob skill at {}", path.display());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3169,6 +3278,34 @@ fn note_watch(ctx: &Context, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_install_accepts_any_number_of_explicit_agent_directories() {
+        let cli = Cli::try_parse_from([
+            "domyjob",
+            "skill",
+            "install",
+            "--to",
+            "first/skills/domyjob",
+            "--to",
+            "another/skills/domyjob",
+        ])
+        .unwrap();
+        let Some(Top::Tools(ToolCommand::Skill(SkillArgs {
+            action: Some(SkillAction::Install { to }),
+        }))) = cli.command
+        else {
+            panic!("skill install did not parse as an install action");
+        };
+        assert_eq!(
+            to,
+            [
+                PathBuf::from("first/skills/domyjob"),
+                PathBuf::from("another/skills/domyjob")
+            ]
+        );
+        Cli::try_parse_from(["domyjob", "skill", "install"]).unwrap_err();
+    }
 
     #[test]
     fn only_every_machine_running_and_succeeding_exits_zero() {

@@ -371,6 +371,49 @@ fn fetch(
     Ok(fetched)
 }
 
+struct ArchiveRequest<'a> {
+    bindings: &'a Bindings,
+    dir: &'a Path,
+    expected_sha256: &'a str,
+    failures: [String; 2],
+}
+
+fn fetch_archive(
+    distribution: &Distribution,
+    request: ArchiveRequest<'_>,
+) -> Result<PathBuf, DistError> {
+    let ArchiveRequest {
+        bindings,
+        dir,
+        expected_sha256,
+        failures: [download_failure, unpack_failure],
+    } = request;
+    let archive = dir.join("archive");
+    if !fetch(
+        distribution,
+        render(&distribution.archive, bindings, "archive")?,
+        &archive,
+    )? {
+        return Err(DistError::Failed {
+            what: download_failure,
+        });
+    }
+    check_digest(
+        archive.display().to_string(),
+        expected_sha256,
+        sha256_file(&archive)?,
+    )?;
+    let unpack = Bindings::new()
+        .with("archive", Arg::path(&archive))
+        .with("dir", Arg::path(dir));
+    if !run(&distribution.unpack, &unpack, "unpack")? {
+        return Err(DistError::Failed {
+            what: unpack_failure,
+        });
+    }
+    Ok(archive)
+}
+
 fn read_text(path: &Path) -> Result<Vec<u8>, DistError> {
     std::fs::read(path)
         .map_err(io("reading", path))
@@ -464,29 +507,18 @@ fn download(
         .targets
         .get(target)
         .ok_or_else(|| DistError::NoTarget(target.clone()))?;
-    let archive = dir.join("archive");
-    if !fetch(
+    fetch_archive(
         distribution,
-        render(&distribution.archive, &bindings, "archive")?,
-        &archive,
-    )? {
-        return Err(DistError::Failed {
-            what: format!("downloading the {target} archive"),
-        });
-    }
-    check_digest(
-        archive.display().to_string(),
-        &digests.archive_sha256,
-        sha256_file(&archive)?,
+        ArchiveRequest {
+            bindings: &bindings,
+            dir: &dir,
+            expected_sha256: &digests.archive_sha256,
+            failures: [
+                format!("downloading the {target} archive"),
+                format!("unpacking {}", dir.join("archive").display()),
+            ],
+        },
     )?;
-    let unpack = Bindings::new()
-        .with("archive", Arg::path(&archive))
-        .with("dir", Arg::path(&dir));
-    if !run(&distribution.unpack, &unpack, "unpack")? {
-        return Err(DistError::Failed {
-            what: format!("unpacking {}", archive.display()),
-        });
-    }
     verify_binary(&manifest, target, &binary)
 }
 
@@ -579,34 +611,23 @@ pub fn self_update(
         .with("version", Arg::version(&found))
         .with("target", Arg::word(&target))
         .with("exe", Arg::literal(exe));
-    let archive = dir.join("archive");
     let digests = manifest
         .get()
         .targets
         .get(&target)
         .ok_or_else(|| DistError::NoTarget(target.clone()))?;
-    if !fetch(
+    fetch_archive(
         distribution,
-        render(&distribution.archive, &bindings, "archive")?,
-        &archive,
-    )? {
-        return Err(DistError::Failed {
-            what: "downloading the update".to_owned(),
-        });
-    }
-    check_digest(
-        archive.display().to_string(),
-        &digests.archive_sha256,
-        sha256_file(&archive)?,
+        ArchiveRequest {
+            bindings: &bindings,
+            dir: &dir,
+            expected_sha256: &digests.archive_sha256,
+            failures: [
+                "downloading the update".to_owned(),
+                "unpacking the update".to_owned(),
+            ],
+        },
     )?;
-    let unpack = Bindings::new()
-        .with("archive", Arg::path(&archive))
-        .with("dir", Arg::path(&dir));
-    if !run(&distribution.unpack, &unpack, "unpack")? {
-        return Err(DistError::Failed {
-            what: "unpacking the update".to_owned(),
-        });
-    }
     let fresh = verify_binary(
         &manifest,
         &target,

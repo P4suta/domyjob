@@ -161,6 +161,7 @@ fn record(
             source,
         })?;
         line.push(b'\n');
+        crate::faults::at("client::index_append", &path).map_err(io("writing", &path))?;
         file.write_all(&line).map_err(io("writing", &path))?;
     }
     Ok(())
@@ -1114,6 +1115,10 @@ pub fn wait(ctx: &Context, reference: &str) -> Result<(Machine, Job), ClientErro
     job_request(ctx, reference, |job| Request::Wait { job })
 }
 
+pub fn retry(ctx: &Context, reference: &str) -> Result<(Machine, Job), ClientError> {
+    job_request(ctx, reference, |job| Request::Retry { job })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
     Follow,
@@ -1359,6 +1364,53 @@ mod tests {
         let text = format!("{good}\n{{\"job\":\"0BBB\n\nnot json\n{good}\n{{\"job\"");
         let entries = readable_lines(&text);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn a_crash_while_appending_the_client_index_leaves_a_readable_prefix() {
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("client");
+            crate::state_file::private_dir(&dir).unwrap();
+            let path = dir.join("index.jsonl");
+            let mut file = crate::state_file::open_append(&path).unwrap();
+            let crashing = crate::faults::crash_after(tmp.path(), None);
+            let mut line = serde_json::to_vec(&entry(1, Some("/a"), Some("tests"))).unwrap();
+            line.push(b'\n');
+            let outcome = crate::faults::at("client::index_append", &path)
+                .and_then(|()| file.write_all(&line));
+            outcome.unwrap();
+            crashing.steps()
+        };
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("client");
+            crate::state_file::private_dir(&dir).unwrap();
+            let path = dir.join("index.jsonl");
+            crate::state_file::write_bytes(
+                &path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&entry(0, Some("/a"), None)).unwrap()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            {
+                let mut file = crate::state_file::open_append(&path).unwrap();
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                let mut line = serde_json::to_vec(&entry(1, Some("/a"), Some("tests"))).unwrap();
+                line.push(b'\n');
+                match crate::faults::at("client::index_append", &path)
+                    .and_then(|()| file.write_all(&line))
+                {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            let text = std::fs::read_to_string(path).unwrap();
+            let readable = readable_lines(&text);
+            assert!(matches!(readable.len(), 1 | 2));
+        }
     }
 
     #[test]

@@ -68,6 +68,30 @@ impl Dirs {
             home,
         }
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(root: &std::path::Path) -> Self {
+        Self {
+            home: root.into(),
+            state: root.join("state"),
+            config: root.join("c"),
+            cache: root.join("k"),
+            keys: crate::keystore::KeyStore::OwnerOnlyFile,
+        }
+    }
+
+    #[cfg(any(test, feature = "failpoints"))]
+    #[must_use]
+    pub fn isolated_for_test(root: &std::path::Path) -> Self {
+        Self {
+            home: root.join("home"),
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            keys: crate::keystore::KeyStore::OwnerOnlyFile,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

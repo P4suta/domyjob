@@ -120,6 +120,7 @@ pub const fn state_look(state: State) -> (Symbol, Tone) {
         State::Failed | State::Errored => (Symbol::Failed, Tone::Bad),
         State::Running | State::Preparing => (Symbol::Running, Tone::Busy),
         State::Queued => (Symbol::Queued, Tone::Waiting),
+        State::RestartPending => (Symbol::Queued, Tone::Stopped),
         State::Killed => (Symbol::Stopped, Tone::Stopped),
         State::Lost => (Symbol::Lost, Tone::Stopped),
     }

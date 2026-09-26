@@ -32,7 +32,7 @@ pub fn wire() -> &'static str {
 #[must_use]
 pub fn build_key() -> &'static str {
     static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| format!("{VERSION}-{}", wire()))
+    KEY.get_or_init(|| format!("{VERSION}-{}-{BUILD_STAMP}", wire()))
 }
 
 #[must_use]
@@ -46,6 +46,7 @@ pub fn is_newer(theirs: &str) -> bool {
     }
 }
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD_STAMP: &str = env!("DOMYJOB_BUILD_STAMP");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "op")]
@@ -68,6 +69,9 @@ pub enum Request {
         job: JobRef,
     },
     Wait {
+        job: JobRef,
+    },
+    Retry {
         job: JobRef,
     },
     Kill {
@@ -100,6 +104,7 @@ pub enum Request {
         change: Change,
     },
     AuditAt {
+        epoch: u64,
         seq: u64,
     },
     AuditHead,
@@ -311,6 +316,7 @@ impl Settings {
 pub struct Hello {
     pub wire: RemoteText,
     pub version: RemoteText,
+    pub build: RemoteText,
     pub os: RemoteText,
     pub arch: RemoteText,
     pub home: RemoteText,
@@ -501,6 +507,10 @@ pub enum Phase {
     Preparing {
         started_at: Timestamp,
     },
+    Starting {
+        started_at: Timestamp,
+        workspace: String,
+    },
     Running {
         started_at: Timestamp,
         pid: u32,
@@ -545,6 +555,7 @@ pub enum State {
     Queued,
     Preparing,
     Running,
+    RestartPending,
     Succeeded,
     Failed,
     Killed,
@@ -559,6 +570,7 @@ impl State {
             Self::Queued => "queued",
             Self::Preparing => "preparing",
             Self::Running => "running",
+            Self::RestartPending => "restart_pending",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Killed => "killed",
@@ -578,16 +590,24 @@ impl Job {
                 Outcome::Killed => State::Killed,
                 Outcome::Errored { .. } => State::Errored,
             },
-            (_, Supervisor::Gone) => State::Lost,
+            (Phase::Queued | Phase::Preparing { .. }, Supervisor::Gone) => State::RestartPending,
+            (Phase::Starting { .. } | Phase::Running { .. }, Supervisor::Gone) => State::Lost,
             (Phase::Queued, Supervisor::Alive) => State::Queued,
             (Phase::Preparing { .. }, Supervisor::Alive) => State::Preparing,
-            (Phase::Running { .. }, Supervisor::Alive) => State::Running,
+            (Phase::Starting { .. } | Phase::Running { .. }, Supervisor::Alive) => State::Running,
         }
     }
 
     #[must_use]
     pub const fn is_settled(&self) -> bool {
-        matches!(self.phase, Phase::Finished { .. }) || matches!(self.supervisor, Supervisor::Gone)
+        matches!(
+            (&self.phase, self.supervisor),
+            (Phase::Finished { .. }, _)
+                | (
+                    Phase::Starting { .. } | Phase::Running { .. },
+                    Supervisor::Gone
+                )
+        )
     }
 
     #[must_use]
@@ -604,6 +624,7 @@ impl Job {
             Phase::Finished { .. }
             | Phase::Queued
             | Phase::Preparing { .. }
+            | Phase::Starting { .. }
             | Phase::Running { .. } => None,
         }
     }
@@ -616,9 +637,9 @@ impl Job {
                 finished_at,
                 ..
             } => Some(start.until(*finished_at)),
-            Phase::Running { started_at, .. } | Phase::Preparing { started_at } => {
-                Some(started_at.until(Timestamp::observe()))
-            }
+            Phase::Running { started_at, .. }
+            | Phase::Starting { started_at, .. }
+            | Phase::Preparing { started_at } => Some(started_at.until(Timestamp::observe())),
             Phase::Finished {
                 started_at: None, ..
             }
@@ -636,6 +657,7 @@ impl Job {
             Phase::Finished { .. }
             | Phase::Queued
             | Phase::Preparing { .. }
+            | Phase::Starting { .. }
             | Phase::Running { .. } => None,
         }
     }
@@ -720,6 +742,11 @@ mod tests {
     }
 
     #[test]
+    fn managed_binary_paths_identify_the_exact_source_build() {
+        assert!(build_key().ends_with(BUILD_STAMP));
+    }
+
+    #[test]
     fn only_a_release_above_this_one_counts_as_newer() {
         assert!(is_newer("999.0.0"));
         assert!(!is_newer(VERSION));
@@ -732,6 +759,7 @@ mod tests {
         let hello = Hello {
             wire: RemoteText::new("w".into()),
             version: RemoteText::new("v".into()),
+            build: RemoteText::new("b".into()),
             os: RemoteText::new("o".into()),
             arch: RemoteText::new("a".into()),
             home: RemoteText::new("h".into()),
@@ -750,7 +778,8 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "arch", "binary", "home", "os", "reply", "shell", "state", "version", "wire"
+                "arch", "binary", "build", "home", "os", "reply", "shell", "state", "version",
+                "wire"
             ]
         );
     }

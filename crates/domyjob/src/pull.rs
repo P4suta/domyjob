@@ -807,6 +807,60 @@ mod tests {
         back.check(&tree).unwrap().apply(&tree, &journal).unwrap();
     }
 
+    fn kept_pull(root: &Path, pulls: &Path) -> (Tree, Journal, Kept, BTreeMap<String, Found>) {
+        let file = |content: usize| Node::File(content, false);
+        let sent: Layout = [
+            ("a".parse().unwrap(), file(1)),
+            ("b".parse().unwrap(), file(2)),
+            ("d/x".parse().unwrap(), file(3)),
+        ]
+        .into();
+        let after: Layout = [
+            ("a".parse().unwrap(), file(2)),
+            ("d/y".parse().unwrap(), file(1)),
+        ]
+        .into();
+        lay_out(root, &sent);
+        let untouched = read_back(root);
+        let tree = Tree::open(root).unwrap();
+        let journal = Journal::open(pulls, "m-job").unwrap();
+        let kept = plan(&sent, &after)
+            .check(&tree)
+            .unwrap()
+            .keep(&tree, &journal)
+            .unwrap();
+        (tree, journal, kept, untouched)
+    }
+
+    #[test]
+    fn a_crash_at_every_workspace_step_can_be_undone_from_the_journal() {
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("project");
+            let pulls = tmp.path().join("pulls");
+            let (tree, journal, kept, _) = kept_pull(&root, &pulls);
+            let crashing = crate::faults::crash_after(tmp.path(), None);
+            kept.apply(&tree, &journal).unwrap();
+            crashing.steps()
+        };
+        assert!(steps > 0);
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("project");
+            let pulls = tmp.path().join("pulls");
+            let (tree, journal, kept, untouched) = kept_pull(&root, &pulls);
+            {
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                match kept.apply(&tree, &journal) {
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            drop(journal);
+            undo_all(&pulls, "m-job");
+            assert_eq!(read_back(&root), untouched, "after step {step}");
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(192))]
 

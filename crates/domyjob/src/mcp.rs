@@ -1,6 +1,7 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -126,67 +127,162 @@ fn permitted(ctx: &Context, args: &RunArgs) -> Result<(), ToolError> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct RunArgs {
+    #[schemars(
+        description = "where to run: a machine, labels joined with + such as windows+gpu, a fact such as os=linux, @group, or @all; comma separated"
+    )]
     machines: String,
+    #[schemars(
+        description = "one element is a script for the machine's shell; several are an argument vector run without a shell"
+    )]
     command: Vec<String>,
+    #[schemars(
+        description = "absolute path of the local directory to send; the command runs in the same place inside it"
+    )]
     directory: String,
+    #[schemars(
+        description = "a runner from the local configuration to hand the command to instead of a shell"
+    )]
     runner: Option<String>,
+    #[schemars(
+        description = "send a version-control revision such as HEAD or main instead of the directory as it is"
+    )]
     rev: Option<String>,
+    #[schemars(description = "stay until the jobs finish and return their digests")]
     wait: Option<bool>,
+    #[schemars(description = "use an empty workspace that is deleted afterwards")]
     fresh: Option<bool>,
+    #[schemars(description = "a name to refer to the job by later, instead of its id")]
     name: Option<crate::domain::JobName>,
 }
 
-#[derive(Debug, Deserialize)]
+macro_rules! bounded_u32 {
+    ($name:ident, $min:literal, $max:literal) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+        struct $name(#[schemars(range(min = $min, max = $max))] u32);
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = u32::deserialize(deserializer)?;
+                if ($min..=$max).contains(&value) {
+                    Ok(Self(value))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "expected an integer from {} through {}",
+                        $min, $max
+                    )))
+                }
+            }
+        }
+
+        impl $name {
+            const fn get(self) -> u32 {
+                self.0
+            }
+        }
+    };
+}
+
+bounded_u32!(TailLines, 0, 1000);
+bounded_u32!(LogLines, 1, 1000);
+bounded_u32!(SearchContext, 0, 20);
+bounded_u32!(ResultLimit, 1, 1000);
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct DigestArgs {
+    #[schemars(
+        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
+    )]
     job: String,
-    tail: Option<u32>,
+    #[schemars(description = "how many of the last lines to include (default 40)")]
+    tail: Option<TailLines>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct SearchArgs {
+    #[schemars(
+        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
+    )]
     job: String,
+    #[schemars(
+        description = "a regular expression (Rust regex syntax), at most 1024 bytes",
+        length(max = 1024)
+    )]
     pattern: String,
-    context: Option<u32>,
-    limit: Option<u32>,
+    #[schemars(description = "lines of context to return on each side of a match (default 2)")]
+    context: Option<SearchContext>,
+    #[schemars(description = "maximum matching lines to return (default 100)")]
+    limit: Option<ResultLimit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct FileArgs {
+    #[schemars(
+        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
+    )]
     job: String,
+    #[schemars(description = "relative to the directory the job ran in")]
     path: crate::domain::RelPath,
+    #[schemars(description = "absolute local path of a file to create")]
     destination: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct JobArgs {
+    #[schemars(
+        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
+    )]
     job: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct LogArgs {
+    #[schemars(
+        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
+    )]
     job: String,
-    lines: Option<u32>,
+    #[schemars(description = "how many of the last lines to return (default 200)")]
+    lines: Option<LogLines>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 struct ListArgs {
+    #[schemars(description = "machine selector; omitted means every known machine")]
     machines: Option<String>,
-    limit: Option<u32>,
+    #[schemars(description = "maximum jobs to return from each machine (default 20)")]
+    limit: Option<ResultLimit>,
 }
 
-const JOB: &str = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)";
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+struct EmptyArgs {}
 
-fn object(required: &[&str], properties: &Value) -> Value {
-    json!({"type": "object", "additionalProperties": false, "required": required, "properties": properties})
+fn input_schema<T: JsonSchema>() -> Value {
+    match serde_json::to_value(schemars::schema_for!(T)) {
+        Ok(schema) => schema,
+        Err(error) => {
+            json!({"type": "object", "description": format!("schema generation failed: {error}")})
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,50 +302,41 @@ fn annotated(title: &str, effect: Effect) -> Value {
 }
 
 fn tools() -> Value {
-    let job = json!({"type": "string", "description": JOB});
     json!([
         {"name": "run",
          "description": "Send a local directory to machines and run a command there. The directory goes as it is on disk, uncommitted edits included; only files the machine lacks are uploaded, and build output stays warm between runs. Without wait it returns the job references at once and the jobs keep running; with wait it returns each job's digest when it finishes.",
          "annotations": annotated("Run a command on machines", Effect::Destroys),
-         "inputSchema": object(&["machines", "command", "directory"], &json!({
-            "machines": {"type": "string", "description": "where to run: a machine, labels joined with + such as windows+gpu, a fact such as os=linux, @group, or @all; comma separated"},
-            "command": {"type": "array", "items": {"type": "string"}, "description": "one element is a script for the machine's shell; several are an argument vector run without a shell"},
-            "directory": {"type": "string", "description": "absolute path of the local directory to send; the command runs in the same place inside it"},
-            "wait": {"type": "boolean", "description": "stay until the jobs finish and return their digests"},
-            "name": {"type": "string", "description": "a name to refer to the job by later, instead of its id"},
-            "rev": {"type": "string", "description": "send a version-control revision such as HEAD or main instead of the directory as it is"},
-            "runner": {"type": "string", "description": "a runner from the local configuration to hand the command to instead of a shell"},
-            "fresh": {"type": "boolean", "description": "use an empty workspace that is deleted afterwards"}}))},
+         "inputSchema": input_schema::<RunArgs>()},
         {"name": "job_digest",
          "description": "The cheapest way to learn what a job did: its state, exit code, how long its log is, and its last lines, with terminal control sequences removed.",
          "annotations": annotated("Summarize a job", Effect::Reads),
-         "inputSchema": object(&["job"], &json!({"job": job, "tail": {"type": "integer", "minimum": 0, "maximum": 1000, "description": "how many of the last lines to include (default 40)"}}))},
+         "inputSchema": input_schema::<DigestArgs>()},
         {"name": "search_logs",
          "description": "Search a job's whole log on its machine with a regular expression and return only the matching lines, numbered, with context around them.",
          "annotations": annotated("Search a job's log", Effect::Reads),
-         "inputSchema": object(&["job", "pattern"], &json!({"job": job, "pattern": {"type": "string", "description": "a regular expression (Rust regex syntax), at most 1024 bytes"}, "context": {"type": "integer", "minimum": 0, "maximum": 20}, "limit": {"type": "integer", "minimum": 1, "maximum": 1000}}))},
+         "inputSchema": input_schema::<SearchArgs>()},
         {"name": "wait_job",
          "description": "Wait until a job finishes, then return its digest. Stopping this call does not stop the job; wait again or ask for its digest later.",
          "annotations": annotated("Wait for a job", Effect::Reads),
-         "inputSchema": object(&["job"], &json!({"job": job}))},
+         "inputSchema": input_schema::<JobArgs>()},
         {"name": "job_status", "description": "Where a job stands, with its full specification.",
          "annotations": annotated("Show a job", Effect::Reads),
-         "inputSchema": object(&["job"], &json!({"job": job}))},
+         "inputSchema": input_schema::<JobArgs>()},
         {"name": "job_logs", "description": "The last lines of a job's output as it was written. Prefer job_digest or search_logs, which cost fewer tokens.",
          "annotations": annotated("Read a job's log", Effect::Reads),
-         "inputSchema": object(&["job"], &json!({"job": job, "lines": {"type": "integer", "minimum": 1}}))},
+         "inputSchema": input_schema::<LogArgs>()},
         {"name": "list_jobs", "description": "Recent jobs on machines, newest first per machine.",
          "annotations": annotated("List jobs", Effect::Reads),
-         "inputSchema": object(&[], &json!({"machines": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}}))},
+         "inputSchema": input_schema::<ListArgs>()},
         {"name": "get_file", "description": "Copy one file out of a job's workspace to a local path under a directory the local policy allows.",
          "annotations": annotated("Fetch a file from a job", Effect::Writes),
-         "inputSchema": object(&["job", "path", "destination"], &json!({"job": job, "path": {"type": "string", "description": "relative to the directory the job ran in"}, "destination": {"type": "string", "description": "absolute local path of a file to create"}}))},
+         "inputSchema": input_schema::<FileArgs>()},
         {"name": "kill_job", "description": "Stop a job and every process it started, at once.",
          "annotations": annotated("Stop a job", Effect::Destroys),
-         "inputSchema": object(&["job"], &json!({"job": job}))},
+         "inputSchema": input_schema::<JobArgs>()},
         {"name": "machines", "description": "The machines domyjob knows, with their labels and how they are reached.",
          "annotations": annotated("List machines", Effect::Reads),
-         "inputSchema": object(&[], &json!({}))}
+         "inputSchema": input_schema::<EmptyArgs>()}
     ])
 }
 
@@ -385,7 +472,7 @@ fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
         Some(selector) => ctx.select(selector)?,
         None => client::known_machines(ctx)?,
     };
-    let (jobs, rejected) = client::list(ctx, &machines, args.limit.unwrap_or(20));
+    let (jobs, rejected) = client::list(ctx, &machines, args.limit.map_or(20, ResultLimit::get));
     answer(&crate::output::Jobs {
         jobs: jobs
             .iter()
@@ -401,8 +488,8 @@ fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
 fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
     let query = client::Query {
         pattern: args.pattern,
-        context: args.context.unwrap_or(2),
-        limit: args.limit.unwrap_or(100),
+        context: args.context.map_or(2, SearchContext::get),
+        limit: args.limit.map_or(100, ResultLimit::get),
     };
     let (machine, found) = client::search(ctx, &args.job, query)?;
     answer(&crate::output::FoundView::of(&machine.name, &found))
@@ -441,7 +528,7 @@ fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError
         McpTool::JobLogs => {
             let args: LogArgs = parse(arguments)?;
             answer(&crate::output::Log {
-                log: tail(ctx, &args.job, args.lines.unwrap_or(200))?,
+                log: tail(ctx, &args.job, args.lines.map_or(200, LogLines::get))?,
             })
         }
         McpTool::WaitJob => {
@@ -456,8 +543,11 @@ fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError
         }
         McpTool::JobDigest => {
             let args: DigestArgs = parse(arguments)?;
-            let (machine, digest) =
-                client::digest(ctx, &args.job, args.tail.unwrap_or(DIGEST_TAIL))?;
+            let (machine, digest) = client::digest(
+                ctx,
+                &args.job,
+                args.tail.map_or(DIGEST_TAIL, TailLines::get),
+            )?;
             answer(&crate::output::DigestView::of(&machine.name, &digest))
         }
         McpTool::SearchLogs => search_logs(ctx, parse(arguments)?),
@@ -468,6 +558,7 @@ fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError
             answer(&crate::output::JobView::summary(&machine.name, &job))
         }
         McpTool::Machines => {
+            let _: EmptyArgs = parse(arguments)?;
             let configured = ctx.config.configured();
             let mut machines = Vec::with_capacity(configured.len());
             for machine in &configured {
@@ -591,6 +682,7 @@ impl crate::ingress::Ingress for LogArgs {}
 impl crate::ingress::Ingress for DigestArgs {}
 impl crate::ingress::Ingress for SearchArgs {}
 impl crate::ingress::Ingress for FileArgs {}
+impl crate::ingress::Ingress for EmptyArgs {}
 
 #[cfg(test)]
 mod tests {
@@ -613,5 +705,20 @@ mod tests {
         assert!(respond(None, "resources/list", &Value::Null).is_none());
         let failed = respond(None, "tools/call", &json!({"name": "run", "arguments": {}})).unwrap();
         assert_eq!(failed.get("isError"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn generated_schemas_and_runtime_parsing_share_their_numeric_bounds() {
+        let schema = input_schema::<LogArgs>();
+        assert_eq!(schema.pointer("/$defs/LogLines/minimum"), Some(&json!(1)));
+        assert_eq!(
+            schema.pointer("/$defs/LogLines/maximum"),
+            Some(&json!(1000))
+        );
+        parse::<LogArgs>(&json!({"job": "latest", "lines": 1})).unwrap();
+        parse::<LogArgs>(&json!({"job": "latest", "lines": 1000})).unwrap();
+        parse::<LogArgs>(&json!({"job": "latest", "lines": 0})).unwrap_err();
+        parse::<LogArgs>(&json!({"job": "latest", "lines": 1001})).unwrap_err();
+        parse::<EmptyArgs>(&json!({"unexpected": true})).unwrap_err();
     }
 }
