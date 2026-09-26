@@ -305,7 +305,7 @@ impl<'a> PerOs<'a> {
 
     #[must_use]
     pub fn client(self) -> &'a Argv {
-        self.for_os(std::env::consts::OS)
+        self.for_os(crate::platform::OS)
     }
 }
 
@@ -342,10 +342,9 @@ per_os!(TransportConf);
 impl TransportConf {
     #[must_use]
     pub const fn sharing(&self) -> Option<&Argv> {
-        if cfg!(windows) {
-            self.share_windows.as_ref()
-        } else {
-            self.share.as_ref()
+        match crate::platform::FAMILY {
+            crate::paths::Family::Windows => self.share_windows.as_ref(),
+            crate::paths::Family::Unix => self.share.as_ref(),
         }
     }
 }

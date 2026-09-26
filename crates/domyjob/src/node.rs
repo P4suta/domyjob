@@ -211,7 +211,7 @@ enum Keep {
 }
 
 fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
-    if cfg!(windows) {
+    if !crate::platform::FAMILY.agent_socket() {
         return None;
     }
     let asked = crate::spawn::Invocation::new(
@@ -287,7 +287,7 @@ pub fn hello(dirs: &Dirs) -> Hello {
     Hello {
         wire: RemoteText::new(crate::protocol::wire().to_owned()),
         version: RemoteText::new(VERSION.to_owned()),
-        os: RemoteText::new(std::env::consts::OS.to_owned()),
+        os: RemoteText::new(crate::platform::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),
         home: RemoteText::new(dirs.home.display().to_string()),
         state: RemoteText::new(dirs.state.display().to_string()),
@@ -792,8 +792,9 @@ impl Node {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let load = sysinfo::System::load_average();
-        let load_hundredths =
-            (!cfg!(windows)).then(|| [load.one, load.five, load.fifteen].map(hundredths));
+        let load_hundredths = crate::platform::FAMILY
+            .load_average()
+            .then(|| [load.one, load.five, load.fifteen].map(hundredths));
         let (disk_total, disk_available) = match fs4::statvfs(self.store.area("jobs")) {
             Ok(stats) => (stats.total_space(), stats.available_space()),
             Err(_unmeasurable) => (0, 0),
@@ -1995,7 +1996,6 @@ mod tests {
         assert!(refused(&ask(&node, &Request::Tail { job, lines: 3 })));
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_agent_a_job_uses_is_the_one_the_machines_ssh_configuration_names() {
         let home = std::path::Path::new("/home/me");

@@ -72,7 +72,7 @@ impl Invocation {
         let mut command = Command::new(self.program.as_arg_str());
         let cmd = crate::shell::kind_of(self.program.as_arg_str()) == crate::shell::Kind::Cmd;
         for arg in &self.args {
-            verbatim_or_quoted(&mut command, arg.as_arg_str(), cmd);
+            crate::platform::push_arg(&mut command, arg.as_arg_str(), cmd);
         }
         if let Some(dir) = &self.dir {
             command.current_dir(dir);
@@ -103,19 +103,4 @@ impl Invocation {
         }
         command
     }
-}
-
-#[cfg(windows)]
-fn verbatim_or_quoted(command: &mut Command, word: &str, cmd: bool) {
-    use std::os::windows::process::CommandExt;
-    if cmd {
-        command.raw_arg(word);
-    } else {
-        command.arg(word);
-    }
-}
-
-#[cfg(not(windows))]
-fn verbatim_or_quoted(command: &mut Command, word: &str, _cmd: bool) {
-    command.arg(word);
 }

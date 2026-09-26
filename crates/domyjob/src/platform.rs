@@ -8,10 +8,19 @@ pub const SOCKET_PATH_LIMIT: usize = if cfg!(windows) { 107 } else { 103 };
 
 use std::path::Path;
 
+use crate::paths::Family;
 use crate::snapshot::Mode;
 
-pub const LINKS: bool = cfg!(unix);
-pub const MODES: bool = cfg!(unix);
+pub const OS: &str = std::env::consts::OS;
+pub const ARCH: &str = std::env::consts::ARCH;
+pub const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
+pub const FAMILY: Family = if cfg!(windows) {
+    Family::Windows
+} else {
+    Family::Unix
+};
+pub const LINKS: bool = FAMILY.links();
+pub const MODES: bool = FAMILY.modes();
 
 const REGULAR: u32 = 0o644;
 const EXECUTABLE: u32 = 0o755;
@@ -347,33 +356,91 @@ pub const fn expose(_path: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) struct ReadOnly(std::path::PathBuf);
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
     reason = "tests make a directory read-only and must give it back even when they panic"
 )]
 impl ReadOnly {
     pub(crate) fn make(dir: &Path) -> std::io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500))?;
+        lock_down(dir)?;
         Ok(Self(dir.to_path_buf()))
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[expect(
     clippy::disallowed_methods,
     reason = "tests make a directory read-only and must give it back even when they panic"
 )]
 impl Drop for ReadOnly {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        match std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)) {
+        let Ok(meta) = std::fs::symlink_metadata(&self.0) else {
+            return;
+        };
+        let mut perms = meta.permissions();
+        let_owner_change(&mut perms);
+        match std::fs::set_permissions(&self.0, perms) {
             Ok(()) | Err(_) => {}
         }
     }
+}
+
+#[cfg(unix)]
+#[must_use]
+pub fn elevated() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "asking Windows whether this process token is elevated needs the token API"
+)]
+#[must_use]
+pub fn elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return true;
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    let Ok(size) = u32::try_from(size_of::<TOKEN_ELEVATION>()) else {
+        return true;
+    };
+    let asked = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            size,
+            &raw mut returned,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    asked == 0 || elevation.TokenIsElevated != 0
+}
+
+#[cfg(windows)]
+pub fn push_arg(command: &mut std::process::Command, word: &str, cmd: bool) {
+    use std::os::windows::process::CommandExt;
+    if cmd {
+        command.raw_arg(word);
+    } else {
+        command.arg(word);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn push_arg(command: &mut std::process::Command, word: &str, _cmd: bool) {
+    command.arg(word);
 }

@@ -149,7 +149,7 @@ pub fn remove(path: &Path) -> Result<(), UserFileError> {
 pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), UserFileError> {
     let staged = unique_beside(current, "new")?;
     std::fs::copy(fresh, &staged).map_err(failed("staging", &staged))?;
-    if cfg!(windows) {
+    if !crate::platform::FAMILY.replaces_running_executables() {
         let retired = unique_beside(current, "old")?;
         std::fs::rename(current, &retired).map_err(failed("retiring", current))?;
         if let Err(error) = std::fs::rename(&staged, current) {

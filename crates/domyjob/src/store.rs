@@ -764,7 +764,7 @@ mod tests {
         store.ids().unwrap_err();
         let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
         let staged = store.stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()));
-        if cfg!(unix) {
+        if crate::platform::MODES {
             assert!(
                 matches!(
                     staged,

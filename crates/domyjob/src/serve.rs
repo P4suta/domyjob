@@ -163,46 +163,8 @@ fn lan_address() -> Option<IpAddr> {
     })
 }
 
-#[cfg(unix)]
-fn elevated() -> bool {
-    rustix::process::geteuid().is_root()
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "asking Windows whether this process token is elevated needs the token API"
-)]
-fn elevated() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return true;
-    }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut returned = 0u32;
-    let Ok(size) = u32::try_from(size_of::<TOKEN_ELEVATION>()) else {
-        return true;
-    };
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            (&raw mut elevation).cast(),
-            size,
-            &raw mut returned,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    asked == 0 || elevation.TokenIsElevated != 0
-}
-
 pub fn refuse_root(allowed: bool) -> Result<(), ServeError> {
-    if elevated() && !allowed {
+    if crate::platform::elevated() && !allowed {
         Err(ServeError::Root)
     } else {
         Ok(())
@@ -233,15 +195,15 @@ impl Greeting {
     fn here() -> Result<Self, Invalid> {
         Ok(Self {
             name: host_name().parse()?,
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
+            os: crate::platform::OS.to_owned(),
+            arch: crate::platform::ARCH.to_owned(),
         })
     }
 }
 
 #[must_use]
 pub fn host_name() -> String {
-    let raw = platform_host_name();
+    let raw = sysinfo::System::host_name().unwrap_or_default();
     let cleaned: String = raw
         .split('.')
         .next()
@@ -260,22 +222,6 @@ pub fn host_name() -> String {
         "machine".to_owned()
     } else {
         cleaned
-    }
-}
-
-#[cfg(unix)]
-fn platform_host_name() -> String {
-    rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[cfg(not(unix))]
-fn platform_host_name() -> String {
-    match std::env::var("COMPUTERNAME") {
-        Ok(name) => name,
-        Err(_unset) => String::new(),
     }
 }
 
