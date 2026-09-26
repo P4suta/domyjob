@@ -80,9 +80,10 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## Exit codes
 
 - `0`: everything asked for succeeded.
-- `1`: domyjob worked, and a job failed, or `status` found a failed job, or `logs --grep` found nothing, or `ls` could not reach a machine, or `doctor` found a problem.
+- `1`: domyjob worked, and a job failed, or `status` found a failed job, or `logs --grep` found nothing, or `doctor` found a problem.
   `run --wait` on a single machine exits with the job's own exit code instead, so it can stand in for running the command there directly.
 - `2`: domyjob itself could not do what was asked; with `--json` the error arrives as `{"error": {"kind": ..., "message": ..., "hint": ...}}`, where `kind` is one of `usage`, `config`, `not_found`, `ambiguous`, `unreachable`, `forbidden`, `protocol`, `security`, `distribution`, `local`, `remote`, and `internal`.
+- `3`: the outcome is unknown: a machine did not answer, or a job was lost track of. The job may still be running; ask again rather than sending it again.
 
 ## When the network or a machine misbehaves
 
@@ -93,7 +94,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## JSON for scripts and agents
 
 Every job in `--json` output has the same shape, with `"schema": 2`:
-`job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), and `detail` (everything else).
+`job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), `notes` (what domyjob itself had to say about the job, kept out of its log), and `detail` (everything else).
 `digest --json` adds `lines`, `bytes`, and `tail`; errors arrive as `{"schema": 2, "error": {kind, message, hint}}`.
 
 ## Other commands
