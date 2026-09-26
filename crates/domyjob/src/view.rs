@@ -81,60 +81,51 @@ pub fn digest(machine: &MachineName, digest: &Digest) -> Result<String, std::fmt
     Ok(out)
 }
 
-pub fn listing(
-    jobs: &[(MachineName, Job)],
-    unreachable: &[(MachineName, String)],
-) -> Result<String, std::fmt::Error> {
+pub fn machine_listing(machine: &MachineName, jobs: &[Job]) -> Result<String, std::fmt::Error> {
     let now = Timestamp::observe();
-    let ids: Vec<&str> = jobs.iter().map(|(_, job)| job.spec.id.as_str()).collect();
-    let rows: Vec<(&MachineName, &Job)> = jobs.iter().map(|(m, j)| (m, j)).collect();
+    let ids: Vec<&str> = jobs.iter().map(|job| job.spec.id.as_str()).collect();
+    let rows: Vec<(&MachineName, &Job)> = jobs.iter().map(|job| (machine, job)).collect();
     let columns = ui::Columns::of(&rows);
     let mut out = String::new();
-    let mut current: Option<&MachineName> = None;
-    for (machine, job) in jobs {
-        if current != Some(machine) {
-            if current.is_some() {
-                out.push('\n');
-            }
-            let count = jobs.iter().filter(|(m, _)| m == machine).count();
-            writeln!(
-                out,
-                "{}  {}",
-                ui::machine(machine),
-                ui::paint(
-                    Tone::Dim,
-                    &format!("{count} {}", if count == 1 { "job" } else { "jobs" })
-                )
-            )?;
-            current = Some(machine);
-        }
+    let count = jobs.len();
+    writeln!(
+        out,
+        "{}  {}",
+        ui::machine(machine),
+        ui::paint(
+            Tone::Dim,
+            &format!("{count} {}", if count == 1 { "job" } else { "jobs" })
+        )
+    )?;
+    for job in jobs {
         writeln!(
             out,
             "  {}",
             ui::job_line(machine, job, (&ids, columns), Some(now))
         )?;
     }
-    if jobs.is_empty() && unreachable.is_empty() {
-        writeln!(
-            out,
-            "{}",
-            ui::paint(
-                Tone::Dim,
-                "No jobs yet. `domyjob run MACHINE -- COMMAND` starts one."
-            )
-        )?;
-    }
-    for (machine, why) in unreachable {
-        writeln!(
-            out,
-            "{} {} unreachable: {}  {} domyjob doctor {machine}",
-            ui::paint(Tone::Bad, "!"),
-            ui::machine(machine),
-            ui::fit(why, 80),
-            ui::paint(Tone::Hint, ui::symbol(Symbol::Hint))
-        )?;
-    }
     Ok(out)
+}
+
+pub fn unreachable_line(machine: &MachineName, why: &str) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{} {} unreachable: {}  {} domyjob doctor {machine}",
+        ui::paint(Tone::Bad, "!"),
+        ui::machine(machine),
+        ui::fit(why, 80),
+        ui::paint(Tone::Hint, ui::symbol(Symbol::Hint))
+    )?;
+    Ok(out)
+}
+
+#[must_use]
+pub fn no_jobs() -> String {
+    ui::paint(
+        Tone::Dim,
+        "No jobs yet. `domyjob run <machine> -- <command>` starts one.",
+    )
 }
 
 pub fn final_line(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Error> {
@@ -671,7 +662,8 @@ pub mod tests {
         let last = crate::terminal::clean(&final_line(&machine, &job).unwrap());
         assert!(last.contains("succeeded · after 3m02s"), "{last}");
         assert!(!last.contains("ago"), "{last}");
-        let listed = crate::terminal::clean(&listing(&[(machine, job)], &[]).unwrap());
+        let listed =
+            crate::terminal::clean(&machine_listing(&machine, std::slice::from_ref(&job)).unwrap());
         assert!(listed.contains("3m02s · "), "{listed}");
         assert!(listed.contains("just now"), "{listed}");
         assert!(listed.starts_with("win  1 job\n"), "{listed}");

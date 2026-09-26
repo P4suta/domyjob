@@ -726,25 +726,17 @@ fn across<T: Send>(
     machines: &[Machine],
     work: impl Fn(&Machine) -> Result<T, RemoteError> + Sync,
 ) -> Vec<(MachineName, Result<T, RemoteError>)> {
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(machines.len());
-        for machine in machines {
-            let work = &work;
-            handles.push((machine.name.clone(), scope.spawn(move || work(machine))));
-        }
-        let mut out = Vec::with_capacity(handles.len());
-        for (name, handle) in handles {
-            let result = match handle.join() {
+    crate::fanout::gathered(machines, work)
+        .into_iter()
+        .zip(machines)
+        .map(|(result, machine)| {
+            let result = match result {
                 Ok(result) => result,
-                Err(_panicked) => Err(RemoteError::Probe {
-                    machine: name.to_string(),
-                    detail: "a worker thread panicked".to_owned(),
-                }),
+                Err(crate::fanout::Panicked) => Err(panicked(machine)),
             };
-            out.push((name, result));
-        }
-        out
-    })
+            (machine.name.clone(), result)
+        })
+        .collect()
 }
 
 pub fn submit(
@@ -941,18 +933,50 @@ pub fn survey(
     Ok((report, jobs))
 }
 
+pub type Listed = Result<(Vec<Job>, Vec<crate::protocol::Unreadable>), RemoteError>;
+
+fn panicked(machine: &Machine) -> RemoteError {
+    RemoteError::Probe {
+        machine: machine.name.to_string(),
+        detail: "a worker thread panicked".to_owned(),
+    }
+}
+
+fn list_one(ctx: &Context, machine: &Machine, limit: u32) -> Listed {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    link.call(&Request::List { limit }, &[])?
+        .into_jobs()
+        .map_err(|other| link.unexpected("jobs", *other))
+}
+
+pub fn list_each(
+    ctx: &Context,
+    machines: &[Machine],
+    limit: u32,
+    mut each: impl FnMut(&Machine, Listed),
+) {
+    crate::fanout::arrivals(
+        machines,
+        |machine| list_one(ctx, machine, limit),
+        |machine, result| {
+            each(
+                machine,
+                match result {
+                    Ok(listed) => listed,
+                    Err(crate::fanout::Panicked) => Err(panicked(machine)),
+                },
+            );
+        },
+    );
+}
+
 #[must_use]
 pub fn list(
     ctx: &Context,
     machines: &[Machine],
     limit: u32,
 ) -> (Vec<(MachineName, Job)>, Vec<Rejected>) {
-    let results = across(machines, |machine| {
-        let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
-        link.call(&Request::List { limit }, &[])?
-            .into_jobs()
-            .map_err(|other| link.unexpected("jobs", *other))
-    });
+    let results = across(machines, |machine| list_one(ctx, machine, limit));
     let mut jobs = Vec::new();
     let mut rejected = Vec::new();
     for (machine, result) in results {

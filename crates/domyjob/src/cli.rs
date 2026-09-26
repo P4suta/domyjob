@@ -47,15 +47,16 @@ struct Cli {
 
 const AFTER_LONG_HELP: &str = "\
 MACHINES:
-  A name from your configuration, any ssh destination such as user@host, a label such as gpu, a fact such as os=windows, @GROUP, or @all. Join labels and facts with +, and separate terms with commas.
+  A name from your configuration, ssh:HOST for an ssh destination not added yet, a label such as gpu, a fact such as os=windows, @GROUP, or @all. Join labels and facts with +, and separate terms with commas.
 
 IF A MACHINE OR THE NETWORK FAILS:
   Jobs keep running on the machine when your connection drops; ask again with status, wait, or logs. A machine that stops answering is reported as went silent.
 
 EXIT STATUS:
   0  everything asked for succeeded
-  1  a job failed, logs --grep found nothing, ls could not reach a machine, or doctor found a problem
+  1  a job failed, logs --grep found nothing, or doctor found a problem
   2  domyjob could not do what was asked
+  3  an outcome is unknown: a machine did not answer, or a job was lost track of
   run --wait on one machine exits with the job's own code.
 
 ENVIRONMENT:
@@ -780,6 +781,7 @@ enum CliError {
 
 const FAILED_JOB: u8 = 1;
 const DOMYJOB_ERROR: u8 = 2;
+const UNKNOWN: u8 = 3;
 
 const fn wants_json(command: &Top) -> bool {
     match command {
@@ -889,13 +891,8 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         Top::Do(args) => run_named(&args),
         Top::Ls(args) => ls(&args),
         Top::Logs(args) => logs(&args),
-        Top::Status(args) => job_command(&args, |job| Request::Status { job }).map(|(job, _)| {
-            if job.succeeded() || !job.is_settled() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(FAILED_JOB)
-            }
-        }),
+        Top::Status(args) => job_command(&args, |job| Request::Status { job })
+            .map(|(job, _)| exit(&[verdict_of(&job)])),
         Top::Digest(args) => digest(&args),
         Top::Kill(args) => {
             job_command(&args, |job| Request::Kill { job }).map(|_| ExitCode::SUCCESS)
@@ -1196,7 +1193,7 @@ fn follow_through_as(
     Ok(if rejected.is_empty() {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(FAILED_JOB)
+        ExitCode::from(UNKNOWN)
     })
 }
 
@@ -1381,26 +1378,42 @@ impl Watching<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
     Succeeded,
+    Pending,
     Failed(Option<i32>),
     Unknown,
     NotRun,
 }
 
+const fn verdict_of(job: &Job) -> Verdict {
+    match job.state() {
+        crate::protocol::State::Succeeded => Verdict::Succeeded,
+        crate::protocol::State::Queued
+        | crate::protocol::State::Preparing
+        | crate::protocol::State::Running => Verdict::Pending,
+        crate::protocol::State::Failed
+        | crate::protocol::State::Killed
+        | crate::protocol::State::Errored => Verdict::Failed(job.exit_code()),
+        crate::protocol::State::Lost => Verdict::Unknown,
+    }
+}
+
 fn exit_for(verdicts: &[Verdict]) -> u8 {
+    let failed = |verdict: &Verdict| matches!(verdict, Verdict::Failed(_));
+    let unknown = |verdict: &Verdict| matches!(verdict, Verdict::Unknown | Verdict::NotRun);
     match verdicts {
+        [] => UNKNOWN,
         [Verdict::Failed(Some(code))] => match u8::try_from((*code).clamp(1, 255)) {
             Ok(byte) => byte,
             Err(_out_of_range) => FAILED_JOB,
         },
-        [_, ..]
-            if verdicts
-                .iter()
-                .all(|verdict| *verdict == Verdict::Succeeded) =>
-        {
-            0
-        }
-        _ => FAILED_JOB,
+        _ if verdicts.iter().any(failed) => FAILED_JOB,
+        _ if verdicts.iter().any(unknown) => UNKNOWN,
+        _ => 0,
     }
+}
+
+fn exit(verdicts: &[Verdict]) -> ExitCode {
+    ExitCode::from(exit_for(verdicts))
 }
 
 struct Settling<'a> {
@@ -1449,11 +1462,7 @@ fn settle(
             eprintln!("domyjob: {error}");
         }
     }
-    Ok(if job.succeeded() {
-        Verdict::Succeeded
-    } else {
-        Verdict::Failed(job.exit_code())
-    })
+    Ok(verdict_of(&job))
 }
 
 fn finish(
@@ -1624,11 +1633,7 @@ fn digest(args: &DigestArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let (machine, found) = client::digest(&ctx, &args.job, args.tail)?;
     show_digest(&machine.name, &found, args.json)?;
-    Ok(if found.job.succeeded() || !found.job.is_settled() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(FAILED_JOB)
-    })
+    Ok(exit(&[verdict_of(&found.job)]))
 }
 
 fn search(args: &LogsArgs, pattern: &str) -> Result<ExitCode, CliError> {
@@ -1716,26 +1721,10 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         Some(selector) => ctx.select(selector)?,
         None => client::known_machines(&ctx)?,
     };
-    let (jobs, rejected) = client::list(&ctx, &machines, args.limit);
-    let failed = if rejected.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(FAILED_JOB)
-    };
-    if !args.json && crate::view::stdout_is_a_person() {
-        let unreachable: Vec<(MachineName, String)> = rejected
-            .iter()
-            .map(|item| (item.machine.clone(), item.error.to_string()))
-            .collect();
-        show(crate::view::listing(&jobs, &unreachable))?;
-        return Ok(failed);
-    }
-    for item in &rejected {
-        eprintln!("domyjob: {}: {}", item.machine, item.error);
-    }
+    let person = !args.json && crate::view::stdout_is_a_person();
     let now = Timestamp::observe();
-    let mut out = std::io::stdout().lock();
-    if !args.json {
+    let mut out = std::io::stdout();
+    if !args.json && !person {
         writeln!(
             out,
             "{:<16}  {:<12}  {:<9}  {:>4}  {:>7}  {:>7}  COMMAND",
@@ -1743,8 +1732,70 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         )
         .map_err(CliError::Output)?;
     }
-    for (machine, job) in &jobs {
-        if args.json {
+    let mut unknown = false;
+    let mut listed_any = false;
+    let mut failure: Option<CliError> = None;
+    client::list_each(&ctx, &machines, args.limit, |machine, result| {
+        let shown = match result {
+            Ok((jobs, unreadable)) => {
+                for bad in unreadable {
+                    unknown = true;
+                    eprintln!(
+                        "domyjob: {}: job {} cannot be read ({})",
+                        machine.name, bad.id, bad.why
+                    );
+                }
+                listed_any |= !jobs.is_empty();
+                list_rows(&machine.name, &jobs, (person, args.json), now)
+            }
+            Err(error) => {
+                unknown = true;
+                if person {
+                    crate::view::unreachable_line(&machine.name, &error.to_string())
+                        .map_err(|e| CliError::Output(std::io::Error::other(e)))
+                        .and_then(|line| {
+                            write!(std::io::stdout(), "{line}").map_err(CliError::Output)
+                        })
+                } else {
+                    eprintln!("domyjob: {}: {error}", machine.name);
+                    Ok(())
+                }
+            }
+        };
+        if let Err(error) = shown {
+            failure.get_or_insert(error);
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if person && !listed_any && !unknown {
+        writeln!(out, "{}", crate::view::no_jobs()).map_err(CliError::Output)?;
+    }
+    Ok(if unknown {
+        ExitCode::from(UNKNOWN)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn list_rows(
+    machine: &MachineName,
+    jobs: &[Job],
+    (person, json): (bool, bool),
+    now: Timestamp,
+) -> Result<(), CliError> {
+    let mut out = std::io::stdout().lock();
+    if person {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let block = crate::view::machine_listing(machine, jobs)
+            .map_err(|e| CliError::Output(std::io::Error::other(e)))?;
+        return writeln!(out, "{block}").map_err(CliError::Output);
+    }
+    for job in jobs {
+        if json {
             writeln!(out, "{}", crate::view::job_json(machine, job)).map_err(CliError::Output)?;
             continue;
         }
@@ -1766,7 +1817,7 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         )
         .map_err(CliError::Output)?;
     }
-    Ok(failed)
+    Ok(())
 }
 
 fn logs(args: &LogsArgs) -> Result<ExitCode, CliError> {
@@ -1867,7 +1918,7 @@ fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> 
     Ok(if all_ok {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(FAILED_JOB)
+        ExitCode::from(DOMYJOB_ERROR)
     })
 }
 
@@ -1913,7 +1964,7 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
     Ok(if rejected.is_empty() {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(FAILED_JOB)
+        ExitCode::from(UNKNOWN)
     })
 }
 
@@ -1971,7 +2022,7 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
     Ok(if all_ok {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(FAILED_JOB)
+        ExitCode::from(DOMYJOB_ERROR)
     })
 }
 
@@ -2049,7 +2100,7 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
     Ok(if reachable {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(FAILED_JOB)
+        ExitCode::from(UNKNOWN)
     })
 }
 
@@ -2125,7 +2176,7 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
         }
         Ok(())
     })?;
-    Ok(ExitCode::from(FAILED_JOB))
+    Ok(ExitCode::from(UNKNOWN))
 }
 
 fn overview_json(
@@ -2163,7 +2214,7 @@ fn show(text: Result<String, std::fmt::Error>) -> Result<(), CliError> {
 
 fn wait(args: &WaitArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let mut all_ok = true;
+    let mut verdicts = Vec::new();
     std::thread::scope(|scope| -> Result<(), CliError> {
         let (done, finished) = std::sync::mpsc::channel();
         for reference in &args.jobs {
@@ -2179,21 +2230,17 @@ fn wait(args: &WaitArgs) -> Result<ExitCode, CliError> {
             match outcome {
                 Ok((machine, job)) => {
                     print_job(&machine.name, &job, args.json)?;
-                    all_ok &= job.succeeded();
+                    verdicts.push(verdict_of(&job));
                 }
                 Err(error) => {
-                    all_ok = false;
+                    verdicts.push(Verdict::Unknown);
                     eprintln!("domyjob: {reference}: {error}");
                 }
             }
         }
         Ok(())
     })?;
-    Ok(if all_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(FAILED_JOB)
-    })
+    Ok(exit(&verdicts))
 }
 
 fn wanted_path(text: &str) -> Result<RelPath, crate::domain::Invalid> {
@@ -3121,20 +3168,26 @@ mod tests {
 
     #[test]
     fn only_every_machine_running_and_succeeding_exits_zero() {
-        use Verdict::{Failed, NotRun, Succeeded, Unknown};
+        use Verdict::{Failed, NotRun, Pending, Succeeded, Unknown};
         assert_eq!(exit_for(&[Succeeded, Succeeded]), 0);
+        assert_eq!(exit_for(&[Succeeded, Pending]), 0);
         assert_eq!(exit_for(&[Failed(Some(3))]), 3);
-        assert_eq!(exit_for(&[Failed(Some(-9))]), 1);
-        for verdicts in [
+        assert_eq!(exit_for(&[Failed(Some(-9))]), FAILED_JOB);
+        for known_failure in [
+            &[Failed(Some(3)), Succeeded][..],
+            &[Failed(None)],
+            &[Failed(Some(3)), Unknown],
+        ] {
+            assert_eq!(exit_for(known_failure), FAILED_JOB, "{known_failure:?}");
+        }
+        for unknown in [
             &[][..],
             &[Succeeded, NotRun],
             &[NotRun],
             &[Unknown],
             &[Succeeded, Unknown],
-            &[Failed(Some(3)), Succeeded],
-            &[Failed(None)],
         ] {
-            assert_eq!(exit_for(verdicts), FAILED_JOB, "{verdicts:?}");
+            assert_eq!(exit_for(unknown), UNKNOWN, "{unknown:?}");
         }
     }
 

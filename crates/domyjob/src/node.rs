@@ -2266,21 +2266,6 @@ mod tests {
         busy.release().unwrap();
     }
 
-    struct Tell(std::sync::mpsc::Sender<Vec<u8>>);
-
-    impl Write for Tell {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            match self.0.send(bytes.to_vec()) {
-                Ok(()) | Err(_) => {}
-            }
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
     fn a_watch_answers_at_once_again_on_every_job_change_and_ends_when_the_client_leaves() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2293,7 +2278,7 @@ mod tests {
         let input = std::io::BufReader::new(Read::chain(std::io::Cursor::new(line), reader));
         let (told, heard) = std::sync::mpsc::channel();
         let serving = std::thread::spawn(move || {
-            node.serve(&Principal::Owner, input, &mut Tell(told))
+            node.serve(&Principal::Owner, input, &mut crate::faults::Told(told))
                 .unwrap();
         });
         let mut wire = Vec::new();

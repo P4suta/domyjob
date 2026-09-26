@@ -98,6 +98,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
+ctrlc = { version = "3.5", features = ["termination"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 schemars = "1"
 semver = "1"
