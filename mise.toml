@@ -1,5 +1,5 @@
 [tools]
-rust = "1.98.0"
+rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
 typos = "1.50.1"
