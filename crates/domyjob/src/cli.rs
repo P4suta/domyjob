@@ -1162,7 +1162,12 @@ fn follow_through_as(
     }
     let notify = notify_targets(ctx, &common.notify);
     if common.wait {
-        let code = finish(ctx, &submitted, &notify, (common, &board, keep.as_ref()));
+        let code = finish(
+            ctx,
+            &submitted,
+            (&notify, rejected.len()),
+            (common, &board, keep.as_ref()),
+        );
         board.clear();
         return code;
     }
@@ -1353,10 +1358,29 @@ impl Watching<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Tally {
-    all_ok: bool,
-    single_code: Option<i32>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Succeeded,
+    Failed(Option<i32>),
+    Unknown,
+    NotRun,
+}
+
+fn exit_for(verdicts: &[Verdict]) -> u8 {
+    match verdicts {
+        [Verdict::Failed(Some(code))] => match u8::try_from((*code).clamp(1, 255)) {
+            Ok(byte) => byte,
+            Err(_out_of_range) => FAILED_JOB,
+        },
+        [_, ..]
+            if verdicts
+                .iter()
+                .all(|verdict| *verdict == Verdict::Succeeded) =>
+        {
+            0
+        }
+        _ => FAILED_JOB,
+    }
 }
 
 struct Settling<'a> {
@@ -1375,21 +1399,18 @@ fn settle(
     }: &Settling<'_>,
     item: &Submitted,
     outcome: Result<Job, ClientError>,
-    tally: &mut Tally,
-) -> Result<(), CliError> {
+) -> Result<Verdict, CliError> {
     let json = common.json;
     let job = match outcome {
         Ok(job) => job,
         Err(error) => {
-            tally.all_ok = false;
-            tally.single_code = None;
             eprintln!(
                 "domyjob: {}: lost track of {} ({error}); it may still be running there, and `domyjob status {}` asks again",
                 item.machine.name,
                 item.job.spec.id,
                 reference(item)
             );
-            return Ok(());
+            return Ok(Verdict::Unknown);
         }
     };
     if common.digest {
@@ -1403,20 +1424,22 @@ fn settle(
     } else {
         report_final(&item.machine, &job, (json, board))?;
     }
-    tally.all_ok &= job.succeeded();
-    tally.single_code = job.exit_code();
     for target in *notify {
         if let Err(error) = crate::notify::send(&ctx.config, target, &item.machine.name, &job) {
             eprintln!("domyjob: {error}");
         }
     }
-    Ok(())
+    Ok(if job.succeeded() {
+        Verdict::Succeeded
+    } else {
+        Verdict::Failed(job.exit_code())
+    })
 }
 
 fn finish(
     ctx: &Context,
     submitted: &[Submitted],
-    notify: &[NotifyTarget],
+    (notify, not_run): (&[NotifyTarget], usize),
     (common, board, keep): (&Common, &crate::board::Board, Option<&regex::Regex>),
 ) -> Result<ExitCode, CliError> {
     let stdout = std::sync::Mutex::new(std::io::stdout());
@@ -1434,10 +1457,7 @@ fn finish(
         keep,
         destination: crate::terminal::Destination::of_stdout(),
     };
-    let mut tally = Tally {
-        all_ok: true,
-        single_code: None,
-    };
+    let mut verdicts = vec![Verdict::Unknown; submitted.len()];
     let settling = Settling {
         ctx,
         notify,
@@ -1462,7 +1482,9 @@ fn finish(
             if let Some(slot) = waiting.get_mut(index) {
                 *slot = false;
             }
-            settle(&settling, item, outcome, &mut tally)?;
+            if let Some(verdict) = verdicts.get_mut(index) {
+                *verdict = settle(&settling, item, outcome)?;
+            }
             let still: Vec<String> = submitted
                 .iter()
                 .zip(&waiting)
@@ -1475,14 +1497,8 @@ fn finish(
         }
         Ok(())
     })?;
-    Ok(match (tally.all_ok, watching.many, tally.single_code) {
-        (true, _, _) => ExitCode::SUCCESS,
-        (false, false, Some(code)) => match u8::try_from(code.clamp(1, 255)) {
-            Ok(byte) => ExitCode::from(byte),
-            Err(_out_of_range) => ExitCode::from(FAILED_JOB),
-        },
-        (false, _, _) => ExitCode::from(FAILED_JOB),
-    })
+    verdicts.extend(std::iter::repeat_n(Verdict::NotRun, not_run));
+    Ok(ExitCode::from(exit_for(&verdicts)))
 }
 
 const DIGEST_TAIL: u32 = 40;
@@ -3005,6 +3021,25 @@ fn note_watch(ctx: &Context, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_every_machine_running_and_succeeding_exits_zero() {
+        use Verdict::{Failed, NotRun, Succeeded, Unknown};
+        assert_eq!(exit_for(&[Succeeded, Succeeded]), 0);
+        assert_eq!(exit_for(&[Failed(Some(3))]), 3);
+        assert_eq!(exit_for(&[Failed(Some(-9))]), 1);
+        for verdicts in [
+            &[][..],
+            &[Succeeded, NotRun],
+            &[NotRun],
+            &[Unknown],
+            &[Succeeded, Unknown],
+            &[Failed(Some(3)), Succeeded],
+            &[Failed(None)],
+        ] {
+            assert_eq!(exit_for(verdicts), FAILED_JOB, "{verdicts:?}");
+        }
+    }
 
     #[test]
     fn a_grep_on_the_stream_shows_only_the_matching_lines() {
