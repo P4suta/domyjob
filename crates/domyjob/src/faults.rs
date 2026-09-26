@@ -90,3 +90,21 @@ mod tests {
         at("faults::later", Path::new("/state/spared/d")).unwrap();
     }
 }
+
+#[cfg(test)]
+#[derive(Debug)]
+pub struct Told(pub std::sync::mpsc::Sender<Vec<u8>>);
+
+#[cfg(test)]
+impl std::io::Write for Told {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self.0.send(bytes.to_vec()) {
+            Ok(()) | Err(_) => {}
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

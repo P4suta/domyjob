@@ -54,7 +54,7 @@ fn job_header(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Erro
     let command = job.spec.command.display();
     writeln!(out, "  {}", ui::paint(Tone::Dim, &command))?;
     if let Some(reason) = job.reason() {
-        writeln!(out, "  {}", ui::paint(Tone::Bad, reason.as_raw_str()))?;
+        writeln!(out, "  {}", ui::paint(Tone::Bad, &reason.to_string()))?;
     }
     Ok(out)
 }
@@ -81,67 +81,65 @@ pub fn digest(machine: &MachineName, digest: &Digest) -> Result<String, std::fmt
     Ok(out)
 }
 
-pub fn listing(
-    jobs: &[(MachineName, Job)],
-    unreachable: &[(MachineName, String)],
-) -> Result<String, std::fmt::Error> {
+pub fn machine_listing(machine: &MachineName, jobs: &[Job]) -> Result<String, std::fmt::Error> {
     let now = Timestamp::observe();
-    let ids: Vec<&str> = jobs.iter().map(|(_, job)| job.spec.id.as_str()).collect();
-    let rows: Vec<(&MachineName, &Job)> = jobs.iter().map(|(m, j)| (m, j)).collect();
+    let ids: Vec<&str> = jobs.iter().map(|job| job.spec.id.as_str()).collect();
+    let rows: Vec<(&MachineName, &Job)> = jobs.iter().map(|job| (machine, job)).collect();
     let columns = ui::Columns::of(&rows);
     let mut out = String::new();
-    let mut current: Option<&MachineName> = None;
-    for (machine, job) in jobs {
-        if current != Some(machine) {
-            if current.is_some() {
-                out.push('\n');
-            }
-            let count = jobs.iter().filter(|(m, _)| m == machine).count();
-            writeln!(
-                out,
-                "{}  {}",
-                ui::machine(machine),
-                ui::paint(
-                    Tone::Dim,
-                    &format!("{count} {}", if count == 1 { "job" } else { "jobs" })
-                )
-            )?;
-            current = Some(machine);
-        }
+    let count = jobs.len();
+    writeln!(
+        out,
+        "{}  {}",
+        ui::machine(machine),
+        ui::paint(
+            Tone::Dim,
+            &format!("{count} {}", if count == 1 { "job" } else { "jobs" })
+        )
+    )?;
+    for job in jobs {
         writeln!(
             out,
             "  {}",
             ui::job_line(machine, job, (&ids, columns), Some(now))
         )?;
     }
-    if jobs.is_empty() && unreachable.is_empty() {
-        writeln!(
-            out,
-            "{}",
-            ui::paint(
-                Tone::Dim,
-                "No jobs yet. `domyjob run MACHINE -- COMMAND` starts one."
-            )
-        )?;
-    }
-    for (machine, why) in unreachable {
-        writeln!(
-            out,
-            "{} {} unreachable: {}  {} domyjob doctor {machine}",
-            ui::paint(Tone::Bad, "!"),
-            ui::machine(machine),
-            ui::fit(why, 80),
-            ui::paint(Tone::Hint, ui::symbol(Symbol::Hint))
-        )?;
-    }
     Ok(out)
+}
+
+pub fn unreachable_line(machine: &MachineName, why: &str) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "{} {} unreachable: {}  {} domyjob doctor {machine}",
+        ui::paint(Tone::Bad, "!"),
+        ui::machine(machine),
+        ui::fit(why, 80),
+        ui::paint(Tone::Hint, ui::symbol(Symbol::Hint))
+    )?;
+    Ok(out)
+}
+
+#[must_use]
+pub fn no_jobs() -> String {
+    ui::paint(
+        Tone::Dim,
+        "No jobs yet. `domyjob run <machine> -- <command>` starts one.",
+    )
 }
 
 pub fn final_line(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Error> {
     let id = job.spec.id.as_str();
     let mut out = ui::job_line(machine, job, (&[id], ui::Columns::default()), None);
     if let Some(reason) = job.reason() {
-        write!(out, "\n  {}", ui::paint(Tone::Bad, reason.as_raw_str()))?;
+        write!(out, "\n  {}", ui::paint(Tone::Bad, &reason.to_string()))?;
+    }
+    for note in &job.notes {
+        write!(
+            out,
+            "\n  {}",
+            ui::paint(Tone::Dim, &format!("note: {note}"))
+        )?;
     }
     if let Some(step) = next_step(machine, job).filter(|_| !job.succeeded()) {
         write!(
@@ -177,13 +175,13 @@ pub fn machine_card(
         ui::machine(machine),
         resources(report)?.join(&ui::paint(Tone::Dim, " · "))
     )?;
-    writeln!(out, "  {}", activity(jobs)?.join("   "))?;
+    writeln!(out, "  {}", activity(jobs, report.max_jobs)?.join("   "))?;
     attention(&mut out, machine, report, (jobs, now))?;
     Ok(out)
 }
 
 fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::Error> {
-    let mut facts = vec![ui::paint(Tone::Dim, report.os.as_raw_str())];
+    let mut facts = vec![ui::paint(Tone::Dim, &report.os.to_string())];
     let mut cores = format!("{} cores", report.cores);
     if let Some([one, ..]) = report.load_hundredths {
         let load = format!("load {}.{:02}", one / 100, one % 100);
@@ -229,7 +227,10 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
     Ok(facts)
 }
 
-fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
+fn activity(
+    jobs: &[Job],
+    at_once: crate::domain::Concurrency,
+) -> Result<Vec<String>, std::fmt::Error> {
     let running: Vec<&Job> = jobs
         .iter()
         .filter(|job| matches!(job.state(), State::Running | State::Preparing))
@@ -268,8 +269,9 @@ fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
     }
     if queued > 0 {
         activity.push(format!(
-            "{} {queued} queued",
-            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued))
+            "{} {queued} queued {}",
+            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued)),
+            ui::paint(Tone::Dim, &format!("({at_once} at once)"))
         ));
     }
     if activity.is_empty() {
@@ -361,7 +363,7 @@ pub fn cleaned(
             out,
             "  {:>9}  {}",
             ui::bytes(item.bytes),
-            ui::paint(Tone::Dim, item.what.as_raw_str())
+            ui::paint(Tone::Dim, &item.what.to_string())
         )?;
     }
     if items.len() > 8 {
@@ -479,17 +481,17 @@ pub fn unreachable_card(
 pub fn first_run() -> Result<String, std::fmt::Error> {
     let mut out = String::new();
     writeln!(out, "{}", ui::paint(Tone::Strong, "No machines yet."))?;
-    writeln!(out, "  Any host your ssh config knows works as it is:")?;
-    writeln!(
-        out,
-        "    {}",
-        ui::paint(Tone::Hint, "domyjob run myhost -- uname -a")
-    )?;
-    writeln!(out, "  Or give one a name and labels:")?;
+    writeln!(out, "  Add a host your ssh config knows:")?;
     writeln!(
         out,
         "    {}",
         ui::paint(Tone::Hint, "domyjob machines add linux --label gpu")
+    )?;
+    writeln!(out, "  Or reach one directly:")?;
+    writeln!(
+        out,
+        "    {}",
+        ui::paint(Tone::Hint, "domyjob run ssh:myhost -- uname -a")
     )?;
     writeln!(
         out,
@@ -528,16 +530,16 @@ pub fn machines(rows: &[Seen<'_>]) -> Result<String, std::fmt::Error> {
                 )
             },
             |facts| {
-                let version = facts.hello.version.as_raw_str();
+                let version = facts.hello.version.to_string();
                 let shown = if version == crate::protocol::VERSION {
-                    version.to_owned()
+                    version
                 } else {
                     stale.push(row.name.clone());
                     ui::paint(Tone::Busy, &format!("{version} !"))
                 };
                 (
-                    facts.hello.os.as_raw_str().to_owned(),
-                    facts.hello.arch.as_raw_str().to_owned(),
+                    facts.hello.os.to_string(),
+                    facts.hello.arch.to_string(),
                     shown,
                 )
             },
@@ -606,7 +608,7 @@ pub fn doctor_reached(
         format!("{}/{}", hello.os, hello.arch),
         hello.version,
         ui::paint(Tone::Dim, &format!("wire {}", hello.wire)),
-        ui::paint(Tone::Dim, hello.shell.as_raw_str())
+        ui::paint(Tone::Dim, &hello.shell.to_string())
     )?;
     Ok(out)
 }
@@ -637,38 +639,6 @@ pub fn doctor_failed(
     Ok(out)
 }
 
-pub const JSON_SCHEMA: u32 = 2;
-
-#[must_use]
-pub fn job_summary_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    serde_json::json!({
-        "schema": JSON_SCHEMA,
-        "job": format!("{machine}:{}", job.spec.id),
-        "machine": machine,
-        "state": job.state().as_str(),
-        "exit_code": job.exit_code(),
-        "name": job.spec.name,
-        "command": job.spec.command.display(),
-        "reason": job.reason().map(|reason| reason.as_raw_str().to_owned()),
-        "behind": job.behind.iter().map(|holder| format!("{machine}:{holder}")).collect::<Vec<_>>(),
-    })
-}
-
-#[must_use]
-pub fn job_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    let mut value = job_summary_json(machine, job);
-    if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "detail".to_owned(),
-            match serde_json::to_value(job) {
-                Ok(detail) => detail,
-                Err(_unencodable) => serde_json::Value::Null,
-            },
-        );
-    }
-    value
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -686,7 +656,8 @@ pub mod tests {
         let last = crate::terminal::clean(&final_line(&machine, &job).unwrap());
         assert!(last.contains("succeeded · after 3m02s"), "{last}");
         assert!(!last.contains("ago"), "{last}");
-        let listed = crate::terminal::clean(&listing(&[(machine, job)], &[]).unwrap());
+        let listed =
+            crate::terminal::clean(&machine_listing(&machine, std::slice::from_ref(&job)).unwrap());
         assert!(listed.contains("3m02s · "), "{listed}");
         assert!(listed.contains("just now"), "{listed}");
         assert!(listed.starts_with("win  1 job\n"), "{listed}");
@@ -708,6 +679,7 @@ pub mod tests {
             },
             uptime_seconds: 60,
             paused: true,
+            max_jobs: crate::domain::Concurrency::DEFAULT,
         };
         let running = {
             let mut job = sample();
@@ -743,7 +715,7 @@ pub mod tests {
         for wanted in [
             "16 cores load 3.20",
             "1 running: tests",
-            "1 queued",
+            "1 queued (4 at once)",
             "failed",
             "domyjob digest linux:0AAAAAAA",
             "domyjob machines resume linux",
@@ -783,6 +755,7 @@ pub mod tests {
             },
             uptime_seconds: 60,
             paused: false,
+            max_jobs: crate::domain::Concurrency::DEFAULT,
         };
         let unreadable = crate::terminal::clean(
             &machine_card(&machine, &unknown, &[], Timestamp::observe()).unwrap(),
@@ -849,38 +822,7 @@ pub mod tests {
             phase: Phase::Queued,
             supervisor: Supervisor::Alive,
             behind: Vec::new(),
+            notes: Vec::new(),
         }
-    }
-
-    #[test]
-    fn the_job_json_keeps_its_shape_for_scripts_and_agents() {
-        let job = sample();
-        let machine: MachineName = "linux".parse().unwrap();
-        let mut keys: Vec<String> = job_json(&machine, &job)
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "behind",
-                "command",
-                "detail",
-                "exit_code",
-                "job",
-                "machine",
-                "name",
-                "reason",
-                "schema",
-                "state"
-            ]
-        );
-        assert_eq!(
-            job_summary_json(&machine, &job).get("job").unwrap(),
-            "linux:0AAAAAAAAAAAAAAA"
-        );
     }
 }

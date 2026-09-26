@@ -124,7 +124,25 @@ fn is_time_method(name: &str) -> bool {
 }
 
 const DECISION_FILES: &[&str] = &["authz.rs", "trust.rs", "audit.rs"];
+const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
+const FAILURE_FILES: &[&str] = &["failure.rs", "xtask/src/lib.rs", "xtask/src/release.rs"];
+
+fn carries_io_source(fields: &syn::Fields) -> bool {
+    let has_path = fields
+        .iter()
+        .any(|field| field.ident.as_ref().is_some_and(|name| name == "path"));
+    has_path
+        && fields.iter().any(|field| {
+            field.ident.as_ref().is_some_and(|name| name == "source")
+                && matches!(&field.ty, syn::Type::Path(path)
+                if path.path.segments.len() >= 2
+                    && path.path.segments.last().is_some_and(|last| last.ident == "Error")
+                    && path.path.segments.iter().rev().nth(1).is_some_and(|io| io.ident == "io"))
+        })
+}
 const WIRE_FILES: &[&str] = &["protocol.rs"];
+const JSON_RULE: &str = "an ad hoc JSON shape drifts from the others; give it a type in output.rs and print it through output";
+const JSON_FILES: &[&str] = &["mcp.rs", "protocol.rs"];
 const LOCAL_ONLY_TYPES: &[&str] = &["ConfigText", "UserText", "Arg", "Rendered", "Secret"];
 
 impl Gate {
@@ -250,6 +268,17 @@ impl Gate {
 }
 
 impl<'ast> Visit<'ast> for Gate {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if self.test_depth == 0
+            && !self.file_is(JSON_FILES)
+            && let Some(last) = mac.path.segments.last()
+            && last.ident == "json"
+        {
+            self.flag(last.ident.span(), JSON_RULE);
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let test = is_test_module(&item.attrs);
         if test {
@@ -278,6 +307,12 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if method == "as_raw_str" && self.file_is(TERMINAL_FILES) {
+            self.flag(
+                call.method.span(),
+                "remote text reaches a terminal only through its Display, which neutralizes control characters",
+            );
+        }
         let exempt = self.file_is(CLOCK_FILES)
             || (self.file_is(LIVENESS_FILES) && LIVENESS_TIME.contains(&method.as_str()));
         if !exempt && is_time_method(&method) {
@@ -312,7 +347,23 @@ impl<'ast> Visit<'ast> for Gate {
         syn::visit::visit_attribute(self, attr);
     }
 
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if carries_io_source(&variant.fields) && !self.file_is(FAILURE_FILES) {
+            self.flag(
+                variant.ident.span(),
+                "an I/O failure is failure::IoFailure, with the action and path it happened at",
+            );
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if carries_io_source(&item.fields) && !self.file_is(FAILURE_FILES) {
+            self.flag(
+                item.ident.span(),
+                "an I/O failure is failure::IoFailure, with the action and path it happened at",
+            );
+        }
         self.check_input(
             &item.attrs,
             item.ident.span(),
@@ -372,6 +423,54 @@ impl<'ast> Visit<'ast> for Gate {
     }
 }
 
+const OS_WORDS: &[&str] = &["unix", "windows", "target_os", "target_family"];
+
+fn mentions_os(tokens: &proc_macro2::TokenStream) -> bool {
+    tokens
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| OS_WORDS.contains(&word))
+}
+
+#[derive(Debug, Default)]
+struct OsBranches {
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for OsBranches {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if (attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+            && let syn::Meta::List(list) = &attr.meta
+            && mentions_os(&list.tokens)
+        {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_attribute(self, attr);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if mac.path.is_ident("cfg") && mentions_os(&mac.tokens) {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        if names.ends_with(&["consts".to_owned(), "OS".to_owned()]) {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+pub fn os_branches(source: &str) -> Result<usize, syn::Error> {
+    let file = syn::parse_file(source)?;
+    let mut branches = OsBranches::default();
+    branches.visit_file(&file);
+    Ok(branches.count)
+}
+
 pub fn check(source: &str) -> Result<Vec<Finding>, syn::Error> {
     check_file(source, "")
 }
@@ -393,6 +492,46 @@ mod tests {
 
     fn rules(source: &str) -> Vec<&'static str> {
         check(source).unwrap().into_iter().map(|f| f.rule).collect()
+    }
+
+    #[test]
+    fn every_way_of_asking_which_system_this_is_is_counted() {
+        let source = "#[cfg(unix)]\nfn a() {}\n#[cfg(not(windows))]\nfn b() { let _ = cfg!(target_os = \"macos\"); let _ = std::env::consts::OS; }\n#[cfg(test)]\nmod tests {}\n#[cfg_attr(unix, inline)]\nfn c() {}";
+        assert_eq!(os_branches(source).unwrap(), 5);
+        assert_eq!(
+            os_branches("#[cfg(feature = \"x\")]\nfn a() {}").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn remote_text_is_never_printed_raw() {
+        let source = "fn f(t: &RemoteText) -> String { t.as_raw_str().to_owned() }";
+        assert_eq!(check_file(source, "src/view.rs").unwrap().len(), 1);
+        assert!(check_file(source, "src/remote.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_io_error_travels_only_inside_io_failure() {
+        let variant =
+            "enum E { Io { action: &'static str, path: PathBuf, source: std::io::Error } }";
+        assert_eq!(rules(variant).len(), 1);
+        assert_eq!(
+            rules("struct S { path: PathBuf, source: std::io::Error }").len(),
+            1
+        );
+        assert!(
+            rules("enum E { Listen { address: SocketAddr, source: std::io::Error } }").is_empty()
+        );
+        assert!(rules("enum E { Output(std::io::Error) }").is_empty());
+        assert!(
+            check_file(
+                "struct IoFailure { source: std::io::Error }",
+                "x/failure.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -451,6 +590,23 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn json_is_shaped_by_a_type_not_by_hand() {
+        for source in [
+            "fn f() { let _v = serde_json::json!({\"a\": 1}); }",
+            "fn f() { let _v = json!([]); }",
+        ] {
+            assert_eq!(rules(source), [JSON_RULE], "{source}");
+        }
+        assert!(
+            check_file("fn f() { let _v = json!({}); }", "src/mcp.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(rules("#[cfg(test)] mod tests { fn f() { let _v = json!(1); } }").is_empty());
+        assert!(rules("fn f() { let _v = serde_json::to_value(&x); }").is_empty());
     }
 
     #[test]

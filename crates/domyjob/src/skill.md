@@ -21,7 +21,8 @@ You then ask for a digest or search the log instead of reading all of it.
 5. Fetch a result if you need one:
    `domyjob get tests target/report.json -o report.json`
 6. Bring back what it changed:
-   `domyjob pull tests` writes the files the job added, altered, or removed into this directory, and refuses if you edited any of them since sending.
+   `domyjob pull tests` writes the files the job added, altered, or removed into the directory it was sent from, and refuses if you edited any of them since sending.
+   `domyjob pull --undo tests` puts them back.
    Commit, sign, and push here: the other machines never need your keys.
 
 When a result is needed right away and the job is short, `domyjob run win --wait --digest -- cargo test` waits and prints only the digest.
@@ -45,7 +46,7 @@ Each job may also set `runner`, `workspace` (`warm` or `fresh`), `dir`, and `env
 
 `domyjob` with no command asks every machine at once and prints one card each: its load, memory, and free disk, what runs and waits there, the last failure, and the one command that deals with whatever needs attention.
 `domyjob --json` gives the same as data, and `domyjob --live` keeps it on screen, redrawn whenever a job starts or finishes (with `--json`, one line per change).
-`domyjob clean MACHINES` frees the disk domyjob holds there (`--dry-run` first shows how much), and `domyjob machines pause MACHINES` stops them taking new jobs until `resume`.
+`domyjob clean MACHINES` frees the disk domyjob holds there (`--dry-run` first shows how much), `domyjob machines pause MACHINES` stops them taking new jobs until `resume`, and `domyjob machines limit MACHINES 8` lets eight run at once.
 
 ## Looking at a machine, instead of ssh
 
@@ -57,6 +58,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 
 - By the name you gave with `--name`: `tests`, or `win:tests` for the one on that machine.
 - The newest job you started: `latest`, or `win:latest`.
+- Names and `latest` mean jobs sent from the project you are in, so two worktrees never answer for each other; an id works from anywhere.
 - By id or any unique prefix of it: `3KX9`, or `win:3KX9`.
 
 ## Choosing machines
@@ -78,9 +80,10 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## Exit codes
 
 - `0`: everything asked for succeeded.
-- `1`: domyjob worked, and a job failed, or `status` found a failed job, or `logs --grep` found nothing, or `ls` could not reach a machine, or `doctor` found a problem.
+- `1`: domyjob worked, and a job failed, or `status` found a failed job, or `logs --grep` found nothing, or `kill` found the job already finished, or `doctor` found a problem.
   `run --wait` on a single machine exits with the job's own exit code instead, so it can stand in for running the command there directly.
 - `2`: domyjob itself could not do what was asked; with `--json` the error arrives as `{"error": {"kind": ..., "message": ..., "hint": ...}}`, where `kind` is one of `usage`, `config`, `not_found`, `ambiguous`, `unreachable`, `forbidden`, `protocol`, `security`, `distribution`, `local`, `remote`, and `internal`.
+- `3`: the outcome is unknown: a machine did not answer, or a job was lost track of. The job may still be running; ask again rather than sending it again.
 
 ## When the network or a machine misbehaves
 
@@ -90,9 +93,11 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 
 ## JSON for scripts and agents
 
-Every job in `--json` output has the same shape, with `"schema": 2`:
-`job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), and `detail` (everything else).
-`digest --json` adds `lines`, `bytes`, and `tail`; errors arrive as `{"schema": 2, "error": {kind, message, hint}}`.
+Every line of `--json` output, and every MCP answer, is one document with `"schema": 3`.
+A job has `job` (`machine:id`), `machine`, `state`, `exit_code`, `name`, `command`, `reason` (why it errored, if it did), `behind` (the jobs a queued job is waiting for), `notes` (what domyjob itself had to say about the job, kept out of its log), and from the command line `detail` (everything else).
+`digest` adds `lines`, `bytes`, and `tail` to the job.
+`ls --json` answers `{"jobs": [...], "unreachable": [...]}`, as the MCP `list_jobs` does.
+Wherever machines are listed, one that could not answer is `{"machine": ..., "error": {kind, message, hint}}`, and a command that failed answers `{"error": {kind, message, hint}}`.
 
 ## Other commands
 

@@ -163,46 +163,8 @@ fn lan_address() -> Option<IpAddr> {
     })
 }
 
-#[cfg(unix)]
-fn elevated() -> bool {
-    rustix::process::geteuid().is_root()
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "asking Windows whether this process token is elevated needs the token API"
-)]
-fn elevated() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return true;
-    }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut returned = 0u32;
-    let Ok(size) = u32::try_from(size_of::<TOKEN_ELEVATION>()) else {
-        return true;
-    };
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            (&raw mut elevation).cast(),
-            size,
-            &raw mut returned,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    asked == 0 || elevation.TokenIsElevated != 0
-}
-
 pub fn refuse_root(allowed: bool) -> Result<(), ServeError> {
-    if elevated() && !allowed {
+    if crate::platform::elevated() && !allowed {
         Err(ServeError::Root)
     } else {
         Ok(())
@@ -233,15 +195,15 @@ impl Greeting {
     fn here() -> Result<Self, Invalid> {
         Ok(Self {
             name: host_name().parse()?,
-            os: std::env::consts::OS.to_owned(),
-            arch: std::env::consts::ARCH.to_owned(),
+            os: crate::platform::OS.to_owned(),
+            arch: crate::platform::ARCH.to_owned(),
         })
     }
 }
 
 #[must_use]
 pub fn host_name() -> String {
-    let raw = platform_host_name();
+    let raw = sysinfo::System::host_name().unwrap_or_default();
     let cleaned: String = raw
         .split('.')
         .next()
@@ -263,22 +225,6 @@ pub fn host_name() -> String {
     }
 }
 
-#[cfg(unix)]
-fn platform_host_name() -> String {
-    rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[cfg(not(unix))]
-fn platform_host_name() -> String {
-    match std::env::var("COMPUTERNAME") {
-        Ok(name) => name,
-        Err(_unset) => String::new(),
-    }
-}
-
 fn send_line<T: Serialize>(writer: &mut dyn Write, value: &T) -> Result<(), ServeError> {
     let mut line = serde_json::to_vec(value).map_err(|_unencodable| ServeError::Exchange)?;
     line.push(b'\n');
@@ -288,12 +234,7 @@ fn send_line<T: Serialize>(writer: &mut dyn Write, value: &T) -> Result<(), Serv
 }
 
 fn read_line<T: crate::ingress::Ingress>(reader: &mut dyn Read) -> Result<T, ServeError> {
-    let mut line = Vec::new();
-    let mut limited = reader.take(GREETING_LIMIT);
-    let mut byte = [0u8; 1];
-    while limited.read(&mut byte)? == 1 && byte != *b"\n" {
-        line.extend_from_slice(&byte);
-    }
+    let line = crate::bounded::line_unread_past(reader, GREETING_LIMIT)?;
     crate::ingress::json(&line).map_err(|_malformed| ServeError::Exchange)
 }
 

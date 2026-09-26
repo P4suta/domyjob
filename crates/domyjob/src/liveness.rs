@@ -471,15 +471,31 @@ mod tests {
         assert_eq!(activity.seen(), (0, 0));
     }
 
+    fn until_written(
+        heard: &std::sync::mpsc::Receiver<Vec<u8>>,
+        wanted: &[u8],
+        seen: &mut Vec<u8>,
+    ) {
+        loop {
+            let chunk = heard.recv().unwrap();
+            seen.extend_from_slice(&chunk);
+            if chunk == wanted {
+                return;
+            }
+        }
+    }
+
     #[test]
     fn a_slow_answer_is_preceded_by_blank_lines_and_followed_by_nothing() {
-        let mut out = Vec::new();
-        with_pulse_every(&mut out, QUICK, |pulsed| {
-            pause(QUICK * 6);
+        let (told, heard) = std::sync::mpsc::channel();
+        let mut seen = Vec::new();
+        with_pulse_every(&mut crate::faults::Told(told), QUICK, |pulsed| {
+            until_written(&heard, b"\n", &mut seen);
             pulsed.write_all(b"{\"reply\":\"job\"}\n").unwrap();
             pause(QUICK * 6);
         });
-        let text = String::from_utf8(out).unwrap();
+        seen.extend(heard.try_iter().flatten());
+        let text = String::from_utf8(seen).unwrap();
         let (before, after) = text.split_once("{\"reply\"").unwrap();
         assert!(
             !before.is_empty() && before.chars().all(|c| c == '\n'),
@@ -490,13 +506,15 @@ mod tests {
 
     #[test]
     fn a_stream_is_kept_alive_with_reserved_chunks_after_its_reply() {
-        let mut out = Vec::new();
-        with_pulse_every(&mut out, QUICK, |pulsed| {
+        let (told, heard) = std::sync::mpsc::channel();
+        let mut seen = Vec::new();
+        with_pulse_every(&mut crate::faults::Told(told), QUICK, |pulsed| {
             pulsed.write_all(STREAM_REPLY).unwrap();
             pulsed.write_all(b"\n").unwrap();
-            pause(QUICK * 6);
+            until_written(&heard, &STREAM_BEAT.to_be_bytes(), &mut seen);
         });
-        let rest = out.get(STREAM_REPLY.len().saturating_add(1)..).unwrap();
+        seen.extend(heard.try_iter().flatten());
+        let rest = seen.get(STREAM_REPLY.len().saturating_add(1)..).unwrap();
         assert!(!rest.is_empty());
         assert!(rest.chunks(4).all(|beat| beat == STREAM_BEAT.to_be_bytes()));
     }

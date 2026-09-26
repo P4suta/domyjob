@@ -131,19 +131,15 @@ fn on_path(name: &str) -> bool {
 
 #[must_use]
 pub fn default_shell() -> String {
-    if cfg!(windows) {
-        if on_path("pwsh") {
-            "pwsh".to_owned()
-        } else {
-            "powershell".to_owned()
-        }
-    } else {
-        match std::env::var("SHELL") {
+    match crate::platform::FAMILY {
+        crate::paths::Family::Windows if on_path("pwsh") => "pwsh".to_owned(),
+        crate::paths::Family::Windows => "powershell".to_owned(),
+        crate::paths::Family::Unix => match std::env::var("SHELL") {
             Ok(shell) if !shell.is_empty() => shell,
             Ok(_) | Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
                 "/bin/sh".to_owned()
             }
-        }
+        },
     }
 }
 

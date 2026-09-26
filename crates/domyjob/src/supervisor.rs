@@ -26,6 +26,47 @@ enum Event {
     Kill,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Asked,
+    Ended,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Ending {
+    Concluded(Outcome),
+    Returned,
+}
+
+impl Stop {
+    fn before_start(self, when: &str) -> (Ending, String) {
+        match self {
+            Self::Asked => (
+                Ending::Concluded(Outcome::Killed),
+                format!("killed while {when}"),
+            ),
+            Self::Ended => (
+                Ending::Returned,
+                format!(
+                    "the machine told domyjob to stop while the job was {when}; it starts again when the machine is next given a command, such as a new job"
+                ),
+            ),
+        }
+    }
+
+    fn while_running(self) -> Outcome {
+        match self {
+            Self::Asked => Outcome::Killed,
+            Self::Ended => Outcome::Errored {
+                reason: RemoteText::new(
+                    "the machine told domyjob to stop while the job ran, as it does when it shuts down; it was not run again because it may already have had effects"
+                        .to_owned(),
+                ),
+            },
+        }
+    }
+}
+
 const LOG_HEAD: u64 = 256 << 20;
 const LOG_TAIL: usize = 8 << 20;
 
@@ -110,9 +151,11 @@ struct Shared {
     finished: Mutex<bool>,
     ended: Condvar,
     killed: AtomicBool,
+    stop: OnceLock<Stop>,
     group: OnceLock<Arc<Group>>,
     events: Sender<Event>,
     log_path: PathBuf,
+    notes_path: PathBuf,
 }
 
 impl Shared {
@@ -126,7 +169,11 @@ impl Shared {
     }
 
     fn say(&self, line: &str) {
-        self.append(format!("domyjob: {line}\n").as_bytes());
+        let noted = crate::state_file::open_append(&self.notes_path)
+            .map(|mut notes| notes.write_all(format!("{line}\n").as_bytes()));
+        match noted {
+            Ok(Ok(()) | Err(_)) | Err(_) => {}
+        }
     }
 
     fn close_log(&self) -> Option<String> {
@@ -160,7 +207,10 @@ impl Shared {
         }
     }
 
-    fn kill(&self) -> Result<(), NodeError> {
+    fn kill(&self, stop: Stop) -> Result<(), NodeError> {
+        match self.stop.set(stop) {
+            Ok(()) | Err(_) => {}
+        }
         self.killed.store(true, Ordering::SeqCst);
         match self.events.send(Event::Kill) {
             Ok(()) | Err(_) => {}
@@ -173,6 +223,19 @@ impl Shared {
 
     fn killed(&self) -> bool {
         self.killed.load(Ordering::SeqCst)
+    }
+
+    fn stopped(&self) -> Stop {
+        match self.stop.get() {
+            Some(stop) => *stop,
+            None => Stop::Asked,
+        }
+    }
+
+    fn before_start(&self, when: &str) -> Ending {
+        let (ending, note) = self.stopped().before_start(when);
+        self.say(&note);
+        ending
     }
 
     fn follow(&self, offset: u64, stream: &Stream) -> std::io::Result<()> {
@@ -212,7 +275,7 @@ fn answer(shared: &Shared, stream: &Stream) {
     };
     match order {
         Order::Kill => {
-            if let Err(error) = shared.kill() {
+            if let Err(error) = shared.kill(Stop::Asked) {
                 shared.say(&format!("stopping the job failed: {error}"));
             }
             shared.until_finished();
@@ -225,44 +288,63 @@ fn answer(shared: &Shared, stream: &Stream) {
 }
 
 #[derive(Debug, Default)]
+struct Tally {
+    open: usize,
+    ended: u64,
+}
+
+#[derive(Debug, Default)]
 struct Connections {
-    open: Mutex<usize>,
-    ended: Condvar,
+    tally: Mutex<Tally>,
+    changed: Condvar,
 }
 
 struct Open(Arc<Connections>);
 
 impl Drop for Open {
     fn drop(&mut self) {
-        if let Ok(mut open) = self.0.open.lock() {
-            *open = open.saturating_sub(1);
+        if let Ok(mut tally) = self.0.tally.lock() {
+            tally.open = tally.open.saturating_sub(1);
+            tally.ended = tally.ended.wrapping_add(1);
         }
-        self.0.ended.notify_all();
+        self.0.changed.notify_all();
     }
 }
 
 trait Counting {
     fn open(&self) -> Open;
-    fn wait_for_one_to_end(&self) -> bool;
+    fn retrying<T, E>(&self, attempt: impl FnMut() -> Result<T, E>) -> Result<T, E>;
 }
 
 impl Counting for Arc<Connections> {
     fn open(&self) -> Open {
-        if let Ok(mut open) = self.open.lock() {
-            *open = open.saturating_add(1);
+        if let Ok(mut tally) = self.tally.lock() {
+            tally.open = tally.open.saturating_add(1);
         }
         Open(Self::clone(self))
     }
 
-    fn wait_for_one_to_end(&self) -> bool {
-        let Ok(open) = self.open.lock() else {
-            return false;
-        };
-        let before = *open;
-        if before == 0 {
-            return false;
+    fn retrying<T, E>(&self, mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+        loop {
+            let mark = match self.tally.lock() {
+                Ok(tally) => tally.ended,
+                Err(_poisoned) => return attempt(),
+            };
+            let error = match attempt() {
+                Ok(done) => return Ok(done),
+                Err(error) => error,
+            };
+            let Ok(tally) = self.tally.lock() else {
+                return Err(error);
+            };
+            match self
+                .changed
+                .wait_while(tally, |tally| tally.ended == mark && tally.open > 0)
+            {
+                Ok(tally) if tally.ended != mark => {}
+                Ok(_) | Err(_) => return Err(error),
+            }
         }
-        self.ended.wait_while(open, |now| *now >= before).is_ok()
     }
 }
 
@@ -270,7 +352,7 @@ fn serve_control(listener: Listener, shared: Arc<Shared>) {
     let connections = Arc::new(Connections::default());
     std::thread::spawn(move || {
         loop {
-            match listener.accept() {
+            match connections.retrying(|| listener.accept()) {
                 Ok(stream) => {
                     let shared = Arc::clone(&shared);
                     let open = connections.open();
@@ -280,10 +362,8 @@ fn serve_control(listener: Listener, shared: Arc<Shared>) {
                     });
                 }
                 Err(error) => {
-                    if !connections.wait_for_one_to_end() {
-                        shared.say(&format!("the control socket stopped accepting: {error}"));
-                        return;
-                    }
+                    shared.say(&format!("the control socket stopped accepting: {error}"));
+                    return;
                 }
             }
         }
@@ -391,7 +471,6 @@ struct Supervisor {
     store: Store,
     cas: Cas,
     spec: Spec,
-    launch: crate::store::LaunchEnv,
     shared: Arc<Shared>,
 }
 
@@ -421,25 +500,28 @@ fn take_charge(
     };
     let control = store.control_path(id);
     crate::state_file::remove_file(&control)?;
-    let listener = Listener::bind(&control).map_err(|source| NodeError::Io {
-        action: "listening on",
-        path: control.clone(),
-        source,
+    let listener = Listener::bind(&control).map_err(|source| {
+        NodeError::Io(crate::failure::IoFailure {
+            action: "listening on",
+            path: control.clone(),
+            source,
+        })
     })?;
     let cas = Cas::open(dirs.state.join("objects"))?;
     if !store.is_published(id)? {
         store.publish(id)?;
     }
     let spec = store.spec(id)?;
-    let launch = store.launch_env(id)?;
     let log_path = store.log_path(id);
     let file = crate::state_file::open_append(&log_path)?;
     let len = file
         .metadata()
-        .map_err(|source| NodeError::Io {
-            action: "measuring",
-            path: log_path.clone(),
-            source,
+        .map_err(|source| {
+            NodeError::Io(crate::failure::IoFailure {
+                action: "measuring",
+                path: log_path.clone(),
+                source,
+            })
         })?
         .len();
     let (events, received) = std::sync::mpsc::channel();
@@ -449,11 +531,23 @@ fn take_charge(
         finished: Mutex::new(false),
         ended: Condvar::new(),
         killed: AtomicBool::new(false),
+        stop: OnceLock::new(),
         group: OnceLock::new(),
         events,
         log_path,
+        notes_path: store.notes_path(id),
     });
     serve_control(listener, Arc::clone(&shared));
+    let told = Arc::clone(&shared);
+    if let Err(error) = ctrlc::set_handler(move || {
+        if let Err(error) = told.kill(Stop::Ended) {
+            told.say(&format!("stopping the job failed: {error}"));
+        }
+    }) {
+        shared.say(&format!(
+            "a shutdown will read as a vanished supervisor, because the machine's requests to stop cannot be heard: {error}"
+        ));
+    }
     if let Err(error) = readiness.announce() {
         shared.say(&format!(
             "the submitter left before the job started: {error}"
@@ -464,7 +558,6 @@ fn take_charge(
         store,
         cas,
         spec,
-        launch,
         shared,
     };
     Ok((supervisor, alive, received))
@@ -479,7 +572,8 @@ impl Supervisor {
         let mut started = None;
         let result = self.run(events, &mut held, &mut started);
         let outcome = match result {
-            Ok(outcome) => outcome,
+            Ok(Ending::Concluded(outcome)) => outcome,
+            Ok(Ending::Returned) => return self.step_back(held),
             Err(error) => {
                 self.shared.say(&error.to_string());
                 Outcome::Errored {
@@ -487,6 +581,11 @@ impl Supervisor {
                 }
             }
         };
+        if let Err(error) = self.record_left() {
+            self.shared.say(&format!(
+                "what the job changed could not be kept, so pull needs its workspace: {error}"
+            ));
+        }
         if let Err(error) = self.cleanup() {
             self.shared.say(&format!("cleaning up: {error}"));
         }
@@ -506,6 +605,18 @@ impl Supervisor {
             self.store
                 .record_outcome_in_place(&self.spec.id, &finished)
                 .map_err(|_also| error)?;
+        }
+        self.shared.finish();
+        released
+    }
+
+    fn step_back(&self, held: Held) -> Result<(), NodeError> {
+        if let Err(error) = self.cleanup() {
+            self.shared.say(&format!("cleaning up: {error}"));
+        }
+        let released = held.release();
+        match self.shared.close_log() {
+            Some(_) | None => {}
         }
         self.shared.finish();
         released
@@ -564,11 +675,10 @@ impl Supervisor {
         events: &Receiver<Event>,
         held: &mut Held,
         started: &mut Option<Timestamp>,
-    ) -> Result<Outcome, NodeError> {
+    ) -> Result<Ending, NodeError> {
         if !self.store.skips_the_queue(&self.spec.id)? {
             let Some(slot) = self.queue(events)? else {
-                self.shared.say("killed while queued");
-                return Ok(Outcome::Killed);
+                return Ok(self.shared.before_start("queued"));
             };
             let holder = Store::slot_holder_path(slot.path());
             match crate::state_file::write_bytes(&holder, self.spec.id.as_str().as_bytes()) {
@@ -583,15 +693,13 @@ impl Supervisor {
         let (root, workspace_lock) = match self.prepare() {
             Ok(prepared) => prepared,
             Err(NodeError::Workspace(crate::workspace::WorkspaceError::Stopped)) => {
-                self.shared.say("killed while preparing");
-                return Ok(Outcome::Killed);
+                return Ok(self.shared.before_start("preparing"));
             }
             Err(other) => return Err(other),
         };
         held.workspace = workspace_lock;
         if self.shared.killed() {
-            self.shared.say("killed while preparing");
-            return Ok(Outcome::Killed);
+            return Ok(self.shared.before_start("preparing"));
         }
         let (group, collecting) = self.start(&root)?;
         let group = Arc::new(group);
@@ -617,12 +725,7 @@ impl Supervisor {
                 "recording that the job runs failed ({error}); it runs regardless"
             ));
         }
-        if let Err(error) = self.store.forget_launch_env(&self.spec.id) {
-            self.shared.say(&format!(
-                "removing the saved launch environment failed: {error}"
-            ));
-        }
-        Ok(self.watch(&group, collecting))
+        Ok(Ending::Concluded(self.watch(&group, collecting)))
     }
 
     fn start(&self, root: &Path) -> Result<(Group, Collecting), NodeError> {
@@ -637,18 +740,12 @@ impl Supervisor {
         };
         let mut command =
             crate::shell::process(&self.spec.command, self.spec.shell.as_deref()).command();
-        command
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&self.launch.vars);
-        for name in &self.launch.not_unicode {
+        command.current_dir(&cwd);
+        for name in self.store.take_launch(&self.spec.id)?.apply(&mut command) {
             self.shared.say(&format!(
                 "the environment variable {} was not passed on because it is not Unicode",
-                crate::terminal::neutralize(name)
+                crate::terminal::neutralize(&name)
             ));
-        }
-        for (key, value) in self.store.env(&self.spec.id)? {
-            command.env(key.as_str(), value);
         }
         command
             .env("DOMYJOB", "1")
@@ -669,10 +766,7 @@ impl Supervisor {
             self.shared.say(&format!("collecting output: {error}"));
         }
         match (status, self.shared.killed()) {
-            (Ok(_) | Err(_), true) => {
-                self.shared.say("killed");
-                Outcome::Killed
-            }
+            (Ok(_) | Err(_), true) => self.shared.stopped().while_running(),
             (Ok(status), false) => match proc::exit_code(status) {
                 0 => Outcome::Succeeded,
                 code => Outcome::Failed { exit_code: code },
@@ -717,11 +811,13 @@ impl Supervisor {
 
     fn fill(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
         match self.fill_once(root, manifest_id) {
-            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Io {
-                action,
-                path,
-                source,
-            })) => {
+            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Tree(
+                crate::tree::TreeError::Io(crate::failure::IoFailure {
+                    action,
+                    path,
+                    source,
+                }),
+            ))) => {
                 self.shared.say(&format!(
                     "the workspace could not be updated ({action} {}: {source}); moving it aside and filling it afresh",
                     path.display()
@@ -751,17 +847,39 @@ impl Supervisor {
             manifest: &manifest,
             previous: &previous,
         };
-        let (applied, changes) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
+        let (applied, _) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
         crate::state_file::write_json(&state, &applied)?;
         crate::state_file::write_bytes(&filled_by_path(root), self.spec.id.as_str().as_bytes())?;
-        self.shared.say(&format!(
-            "workspace {} ({} written, {} unchanged, {} removed)",
-            root.display(),
-            changes.written,
-            changes.kept,
-            changes.removed
-        ));
         Ok(())
+    }
+
+    fn record_left(&self) -> Result<(), NodeError> {
+        let Location::Snapshot { source, .. } = &self.spec.location else {
+            return Ok(());
+        };
+        let Some(root) =
+            crate::state_file::read_bytes(&self.store.workspace_record(&self.spec.id))?
+        else {
+            return Ok(());
+        };
+        let root = PathBuf::from(String::from_utf8_lossy(&root).trim());
+        let Some(workspace) = crate::workspace::Workspace::open_existing(&root)? else {
+            return Ok(());
+        };
+        let sent = self.cas.manifest(&source.manifest)?;
+        let left = workspace.left(&sent)?;
+        for item in &left {
+            if let Some(crate::snapshot::Entry::File { blob, size, .. }) = &item.now
+                && !self.cas.has(blob)?
+            {
+                let mut file = workspace.open_file(&item.path)?;
+                self.cas.receive(&mut file, blob, *size)?;
+            }
+        }
+        Ok(crate::state_file::write_json(
+            &self.store.left_path(&self.spec.id),
+            &left,
+        )?)
     }
 
     fn cleanup(&self) -> Result<(), NodeError> {
@@ -784,6 +902,24 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_the_machine_stops_before_it_starts_is_returned_and_one_it_stops_while_running_is_closed()
+     {
+        assert_eq!(
+            Stop::Asked.before_start("queued").0,
+            Ending::Concluded(Outcome::Killed)
+        );
+        let (ending, note) = Stop::Ended.before_start("preparing");
+        assert_eq!(ending, Ending::Returned);
+        assert!(note.contains("while the job was preparing") && note.contains("starts again"));
+        assert_eq!(Stop::Asked.while_running(), Outcome::Killed);
+        let ended = Stop::Ended.while_running();
+        assert!(
+            matches!(&ended, Outcome::Errored { reason } if reason.as_raw_str().contains("told domyjob to stop")),
+            "{ended:?}"
+        );
+    }
 
     #[test]
     fn an_endless_log_keeps_its_start_and_its_end_and_says_what_was_left_out() {
@@ -821,15 +957,42 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_accept_waits_for_a_connection_to_end_and_gives_up_when_none_are_open() {
+    fn a_failed_accept_is_retried_after_any_connection_ends_and_given_up_when_none_are_open() {
         let connections = Arc::new(Connections::default());
-        assert!(!connections.wait_for_one_to_end());
+        let mut alone = 0;
+        let nothing_open: Result<(), usize> = connections.retrying(|| {
+            alone += 1;
+            Err(alone)
+        });
+        assert_eq!(nothing_open, Err(1));
+
         let first = connections.open();
         let second = connections.open();
-        let ending = std::thread::spawn(move || drop(first));
-        assert!(connections.wait_for_one_to_end());
+        let mut pending = Some(first);
+        let mut during = 0;
+        let ended_before_the_wait = connections.retrying(|| {
+            during += 1;
+            drop(pending.take());
+            if during < 2 { Err(during) } else { Ok(during) }
+        });
+        assert_eq!(ended_before_the_wait, Ok(2));
+
+        let (go, wait_for_go) = std::sync::mpsc::channel::<()>();
+        let ending = std::thread::spawn(move || {
+            wait_for_go.recv().unwrap();
+            drop(second);
+        });
+        let mut after = 0;
+        let ended_while_waiting: Result<usize, usize> = connections.retrying(|| {
+            after += 1;
+            if after < 2 {
+                go.send(()).unwrap();
+                Err(after)
+            } else {
+                Ok(after)
+            }
+        });
         ending.join().unwrap();
-        drop(second);
-        assert!(!connections.wait_for_one_to_end());
+        assert_eq!(ended_while_waiting, Ok(2));
     }
 }

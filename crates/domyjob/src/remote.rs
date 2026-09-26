@@ -8,7 +8,7 @@ use crate::config::{Binary, Config, ConfigError, Machine};
 use crate::dist::Deliverable;
 use crate::domain::{BlobId, MachineName};
 use crate::paths::{Dirs, Family};
-use crate::protocol::{Frame, Hello, Refusal, Reply, Request, VERSION, wire};
+use crate::protocol::{Frame, Hello, Refusal, Reply, Request, VERSION, build_key, wire};
 use crate::snapshot::{Origin, SnapshotError};
 use crate::template::{Arg, Argv, Bindings, TemplateError};
 
@@ -17,6 +17,38 @@ fn witness_path(dirs: &Dirs, machine: &MachineName) -> PathBuf {
     dirs.state
         .join("witness")
         .join(format!("{}.json", tag.get(..32).unwrap_or(tag.as_str())))
+}
+
+impl RemoteError {
+    #[must_use]
+    pub fn machine(&self) -> Option<&str> {
+        match self {
+            Self::Empty { machine }
+            | Self::Start { machine, .. }
+            | Self::Pipe { machine, .. }
+            | Self::Exited { machine, .. }
+            | Self::Garbled { machine, .. }
+            | Self::Refused { machine, .. }
+            | Self::Unreadable { machine, .. }
+            | Self::Silent { machine, .. }
+            | Self::Stream { machine, .. }
+            | Self::Unexpected { machine, .. }
+            | Self::Protocol { machine, .. }
+            | Self::Newer { machine, .. }
+            | Self::Probe { machine, .. }
+            | Self::Tampered { machine, .. }
+            | Self::AuditRolledBack { machine, .. }
+            | Self::AuditRewritten { machine, .. }
+            | Self::Outdated { machine, .. }
+            | Self::Unbuilt { machine, .. } => Some(machine),
+            Self::Config(_)
+            | Self::Template { .. }
+            | Self::Dist(_)
+            | Self::State(_)
+            | Self::Snapshot(_)
+            | Self::Io(_) => None,
+        }
+    }
 }
 
 pub fn witnessed(
@@ -204,12 +236,8 @@ pub enum RemoteError {
     Unbuilt { machine: String, was: String },
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +311,54 @@ enum Remote {
     Promote(Family),
     Uninstall(Family, Placement),
     Scrub(Family),
+    Build(Family),
+}
+
+fn build_unix() -> Arg {
+    Arg::joined(&[
+        "set -e; PATH=\"$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH\"; ",
+        "c=\"$HOME/.cache/domyjob\"; s=\"$c/source-$$\"; rm -rf \"$s\"; mkdir -p \"$s\"; ",
+        "tar -x -m -C \"$s\"; cd \"$s\"; ",
+        "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null' EXIT; ",
+        "cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
+        "d=\"$c/bin/",
+        build_key(),
+        "\"; mkdir -p \"$d\"; cp \"$c/build/release/domyjob\" \"$d/domyjob.$$\"; ",
+        "chmod 755 \"$d/domyjob.$$\"; mv -f \"$d/domyjob.$$\" \"$d/domyjob.incoming\"; ",
+        "cd /; rm -rf \"$s\"",
+    ])
+}
+
+fn build_windows_script() -> Arg {
+    Arg::joined(&[
+        "$ErrorActionPreference = 'Stop'; ",
+        "$c = Join-Path $env:USERPROFILE '.cache\\domyjob'; $s = Join-Path $c \"source-$PID\"; ",
+        "if (Test-Path $s) { Remove-Item -Recurse -Force $s }; New-Item -ItemType Directory -Force $s | Out-Null; ",
+        "$b = Join-Path $env:TEMP 'domyjob-source-",
+        session(),
+        ".b64'; $t = \"$s.tar\"; ",
+        "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String(((Get-Content -Raw $b) -replace '\\s', ''))); Remove-Item -Force $b; ",
+        "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
+        "$cargo = Start-Process cargo -ArgumentList 'build','--release','--locked','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -PassThru; ",
+        "while (-not $cargo.WaitForExit(5000)) { [Console]::Error.Write('.') }; $built = $cargo.ExitCode; ",
+        "if ($built) { exit $built }; ",
+        "$d = Join-Path $c 'bin\\",
+        build_key(),
+        "'; New-Item -ItemType Directory -Force $d | Out-Null; ",
+        "Copy-Item -Force (Join-Path $c 'build\\release\\domyjob.exe') (Join-Path $d 'domyjob.incoming.exe'); ",
+        "Remove-Item -Recurse -Force $s, $t",
+    ])
+}
+
+fn build_windows() -> Arg {
+    Arg::concat(&[
+        Arg::joined(&[
+            "findstr . > %TEMP%\\domyjob-source-",
+            session(),
+            ".b64 && powershell -NoProfile -NonInteractive -InputFormat None -EncodedCommand ",
+        ]),
+        Arg::powershell_encoded(&build_windows_script()),
+    ])
 }
 
 const PROBE_WINDOWS: &str = "[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture";
@@ -290,19 +366,19 @@ const PROBE_WINDOWS: &str = "[System.Runtime.InteropServices.RuntimeInformation]
 fn install_windows_script() -> Arg {
     Arg::joined(&[
         "mkdir %USERPROFILE%\\.cache\\domyjob\\bin\\",
-        VERSION,
+        build_key(),
         " 2>nul & findstr . > %TEMP%\\domyjob-",
-        VERSION,
+        build_key(),
         "-",
         session(),
         ".b64 && certutil -f -decode %TEMP%\\domyjob-",
-        VERSION,
+        build_key(),
         "-",
         session(),
         ".b64 %USERPROFILE%\\.cache\\domyjob\\bin\\",
-        VERSION,
+        build_key(),
         "\\domyjob.incoming.exe >nul && del %TEMP%\\domyjob-",
-        VERSION,
+        build_key(),
         "-",
         session(),
         ".b64",
@@ -323,7 +399,7 @@ fn uninstall_argv(family: Family, placement: Placement) -> Vec<Arg> {
             Arg::literal("-c"),
             Arg::joined(&[
                 "exec \"$HOME/.cache/domyjob/bin/",
-                VERSION,
+                build_key(),
                 "/domyjob\" self uninstall --yes",
             ]),
         ],
@@ -361,7 +437,7 @@ fn scrub_argv(family: Family) -> Vec<Arg> {
 fn uninstall_windows() -> Arg {
     Arg::joined(&[
         ".\\.cache\\domyjob\\bin\\",
-        VERSION,
+        build_key(),
         "\\domyjob.exe self uninstall --yes",
     ])
 }
@@ -369,7 +445,7 @@ fn uninstall_windows() -> Arg {
 fn staged_windows() -> Arg {
     Arg::joined(&[
         ".\\.cache\\domyjob\\bin\\",
-        VERSION,
+        build_key(),
         "\\domyjob.incoming.exe node",
     ])
 }
@@ -377,7 +453,7 @@ fn staged_windows() -> Arg {
 fn promote_windows_script() -> Arg {
     Arg::joined(&[
         "cd /d %USERPROFILE%\\.cache\\domyjob\\bin\\",
-        VERSION,
+        build_key(),
         " && (del /q domyjob.old-*.exe 2>nul & if exist domyjob.exe move /y domyjob.exe domyjob.old-%RANDOM%%RANDOM%.exe >nul) && move /y domyjob.incoming.exe domyjob.exe >nul",
     ])
 }
@@ -385,7 +461,7 @@ fn promote_windows_script() -> Arg {
 fn install_unix_script() -> Arg {
     Arg::joined(&[
         "d=\"$HOME/.cache/domyjob/bin/",
-        VERSION,
+        build_key(),
         "\"; mkdir -p \"$d\" && cat > \"$d/domyjob.$$\" && chmod 755 \"$d/domyjob.$$\" && mv -f \"$d/domyjob.$$\" \"$d/domyjob.incoming\"",
     ])
 }
@@ -410,7 +486,7 @@ impl Remote {
                 Arg::literal("-c"),
                 Arg::joined(&[
                     "exec \"$HOME/.cache/domyjob/bin/",
-                    VERSION,
+                    build_key(),
                     "/domyjob\" node",
                 ]),
             ],
@@ -452,7 +528,7 @@ impl Remote {
                 Arg::literal("-c"),
                 Arg::joined(&[
                     "exec \"$HOME/.cache/domyjob/bin/",
-                    VERSION,
+                    build_key(),
                     "/domyjob.incoming\" node",
                 ]),
             ],
@@ -464,7 +540,7 @@ impl Remote {
                 Arg::literal("-c"),
                 Arg::joined(&[
                     "d=\"$HOME/.cache/domyjob/bin/",
-                    VERSION,
+                    build_key(),
                     "\"; mv -f \"$d/domyjob.incoming\" \"$d/domyjob\"",
                 ]),
             ],
@@ -475,6 +551,10 @@ impl Remote {
             ],
             Self::Uninstall(family, placement) => uninstall_argv(*family, *placement),
             Self::Scrub(family) => scrub_argv(*family),
+            Self::Build(Family::Unix) => vec![Arg::literal("sh"), Arg::literal("-c"), build_unix()],
+            Self::Build(Family::Windows) => {
+                vec![Arg::literal("cmd"), Arg::literal("/c"), build_windows()]
+            }
         }
     }
 
@@ -496,8 +576,10 @@ impl Remote {
                 Arg::cmd_wrapped(&Arg::literal("domyjob self uninstall --yes"))
             }
             Self::Scrub(Family::Windows) => Arg::cmd_wrapped(&Arg::literal(SCRUB_WINDOWS)),
+            Self::Build(Family::Windows) => Arg::cmd_wrapped(&build_windows()),
             Self::WindowsArch => Arg::spaced(&self.argv()),
-            Self::Probe
+            Self::Build(Family::Unix)
+            | Self::Probe
             | Self::Node(Family::Unix, _)
             | Self::Install(Family::Unix)
             | Self::Staged(Family::Unix)
@@ -555,11 +637,7 @@ impl<'a> Link<'a> {
         machine: &Machine,
     ) -> Result<Self, RemoteError> {
         let transport = config.transport(&machine.transport)?;
-        let local = if cfg!(windows) {
-            Family::Windows
-        } else {
-            Family::Unix
-        };
+        let local = crate::platform::FAMILY;
         let cached = match transport.binary {
             Binary::Itself | Binary::Present => None,
             Binary::Upload => cached_facts(dirs, machine)?,
@@ -679,11 +757,7 @@ impl<'a> Link<'a> {
         chosen: Option<Deliverable>,
     ) -> Result<(Self, Hello), RemoteError> {
         let binary = config.transport(&machine.transport)?.binary;
-        let family = if cfg!(windows) {
-            Family::Windows
-        } else {
-            Family::Unix
-        };
+        let family = crate::platform::FAMILY;
         let mut link = Self {
             machine: machine.clone(),
             config,
@@ -905,10 +979,12 @@ impl<'a> Link<'a> {
 
     fn command_from(&self, template: &Argv, remote: &Remote) -> Result<Command, RemoteError> {
         let transport = self.config.transport(&self.machine.transport)?;
-        let exe = std::env::current_exe().map_err(|source| RemoteError::Io {
-            action: "locating",
-            path: PathBuf::from("domyjob"),
-            source,
+        let exe = std::env::current_exe().map_err(|source| {
+            RemoteError::Io(crate::failure::IoFailure {
+                action: "locating",
+                path: PathBuf::from("domyjob"),
+                source,
+            })
         })?;
         let remote_argv = match (transport.binary, remote) {
             (Binary::Itself, Remote::Node(..)) => vec![Arg::path(&exe), Arg::literal("node")],
@@ -966,6 +1042,16 @@ impl<'a> Link<'a> {
     }
 
     fn capture(&self, remote: &Remote, input: &[u8]) -> Result<Captured, RemoteError> {
+        self.capture_telling(remote, input, &|_| {})
+    }
+
+    fn capture_telling(
+        &self,
+        remote: &Remote,
+        input: &[u8],
+        tell: &(dyn Fn(&str) + Sync),
+    ) -> Result<Captured, RemoteError> {
+        use std::io::{BufRead as _, Read as _};
         let mut child = self.spawn(remote)?;
         let pipe = |doing| {
             let machine = self.name();
@@ -975,28 +1061,53 @@ impl<'a> Link<'a> {
                 source,
             }
         };
-        let Some(stdin) = child.stdin.take() else {
-            return Err(pipe("connecting")(std::io::Error::other("no stdin")));
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            return Err(pipe("connecting")(std::io::Error::other("no pipes")));
         };
         let activity = crate::liveness::Activity::default();
         let mut stdin = crate::liveness::Counted::new(stdin, activity.clone());
+        let mut stdout = crate::liveness::Counted::new(stdout, activity.clone());
+        let stderr = BufReader::new(crate::liveness::Counted::new(stderr, activity.clone()));
         let pid = child.id();
         let watchdog =
             crate::liveness::Watchdog::guard(&activity, crate::liveness::LIMITS, move || {
                 crate::proc::terminate(pid);
             });
-        let written = std::thread::scope(|scope| {
-            let writer = scope.spawn(move || stdin.write_all(input));
-            let out = child.wait_with_output();
-            (writer.join(), out)
+        let (writer, out, errors) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let written = stdin.write_all(input);
+                drop(stdin);
+                written
+            });
+            let errors = scope.spawn(move || -> std::io::Result<String> {
+                let mut said = String::new();
+                for line in stderr.lines() {
+                    let line = line?;
+                    tell(&line);
+                    said.push_str(&line);
+                    said.push('\n');
+                }
+                Ok(said)
+            });
+            let mut out = Vec::new();
+            let read = stdout.read_to_end(&mut out).map(|_| out);
+            (writer.join(), read, errors.join())
         });
+        let status = child.wait().map_err(pipe("reading"))?;
         let silenced = watchdog.silenced();
         drop(watchdog);
         if silenced {
             return Err(self.silent("setting up"));
         }
-        let (writer, out) = written;
         let out = out.map_err(pipe("reading"))?;
+        let errors = match errors {
+            Ok(said) => said.map_err(pipe("reading"))?,
+            Err(_panicked) => {
+                return Err(pipe("reading")(std::io::Error::other("reader panicked")));
+            }
+        };
         match writer {
             Ok(Ok(())) => {}
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
@@ -1006,9 +1117,9 @@ impl<'a> Link<'a> {
             }
         }
         Ok(Captured {
-            status: out.status,
-            out: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-            errors: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            status,
+            out: String::from_utf8_lossy(&out).trim().to_owned(),
+            errors: errors.trim().to_owned(),
         })
     }
 
@@ -1052,39 +1163,12 @@ impl<'a> Link<'a> {
     }
 
     fn install_for(&mut self, deliverable: &Deliverable) -> Result<Hello, RemoteError> {
-        let binary = deliverable.binary();
-        let bytes = std::fs::read(binary.path()).map_err(|source| RemoteError::Io {
-            action: "reading",
-            path: binary.path().to_path_buf(),
-            source,
-        })?;
-        let payload = match self.family {
-            Family::Unix => bytes,
-            Family::Windows => base64_lines(&bytes).into_bytes(),
+        let expected = match deliverable.binary() {
+            Some(binary) => Some(self.upload(deliverable, binary)?),
+            None => None,
         };
-        match deliverable {
-            Deliverable::Verified(_) => {
-                eprintln!(
-                    "domyjob: installing domyjob {VERSION} on {}",
-                    self.machine.name
-                );
-            }
-            Deliverable::Unsigned { .. } => {
-                eprintln!(
-                    "domyjob: WARNING installing an UNSIGNED domyjob on {} because you asked for it; sha256 {}",
-                    self.machine.name,
-                    binary.sha256()
-                );
-            }
-        }
-        let staged = self.capture(&Remote::Install(self.family), &payload)?;
-        if !staged.status.success() {
-            return Err(RemoteError::Exited {
-                machine: self.name(),
-                doing: "staging",
-                status: staged.status,
-                said: said(&staged.errors),
-            });
+        if let Deliverable::Source { archive, .. } = deliverable {
+            self.build(archive)?;
         }
         let hello = self
             .exchange_with(
@@ -1094,14 +1178,12 @@ impl<'a> Link<'a> {
             )?
             .into_hello()
             .map_err(|other| self.unexpected("hello", *other))?;
-        if !hello
-            .binary
-            .as_raw_str()
-            .eq_ignore_ascii_case(binary.sha256())
+        if let Some(expected) = expected
+            && !hello.binary.as_raw_str().eq_ignore_ascii_case(&expected)
         {
             return Err(RemoteError::Tampered {
                 machine: self.name(),
-                expected: binary.sha256().to_owned(),
+                expected,
                 reported: hello.binary,
             });
         }
@@ -1116,6 +1198,74 @@ impl<'a> Link<'a> {
         }
         self.placement = Placement::Managed;
         Ok(hello)
+    }
+
+    fn upload(
+        &self,
+        deliverable: &Deliverable,
+        binary: &crate::dist::Binary,
+    ) -> Result<String, RemoteError> {
+        let bytes =
+            std::fs::read(binary.path()).map_err(crate::failure::io("reading", binary.path()))?;
+        let payload = match self.family {
+            Family::Unix => bytes,
+            Family::Windows => base64_lines(&bytes).into_bytes(),
+        };
+        match deliverable {
+            Deliverable::Verified(_) => {
+                eprintln!(
+                    "domyjob: installing domyjob {VERSION} on {}",
+                    self.machine.name
+                );
+            }
+            Deliverable::Unsigned { .. } | Deliverable::Source { .. } => {
+                eprintln!(
+                    "domyjob: WARNING installing an UNSIGNED domyjob on {} because you asked for it; sha256 {}",
+                    self.machine.name,
+                    binary.sha256()
+                );
+            }
+        }
+        self.expect_success(
+            &self.capture(&Remote::Install(self.family), &payload)?,
+            "staging",
+        )?;
+        Ok(binary.sha256().to_owned())
+    }
+
+    fn build(&self, archive: &[u8]) -> Result<(), RemoteError> {
+        eprintln!(
+            "domyjob: {}: building domyjob {VERSION} from the sent source",
+            self.machine.name
+        );
+        let payload = match self.family {
+            Family::Unix => archive.to_vec(),
+            Family::Windows => base64_lines(archive).into_bytes(),
+        };
+        let name = self.name();
+        let tell = move |line: &str| {
+            let line = line.trim().trim_start_matches('.').trim_start();
+            if line.starts_with("Compiling domyjob") || line.starts_with("Finished") {
+                eprintln!("domyjob: {name}: {}", crate::terminal::neutralize(line));
+            }
+        };
+        self.expect_success(
+            &self.capture_telling(&Remote::Build(self.family), &payload, &tell)?,
+            "building from source",
+        )
+    }
+
+    fn expect_success(&self, captured: &Captured, doing: &'static str) -> Result<(), RemoteError> {
+        if captured.status.success() {
+            Ok(())
+        } else {
+            Err(RemoteError::Exited {
+                machine: self.name(),
+                doing,
+                status: captured.status,
+                said: said(&captured.errors),
+            })
+        }
     }
 
     pub fn call(

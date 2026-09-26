@@ -21,7 +21,9 @@ pub enum Invalid {
     ChainHash(String),
     #[error("{0:?} is not a machine name")]
     MachineName(String),
-    #[error("{0:?} is not a relative path such as dir/file.txt (no leading /, no .., no drive)")]
+    #[error(
+        "{0:?} is not a relative path such as dir/file.txt (no leading /, no .., no drive, nothing inside version-control metadata)"
+    )]
     RelPath(String),
     #[error("{0:?} is not an environment variable name")]
     EnvName(String),
@@ -45,8 +47,8 @@ pub enum Invalid {
     Exposure(String),
     #[error("{0:?} is not a 32-byte hex key")]
     Key(String),
-    #[error("{0} is not a concurrency: expected 1 to 64")]
-    Concurrency(u32),
+    #[error("{0:?} is not a number of jobs at once: expected 1 to 64")]
+    Concurrency(String),
     #[error("the system random source failed: {0}")]
     Random(getrandom::Error),
 }
@@ -60,6 +62,10 @@ fn portable_component(part: &str) -> bool {
     let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
     !part.ends_with('.') && !part.ends_with(' ') && !WINDOWS_DEVICES.contains(&stem.as_str())
 }
+
+pub const METADATA_DIRS: &[&str] = &[
+    ".git", ".jj", ".hg", ".svn", ".pijul", "_darcs", ".bzr", "CVS",
+];
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -222,7 +228,8 @@ text_newtype!(
         && !s.split('/').any(str::is_empty)
         && !s.contains(['<', '>', '"', '|', '?', '*'])
         && !s.chars().any(char::is_control)
-        && s.split('/').all(portable_component),
+        && s.split('/').all(portable_component)
+        && !s.split('/').any(|part| METADATA_DIRS.contains(&part)),
     RelPath
 );
 text_newtype!(
@@ -237,7 +244,7 @@ text_newtype!(
     JobName,
     |s| (1..=64).contains(&s.len())
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)),
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
     JobName
 );
 
@@ -331,6 +338,11 @@ impl RelPath {
     pub fn parts(&self) -> std::str::Split<'_, char> {
         self.0.split('/')
     }
+
+    #[must_use]
+    pub fn to_local(&self) -> std::path::PathBuf {
+        self.parts().collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -343,8 +355,25 @@ impl TryFrom<u32> for Concurrency {
     fn try_from(value: u32) -> Result<Self, Invalid> {
         match NonZeroU32::new(value) {
             Some(n) if value <= Self::MOST => Ok(Self(n)),
-            Some(_) | None => Err(Invalid::Concurrency(value)),
+            Some(_) | None => Err(Invalid::Concurrency(value.to_string())),
         }
+    }
+}
+
+impl std::str::FromStr for Concurrency {
+    type Err = Invalid;
+
+    fn from_str(text: &str) -> Result<Self, Invalid> {
+        match text.parse::<u32>() {
+            Ok(value) => Self::try_from(value),
+            Err(_not_a_number) => Err(Invalid::Concurrency(text.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for Concurrency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -411,6 +440,9 @@ mod tests {
         "../x".parse::<RelPath>().unwrap_err();
         "a//b".parse::<RelPath>().unwrap_err();
         "/abs".parse::<RelPath>().unwrap_err();
+        ".git/hooks/post-checkout".parse::<RelPath>().unwrap_err();
+        "vendor/lib/.jj/repo".parse::<RelPath>().unwrap_err();
+        ".github/workflows/ci.yml".parse::<RelPath>().unwrap();
         "crates/core".parse::<RelPath>().unwrap();
         "-oProxyCommand=x".parse::<MachineName>().unwrap_err();
         "me@build-box".parse::<MachineName>().unwrap();

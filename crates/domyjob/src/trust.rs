@@ -289,12 +289,14 @@ mod tests {
         Identity::load_or_create(&d).map(drop).unwrap_err();
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_identity_that_cannot_be_saved_is_an_error() {
+        if !crate::platform::MODES {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        let _read_only = state_file::ReadOnly::make(&d.state).unwrap();
+        let _read_only = crate::platform::ReadOnly::make(&d.state).unwrap();
         Identity::load_or_create(&d).map(drop).unwrap_err();
     }
 

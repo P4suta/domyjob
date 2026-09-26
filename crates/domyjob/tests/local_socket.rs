@@ -2,12 +2,7 @@ use std::io::{Read, Write};
 
 #[test]
 fn a_socket_answers_until_its_listener_is_gone() {
-    let short = if cfg!(windows) {
-        std::env::temp_dir()
-    } else {
-        std::path::PathBuf::from("/tmp")
-    };
-    let tmp = tempfile::tempdir_in(short).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("s");
     assert!(matches!(
         domyjob::local_socket::Stream::connect(&path).unwrap(),

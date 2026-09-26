@@ -10,11 +10,8 @@ pub const FILE: &str = "domyjob.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
-    #[error("reading {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{origin}: {source}")]
     Parse {
         origin: String,
@@ -74,7 +71,7 @@ impl Project {
         match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse(&text, &path.display().to_string()).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(ProjectError::Read { path, source }),
+            Err(source) => Err(crate::failure::io("reading", &path)(source).into()),
         }
     }
 
@@ -88,15 +85,12 @@ impl Project {
 pub fn find_root(start: &Path) -> Result<Option<PathBuf>, ProjectError> {
     for dir in start.ancestors() {
         let path = dir.join(FILE);
-        crate::faults::at("project::stat", &path).map_err(|source| ProjectError::Read {
-            path: path.clone(),
-            source,
-        })?;
+        crate::faults::at("project::stat", &path).map_err(crate::failure::io("checking", &path))?;
         match std::fs::metadata(&path) {
             Ok(meta) if meta.is_file() => return Ok(Some(dir.to_path_buf())),
             Ok(_) => return Err(ProjectError::NotFile(path)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(ProjectError::Read { path, source }),
+            Err(source) => return Err(crate::failure::io("checking", &path)(source).into()),
         }
     }
     Ok(None)
@@ -156,7 +150,7 @@ workspace = "fresh"
         let tag = marker.display().to_string();
         {
             let _faults = crate::faults::inject(&[("project::stat", &tag)]);
-            assert!(matches!(find_root(&child), Err(ProjectError::Read { .. })));
+            assert!(matches!(find_root(&child), Err(ProjectError::Io(_))));
         }
         crate::state_file::private_dir(&marker).unwrap();
         assert!(matches!(find_root(&child), Err(ProjectError::NotFile(_))));

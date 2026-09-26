@@ -70,6 +70,8 @@ disallowed-methods = [
   { path = "std::fs::Metadata::modified", reason = "timestamps on files decide nothing here; compare content" },
   { path = "std::fs::Metadata::accessed", reason = "timestamps on files decide nothing here; compare content" },
   { path = "std::fs::Metadata::created", reason = "timestamps on files decide nothing here; compare content" },
+  { path = "cap_std::fs::Dir::read_link", reason = "refuses a link whose target is absolute; read_link_contents reads any link" },
+  { path = "cap_std::fs::Dir::symlink", reason = "refuses an absolute target; symlink_contents makes the link as recorded", allow-invalid = true },
   { path = "cap_std::fs::Metadata::modified", reason = "timestamps on files decide nothing here; compare content" },
   { path = "cap_std::fs::Metadata::accessed", reason = "timestamps on files decide nothing here; compare content" },
   { path = "cap_std::fs::Metadata::created", reason = "timestamps on files decide nothing here; compare content" },

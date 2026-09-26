@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,12 +37,8 @@ pub enum ClientError {
     },
     #[error("nothing to run: give a command after --")]
     NoInput,
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{path} holds a malformed record: {source}")]
     Index {
         path: PathBuf,
@@ -65,19 +62,12 @@ pub enum ClientError {
         machine: MachineName,
         why: Unpacking,
     },
-    #[error("this directory is not the project job {job} was sent from")]
-    OtherProject { job: JobId },
+    #[error("this machine has no note of a directory sent with {job}")]
+    NotSent { job: JobId },
+    #[error("{reference} means a job sent from here, and the one by that name was sent from {}", .root.display())]
+    Elsewhere { reference: String, root: PathBuf },
     #[error("machine {0} answered but left no facts for label selection")]
     NoFacts(MachineName),
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ClientError + use<> {
-    let path = path.to_path_buf();
-    move |source| ClientError::Io {
-        action,
-        path,
-        source,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,9 +118,29 @@ struct IndexEntry {
     job: JobId,
     machine: MachineName,
     name: Option<JobName>,
+    from: Option<SentFrom>,
 }
 
-fn record(ctx: &Context, submitted: &[Submitted]) -> Result<(), ClientError> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SentFrom {
+    pub root: PathBuf,
+    pub manifest: BlobId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierEntry {
+    job: JobId,
+    machine: MachineName,
+    name: Option<JobName>,
+}
+
+fn record(
+    ctx: &Context,
+    submitted: &[Submitted],
+    from: Option<&SentFrom>,
+) -> Result<(), ClientError> {
     let path = ctx.index_path();
     let mut file = crate::state_file::open_append(&path)?;
     for item in submitted {
@@ -138,6 +148,7 @@ fn record(ctx: &Context, submitted: &[Submitted]) -> Result<(), ClientError> {
             job: item.job.spec.id.clone(),
             machine: item.machine.name.clone(),
             name: item.job.spec.name.clone(),
+            from: from.cloned(),
         };
         let mut line = serde_json::to_vec(&entry).map_err(|source| ClientError::Index {
             path: path.clone(),
@@ -163,7 +174,17 @@ fn readable_lines(text: &str) -> Vec<IndexEntry> {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| match crate::ingress::json_text(line) {
             Ok(entry) => Some(entry),
-            Err(_torn_or_foreign) => None,
+            Err(_torn_foreign_or_earlier) => {
+                match crate::ingress::json_text::<EarlierEntry>(line) {
+                    Ok(EarlierEntry { job, machine, name }) => Some(IndexEntry {
+                        job,
+                        machine,
+                        name,
+                        from: None,
+                    }),
+                    Err(_torn_or_foreign) => None,
+                }
+            }
         })
         .collect()
 }
@@ -201,29 +222,50 @@ fn newest<'a>(
 }
 
 pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientError> {
+    let here = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(start) => Some(root_of(&start, None, &ctx.config)?),
+        Err(_no_directory) => None,
+    };
+    let (machine, reference) = resolve(&index(ctx)?, here.as_deref(), text)?;
+    Ok((ctx.config.machine(&machine)?, reference))
+}
+
+fn resolve(
+    entries: &[IndexEntry],
+    here: Option<&Path>,
+    text: &str,
+) -> Result<(MachineName, JobRef), ClientError> {
     let (machine, rest) = match text.rsplit_once(':') {
         Some((machine, rest)) => (Some(machine.parse::<MachineName>()?), rest),
         None => (None, text),
     };
-    let entries = index(ctx)?;
-    let found = |entry: Option<&IndexEntry>| {
-        entry
-            .map(|e| (ctx.config.machine(&e.machine), e.job.clone().into()))
-            .ok_or_else(|| ClientError::Unknown(text.to_owned()))
-    };
-    if let Ok(name) = rest.parse::<JobName>()
-        && let Some(entry) = newest(&entries, machine.as_ref(), |e| {
-            e.name.as_ref() == Some(&name)
+    let scoped: Vec<IndexEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .from
+                .as_ref()
+                .is_some_and(|from| here.is_some_and(|here| from.root == here))
         })
+        .cloned()
+        .collect();
+    let found = |entry: Option<&IndexEntry>| -> Result<(MachineName, JobRef), ClientError> {
+        match entry {
+            Some(entry) => Ok((entry.machine.clone(), entry.job.clone().into())),
+            None => Err(elsewhere(entries, rest, text)),
+        }
+    };
+    let named =
+        |name: &JobName| newest(&scoped, machine.as_ref(), |e| e.name.as_ref() == Some(name));
+    if let Ok(name) = rest.parse::<JobName>()
+        && let Some(entry) = named(&name)
     {
         return found(Some(entry));
     }
-    match (wanted(rest)?, machine) {
-        (Wanted::Latest, machine) => found(newest(&entries, machine.as_ref(), |_| true)),
-        (Wanted::Named(name), machine) => found(newest(&entries, machine.as_ref(), |e| {
-            e.name.as_ref() == Some(&name)
-        })),
-        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine), reference)),
+    match (wanted(rest)?, machine.clone()) {
+        (Wanted::Latest, machine) => found(newest(&scoped, machine.as_ref(), |_| true)),
+        (Wanted::Named(name), _) => found(named(&name)),
+        (Wanted::Id(reference), Some(machine)) => Ok((machine, reference)),
         (Wanted::Id(reference), None) => {
             let mut matches: Vec<&IndexEntry> = entries
                 .iter()
@@ -231,9 +273,9 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 .collect();
             matches.dedup_by(|a, b| a.machine == b.machine);
             match matches.as_slice() {
-                [only] => Ok((ctx.config.machine(&only.machine), reference)),
+                [only] => Ok((only.machine.clone(), reference)),
                 [] => match rest.parse::<JobName>() {
-                    Ok(name) => found(newest(&entries, None, |e| e.name.as_ref() == Some(&name))),
+                    Ok(name) => found(named(&name)),
                     Err(_not_a_name) => Err(ClientError::Unknown(text.to_owned())),
                 },
                 many => Err(ClientError::Ambiguous {
@@ -253,6 +295,21 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 }),
             }
         }
+    }
+}
+
+fn elsewhere(entries: &[IndexEntry], rest: &str, text: &str) -> ClientError {
+    let named = rest.parse::<JobName>();
+    let other = entries.iter().rev().find(|entry| match &named {
+        Ok(name) => entry.name.as_ref() == Some(name),
+        Err(_not_a_name) => rest == "latest",
+    });
+    match other.and_then(|entry| entry.from.as_ref()) {
+        Some(from) => ClientError::Elsewhere {
+            reference: text.to_owned(),
+            root: from.root.clone(),
+        },
+        None => ClientError::Unknown(text.to_owned()),
     }
 }
 
@@ -343,6 +400,23 @@ fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBu
         return Ok(found);
     }
     Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
+}
+
+pub fn source_archive(
+    ctx: &Context,
+    start: &Path,
+    rev: Option<&crate::domain::Revision>,
+) -> Result<Vec<u8>, ClientError> {
+    let root = root_of(start, None, &ctx.config)?;
+    let snapshot = match rev {
+        None => snapshot::from_directory(&root)?,
+        Some(rev) => {
+            let detected = snapshot::detect(&ctx.config, &root)?
+                .ok_or_else(|| SnapshotError::NoSource(root.clone()))?;
+            snapshot::from_revision(&detected, rev)?
+        }
+    };
+    Ok(snapshot::archive(&snapshot)?)
 }
 
 pub fn project_here(
@@ -574,7 +648,6 @@ impl Plan<'_> {
             location,
             env: self.order.env.clone(),
             shell: self.order.shell.clone().or_else(|| machine.shell.clone()),
-            concurrency: machine.max_jobs,
             queue: self.order.queue,
         }
     }
@@ -582,10 +655,12 @@ impl Plan<'_> {
     fn one(&self, machine: &Machine) -> Result<Submitted, RemoteError> {
         let report = |stage: Stage<'_>| (self.report)(&machine.name, stage);
         report(Stage::Connecting);
-        let nonce = crate::domain::Nonce::generate().map_err(|e| RemoteError::Io {
-            action: "choosing a nonce for",
-            path: PathBuf::from(machine.name.as_str()),
-            source: std::io::Error::other(e.to_string()),
+        let nonce = crate::domain::Nonce::generate().map_err(|e| {
+            RemoteError::Io(crate::failure::IoFailure {
+                action: "choosing a nonce for",
+                path: PathBuf::from(machine.name.as_str()),
+                source: std::io::Error::other(e.to_string()),
+            })
         })?;
         let mut link = Link::open(&self.ctx.config, &self.ctx.dirs, machine)?;
         report(Stage::Connected);
@@ -628,7 +703,11 @@ impl Plan<'_> {
             machine: machine.clone(),
             job,
         };
-        if let Err(error) = record(self.ctx, std::slice::from_ref(&submitted)) {
+        let from = self.prepared.as_ref().map(|prepared| SentFrom {
+            root: prepared.root.clone(),
+            manifest: prepared.manifest.0.clone(),
+        });
+        if let Err(error) = record(self.ctx, std::slice::from_ref(&submitted), from.as_ref()) {
             eprintln!(
                 "domyjob: {}: submitted {} but could not note it on this machine, so `latest` and its name will not find it: {error}",
                 machine.name, submitted.job.spec.id
@@ -643,25 +722,17 @@ fn across<T: Send>(
     machines: &[Machine],
     work: impl Fn(&Machine) -> Result<T, RemoteError> + Sync,
 ) -> Vec<(MachineName, Result<T, RemoteError>)> {
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(machines.len());
-        for machine in machines {
-            let work = &work;
-            handles.push((machine.name.clone(), scope.spawn(move || work(machine))));
-        }
-        let mut out = Vec::with_capacity(handles.len());
-        for (name, handle) in handles {
-            let result = match handle.join() {
+    crate::fanout::gathered(machines, work)
+        .into_iter()
+        .zip(machines)
+        .map(|(result, machine)| {
+            let result = match result {
                 Ok(result) => result,
-                Err(_panicked) => Err(RemoteError::Probe {
-                    machine: name.to_string(),
-                    detail: "a worker thread panicked".to_owned(),
-                }),
+                Err(crate::fanout::Panicked) => Err(panicked(machine)),
             };
-            out.push((name, result));
-        }
-        out
-    })
+            (machine.name.clone(), result)
+        })
+        .collect()
 }
 
 pub fn submit(
@@ -774,7 +845,9 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
     names.dedup();
     let mut machines = Vec::new();
     for name in names {
-        let machine = ctx.config.machine(&name);
+        let Ok(machine) = ctx.config.machine(&name) else {
+            continue;
+        };
         if cached_facts(&ctx.dirs, &machine)?.is_some() || machine.transport == "local" {
             machines.push(machine);
         }
@@ -793,13 +866,13 @@ pub fn clean(
         .map_err(|other| link.unexpected("what was cleaned", *other))
 }
 
-pub fn pause(
+pub fn configure(
     ctx: &Context,
     machine: &Machine,
-    paused: bool,
+    change: crate::protocol::Change,
 ) -> Result<crate::protocol::Report, RemoteError> {
     let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
-    link.call(&Request::Pause { paused }, &[])?
+    link.call(&Request::Configure { change }, &[])?
         .into_report()
         .map_err(|other| link.unexpected("a report", *other))
 }
@@ -856,18 +929,50 @@ pub fn survey(
     Ok((report, jobs))
 }
 
+pub type Listed = Result<(Vec<Job>, Vec<crate::protocol::Unreadable>), RemoteError>;
+
+fn panicked(machine: &Machine) -> RemoteError {
+    RemoteError::Probe {
+        machine: machine.name.to_string(),
+        detail: "a worker thread panicked".to_owned(),
+    }
+}
+
+fn list_one(ctx: &Context, machine: &Machine, limit: u32) -> Listed {
+    let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
+    link.call(&Request::List { limit }, &[])?
+        .into_jobs()
+        .map_err(|other| link.unexpected("jobs", *other))
+}
+
+pub fn list_each(
+    ctx: &Context,
+    machines: &[Machine],
+    limit: u32,
+    mut each: impl FnMut(&Machine, Listed),
+) {
+    crate::fanout::arrivals(
+        machines,
+        |machine| list_one(ctx, machine, limit),
+        |machine, result| {
+            each(
+                machine,
+                match result {
+                    Ok(listed) => listed,
+                    Err(crate::fanout::Panicked) => Err(panicked(machine)),
+                },
+            );
+        },
+    );
+}
+
 #[must_use]
 pub fn list(
     ctx: &Context,
     machines: &[Machine],
     limit: u32,
 ) -> (Vec<(MachineName, Job)>, Vec<Rejected>) {
-    let results = across(machines, |machine| {
-        let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
-        link.call(&Request::List { limit }, &[])?
-            .into_jobs()
-            .map_err(|other| link.unexpected("jobs", *other))
-    });
+    let results = across(machines, |machine| list_one(ctx, machine, limit));
     let mut jobs = Vec::new();
     let mut rejected = Vec::new();
     for (machine, result) in results {
@@ -1076,8 +1181,8 @@ pub fn get(
 pub struct Pulled {
     pub machine: Machine,
     pub job: Job,
-    pub changes: Vec<snapshot::Change>,
-    pub contents: BTreeMap<RelPath, Vec<u8>>,
+    pub from: SentFrom,
+    pub plan: crate::pull::Plan<crate::pull::Forward>,
 }
 
 pub fn changes(ctx: &Context, reference: &str) -> Result<Pulled, ClientError> {
@@ -1092,23 +1197,46 @@ pub fn changes(ctx: &Context, reference: &str) -> Result<Pulled, ClientError> {
         )?
         .into_job()
         .map_err(|other| link.unexpected("a job", *other))?;
+    let from = sent_from(ctx, &machine.name, &job.spec.id)?;
     let mut payload = Vec::new();
     link.stream(&Request::Changes { job: job_ref }, &mut payload)?
         .into_stream()
         .map_err(|other| link.unexpected("changes", *other))?;
-    let (changes, contents) = unpack(&payload).map_err(|why| ClientError::Unpacked {
+    let plan = unpack(&payload, &from.manifest).map_err(|why| ClientError::Unpacked {
         machine: machine.name.clone(),
         why,
     })?;
     Ok(Pulled {
         machine,
         job,
-        changes,
-        contents,
+        from,
+        plan,
     })
 }
 
-type Unpacked = (Vec<snapshot::Change>, BTreeMap<RelPath, Vec<u8>>);
+pub fn recorded(ctx: &Context, text: &str) -> Result<(MachineName, JobId), ClientError> {
+    let (machine, reference) = locate(ctx, text)?;
+    index(ctx)?
+        .into_iter()
+        .rev()
+        .find(|entry| entry.machine == machine.name && entry.job.matches(&reference))
+        .map(|entry| (entry.machine, entry.job))
+        .ok_or_else(|| ClientError::Unknown(text.to_owned()))
+}
+
+#[must_use]
+pub fn pulls(ctx: &Context) -> PathBuf {
+    ctx.dirs.state.join("client").join("pulls")
+}
+
+fn sent_from(ctx: &Context, machine: &MachineName, job: &JobId) -> Result<SentFrom, ClientError> {
+    index(ctx)?
+        .into_iter()
+        .rev()
+        .find(|entry| &entry.job == job && &entry.machine == machine)
+        .and_then(|entry| entry.from)
+        .ok_or_else(|| ClientError::NotSent { job: job.clone() })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Unpacking {
@@ -1116,57 +1244,117 @@ pub enum Unpacking {
     NoList,
     #[error("the list of changes is not valid: {0}")]
     List(serde_json::Error),
+    #[error("the list of what was sent is cut short")]
+    NoManifest,
     #[error("{0} is too large for this machine")]
     TooLarge(RelPath),
     #[error("{0} was cut short")]
     Short(RelPath),
-    #[error("{0} does not match its digest")]
-    Damaged(RelPath),
     #[error("more arrived than the list of changes describes")]
     Extra,
+    #[error(transparent)]
+    Malformed(#[from] crate::pull::Malformed),
 }
 
-fn unpack(payload: &[u8]) -> Result<Unpacked, Unpacking> {
+fn unpack(
+    payload: &[u8],
+    recorded: &BlobId,
+) -> Result<crate::pull::Plan<crate::pull::Forward>, Unpacking> {
     let end = payload
         .iter()
         .position(|b| *b == b'\n')
         .ok_or(Unpacking::NoList)?;
-    let (list, rest) = payload.split_at(end);
-    let mut rest = rest.get(1..).unwrap_or_default();
-    let changes: Vec<snapshot::Change> = crate::ingress::json(list).map_err(Unpacking::List)?;
+    let (list, after_list) = payload.split_at(end);
+    let after_list = after_list.get(1..).unwrap_or_default();
+    let header: snapshot::Changed = crate::ingress::json(list).map_err(Unpacking::List)?;
+    let split = match usize::try_from(header.sent) {
+        Ok(size) => after_list.split_at_checked(size),
+        Err(_too_large) => None,
+    };
+    let (raw, mut rest) = split.ok_or(Unpacking::NoManifest)?;
+    let sent = crate::pull::SentManifest::verified(raw, recorded)?;
     let mut contents = BTreeMap::new();
-    for change in &changes {
-        if let Some(Entry::File { blob, size, .. }) = &change.after {
+    for left in &header.left {
+        if let Some(Entry::File { size, .. }) = &left.now {
             let wanted = usize::try_from(*size)
-                .map_err(|_too_large| Unpacking::TooLarge(change.path.clone()))?;
+                .map_err(|_too_large| Unpacking::TooLarge(left.path.clone()))?;
             let (bytes, next) = rest
                 .split_at_checked(wanted)
-                .ok_or_else(|| Unpacking::Short(change.path.clone()))?;
-            if BlobId::of(bytes) != *blob {
-                return Err(Unpacking::Damaged(change.path.clone()));
-            }
-            contents.insert(change.path.clone(), bytes.to_vec());
+                .ok_or_else(|| Unpacking::Short(left.path.clone()))?;
+            contents.insert(left.path.clone(), bytes.to_vec());
             rest = next;
         }
     }
-    if rest.is_empty() {
-        Ok((changes, contents))
-    } else {
-        Err(Unpacking::Extra)
+    if !rest.is_empty() {
+        return Err(Unpacking::Extra);
     }
+    Ok(crate::pull::Plan::new(&sent, header.left, contents)?)
 }
 
 impl crate::ingress::Ingress for IndexEntry {}
+impl crate::ingress::Ingress for EarlierEntry {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn entry(job: usize, root: Option<&str>, name: Option<&str>) -> IndexEntry {
+        IndexEntry {
+            job: format!("0{job:015}").replace('0', "A").parse().unwrap(),
+            machine: "linux".parse().unwrap(),
+            name: name.map(|name| name.parse().unwrap()),
+            from: root.map(|root| SentFrom {
+                root: PathBuf::from(root),
+                manifest: BlobId::of(b"m"),
+            }),
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn names_and_latest_never_reach_outside_the_project_asked_from(
+            picks in proptest::collection::vec((0usize..3, 0usize..3), 0..12),
+            here in 0usize..3,
+            ask in 0usize..3,
+        ) {
+            let roots = [Some("/a"), Some("/b"), None];
+            let names = ["tests", "build", "lint"];
+            let entries: Vec<IndexEntry> = picks
+                .iter()
+                .enumerate()
+                .map(|(n, (root, name))| {
+                    entry(n, *roots.get(*root).unwrap(), Some(names.get(*name).unwrap()))
+                })
+                .collect();
+            let here_root = roots.get(here).unwrap().map(Path::new);
+            for asked in [*names.get(ask).unwrap(), "latest"] {
+                if let Ok((_, reference)) = resolve(&entries, here_root, asked) {
+                    let chosen = entries
+                        .iter()
+                        .find(|e| JobRef::from(e.job.clone()) == reference)
+                        .unwrap();
+                    let from = chosen.from.as_ref().map(|f| f.root.as_path());
+                    proptest::prop_assert_eq!(from, here_root);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_id_reaches_any_project_and_a_name_from_elsewhere_says_where() {
+        let entries = vec![entry(1, Some("/a"), Some("tests")), entry(2, None, None)];
+        let other = resolve(&entries, Some(Path::new("/b")), "tests").unwrap_err();
+        assert!(matches!(other, ClientError::Elsewhere { .. }), "{other}");
+        let id = entries.first().unwrap().job.to_string();
+        resolve(&entries, Some(Path::new("/b")), &id).unwrap();
+        resolve(&entries, None, "latest").unwrap_err();
+    }
+
     #[test]
     fn unreadable_machine_facts_are_an_error_to_label_selection() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = Context {
-            config: Config::builtin().unwrap(),
+            config: Config::layered("[machines.linux]", "test").unwrap(),
             dirs: Dirs {
                 home: tmp.path().to_path_buf(),
                 state: tmp.path().join("state"),
@@ -1175,7 +1363,7 @@ mod tests {
                 keys: crate::keystore::KeyStore::OwnerOnlyFile,
             },
         };
-        let machine = ctx.config.machine(&"linux".parse().unwrap());
+        let machine = ctx.config.machine(&"linux".parse().unwrap()).unwrap();
         let tag = ctx
             .dirs
             .cache
@@ -1199,54 +1387,73 @@ mod tests {
     }
 
     #[test]
-    fn changes_unpack_only_when_every_file_arrives_whole_and_as_described() {
+    fn changes_unpack_only_against_the_list_this_machine_sent() {
         let entry = |text: &[u8]| Entry::File {
             blob: BlobId::of(text),
             size: crate::domain::len_u64(text.len()),
             mode: snapshot::Mode::Regular,
         };
-        let changes = vec![
-            snapshot::Change {
-                path: "a.txt".parse().unwrap(),
-                before: None,
-                after: Some(entry(b"alpha")),
-            },
-            snapshot::Change {
-                path: "gone.txt".parse().unwrap(),
-                before: Some(entry(b"x")),
-                after: None,
-            },
-            snapshot::Change {
-                path: "b.txt".parse().unwrap(),
-                before: None,
-                after: Some(entry(b"beta")),
-            },
-        ];
-        let payload = |tail: &[u8]| {
-            let mut bytes = serde_json::to_vec(&changes).unwrap();
+        let sent = snapshot::Manifest {
+            entries: BTreeMap::from([
+                ("gone.txt".parse().unwrap(), entry(b"x")),
+                ("same.txt".parse().unwrap(), entry(b"same")),
+            ]),
+        };
+        let (recorded, raw) = sent.encode().unwrap();
+        let left = |path: &str, now: Option<Entry>| snapshot::Left {
+            path: path.parse().unwrap(),
+            now,
+        };
+        let changed = snapshot::Changed {
+            sent: crate::domain::len_u64(raw.len()),
+            left: vec![
+                left("a.txt", Some(entry(b"alpha"))),
+                left("b.txt", Some(entry(b"beta"))),
+                left("gone.txt", None),
+                left("same.txt", Some(entry(b"same"))),
+            ],
+        };
+        let payload = |header: &snapshot::Changed, listed: &[u8], tail: &[u8]| {
+            let mut bytes = serde_json::to_vec(header).unwrap();
             bytes.push(b'\n');
+            bytes.extend_from_slice(listed);
             bytes.extend_from_slice(tail);
             bytes
         };
-        let (listed, contents) = unpack(&payload(b"alphabeta")).unwrap();
-        assert_eq!(listed, changes);
-        assert_eq!(contents.get(&"b.txt".parse().unwrap()).unwrap(), b"beta");
-        assert_eq!(contents.len(), 2);
+        let plan = unpack(&payload(&changed, &raw, b"alphabetasame"), &recorded).unwrap();
+        let kinds: String = plan.steps().iter().map(|s| s.kind().letter()).collect();
+        assert_eq!(kinds, "AAD");
         assert!(matches!(
-            unpack(&payload(b"alphabeta!")),
+            unpack(&payload(&changed, &raw, b"alphabetasame!"), &recorded),
             Err(Unpacking::Extra)
         ));
         assert!(matches!(
-            unpack(&payload(b"alphabet")),
+            unpack(&payload(&changed, &raw, b"alphabet"), &recorded),
             Err(Unpacking::Short(_))
         ));
         assert!(matches!(
-            unpack(&payload(b"alphaBETA")),
-            Err(Unpacking::Damaged(_))
+            unpack(&payload(&changed, &raw, b"alphaBETAsame"), &recorded),
+            Err(Unpacking::Malformed(crate::pull::Malformed::Damaged(_)))
         ));
-        assert!(matches!(unpack(b"[]"), Err(Unpacking::NoList)));
-        assert!(matches!(unpack(b"{\n"), Err(Unpacking::List(_))));
-        assert!(unpack(b"[]\n").unwrap().0.is_empty());
+        assert!(matches!(
+            unpack(
+                &payload(&changed, &raw, b"alphabetasame"),
+                &BlobId::of(b"other")
+            ),
+            Err(Unpacking::Malformed(crate::pull::Malformed::OtherManifest))
+        ));
+        let mut twice = changed.clone();
+        twice.left.swap(0, 1);
+        assert!(matches!(
+            unpack(&payload(&twice, &raw, b"betaalphasame"), &recorded),
+            Err(Unpacking::Malformed(crate::pull::Malformed::Unordered(_)))
+        ));
+        assert!(matches!(
+            unpack(&payload(&changed, raw.get(..3).unwrap(), b""), &recorded),
+            Err(Unpacking::NoManifest)
+        ));
+        assert!(matches!(unpack(b"{}", &recorded), Err(Unpacking::NoList)));
+        assert!(matches!(unpack(b"{\n", &recorded), Err(Unpacking::List(_))));
     }
 
     #[test]

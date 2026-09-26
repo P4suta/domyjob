@@ -10,20 +10,14 @@ use crate::domain::{BlobId, Invalid, RelPath};
 use crate::protocol::Revision;
 use crate::template::{Arg, Bindings, TemplateError};
 
-pub const METADATA_DIRS: &[&str] = &[
-    ".git", ".jj", ".hg", ".svn", ".pijul", "_darcs", ".bzr", "CVS",
-];
+use crate::domain::METADATA_DIRS;
 pub const IGNORE_FILE: &str = ".domyjobignore";
 const SHOW_THREADS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("walking {root}: {source}")]
     Walk {
         root: PathBuf,
@@ -60,20 +54,85 @@ pub enum SnapshotError {
     State(#[from] crate::state_file::StateError),
     #[error("encoding the manifest: {0}")]
     Encode(serde_json::Error),
+    #[error("packing the source: {0}")]
+    Archive(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Regular,
     Executable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Mode {
+    #[must_use]
+    pub const fn unix_bits(self) -> u32 {
+        match self {
+            Self::Regular => 0o644,
+            Self::Executable => 0o755,
+        }
+    }
+}
+
+pub fn archive(snapshot: &Snapshot) -> Result<Vec<u8>, SnapshotError> {
+    let failed = |source: std::io::Error| SnapshotError::Archive(source.to_string());
+    let mut builder = tar::Builder::new(Vec::new());
+    for (rel, entry) in &snapshot.manifest.entries {
+        let mut header = tar::Header::new_gnu();
+        match entry {
+            Entry::File { blob, mode, .. } => {
+                let bytes = snapshot
+                    .origins
+                    .get(blob)
+                    .ok_or_else(|| SnapshotError::Archive(format!("{rel} has no content")))?
+                    .read()?;
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(mode.unix_bits());
+                header.set_size(crate::domain::len_u64(bytes.len()));
+                builder
+                    .append_data(&mut header, rel.as_str(), bytes.as_slice())
+                    .map_err(failed)?;
+            }
+            Entry::Symlink { target } => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_mode(0o777);
+                header.set_size(0);
+                builder
+                    .append_link(&mut header, rel.as_str(), target)
+                    .map_err(failed)?;
+            }
+        }
+    }
+    builder.into_inner().map_err(failed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
     File { blob: BlobId, size: u64, mode: Mode },
     Symlink { target: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Left {
+    pub path: RelPath,
+    pub now: Option<Entry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Changed {
+    pub sent: u64,
+    pub left: Vec<Left>,
+}
+
+impl crate::ingress::Ingress for Changed {}
+impl crate::ingress::Ingress for Left {}
+
+fn metadata(name: &str) -> bool {
+    METADATA_DIRS.contains(&name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,10 +213,12 @@ pub enum Origin {
 impl Origin {
     pub fn read(&self) -> Result<Vec<u8>, SnapshotError> {
         match self {
-            Self::Disk(path) => std::fs::read(path).map_err(|source| SnapshotError::Io {
-                action: "reading",
-                path: path.clone(),
-                source,
+            Self::Disk(path) => std::fs::read(path).map_err(|source| {
+                SnapshotError::Io(crate::failure::IoFailure {
+                    action: "reading",
+                    path: path.clone(),
+                    source,
+                })
             }),
             Self::Memory(bytes) => Ok(bytes.clone()),
         }
@@ -169,21 +230,6 @@ pub struct Snapshot {
     pub manifest: Manifest,
     pub origins: BTreeMap<BlobId, Origin>,
     pub revision: Revision,
-}
-
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> Mode {
-    use std::os::unix::fs::PermissionsExt;
-    if meta.permissions().mode() & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
-    }
-}
-
-#[cfg(not(unix))]
-const fn mode_of(_meta: &std::fs::Metadata) -> Mode {
-    Mode::Regular
 }
 
 pub fn relative(root: &Path, path: &Path) -> Result<RelPath, SnapshotError> {
@@ -211,15 +257,22 @@ struct Pending {
     mode: Mode,
 }
 
-fn walker(root: &Path) -> ignore::Walk {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rules {
+    Everywhere,
+    InsideOnly,
+}
+
+fn walker(root: &Path, rules: Rules) -> ignore::Walk {
+    let everywhere = rules == Rules::Everywhere;
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(false)
-        .parents(true)
+        .parents(false)
         .ignore(true)
         .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_global(everywhere)
+        .git_exclude(everywhere)
         .require_git(false)
         .follow_links(false)
         .add_custom_ignore_filename(IGNORE_FILE)
@@ -227,9 +280,23 @@ fn walker(root: &Path) -> ignore::Walk {
             entry
                 .file_name()
                 .to_str()
-                .is_none_or(|name| !METADATA_DIRS.contains(&name))
+                .is_none_or(|name| !metadata(name))
         });
     walker.build()
+}
+
+pub fn inside_paths(root: &Path) -> Result<Vec<RelPath>, SnapshotError> {
+    let mut paths = Vec::new();
+    for item in walker(root, Rules::InsideOnly) {
+        let item = item.map_err(|source| SnapshotError::Walk {
+            root: root.to_path_buf(),
+            source,
+        })?;
+        if item.file_type().is_some_and(|kind| !kind.is_dir()) {
+            paths.push(relative(root, item.path())?);
+        }
+    }
+    Ok(paths)
 }
 
 enum Found {
@@ -241,10 +308,12 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     let rel = relative(root, path)?;
     let io = |action| {
         let path = path.to_path_buf();
-        move |source| SnapshotError::Io {
-            action,
-            path,
-            source,
+        move |source| {
+            SnapshotError::Io(crate::failure::IoFailure {
+                action,
+                path,
+                source,
+            })
         }
     };
     if symlink {
@@ -259,7 +328,7 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     Ok(Found::Hash(Pending {
         rel,
         path: path.to_path_buf(),
-        mode: mode_of(&meta),
+        mode: crate::platform::Moded::mode(&meta),
     }))
 }
 
@@ -278,7 +347,7 @@ fn disk_origins(root: &Path, manifest: &Manifest) -> BTreeMap<BlobId, Origin> {
 pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
     let mut entries = BTreeMap::new();
     let mut pending = Vec::new();
-    for item in walker(root) {
+    for item in walker(root, Rules::Everywhere) {
         let item = item.map_err(|source| SnapshotError::Walk {
             root: root.to_path_buf(),
             source,
@@ -318,13 +387,13 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
 
 fn hash_file(path: &Path) -> Result<(BlobId, u64), SnapshotError> {
     let mut hasher = blake3::Hasher::new();
-    hasher
-        .update_mmap(path)
-        .map_err(|source| SnapshotError::Io {
+    hasher.update_mmap(path).map_err(|source| {
+        SnapshotError::Io(crate::failure::IoFailure {
             action: "hashing",
             path: path.to_path_buf(),
             source,
-        })?;
+        })
+    })?;
     Ok((BlobId::from_hash(&hasher.finalize()), hasher.count()))
 }
 
@@ -386,11 +455,11 @@ pub fn detect<'a>(config: &'a Config, start: &Path) -> Result<Option<Detected<'a
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(failure) => {
-                    return Err(SnapshotError::Io {
+                    return Err(SnapshotError::Io(crate::failure::IoFailure {
                         action: "checking",
                         path: marker,
                         source: failure,
-                    });
+                    }));
                 }
             }
         }
@@ -442,29 +511,40 @@ fn parse_listing(
     separator: Separator,
     bytes: &[u8],
 ) -> Result<Vec<Listed>, SnapshotError> {
-    let text = String::from_utf8_lossy(bytes);
     let split = match separator {
-        Separator::Nul => '\0',
-        Separator::Newline => '\n',
+        Separator::Nul => b'\0',
+        Separator::Newline => b'\n',
     };
     let bad = |detail: String| SnapshotError::Output {
         source_name: source_name.to_owned(),
         detail,
     };
     let mut out = Vec::new();
-    for record in text
-        .split(split)
-        .map(|r| r.trim_matches(['\n', '\r']))
-        .filter(|r| !r.is_empty())
-    {
-        let fields: Vec<&str> = record.split('\t').collect();
-        let (path, kind, mode) = match fields.as_slice() {
-            [path] => (*path, "file", ""),
-            [path, kind] => (*path, *kind, ""),
-            [path, kind, mode] => (*path, *kind, *mode),
-            _ => return Err(bad(format!("cannot read listing record {record:?}"))),
+    for record in bytes.split(|byte| *byte == split) {
+        let record = match separator {
+            Separator::Nul => record,
+            Separator::Newline => record.strip_suffix(b"\r").unwrap_or(record),
         };
-        let symlink = kind == "symlink" || mode == "120000";
+        if record.is_empty() {
+            continue;
+        }
+        let record = std::str::from_utf8(record).map_err(|_not_utf8| {
+            SnapshotError::Unportable(PathBuf::from(String::from_utf8_lossy(record).into_owned()))
+        })?;
+        let (words, path) = match record.split_once('\t') {
+            Some((words, path)) => (words, path),
+            None => ("", record),
+        };
+        let mut words = words.split(' ');
+        let (mode, kind) = match (words.next(), words.next()) {
+            (Some(mode), Some(kind)) => (mode, kind),
+            (Some(""), None) | (None, _) => ("", "file"),
+            (Some(other), None) => {
+                return Err(bad(format!(
+                    "cannot read listing record {other:?} {path:?}"
+                )));
+            }
+        };
         match kind {
             "file" | "blob" | "symlink" => {}
             "tree" | "commit" | "git-submodule" | "submodule" => continue,
@@ -473,11 +553,10 @@ fn parse_listing(
         let rel = path
             .parse::<RelPath>()
             .map_err(|_invalid| SnapshotError::Unportable(PathBuf::from(path)))?;
-        let executable = mode == "true" || mode.ends_with("755");
         out.push(Listed {
             rel,
-            symlink,
-            mode: if executable {
+            symlink: kind == "symlink" || mode == "120000",
+            mode: if mode == "true" || mode.ends_with("755") {
                 Mode::Executable
             } else {
                 Mode::Regular
@@ -642,6 +721,7 @@ mod tests {
         reason = "the test builds a fixture repository with the real git"
     )]
     fn run(dir: &Path, program: &str, args: &[&str]) {
+        let no_settings = tempfile::NamedTempFile::new().unwrap();
         let out = std::process::Command::new(program)
             .current_dir(dir)
             .args(args)
@@ -649,10 +729,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", no_settings.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -678,9 +755,10 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_directory_needs_no_version_control() {
+    fn a_plain_directory_needs_no_version_control_and_ignores_nothing_from_outside() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        std::fs::write(tmp.path().join(".gitignore"), "*\n").unwrap();
+        let root = &tmp.path().join("project");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
@@ -702,6 +780,34 @@ mod tests {
             changed.manifest.encode().unwrap().0,
             first.manifest.encode().unwrap().0
         );
+    }
+
+    #[test]
+    fn a_clean_commit_sends_exactly_what_its_checkout_sends_whatever_the_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run(root, "git", &["init", "-q"]);
+        for (name, text) in [
+            ("src/\u{fc}nits/mod.rs", "nfc"),
+            ("with space.txt", "space"),
+            ("\u{65e5}\u{672c}\u{8a9e}/\u{6587}\u{66f8}.md", "cjk"),
+            ("run.sh", "echo"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+        }
+        crate::platform::set_mode(&root.join("run.sh"), Mode::Executable).unwrap();
+        if crate::platform::LINKS {
+            crate::platform::make_link("with space.txt", &root.join("link")).unwrap();
+        }
+        run(root, "git", &["add", "."]);
+        run(root, "git", &["commit", "-qm", "names"]);
+        let config = Config::builtin().unwrap();
+        let detected = detect(&config, root).unwrap().unwrap();
+        let committed = from_revision(&detected, &"HEAD".parse().unwrap()).unwrap();
+        let checked_out = from_directory(root).unwrap();
+        assert_eq!(committed.manifest, checked_out.manifest);
     }
 
     #[test]
@@ -868,16 +974,23 @@ mod tests {
 
     #[test]
     fn listings_are_parsed_strictly() {
-        let text = b"a.txt\tfile\tfalse\0bin/x\tfile\ttrue\0sub\tgit-submodule\tfalse\0";
-        let listed = parse_listing("jj", Separator::Nul, text).unwrap();
-        assert_eq!(listed.len(), 2);
+        let text = "false file\ta.txt\x00true file\tbin/x\x00false git-submodule\tsub\x00100644 blob e25f\tsp ace.txt\x00";
+        let listed = parse_listing("jj", Separator::Nul, text.as_bytes()).unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed.get(1).map(|l| l.mode), Some(Mode::Executable));
         assert!(matches!(
-            parse_listing("jj", Separator::Nul, b"x\tconflict\tfalse"),
+            parse_listing("jj", Separator::Nul, b"false conflict\tx"),
             Err(SnapshotError::Output { .. })
         ));
         assert!(matches!(
-            parse_listing("jj", Separator::Nul, b"../x\tfile"),
+            parse_listing("jj", Separator::Nul, b"false file\t../x"),
             Err(SnapshotError::Unportable(_))
         ));
+        assert!(matches!(
+            parse_listing("git", Separator::Nul, b"100644 blob e25f\t\xff.txt"),
+            Err(SnapshotError::Unportable(_))
+        ));
+        let lines = parse_listing("hg", Separator::Newline, b"a.txt\r\nb.txt\n").unwrap();
+        assert_eq!(lines.len(), 2);
     }
 }

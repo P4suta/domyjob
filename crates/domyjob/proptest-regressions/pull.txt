@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 789f49aa4490403f5d8e8a849082e03bc538309b7f55d643ca142b8d39b4496b # shrinks to sent = {RelPath("a"): File(0, false)}, after = {}, edited = Some({}), fault = None
+cc ae440dfef5f38f7142a16c7b6ea7ee747c77ba3b5209e56f5ac760b661e619ae # shrinks to sent = {RelPath("d/x"): File(0, false)}, after = {RelPath("d"): File(0, false)}, edited = None, fault = Some(0)
+cc f8a9c41c39ac8139554f48eb953e6d18425b8afcf30a58685facd1683de2db74 # shrinks to sent = {RelPath("l"): File(0, false)}, after = {RelPath("l/x"): File(0, false)}, edited = None, fault = None
+cc 9a7f873c62c3599f5b0707b62c6da8545d3acefde76d4420e089e9a20198d748 # shrinks to sent = {RelPath("l/x"): File(0, false)}, after = {RelPath("l"): Link(2)}, edited = None, fault = None
+cc 1d54c1f2d3b70132e04c3d280db4f5352830bf05c3cddefc446510e7bf1703e2 # shrinks to sent = {RelPath("d"): File(0, false)}, after = {RelPath("d/x"): File(0, false)}, edited = None, fault = Some(0)
