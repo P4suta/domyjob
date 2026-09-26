@@ -674,7 +674,7 @@ mod tests {
             ("LC_ALL".into(), "C".into()),
             ("ProgramFiles(x86)".into(), "C:/Program Files (x86)".into()),
             ("USERPROFILE".into(), "C:/Users/me".into()),
-            ("DOMYJOB_CI_CANARY".into(), "must-not-leak".into()),
+            ("CI_CANARY".into(), "must-not-leak".into()),
             ("SSH_CONNECTION".into(), "secret-session-detail".into()),
         ]);
         assert_eq!(launch.vars.get("PATH").map(String::as_str), Some("/bin"));
@@ -687,14 +687,10 @@ mod tests {
             launch.vars.get("USERPROFILE").map(String::as_str),
             Some("C:/Users/me")
         );
-        assert!(!launch.vars.contains_key("DOMYJOB_CI_CANARY"));
+        assert!(!launch.vars.contains_key("CI_CANARY"));
         assert!(!launch.vars.contains_key("SSH_CONNECTION"));
-        if std::env::var_os("DOMYJOB_CI_CANARY").is_some() {
-            assert!(
-                !LaunchEnv::of_this_process()
-                    .vars
-                    .contains_key("DOMYJOB_CI_CANARY")
-            );
+        if std::env::var_os("CI_CANARY").is_some() {
+            assert!(!LaunchEnv::of_this_process().vars.contains_key("CI_CANARY"));
         }
     }
 
