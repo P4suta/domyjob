@@ -20,6 +20,9 @@ You then ask for a digest or search the log instead of reading all of it.
    `domyjob logs tests --grep 'panicked|error\[' --context 3`
 5. Fetch a result if you need one:
    `domyjob get tests target/report.json -o report.json`
+6. Bring back what it changed:
+   `domyjob pull tests` writes the files the job added, altered, or removed into this directory, and refuses if you edited any of them since sending.
+   Commit, sign, and push here: the other machines never need your keys.
 
 When a result is needed right away and the job is short, `domyjob run win --wait --digest -- cargo test` waits and prints only the digest.
 To watch it live but only see what matters, `--wait --grep 'test result|panicked'` shows just the matching lines while the whole log stays on the machine.
@@ -37,6 +40,12 @@ run = ["cargo", "test"]
 
 `domyjob do test` runs it where `on` says, `--on win` runs it elsewhere, and `domyjob do test @main` sends that revision instead of the directory on disk.
 Each job may also set `runner`, `workspace` (`warm` or `fresh`), `dir`, and `env`.
+
+## Looking at machines
+
+`domyjob` with no command asks every machine at once and prints one card each: its load, memory, and free disk, what runs and waits there, the last failure, and the one command that deals with whatever needs attention.
+`domyjob --json` gives the same as data, and `domyjob --live` keeps it on screen, redrawn whenever a job starts or finishes (with `--json`, one line per change).
+`domyjob clean MACHINES` frees the disk domyjob holds there (`--dry-run` first shows how much), and `domyjob machines pause MACHINES` stops them taking new jobs until `resume`.
 
 ## Looking at a machine, instead of ssh
 
@@ -88,6 +97,7 @@ Every job in `--json` output has the same shape, with `"schema": 2`:
 ## Other commands
 
 - `domyjob ls` lists jobs on every machine; `domyjob status JOB` shows one.
+- `domyjob history` shows each kind of job's recent outcomes, success rate, and typical duration, to tell a flaky job from a broken one.
 - `domyjob kill JOB` stops a job and everything it started, at once.
 - `domyjob logs JOB -f` follows a running job's output; prefer `digest` and `--grep`, which cost far fewer tokens.
 - Add `--json` to `run`, `digest`, `status`, `wait`, `ls`, and `logs --grep` for machine-readable output.

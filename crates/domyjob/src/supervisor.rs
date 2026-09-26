@@ -225,44 +225,63 @@ fn answer(shared: &Shared, stream: &Stream) {
 }
 
 #[derive(Debug, Default)]
+struct Tally {
+    open: usize,
+    ended: u64,
+}
+
+#[derive(Debug, Default)]
 struct Connections {
-    open: Mutex<usize>,
-    ended: Condvar,
+    tally: Mutex<Tally>,
+    changed: Condvar,
 }
 
 struct Open(Arc<Connections>);
 
 impl Drop for Open {
     fn drop(&mut self) {
-        if let Ok(mut open) = self.0.open.lock() {
-            *open = open.saturating_sub(1);
+        if let Ok(mut tally) = self.0.tally.lock() {
+            tally.open = tally.open.saturating_sub(1);
+            tally.ended = tally.ended.wrapping_add(1);
         }
-        self.0.ended.notify_all();
+        self.0.changed.notify_all();
     }
 }
 
 trait Counting {
     fn open(&self) -> Open;
-    fn wait_for_one_to_end(&self) -> bool;
+    fn retrying<T, E>(&self, attempt: impl FnMut() -> Result<T, E>) -> Result<T, E>;
 }
 
 impl Counting for Arc<Connections> {
     fn open(&self) -> Open {
-        if let Ok(mut open) = self.open.lock() {
-            *open = open.saturating_add(1);
+        if let Ok(mut tally) = self.tally.lock() {
+            tally.open = tally.open.saturating_add(1);
         }
         Open(Self::clone(self))
     }
 
-    fn wait_for_one_to_end(&self) -> bool {
-        let Ok(open) = self.open.lock() else {
-            return false;
-        };
-        let before = *open;
-        if before == 0 {
-            return false;
+    fn retrying<T, E>(&self, mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+        loop {
+            let mark = match self.tally.lock() {
+                Ok(tally) => tally.ended,
+                Err(_poisoned) => return attempt(),
+            };
+            let error = match attempt() {
+                Ok(done) => return Ok(done),
+                Err(error) => error,
+            };
+            let Ok(tally) = self.tally.lock() else {
+                return Err(error);
+            };
+            match self
+                .changed
+                .wait_while(tally, |tally| tally.ended == mark && tally.open > 0)
+            {
+                Ok(tally) if tally.ended != mark => {}
+                Ok(_) | Err(_) => return Err(error),
+            }
         }
-        self.ended.wait_while(open, |now| *now >= before).is_ok()
     }
 }
 
@@ -270,7 +289,7 @@ fn serve_control(listener: Listener, shared: Arc<Shared>) {
     let connections = Arc::new(Connections::default());
     std::thread::spawn(move || {
         loop {
-            match listener.accept() {
+            match connections.retrying(|| listener.accept()) {
                 Ok(stream) => {
                     let shared = Arc::clone(&shared);
                     let open = connections.open();
@@ -280,10 +299,8 @@ fn serve_control(listener: Listener, shared: Arc<Shared>) {
                     });
                 }
                 Err(error) => {
-                    if !connections.wait_for_one_to_end() {
-                        shared.say(&format!("the control socket stopped accepting: {error}"));
-                        return;
-                    }
+                    shared.say(&format!("the control socket stopped accepting: {error}"));
+                    return;
                 }
             }
         }
@@ -821,15 +838,42 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_accept_waits_for_a_connection_to_end_and_gives_up_when_none_are_open() {
+    fn a_failed_accept_is_retried_after_any_connection_ends_and_given_up_when_none_are_open() {
         let connections = Arc::new(Connections::default());
-        assert!(!connections.wait_for_one_to_end());
+        let mut alone = 0;
+        let nothing_open: Result<(), usize> = connections.retrying(|| {
+            alone += 1;
+            Err(alone)
+        });
+        assert_eq!(nothing_open, Err(1));
+
         let first = connections.open();
         let second = connections.open();
-        let ending = std::thread::spawn(move || drop(first));
-        assert!(connections.wait_for_one_to_end());
+        let mut pending = Some(first);
+        let mut during = 0;
+        let ended_before_the_wait = connections.retrying(|| {
+            during += 1;
+            drop(pending.take());
+            if during < 2 { Err(during) } else { Ok(during) }
+        });
+        assert_eq!(ended_before_the_wait, Ok(2));
+
+        let (go, wait_for_go) = std::sync::mpsc::channel::<()>();
+        let ending = std::thread::spawn(move || {
+            wait_for_go.recv().unwrap();
+            drop(second);
+        });
+        let mut after = 0;
+        let ended_while_waiting: Result<usize, usize> = connections.retrying(|| {
+            after += 1;
+            if after < 2 {
+                go.send(()).unwrap();
+                Err(after)
+            } else {
+                Ok(after)
+            }
+        });
         ending.join().unwrap();
-        drop(second);
-        assert!(!connections.wait_for_one_to_end());
+        assert_eq!(ended_while_waiting, Ok(2));
     }
 }

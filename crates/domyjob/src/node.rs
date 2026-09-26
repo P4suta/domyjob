@@ -13,8 +13,8 @@ use crate::lock::LockError;
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Follow, Frame, Hello, Job, Location, PROTOCOL, Phase, Refusal, RefusalCode, Reply, Request,
-    Spec, Submission, VERSION,
+    Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
+    Submission, VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::terminal::RemoteText;
@@ -57,8 +57,14 @@ pub enum NodeError {
         "job {job}'s workspace has since been filled by job {by}, so its files are gone; run it with --fresh to keep them apart"
     )]
     Reused { job: JobId, by: String },
+    #[error("job {0} has not finished; its changes can be pulled once it has")]
+    Unfinished(JobId),
+    #[error("this machine is paused and takes no new jobs until it is resumed")]
+    Paused,
     #[error(transparent)]
     Workspace(#[from] crate::workspace::WorkspaceError),
+    #[error(transparent)]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
     #[error("{action} {path}: {source}")]
     Io {
         action: &'static str,
@@ -98,7 +104,9 @@ impl NodeError {
                 RefusalCode::NoSuchPath
             }
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
-            Self::Request(_)
+            Self::Paused => RefusalCode::Paused,
+            Self::Unfinished(_)
+            | Self::Request(_)
             | Self::Invalid(_)
             | Self::Input(_)
             | Self::TooMany(_)
@@ -109,6 +117,7 @@ impl NodeError {
             Self::Proc(_) | Self::AlreadySupervised(_) | Self::NotStarted(_) => RefusalCode::Spawn,
             Self::Store(_)
             | Self::Workspace(_)
+            | Self::Snapshot(_)
             | Self::QueueClosed
             | Self::Panicked(_)
             | Self::Control(_)
@@ -123,6 +132,74 @@ impl NodeError {
     }
 }
 
+fn telling(jobs: &std::path::Path, path: &std::path::Path) -> bool {
+    path.parent() == Some(jobs)
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "phase.json" || name == "outcome")
+}
+
+fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
+    NodeError::Io {
+        action: "watching",
+        path: jobs.to_path_buf(),
+        source: std::io::Error::other(error.to_string()),
+    }
+}
+
+fn size_of(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&next) {
+                pending.extend(entries.flatten().map(|entry| entry.path()));
+            }
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+fn disk_is_short(area: &std::path::Path) -> bool {
+    match fs4::statvfs(area) {
+        Ok(stats) => short(stats.available_space(), stats.total_space()),
+        Err(_unmeasurable) => false,
+    }
+}
+
+fn cores() -> u32 {
+    let count = match std::thread::available_parallelism() {
+        Ok(count) => count.get(),
+        Err(_unknown) => return 0,
+    };
+    match u32::try_from(count) {
+        Ok(fits) => fits,
+        Err(_beyond_u32) => u32::MAX,
+    }
+}
+
+fn hundredths(value: f64) -> u32 {
+    let scaled = (value * 100.0).round();
+    if scaled.is_finite() && scaled >= 0.0 && scaled <= f64::from(u32::MAX) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::as_conversions,
+            reason = "the value was just checked to be a whole number within u32"
+        )]
+        let whole = scaled as u32;
+        whole
+    } else {
+        0
+    }
+}
+
 fn short(available: u64, total: u64) -> bool {
     available < (total / ROOM_SHARE).min(ROOM_AT_LEAST)
 }
@@ -131,6 +208,47 @@ fn short(available: u64, total: u64) -> bool {
 enum Keep {
     Every,
     Unfinished,
+}
+
+fn configured_agent(home: &std::path::Path) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let asked = crate::spawn::Invocation::new(
+        crate::template::Arg::literal("ssh"),
+        vec![
+            crate::template::Arg::literal("-G"),
+            crate::template::Arg::literal("localhost"),
+        ],
+    )
+    .command()
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .output();
+    let printed = match asked {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(_) | Err(_) => return None,
+    };
+    let agent = identity_agent(&printed, home)?;
+    match std::fs::symlink_metadata(&agent) {
+        Ok(_) => Some(agent),
+        Err(_absent) => None,
+    }
+}
+
+fn identity_agent(printed: &str, home: &std::path::Path) -> Option<PathBuf> {
+    let value = printed
+        .lines()
+        .find_map(|line| line.strip_prefix("identityagent "))?
+        .trim();
+    if value.eq_ignore_ascii_case("none") || value == "SSH_AUTH_SOCK" || value.starts_with('$') {
+        return None;
+    }
+    let path = match value.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(value),
+    };
+    path.is_absolute().then_some(path)
 }
 
 fn out_of_space(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -161,12 +279,13 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
+    short: fn(&std::path::Path) -> bool,
 }
 
 #[must_use]
 pub fn hello(dirs: &Dirs) -> Hello {
     Hello {
-        protocol: PROTOCOL,
+        wire: RemoteText::new(crate::protocol::wire().to_owned()),
         version: RemoteText::new(VERSION.to_owned()),
         os: RemoteText::new(std::env::consts::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),
@@ -230,6 +349,10 @@ fn read_line<T: crate::ingress::Ingress>(input: &mut dyn BufRead) -> Result<T, N
 const fn action(request: &Request) -> &'static str {
     match request {
         Request::Hello => "hello",
+        Request::Report => "report",
+        Request::Watch => "watch",
+        Request::Clean { .. } => "clean",
+        Request::Pause { .. } => "pause",
         Request::Hold => "hold",
         Request::Missing { .. } => "missing",
         Request::Upload { .. } => "upload",
@@ -245,6 +368,7 @@ const fn action(request: &Request) -> &'static str {
         Request::Digest { .. } => "digest",
         Request::Search { .. } => "search",
         Request::Get { .. } => "get",
+        Request::Changes { .. } => "changes",
     }
 }
 
@@ -256,10 +380,15 @@ fn subject(request: &Request) -> Option<String> {
         | Request::Logs { job, .. }
         | Request::Tail { job, .. }
         | Request::Digest { job, .. }
-        | Request::Search { job, .. } => Some(job.to_string()),
+        | Request::Search { job, .. }
+        | Request::Changes { job } => Some(job.to_string()),
         Request::Get { job, path } => Some(format!("{job} {path}")),
         Request::Submit { submission } => Some(submission.command.display()),
         Request::Hello
+        | Request::Report
+        | Request::Watch
+        | Request::Clean { .. }
+        | Request::Pause { .. }
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -271,8 +400,15 @@ fn subject(request: &Request) -> Option<String> {
 
 const fn audited(request: &Request) -> bool {
     match request {
-        Request::Submit { .. } | Request::Kill { .. } | Request::Get { .. } => true,
+        Request::Submit { .. }
+        | Request::Kill { .. }
+        | Request::Clean { .. }
+        | Request::Pause { .. }
+        | Request::Get { .. }
+        | Request::Changes { .. } => true,
         Request::Hello
+        | Request::Report
+        | Request::Watch
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -299,6 +435,7 @@ impl Node {
             store,
             cas,
             audit,
+            short: disk_is_short,
         })
     }
 
@@ -363,7 +500,12 @@ impl Node {
             }
             Request::Tail { job, lines } => self.tail(&self.own(&principal, &job)?, lines, output),
             Request::Get { job, path } => self.get(&self.own(&principal, &job)?, &path, output),
+            Request::Changes { job } => self.changes(&self.own(&principal, &job)?, output),
+            Request::Watch => self.watch(&principal, input, output),
             single @ (Request::Hello
+            | Request::Report
+            | Request::Clean { .. }
+            | Request::Pause { .. }
             | Request::AuditAt { .. }
             | Request::AuditHead
             | Request::Digest { .. }
@@ -395,6 +537,14 @@ impl Node {
     ) -> Result<Reply, NodeError> {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
+            Request::Report => Reply::Report(Box::new(self.report())),
+            Request::Pause { paused } => {
+                self.pause(paused)?;
+                Reply::Report(Box::new(self.report()))
+            }
+            Request::Clean { apply, logs, idle } => {
+                Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
+            }
             Request::AuditAt { seq } => Reply::AuditAt {
                 hash: self.audit.hash_at(seq)?,
             },
@@ -438,7 +588,12 @@ impl Node {
                 Order::Kill,
                 input,
             )?)),
-            Request::Hold | Request::Logs { .. } | Request::Tail { .. } | Request::Get { .. } => {
+            Request::Hold
+            | Request::Logs { .. }
+            | Request::Tail { .. }
+            | Request::Get { .. }
+            | Request::Watch
+            | Request::Changes { .. } => {
                 return Err(NodeError::Misrouted(action(&request)));
             }
         })
@@ -464,6 +619,9 @@ impl Node {
     }
 
     fn accept(&self, principal: &Principal, submission: Submission) -> Result<Job, NodeError> {
+        if submission.queue == crate::protocol::Queue::Slot && self.paused() {
+            return Err(NodeError::Paused);
+        }
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
         let nonce_path = self.store.nonce_path(
             &crate::supervisor::scope_name(&principal.submitter()),
@@ -492,7 +650,8 @@ impl Node {
             submitted_by: principal.submitter(),
             submitted_at: Timestamp::observe(),
         };
-        let launch = crate::store::LaunchEnv::of_this_process();
+        let launch = crate::store::LaunchEnv::of_this_process()
+            .with_agent(configured_agent(&self.dirs.home));
         let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&spec.id))?;
         self.store.stage(&spec, (&submission.env, &launch))?;
         if submission.queue == crate::protocol::Queue::Now {
@@ -585,11 +744,53 @@ impl Node {
         }
     }
 
-    fn short_of_room(&self) -> bool {
-        match fs4::statvfs(self.store.area("jobs")) {
-            Ok(stats) => short(stats.available_space(), stats.total_space()),
-            Err(_unmeasurable) => false,
+    fn report(&self) -> crate::protocol::Report {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let load = sysinfo::System::load_average();
+        let load_hundredths =
+            (!cfg!(windows)).then(|| [load.one, load.five, load.fifteen].map(hundredths));
+        let (disk_total, disk_available) = match fs4::statvfs(self.store.area("jobs")) {
+            Ok(stats) => (stats.total_space(), stats.available_space()),
+            Err(_unmeasurable) => (0, 0),
+        };
+        crate::protocol::Report {
+            host: RemoteText::new(sysinfo::System::host_name().unwrap_or_default()),
+            os: RemoteText::new(sysinfo::System::long_os_version().unwrap_or_default()),
+            cores: cores(),
+            load_hundredths,
+            memory_total: system.total_memory(),
+            memory_available: system.available_memory(),
+            disk_total,
+            disk_available,
+            disk_short: short(disk_available, disk_total),
+            uptime_seconds: sysinfo::System::uptime(),
+            paused: self.paused(),
         }
+    }
+
+    fn pause_path(&self) -> PathBuf {
+        self.store.area("paused")
+    }
+
+    fn paused(&self) -> bool {
+        matches!(
+            crate::state_file::read_bytes(&self.pause_path()),
+            Ok(Some(_))
+        )
+    }
+
+    fn pause(&self, paused: bool) -> Result<(), NodeError> {
+        if paused {
+            crate::state_file::write_bytes(&self.pause_path(), b"paused")?;
+        } else {
+            crate::state_file::remove_file(&self.pause_path())?;
+        }
+        Ok(())
+    }
+
+    fn short_of_room(&self) -> bool {
+        (self.short)(&self.store.area("jobs"))
     }
 
     fn make_room(&self, short: &impl Fn() -> bool) -> Result<(), NodeError> {
@@ -597,33 +798,123 @@ impl Node {
             return Ok(());
         }
         for (workspace, lock) in self.idle_workspaces() {
-            if let Some(idle) = crate::lock::OsLock::try_exclusive(&lock)? {
-                let aside = self
-                    .store
-                    .area("trash")
-                    .join(format!("workspace-{}", JobId::generate()?));
-                crate::state_file::move_aside(&workspace, &aside)?;
-                crate::state_file::remove_tree_forcibly(&aside)?;
-                idle.release()?;
-                if !short() {
-                    return Ok(());
-                }
+            if self.evict(&workspace, &lock)? && !short() {
+                return Ok(());
             }
         }
         for id in self.finished_largest_log_first()? {
-            let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(&id))?
-            else {
-                continue;
-            };
-            let log = self.store.log_path(&id);
-            crate::state_file::cut_to(&log, 0)?;
-            crate::state_file::overwrite_in_place(&log, DISCARDED)?;
-            alive.release()?;
-            if !short() {
+            if self.discard_log(&id)? && !short() {
                 return Ok(());
             }
         }
         self.collect(Keep::Unfinished)
+    }
+
+    fn stale(&self, workspace: &std::path::Path) -> bool {
+        let filled_by = crate::supervisor::filled_by_path(workspace);
+        let last = match crate::state_file::read_bytes(&filled_by) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return true,
+            Err(_unreadable) => return false,
+        };
+        match String::from_utf8_lossy(&last).trim().parse::<JobId>() {
+            Ok(id) => matches!(self.store.is_published(&id), Ok(false)),
+            Err(_foreign) => true,
+        }
+    }
+
+    fn evict(
+        &self,
+        workspace: &std::path::Path,
+        lock: &std::path::Path,
+    ) -> Result<bool, NodeError> {
+        let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
+            return Ok(false);
+        };
+        let aside = self
+            .store
+            .area("trash")
+            .join(format!("workspace-{}", JobId::generate()?));
+        crate::state_file::move_aside(workspace, &aside)?;
+        crate::state_file::remove_tree_forcibly(&aside)?;
+        idle.release()?;
+        Ok(true)
+    }
+
+    fn discard_log(&self, id: &JobId) -> Result<bool, NodeError> {
+        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
+            return Ok(false);
+        };
+        let log = self.store.log_path(id);
+        crate::state_file::cut_to(&log, 0)?;
+        crate::state_file::overwrite_in_place(&log, DISCARDED)?;
+        alive.release()?;
+        Ok(true)
+    }
+
+    fn clean(
+        &self,
+        (apply, logs, idle): (bool, bool, bool),
+    ) -> Result<crate::protocol::Cleaned, NodeError> {
+        let work = self.store.area("work");
+        let mut items = Vec::new();
+        for (workspace, lock) in self.idle_workspaces() {
+            let stale = self.stale(&workspace);
+            if !stale && !idle {
+                continue;
+            }
+            let bytes = size_of(&workspace);
+            if apply && !self.evict(&workspace, &lock)? {
+                continue;
+            }
+            let shown = match workspace.strip_prefix(&work) {
+                Ok(inside) => inside,
+                Err(_elsewhere) => &workspace,
+            };
+            items.push(crate::protocol::Freeable {
+                what: RemoteText::new(format!(
+                    "{} workspace {}",
+                    if stale { "stale" } else { "idle" },
+                    shown.display()
+                )),
+                bytes,
+            });
+        }
+        if logs {
+            let finished = self.finished_largest_log_first()?;
+            let mut bytes = 0u64;
+            let mut count = 0u64;
+            for id in &finished {
+                let size = size_of(&self.store.log_path(id));
+                if apply && !self.discard_log(id)? {
+                    continue;
+                }
+                bytes = bytes
+                    .saturating_add(size.saturating_sub(crate::domain::len_u64(DISCARDED.len())));
+                count = count.saturating_add(1);
+            }
+            if count > 0 {
+                items.push(crate::protocol::Freeable {
+                    what: RemoteText::new(format!("the logs of {count} finished jobs")),
+                    bytes,
+                });
+            }
+        }
+        let trash = size_of(&self.store.area("trash"));
+        if trash > 0 {
+            items.push(crate::protocol::Freeable {
+                what: RemoteText::new("things set aside to remove".to_owned()),
+                bytes: trash,
+            });
+        }
+        if apply {
+            self.empty_trash();
+            self.collect(Keep::Every)?;
+        }
+        Ok(crate::protocol::Cleaned {
+            applied: apply,
+            items,
+        })
     }
 
     fn idle_workspaces(&self) -> Vec<(PathBuf, PathBuf)> {
@@ -752,7 +1043,11 @@ impl Node {
             };
             needed.push(spec);
         }
-        let reachable = self.reachable(&needed)?;
+        let mut reachable = self.reachable(&needed)?;
+        reachable.extend(spent.iter().filter_map(|spec| match &spec.location {
+            Location::Snapshot { source, .. } => Some(source.manifest.clone()),
+            Location::Home => None,
+        }));
         let doomed: Vec<BlobId> = match keep {
             Keep::Every => self.cas.stored()?,
             Keep::Unfinished => self.reachable(&spent)?.into_iter().collect(),
@@ -986,6 +1281,115 @@ impl Node {
         let Location::Snapshot { subdir, .. } = &job.spec.location else {
             return Err(NodeError::NoWorkspace(job.spec.id));
         };
+        let (_, workspace) = self.workspace_of(id)?;
+        let inside = match subdir {
+            Some(sub) => format!("{sub}/{path}").parse::<crate::domain::RelPath>()?,
+            None => path.clone(),
+        };
+        let mut file = workspace.open_file(&inside)?;
+        streamed(output, |framed| {
+            std::io::copy(&mut file, framed)
+                .map(drop)
+                .map_err(NodeError::Output)
+        })
+    }
+
+    fn changes(&self, id: &JobId, output: &mut dyn Write) -> Result<(), NodeError> {
+        let job = self.store.job(id)?;
+        let Location::Snapshot { source, .. } = &job.spec.location else {
+            return Err(NodeError::NoWorkspace(job.spec.id));
+        };
+        if !job.is_settled() {
+            return Err(NodeError::Unfinished(job.spec.id));
+        }
+        let sent = self.cas.manifest(&source.manifest)?;
+        let (root, workspace) = self.workspace_of(id)?;
+        let now = crate::snapshot::from_directory(&root)?.manifest;
+        let changes = crate::snapshot::changes(&sent, &now);
+        streamed(output, |framed| {
+            let mut listed =
+                serde_json::to_vec(&changes).map_err(|e| NodeError::Output(e.into()))?;
+            listed.push(b'\n');
+            framed.write_all(&listed).map_err(NodeError::Output)?;
+            for change in &changes {
+                if let Some(crate::snapshot::Entry::File { size, .. }) = &change.after {
+                    let file = workspace.open_file(&change.path)?;
+                    let copied =
+                        std::io::copy(&mut file.take(*size), framed).map_err(NodeError::Output)?;
+                    if copied != *size {
+                        return Err(NodeError::Output(std::io::Error::other(format!(
+                            "{} changed while it was being sent",
+                            change.path
+                        ))));
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn watch(
+        &self,
+        principal: &Principal,
+        mut input: impl Input,
+        output: &mut dyn Write,
+    ) -> Result<(), NodeError> {
+        let jobs = self.store.area("jobs");
+        let (wake, woken) = std::sync::mpsc::channel::<bool>();
+        let changed = wake.clone();
+        let area = jobs.clone();
+        let mut notifier =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event
+                    && event.paths.iter().any(|path| telling(&area, path))
+                {
+                    match changed.send(true) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+            })
+            .map_err(|error| watching(&jobs, &error))?;
+        notify::Watcher::watch(&mut notifier, &jobs, notify::RecursiveMode::Recursive)
+            .map_err(|error| watching(&jobs, &error))?;
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 256];
+            while let Ok(read) = input.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+            }
+            match wake.send(false) {
+                Ok(()) | Err(_) => {}
+            }
+        });
+        streamed(output, |framed| {
+            loop {
+                let (listed, _unreadable) = self.list(principal, 50)?;
+                let survey = crate::protocol::Survey {
+                    report: self.report(),
+                    jobs: listed,
+                };
+                let mut line =
+                    serde_json::to_vec(&survey).map_err(|e| NodeError::Output(e.into()))?;
+                line.push(b'\n');
+                framed.write_all(&line).map_err(NodeError::Output)?;
+                framed.flush().map_err(NodeError::Output)?;
+                match woken.recv() {
+                    Ok(true) => {
+                        if woken.try_iter().any(|job_changed| !job_changed) {
+                            return Ok(());
+                        }
+                    }
+                    Ok(false) | Err(_) => return Ok(()),
+                }
+            }
+        })
+    }
+
+    fn workspace_of(
+        &self,
+        id: &JobId,
+    ) -> Result<(PathBuf, crate::workspace::Workspace), NodeError> {
         let recorded = self.store.workspace_record(id);
         let root = crate::state_file::read_bytes(&recorded)?
             .ok_or_else(|| NodeError::NoWorkspace(id.clone()))?;
@@ -999,16 +1403,7 @@ impl Node {
         }
         let workspace = crate::workspace::Workspace::open_existing(&root)?
             .ok_or_else(|| NodeError::NoWorkspace(id.clone()))?;
-        let inside = match subdir {
-            Some(sub) => format!("{sub}/{path}").parse::<crate::domain::RelPath>()?,
-            None => path.clone(),
-        };
-        let mut file = workspace.open_file(&inside)?;
-        streamed(output, |framed| {
-            std::io::copy(&mut file, framed)
-                .map(drop)
-                .map_err(NodeError::Output)
-        })
+        Ok((root, workspace))
     }
 }
 
@@ -1081,7 +1476,10 @@ mod tests {
             .unwrap();
         crate::state_file::write_bytes(&store.log_path(&id), log).unwrap();
         (
-            Node::open(dirs(root)).unwrap(),
+            Node {
+                short: |_| false,
+                ..Node::open(dirs(root)).unwrap()
+            },
             id.as_str().parse().unwrap(),
         )
     }
@@ -1307,6 +1705,31 @@ mod tests {
         assert!(refused(&ask(&node, &Request::Tail { job, lines: 3 })));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_agent_a_job_uses_is_the_one_the_machines_ssh_configuration_names() {
+        let home = std::path::Path::new("/home/me");
+        let printed = |agent: &str| format!("user me\nidentityagent {agent}\nport 22\n");
+        assert_eq!(
+            identity_agent(&printed("~/.agent/agent.sock"), home),
+            Some(home.join(".agent/agent.sock"))
+        );
+        assert_eq!(
+            identity_agent(&printed("/run/agent.sock"), home),
+            Some(PathBuf::from("/run/agent.sock"))
+        );
+        for unusable in ["none", "SSH_AUTH_SOCK", "$AGENT", "relative.sock"] {
+            assert_eq!(identity_agent(&printed(unusable), home), None, "{unusable}");
+        }
+        assert_eq!(identity_agent("user me\n", home), None);
+        let launch = LaunchEnv::default().with_agent(Some(PathBuf::from("/run/agent.sock")));
+        assert_eq!(
+            launch.vars.get("SSH_AUTH_SOCK").map(String::as_str),
+            Some("/run/agent.sock")
+        );
+        assert!(LaunchEnv::default().with_agent(None).vars.is_empty());
+    }
+
     #[test]
     fn a_disk_is_short_below_a_tenth_of_its_size_or_ten_gigabytes() {
         let gib: u64 = 1 << 30;
@@ -1454,6 +1877,186 @@ mod tests {
                 .unwrap_err();
             }
         }
+    }
+
+    #[test]
+    fn a_finished_job_sends_back_exactly_what_it_changed_and_an_unfinished_one_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let workspace = tmp.path().join("ws");
+        for (name, text) in [
+            ("keep.txt", "same"),
+            ("edit.txt", "old"),
+            ("drop.txt", "bye"),
+        ] {
+            crate::state_file::write_bytes(&workspace.join(name), text.as_bytes()).unwrap();
+        }
+        crate::state_file::write_bytes(&workspace.join(".gitignore"), b"target/\n").unwrap();
+        let sent = crate::snapshot::from_directory(&workspace).unwrap();
+        let (manifest, bytes) = sent.manifest.encode().unwrap();
+        node.cas.put(&manifest, &bytes).unwrap();
+        sent_manifest(&store, &id, &manifest);
+        crate::state_file::write_bytes(
+            &store.workspace_record(&id),
+            workspace.display().to_string().as_bytes(),
+        )
+        .unwrap();
+        crate::state_file::write_bytes(&workspace.join("edit.txt"), b"new").unwrap();
+        crate::state_file::remove_file(&workspace.join("drop.txt")).unwrap();
+        crate::state_file::write_bytes(&workspace.join("born.txt"), b"hi").unwrap();
+        crate::state_file::write_bytes(&workspace.join("target/out.bin"), b"built").unwrap();
+
+        let mut payload = Vec::new();
+        let wire = ask(&node, &Request::Changes { job: job.clone() });
+        let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut payload).unwrap();
+        assert!(matches!(reply, Reply::Stream), "{reply:?}");
+        let end = payload.iter().position(|b| *b == b'\n').unwrap();
+        let listed: Vec<crate::snapshot::Change> =
+            crate::ingress::json(payload.get(..end).unwrap()).unwrap();
+        let paths: Vec<String> = listed.iter().map(|c| c.path.to_string()).collect();
+        assert_eq!(paths, ["born.txt", "drop.txt", "edit.txt"]);
+        assert_eq!(payload.get(end + 1..).unwrap(), b"hinew");
+
+        store.set_phase(&id, &Phase::Queued).unwrap();
+        let _alive = crate::lock::OsLock::exclusive(&store.alive_path(&id)).unwrap();
+        assert!(refused(&ask(&node, &Request::Changes { job })));
+    }
+
+    fn sent_manifest(store: &Store, id: &JobId, manifest: &BlobId) {
+        let mut spec = store.spec(id).unwrap();
+        spec.location = Location::Snapshot {
+            source: crate::protocol::Source {
+                project: "proj".parse().unwrap(),
+                manifest: manifest.clone(),
+                revision: crate::protocol::Revision::WorkingDirectory,
+            },
+            subdir: None,
+            workspace: crate::protocol::Workspace::Warm,
+        };
+        crate::state_file::write_json(&store.job_dir(id).join("spec.json"), &spec).unwrap();
+    }
+
+    #[test]
+    fn a_report_describes_the_machine_and_a_paused_one_refuses_new_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let report = node.report();
+        assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
+        assert!(!report.paused);
+        let wire = ask(&node, &Request::Pause { paused: true });
+        let paused = crate::remote::receive("m", &mut wire.as_slice(), &mut Vec::new()).unwrap();
+        assert!(paused.into_report().unwrap().paused);
+        let nonce = crate::domain::Nonce::generate().unwrap();
+        let refused_while_paused = ask(&node, &submission(nonce, Location::Home));
+        let reply =
+            crate::remote::receive("m", &mut refused_while_paused.as_slice(), &mut Vec::new())
+                .unwrap();
+        assert!(
+            matches!(&reply, Reply::Refused(refusal) if refusal.code == RefusalCode::Paused),
+            "{reply:?}"
+        );
+        node.pause(false).unwrap();
+        assert!(!node.report().paused);
+    }
+
+    #[test]
+    fn cleaning_frees_stale_workspaces_and_on_request_every_idle_one_and_old_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let project = store.area("work").join("owner").join("proj");
+        for slot in ["0", "1"] {
+            crate::state_file::write_bytes(&project.join(slot).join("out"), &[b'b'; 5_000])
+                .unwrap();
+        }
+        let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
+        let recent = project.join("3");
+        crate::state_file::write_bytes(&recent.join("out"), b"warm").unwrap();
+        crate::state_file::write_bytes(
+            &crate::supervisor::filled_by_path(&recent),
+            id.as_str().as_bytes(),
+        )
+        .unwrap();
+        let listed = node.clean((false, true, false)).unwrap();
+        assert!(!listed.applied);
+        assert!(
+            listed.items.iter().any(|item| item.bytes == 5_000),
+            "{listed:?}"
+        );
+        assert!(project.join("0").join("out").try_exists().unwrap());
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
+
+        let freed = node.clean((true, false, false)).unwrap();
+        assert!(freed.applied);
+        assert_eq!(freed.items.len(), 1, "{freed:?}");
+        assert!(recent.join("out").try_exists().unwrap());
+        assert!(!project.join("0").try_exists().unwrap());
+        assert!(project.join("1").join("out").try_exists().unwrap());
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
+        node.clean((true, true, true)).unwrap();
+        assert!(!recent.join("out").try_exists().unwrap());
+        assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
+        busy.release().unwrap();
+    }
+
+    struct Tell(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl Write for Tell {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.0.send(bytes.to_vec()) {
+                Ok(()) | Err(_) => {}
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_watch_answers_at_once_again_on_every_job_change_and_ends_when_the_client_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id = store.resolve(&job).unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut line = serde_json::to_vec(&Request::Watch).unwrap();
+        line.push(b'\n');
+        let input = std::io::BufReader::new(Read::chain(std::io::Cursor::new(line), reader));
+        let (told, heard) = std::sync::mpsc::channel();
+        let serving = std::thread::spawn(move || {
+            node.serve(&Principal::Owner, input, &mut Tell(told))
+                .unwrap();
+        });
+        let mut wire = Vec::new();
+        let mut surveys = 0;
+        while surveys < 2 {
+            let chunk = heard.recv().unwrap();
+            if chunk.windows(8).any(|w| w == b"\"report\"") {
+                surveys += 1;
+                if surveys == 1 {
+                    store.set_phase(&id, &Phase::Queued).unwrap();
+                }
+            }
+            wire.extend(chunk);
+        }
+        drop(writer);
+        serving.join().unwrap();
+        wire.extend(heard.try_iter().flatten());
+        let mut streamed = Vec::new();
+        let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut streamed).unwrap();
+        assert!(matches!(reply, Reply::Stream));
+        let lines: Vec<&[u8]> = streamed
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert!(lines.len() >= 2, "{}", String::from_utf8_lossy(&streamed));
+        let last: crate::protocol::Survey = crate::ingress::json(lines.last().unwrap()).unwrap();
+        assert_eq!(last.jobs.first().unwrap().phase, Phase::Queued);
     }
 
     #[test]
@@ -1749,7 +2352,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let finished = sent(&node, &store, &first, br#"{"entries":{}}"#);
+        let (finished_manifest, finished_content) =
+            holding(&node, b"only a finished job used this");
+        let finished = sent(&node, &store, &first, &finished_manifest);
         let unfinished = sent(&node, &store, running, br#"{ "entries":{}}"#);
         let stray = BlobId::of(b"stray");
         node.cas.put(&stray, b"stray").unwrap();
@@ -1781,7 +2386,24 @@ mod tests {
         assert!(!kept.contains(&stray));
         node.collect(Keep::Unfinished).unwrap();
         let left = node.cas.stored().unwrap();
-        assert!(!left.contains(&finished) && left.contains(&unfinished));
+        assert!(left.contains(&finished) && left.contains(&unfinished));
+        assert!(!left.contains(&finished_content));
+    }
+
+    fn holding(node: &Node, content: &[u8]) -> (Vec<u8>, BlobId) {
+        let blob = BlobId::of(content);
+        node.cas.put(&blob, content).unwrap();
+        let manifest = crate::snapshot::Manifest {
+            entries: std::collections::BTreeMap::from([(
+                "a.txt".parse().unwrap(),
+                crate::snapshot::Entry::File {
+                    blob: blob.clone(),
+                    size: crate::domain::len_u64(content.len()),
+                    mode: crate::snapshot::Mode::Regular,
+                },
+            )]),
+        };
+        (serde_json::to_vec(&manifest).unwrap(), blob)
     }
 
     fn finished_like(store: &Store, first: &JobId, more: &[&str]) -> Vec<JobId> {
@@ -1850,7 +2472,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let spent = snapshot(small, br#"{ "entries": {} }"#);
+        let (spent_manifest, spent_content) = holding(&node, b"sent for a job that finished");
+        let spent = snapshot(small, &spent_manifest);
         let uploaded = BlobId::of(b"sent for a submission still on its way");
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
@@ -1861,8 +2484,8 @@ mod tests {
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), DISCARDED);
         assert!(project.join("1").join("file").try_exists().unwrap());
         let kept = node.cas.stored().unwrap();
-        assert!(kept.contains(&needed));
-        assert!(!kept.contains(&spent));
+        assert!(kept.contains(&needed) && kept.contains(&spent));
+        assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
         node.make_room(&|| false).unwrap();
         busy.release().unwrap();

@@ -69,7 +69,18 @@ fn crockford(text: &str) -> bool {
 
 macro_rules! text_newtype {
     ($name:ident, $check:expr, $variant:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[derive(
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+            schemars::JsonSchema,
+        )]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
 
@@ -322,7 +333,7 @@ impl RelPath {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(try_from = "u32", into = "u32")]
 pub struct Concurrency(NonZeroU32);
 

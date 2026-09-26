@@ -78,6 +78,33 @@ pub enum Entry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Change {
+    pub path: RelPath,
+    pub before: Option<Entry>,
+    pub after: Option<Entry>,
+}
+
+impl crate::ingress::Ingress for Vec<Change> {}
+
+#[must_use]
+pub fn changes(before: &Manifest, after: &Manifest) -> Vec<Change> {
+    let paths: std::collections::BTreeSet<&RelPath> =
+        before.entries.keys().chain(after.entries.keys()).collect();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let (was, now) = (before.entries.get(path), after.entries.get(path));
+            (was != now).then(|| Change {
+                path: path.clone(),
+                before: was.cloned(),
+                after: now.cloned(),
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub entries: BTreeMap<RelPath, Entry>,
 }
@@ -371,15 +398,21 @@ pub fn detect<'a>(config: &'a Config, start: &Path) -> Result<Option<Detected<'a
     Ok(None)
 }
 
-fn run_template(source_name: &str, argv: &[Arg]) -> Result<Vec<u8>, SnapshotError> {
+fn run_template(
+    (source_name, source): (&str, &SourceConf),
+    argv: &[Arg],
+) -> Result<Vec<u8>, SnapshotError> {
     let Some(invocation) = crate::spawn::Invocation::from_words(argv.to_vec()) else {
         return Err(SnapshotError::Output {
             source_name: source_name.to_owned(),
             detail: "empty command".to_owned(),
         });
     };
-    let out = invocation
-        .command()
+    let mut command = invocation.command();
+    for name in source.unset.iter().flatten() {
+        command.env_remove(name);
+    }
+    let out = command
         .stdin(Stdio::null())
         .output()
         .map_err(|error| SnapshotError::Start {
@@ -461,7 +494,7 @@ pub fn identity(detected: &Detected<'_>) -> Option<PathBuf> {
         .identity
         .as_ref()?
         .render(&Bindings::new().with("root", Arg::path(&detected.root)));
-    let printed = match argv.map(|argv| run_template(detected.name, &argv)) {
+    let printed = match argv.map(|argv| run_template((detected.name, detected.source), &argv)) {
         Ok(Ok(printed)) => printed,
         Ok(Err(_)) | Err(_) => return None,
     };
@@ -481,7 +514,7 @@ pub fn from_revision(
     };
     let root = Arg::path(&detected.root);
     let resolved = run_template(
-        name,
+        (name, source),
         &source
             .resolve
             .render(
@@ -504,7 +537,10 @@ pub fn from_revision(
     let base = Bindings::new()
         .with("root", root)
         .with("commit", Arg::word(&commit));
-    let listing = run_template(name, &source.list.render(&base).map_err(template)?)?;
+    let listing = run_template(
+        (name, source),
+        &source.list.render(&base).map_err(template)?,
+    )?;
     let listed = parse_listing(name, source.separator, &listing)?;
     let contents = show_all(name, source, &base, &listed)?;
     let mut entries = BTreeMap::new();
@@ -563,7 +599,7 @@ fn show_all(
                                     source_name: name.to_owned(),
                                     source: e,
                                 })?;
-                            run_template(name, &argv)
+                            run_template((name, source), &argv)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -612,6 +648,11 @@ mod tests {
                 if cfg!(windows) { "NUL" } else { "/dev/null" },
             )
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
             .output()
             .unwrap();
         assert!(
@@ -724,6 +765,53 @@ mod tests {
             std::fs::canonicalize(other_id).unwrap(),
             std::fs::canonicalize(main_id).unwrap()
         );
+    }
+
+    #[test]
+    fn changes_are_what_was_added_altered_or_removed_and_nothing_else() {
+        let file = |text: &[u8], mode| Entry::File {
+            blob: BlobId::of(text),
+            size: crate::domain::len_u64(text.len()),
+            mode,
+        };
+        let manifest = |entries: &[(&str, Entry)]| Manifest {
+            entries: entries
+                .iter()
+                .map(|(path, entry)| (path.parse().unwrap(), entry.clone()))
+                .collect(),
+        };
+        let sent = manifest(&[
+            ("same.txt", file(b"same", Mode::Regular)),
+            ("edited.txt", file(b"old", Mode::Regular)),
+            ("run.sh", file(b"echo", Mode::Regular)),
+            ("gone.txt", file(b"bye", Mode::Regular)),
+        ]);
+        let now = manifest(&[
+            ("same.txt", file(b"same", Mode::Regular)),
+            ("edited.txt", file(b"new", Mode::Regular)),
+            ("run.sh", file(b"echo", Mode::Executable)),
+            ("born.txt", file(b"hi", Mode::Regular)),
+        ]);
+        let found: Vec<(String, bool, bool)> = changes(&sent, &now)
+            .into_iter()
+            .map(|change| {
+                (
+                    change.path.to_string(),
+                    change.before.is_some(),
+                    change.after.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("born.txt".to_owned(), false, true),
+                ("edited.txt".to_owned(), true, true),
+                ("gone.txt".to_owned(), true, false),
+                ("run.sh".to_owned(), true, true),
+            ]
+        );
+        assert!(changes(&sent, &sent).is_empty());
     }
 
     #[test]

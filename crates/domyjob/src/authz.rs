@@ -34,7 +34,9 @@ impl Capability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub enum Submitter {
     Owner,
@@ -104,6 +106,8 @@ pub const fn access(request: &Request) -> Access {
             Access::Needs(Capability::Submit)
         }
         Request::List { .. }
+        | Request::Report
+        | Request::Watch
         | Request::AuditAt { .. }
         | Request::AuditHead
         | Request::Digest { .. }
@@ -112,8 +116,10 @@ pub const fn access(request: &Request) -> Access {
         | Request::Wait { .. }
         | Request::Logs { .. }
         | Request::Tail { .. } => Access::Needs(Capability::Observe),
-        Request::Kill { .. } => Access::Needs(Capability::Kill),
-        Request::Get { .. } => Access::Needs(Capability::Fetch),
+        Request::Kill { .. } | Request::Clean { .. } | Request::Pause { .. } => {
+            Access::Needs(Capability::Kill)
+        }
+        Request::Get { .. } | Request::Changes { .. } => Access::Needs(Capability::Fetch),
     }
 }
 

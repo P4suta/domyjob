@@ -8,7 +8,7 @@ use crate::config::{Binary, Config, ConfigError, Machine};
 use crate::dist::Deliverable;
 use crate::domain::{BlobId, MachineName};
 use crate::paths::{Dirs, Family};
-use crate::protocol::{Frame, Hello, PROTOCOL, Refusal, Reply, Request, VERSION};
+use crate::protocol::{Frame, Hello, Refusal, Reply, Request, VERSION, wire};
 use crate::snapshot::{Origin, SnapshotError};
 use crate::template::{Arg, Argv, Bindings, TemplateError};
 
@@ -150,19 +150,19 @@ pub enum RemoteError {
         got: Box<Reply>,
     },
     #[error(
-        "{machine}: runs domyjob {version}, which speaks protocol {theirs}; this domyjob speaks {PROTOCOL}"
+        "{machine}: runs domyjob {version}, whose messages differ from this one's (wire {theirs}, here {ours})",
+        ours = wire()
     )]
     Protocol {
         machine: String,
-        theirs: u32,
+        theirs: crate::terminal::RemoteText,
         version: crate::terminal::RemoteText,
     },
     #[error(
-        "{machine}: runs domyjob {version}, newer than this one (protocol {theirs} against {PROTOCOL}); it was left as it is"
+        "{machine}: runs domyjob {version}, newer than this one ({VERSION}); it was left as it is"
     )]
     Newer {
         machine: String,
-        theirs: u32,
         version: crate::terminal::RemoteText,
     },
     #[error("{machine}: could not tell which operating system it runs: {detail}")]
@@ -192,13 +192,11 @@ pub enum RemoteError {
     )]
     AuditRewritten { machine: String, seq: u64 },
     #[error(
-        "{machine} runs domyjob {version}, which speaks protocol {theirs} where this one speaks {protocol}, and no matching copy can be installed there: {cause}",
-        protocol = PROTOCOL
+        "{machine} runs domyjob {version}, whose messages differ from this one's, and no matching copy can be installed there: {cause}"
     )]
     Outdated {
         machine: String,
         version: crate::terminal::RemoteText,
-        theirs: u32,
         cause: Box<crate::dist::DistError>,
     },
     #[error(
@@ -584,7 +582,7 @@ impl<'a> Link<'a> {
                 link.remember(hello)?;
             }
             (Binary::Upload, Some(_)) => match link.hello() {
-                Ok(hello) if hello.protocol == PROTOCOL => link.remember(hello)?,
+                Ok(hello) if hello.wire.as_raw_str() == wire() => link.remember(hello)?,
                 Ok(_)
                 | Err(
                     RemoteError::Exited { .. }
@@ -603,12 +601,12 @@ impl<'a> Link<'a> {
     fn attempt(&mut self, placement: Placement) -> Result<Answer, RemoteError> {
         self.placement = placement;
         match self.hello() {
-            Ok(hello) if hello.protocol == PROTOCOL => Ok(Answer::Matches(hello)),
+            Ok(hello) if hello.wire.as_raw_str() == wire() => Ok(Answer::Matches(hello)),
             Ok(hello) => Ok(Answer::Speaks(crate::protocol::Speaker::of(&hello))),
             Err(RemoteError::Protocol {
                 theirs, version, ..
             }) => Ok(Answer::Speaks(crate::protocol::Speaker {
-                protocol: theirs,
+                wire: theirs,
                 version,
             })),
             Err(RemoteError::Exited { .. } | RemoteError::Garbled { .. }) => Ok(Answer::Silent),
@@ -624,17 +622,16 @@ impl<'a> Link<'a> {
                 Answer::Matches(hello) => {
                     if hello.version.as_raw_str() != VERSION {
                         eprintln!(
-                            "domyjob: {} runs domyjob {}, this is {VERSION}; they speak the same protocol, and `domyjob self update` there aligns them",
+                            "domyjob: {} runs domyjob {}, this is {VERSION}; their messages match, and `domyjob self update` there aligns them",
                             self.machine.name, hello.version
                         );
                     }
                     return self.remember(hello);
                 }
                 Answer::Speaks(speaker) => {
-                    if speaker.protocol > PROTOCOL {
+                    if crate::protocol::is_newer(speaker.version.as_raw_str()) {
                         return Err(RemoteError::Newer {
                             machine: self.name(),
-                            theirs: speaker.protocol,
                             version: speaker.version,
                         });
                     }
@@ -660,7 +657,6 @@ impl<'a> Link<'a> {
                     Some(speaker) => RemoteError::Outdated {
                         machine: self.name(),
                         version: speaker.version,
-                        theirs: speaker.protocol,
                         cause: Box::new(cause),
                     },
                     None => RemoteError::Dist(cause),
@@ -762,10 +758,10 @@ impl<'a> Link<'a> {
     }
 
     fn remember(&self, hello: Hello) -> Result<(), RemoteError> {
-        if hello.protocol != PROTOCOL {
+        if hello.wire.as_raw_str() != wire() {
             return Err(RemoteError::Protocol {
                 machine: self.machine.name.to_string(),
-                theirs: hello.protocol,
+                theirs: hello.wire,
                 version: hello.version,
             });
         }
@@ -893,6 +889,8 @@ impl<'a> Link<'a> {
             | Reply::AuditHead(_)
             | Reply::Digest(_)
             | Reply::Found(_)
+            | Reply::Report(_)
+            | Reply::Cleaned(_)
             | Reply::Stream) => RemoteError::Unexpected {
                 machine: self.name(),
                 expected,
@@ -1288,9 +1286,9 @@ pub fn receive(
         Ok(reply) => reply,
         Err(error) => {
             return Err(match crate::protocol::Speaker::glimpse(&raw) {
-                Some(speaker) if speaker.protocol != PROTOCOL => RemoteError::Protocol {
+                Some(speaker) if speaker.wire.as_raw_str() != wire() => RemoteError::Protocol {
                     machine: machine.to_owned(),
-                    theirs: speaker.protocol,
+                    theirs: speaker.wire,
                     version: speaker.version,
                 },
                 Some(_) | None => RemoteError::Garbled {

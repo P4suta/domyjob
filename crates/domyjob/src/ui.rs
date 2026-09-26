@@ -79,6 +79,7 @@ pub enum Symbol {
     Sending,
     Hint,
     Gutter,
+    Warning,
 }
 
 #[must_use]
@@ -107,6 +108,8 @@ pub fn symbol(symbol: Symbol) -> &'static str {
         (Symbol::Hint, false) => "->",
         (Symbol::Gutter, true) => "│",
         (Symbol::Gutter, false) => "|",
+        (Symbol::Warning, true) => "▲",
+        (Symbol::Warning, false) => "!",
     }
 }
 
@@ -191,7 +194,7 @@ impl Columns {
 
 const LABEL_ROOM: usize = 40;
 
-fn label(job: &Job) -> String {
+pub fn label(job: &Job) -> String {
     job.spec
         .name
         .as_ref()

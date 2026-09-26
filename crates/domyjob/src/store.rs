@@ -63,6 +63,15 @@ pub struct LaunchEnv {
 
 impl LaunchEnv {
     #[must_use]
+    pub fn with_agent(mut self, agent: Option<PathBuf>) -> Self {
+        if let Some(agent) = agent {
+            self.vars
+                .insert("SSH_AUTH_SOCK".to_owned(), agent.display().to_string());
+        }
+        self
+    }
+
+    #[must_use]
     pub fn of_this_process() -> Self {
         let mut launch = Self::default();
         for (key, value) in std::env::vars_os() {
