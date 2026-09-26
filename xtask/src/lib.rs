@@ -42,6 +42,52 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GateError> {
     Ok(())
 }
 
+const PLATFORM: &str = "crates/domyjob/src/platform.rs";
+
+const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
+    ("crates/domyjob/src/cli.rs", 2),
+    ("crates/domyjob/src/config.rs", 2),
+    ("crates/domyjob/src/dist.rs", 2),
+    ("crates/domyjob/src/keystore.rs", 5),
+    ("crates/domyjob/src/local_socket.rs", 3),
+    ("crates/domyjob/src/node.rs", 4),
+    ("crates/domyjob/src/paths.rs", 1),
+    ("crates/domyjob/src/proc.rs", 6),
+    ("crates/domyjob/src/pull.rs", 16),
+    ("crates/domyjob/src/remote.rs", 2),
+    ("crates/domyjob/src/serve.rs", 5),
+    ("crates/domyjob/src/service.rs", 6),
+    ("crates/domyjob/src/shell.rs", 1),
+    ("crates/domyjob/src/snapshot.rs", 3),
+    ("crates/domyjob/src/spawn.rs", 3),
+    ("crates/domyjob/src/state_file.rs", 19),
+    ("crates/domyjob/src/store.rs", 1),
+    ("crates/domyjob/src/trust.rs", 1),
+    ("crates/domyjob/src/user_files.rs", 1),
+    ("crates/domyjob/src/workspace.rs", 10),
+    ("crates/domyjob/tests/local_socket.rs", 1),
+    ("xtask/src/release.rs", 1),
+];
+
+fn os_findings(shown: &str, branches: usize) -> Option<String> {
+    if shown == PLATFORM {
+        return None;
+    }
+    let allowed = NOT_YET_ONE_PATH
+        .iter()
+        .find(|(file, _)| *file == shown)
+        .map_or(0, |(_, allowed)| *allowed);
+    match branches.cmp(&allowed) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(format!(
+            "{shown}: {branches} operating-system branches where {allowed} are allowed; put the difference in {PLATFORM} and use one path everywhere else"
+        )),
+        std::cmp::Ordering::Less => Some(format!(
+            "{shown}: now {branches} operating-system branches; lower its allowance in NOT_YET_ONE_PATH from {allowed} to {branches}"
+        )),
+    }
+}
+
 pub fn gates(root: &Path) -> Result<usize, GateError> {
     let mut files = Vec::new();
     for dir in ["crates", "xtask"] {
@@ -57,7 +103,16 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
         let shown = match path.strip_prefix(root) {
             Ok(inner) => inner.display().to_string(),
             Err(_outside) => path.display().to_string(),
-        };
+        }
+        .replace('\\', "/");
+        let branches = syntax::os_branches(&source).map_err(|source| GateError::Parse {
+            path: path.clone(),
+            source,
+        })?;
+        if let Some(finding) = os_findings(&shown, branches) {
+            eprintln!("{finding}");
+            count = count.saturating_add(1);
+        }
         for comment in comments::find(&source) {
             eprintln!(
                 "{shown}:{}: comments are not written; put the reason in the commit message",
