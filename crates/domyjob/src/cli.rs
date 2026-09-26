@@ -1721,26 +1721,10 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         Some(selector) => ctx.select(selector)?,
         None => client::known_machines(&ctx)?,
     };
-    let (jobs, rejected) = client::list(&ctx, &machines, args.limit);
-    let failed = if rejected.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(UNKNOWN)
-    };
-    if !args.json && crate::view::stdout_is_a_person() {
-        let unreachable: Vec<(MachineName, String)> = rejected
-            .iter()
-            .map(|item| (item.machine.clone(), item.error.to_string()))
-            .collect();
-        show(crate::view::listing(&jobs, &unreachable))?;
-        return Ok(failed);
-    }
-    for item in &rejected {
-        eprintln!("domyjob: {}: {}", item.machine, item.error);
-    }
+    let person = !args.json && crate::view::stdout_is_a_person();
     let now = Timestamp::observe();
-    let mut out = std::io::stdout().lock();
-    if !args.json {
+    let mut out = std::io::stdout();
+    if !args.json && !person {
         writeln!(
             out,
             "{:<16}  {:<12}  {:<9}  {:>4}  {:>7}  {:>7}  COMMAND",
@@ -1748,8 +1732,70 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         )
         .map_err(CliError::Output)?;
     }
-    for (machine, job) in &jobs {
-        if args.json {
+    let mut unknown = false;
+    let mut listed_any = false;
+    let mut failure: Option<CliError> = None;
+    client::list_each(&ctx, &machines, args.limit, |machine, result| {
+        let shown = match result {
+            Ok((jobs, unreadable)) => {
+                for bad in unreadable {
+                    unknown = true;
+                    eprintln!(
+                        "domyjob: {}: job {} cannot be read ({})",
+                        machine.name, bad.id, bad.why
+                    );
+                }
+                listed_any |= !jobs.is_empty();
+                list_rows(&machine.name, &jobs, (person, args.json), now)
+            }
+            Err(error) => {
+                unknown = true;
+                if person {
+                    crate::view::unreachable_line(&machine.name, &error.to_string())
+                        .map_err(|e| CliError::Output(std::io::Error::other(e)))
+                        .and_then(|line| {
+                            write!(std::io::stdout(), "{line}").map_err(CliError::Output)
+                        })
+                } else {
+                    eprintln!("domyjob: {}: {error}", machine.name);
+                    Ok(())
+                }
+            }
+        };
+        if let Err(error) = shown {
+            failure.get_or_insert(error);
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if person && !listed_any && !unknown {
+        writeln!(out, "{}", crate::view::no_jobs()).map_err(CliError::Output)?;
+    }
+    Ok(if unknown {
+        ExitCode::from(UNKNOWN)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn list_rows(
+    machine: &MachineName,
+    jobs: &[Job],
+    (person, json): (bool, bool),
+    now: Timestamp,
+) -> Result<(), CliError> {
+    let mut out = std::io::stdout().lock();
+    if person {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let block = crate::view::machine_listing(machine, jobs)
+            .map_err(|e| CliError::Output(std::io::Error::other(e)))?;
+        return writeln!(out, "{block}").map_err(CliError::Output);
+    }
+    for job in jobs {
+        if json {
             writeln!(out, "{}", crate::view::job_json(machine, job)).map_err(CliError::Output)?;
             continue;
         }
@@ -1771,7 +1817,7 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
         )
         .map_err(CliError::Output)?;
     }
-    Ok(failed)
+    Ok(())
 }
 
 fn logs(args: &LogsArgs) -> Result<ExitCode, CliError> {
