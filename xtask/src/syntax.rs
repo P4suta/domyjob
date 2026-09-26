@@ -372,6 +372,54 @@ impl<'ast> Visit<'ast> for Gate {
     }
 }
 
+const OS_WORDS: &[&str] = &["unix", "windows", "target_os", "target_family"];
+
+fn mentions_os(tokens: &proc_macro2::TokenStream) -> bool {
+    tokens
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| OS_WORDS.contains(&word))
+}
+
+#[derive(Debug, Default)]
+struct OsBranches {
+    count: usize,
+}
+
+impl<'ast> Visit<'ast> for OsBranches {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if (attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+            && let syn::Meta::List(list) = &attr.meta
+            && mentions_os(&list.tokens)
+        {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_attribute(self, attr);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if mac.path.is_ident("cfg") && mentions_os(&mac.tokens) {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+        if names.ends_with(&["consts".to_owned(), "OS".to_owned()]) {
+            self.count = self.count.saturating_add(1);
+        }
+        syn::visit::visit_path(self, path);
+    }
+}
+
+pub fn os_branches(source: &str) -> Result<usize, syn::Error> {
+    let file = syn::parse_file(source)?;
+    let mut branches = OsBranches::default();
+    branches.visit_file(&file);
+    Ok(branches.count)
+}
+
 pub fn check(source: &str) -> Result<Vec<Finding>, syn::Error> {
     check_file(source, "")
 }
@@ -393,6 +441,16 @@ mod tests {
 
     fn rules(source: &str) -> Vec<&'static str> {
         check(source).unwrap().into_iter().map(|f| f.rule).collect()
+    }
+
+    #[test]
+    fn every_way_of_asking_which_system_this_is_is_counted() {
+        let source = "#[cfg(unix)]\nfn a() {}\n#[cfg(not(windows))]\nfn b() { let _ = cfg!(target_os = \"macos\"); let _ = std::env::consts::OS; }\n#[cfg(test)]\nmod tests {}\n#[cfg_attr(unix, inline)]\nfn c() {}";
+        assert_eq!(os_branches(source).unwrap(), 5);
+        assert_eq!(
+            os_branches("#[cfg(feature = \"x\")]\nfn a() {}").unwrap(),
+            0
+        );
     }
 
     #[test]

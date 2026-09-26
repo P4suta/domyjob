@@ -556,11 +556,7 @@ impl<'a> Link<'a> {
         machine: &Machine,
     ) -> Result<Self, RemoteError> {
         let transport = config.transport(&machine.transport)?;
-        let local = if cfg!(windows) {
-            Family::Windows
-        } else {
-            Family::Unix
-        };
+        let local = crate::platform::FAMILY;
         let cached = match transport.binary {
             Binary::Itself | Binary::Present => None,
             Binary::Upload => cached_facts(dirs, machine)?,
@@ -680,11 +676,7 @@ impl<'a> Link<'a> {
         chosen: Option<Deliverable>,
     ) -> Result<(Self, Hello), RemoteError> {
         let binary = config.transport(&machine.transport)?.binary;
-        let family = if cfg!(windows) {
-            Family::Windows
-        } else {
-            Family::Unix
-        };
+        let family = crate::platform::FAMILY;
         let mut link = Self {
             machine: machine.clone(),
             config,

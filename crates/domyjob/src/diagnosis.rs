@@ -142,6 +142,14 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
 pub const fn of_client(error: &ClientError) -> Diagnosis {
     match error {
         ClientError::Remote(remote) => of_remote(remote),
+        ClientError::Config(crate::config::ConfigError::Unknown { .. }) => hinted(
+            Kind::Usage,
+            "add it with `domyjob machines add NAME`, or reach an ssh host directly as ssh:HOST",
+        ),
+        ClientError::Config(crate::config::ConfigError::ThisMachine(_)) => hinted(
+            Kind::Usage,
+            "`domyjob self uninstall` removes domyjob from this machine",
+        ),
         ClientError::Config(_) | ClientError::Project(_) | ClientError::Runner { .. } => {
             plain(Kind::Config)
         }
@@ -163,9 +171,41 @@ pub const fn of_client(error: &ClientError) -> Diagnosis {
             Kind::Protocol,
             "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",
         ),
-        ClientError::OtherProject { .. } => hinted(
+        ClientError::NotSent { .. } => hinted(
             Kind::Usage,
-            "run it inside the project the job was sent from, or name that project with --root",
+            "pull brings back jobs `domyjob run` sent with a directory from this machine; `domyjob get JOB PATH` copies one file",
         ),
     }
+}
+
+#[must_use]
+pub const fn of_pull(error: &crate::pull::PullError) -> Diagnosis {
+    use crate::pull::PullError;
+    let (kind, hint) = match error {
+        PullError::Diverged(_) => (
+            Kind::Usage,
+            Some("commit or set aside your own edits to those files, then pull again"),
+        ),
+        PullError::Edited(_) => (
+            Kind::Usage,
+            Some("set aside your edits to those files, then undo again"),
+        ),
+        PullError::Gone(_) => (
+            Kind::Usage,
+            Some("put the directory back where the job was sent from"),
+        ),
+        PullError::NeverPulled(_) => (Kind::Usage, None),
+        PullError::Malformed(_) => (
+            Kind::Protocol,
+            Some(
+                "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",
+            ),
+        ),
+        PullError::NotKept(_)
+        | PullError::Io { .. }
+        | PullError::State(_)
+        | PullError::Lock(_)
+        | PullError::Tree(_) => (Kind::Local, None),
+    };
+    Diagnosis { kind, hint }
 }

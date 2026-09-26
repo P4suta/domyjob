@@ -65,8 +65,8 @@ pub enum ClientError {
         machine: MachineName,
         why: Unpacking,
     },
-    #[error("this directory is not the project job {job} was sent from")]
-    OtherProject { job: JobId },
+    #[error("this machine has no note of a directory sent with {job}")]
+    NotSent { job: JobId },
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ClientError + use<> {
@@ -134,9 +134,29 @@ struct IndexEntry {
     job: JobId,
     machine: MachineName,
     name: Option<JobName>,
+    from: Option<SentFrom>,
 }
 
-fn record(ctx: &Context, submitted: &[Submitted]) -> Result<(), ClientError> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SentFrom {
+    pub root: PathBuf,
+    pub manifest: BlobId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierEntry {
+    job: JobId,
+    machine: MachineName,
+    name: Option<JobName>,
+}
+
+fn record(
+    ctx: &Context,
+    submitted: &[Submitted],
+    from: Option<&SentFrom>,
+) -> Result<(), ClientError> {
     let path = ctx.index_path();
     let mut file = crate::state_file::open_append(&path)?;
     for item in submitted {
@@ -144,6 +164,7 @@ fn record(ctx: &Context, submitted: &[Submitted]) -> Result<(), ClientError> {
             job: item.job.spec.id.clone(),
             machine: item.machine.name.clone(),
             name: item.job.spec.name.clone(),
+            from: from.cloned(),
         };
         let mut line = serde_json::to_vec(&entry).map_err(|source| ClientError::Index {
             path: path.clone(),
@@ -169,7 +190,17 @@ fn readable_lines(text: &str) -> Vec<IndexEntry> {
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| match crate::ingress::json_text(line) {
             Ok(entry) => Some(entry),
-            Err(_torn_or_foreign) => None,
+            Err(_torn_foreign_or_earlier) => {
+                match crate::ingress::json_text::<EarlierEntry>(line) {
+                    Ok(EarlierEntry { job, machine, name }) => Some(IndexEntry {
+                        job,
+                        machine,
+                        name,
+                        from: None,
+                    }),
+                    Err(_torn_or_foreign) => None,
+                }
+            }
         })
         .collect()
 }
@@ -212,10 +243,12 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
         None => (None, text),
     };
     let entries = index(ctx)?;
-    let found = |entry: Option<&IndexEntry>| {
-        entry
-            .map(|e| (ctx.config.machine(&e.machine), e.job.clone().into()))
-            .ok_or_else(|| ClientError::Unknown(text.to_owned()))
+    let found = |entry: Option<&IndexEntry>| -> Result<(Machine, JobRef), ClientError> {
+        let entry = entry.ok_or_else(|| ClientError::Unknown(text.to_owned()))?;
+        Ok((
+            ctx.config.machine(&entry.machine)?,
+            entry.job.clone().into(),
+        ))
     };
     if let Ok(name) = rest.parse::<JobName>()
         && let Some(entry) = newest(&entries, machine.as_ref(), |e| {
@@ -229,7 +262,7 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
         (Wanted::Named(name), machine) => found(newest(&entries, machine.as_ref(), |e| {
             e.name.as_ref() == Some(&name)
         })),
-        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine), reference)),
+        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine)?, reference)),
         (Wanted::Id(reference), None) => {
             let mut matches: Vec<&IndexEntry> = entries
                 .iter()
@@ -237,7 +270,7 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 .collect();
             matches.dedup_by(|a, b| a.machine == b.machine);
             match matches.as_slice() {
-                [only] => Ok((ctx.config.machine(&only.machine), reference)),
+                [only] => Ok((ctx.config.machine(&only.machine)?, reference)),
                 [] => match rest.parse::<JobName>() {
                     Ok(name) => found(newest(&entries, None, |e| e.name.as_ref() == Some(&name))),
                     Err(_not_a_name) => Err(ClientError::Unknown(text.to_owned())),
@@ -631,7 +664,11 @@ impl Plan<'_> {
             machine: machine.clone(),
             job,
         };
-        if let Err(error) = record(self.ctx, std::slice::from_ref(&submitted)) {
+        let from = self.prepared.as_ref().map(|prepared| SentFrom {
+            root: prepared.root.clone(),
+            manifest: prepared.manifest.0.clone(),
+        });
+        if let Err(error) = record(self.ctx, std::slice::from_ref(&submitted), from.as_ref()) {
             eprintln!(
                 "domyjob: {}: submitted {} but could not note it on this machine, so `latest` and its name will not find it: {error}",
                 machine.name, submitted.job.spec.id
@@ -777,7 +814,9 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
     names.dedup();
     let mut machines = Vec::new();
     for name in names {
-        let machine = ctx.config.machine(&name);
+        let Ok(machine) = ctx.config.machine(&name) else {
+            continue;
+        };
         if cached_facts(&ctx.dirs, &machine)?.is_some() || machine.transport == "local" {
             machines.push(machine);
         }
@@ -1079,8 +1118,8 @@ pub fn get(
 pub struct Pulled {
     pub machine: Machine,
     pub job: Job,
-    pub changes: Vec<snapshot::Change>,
-    pub contents: BTreeMap<RelPath, Vec<u8>>,
+    pub from: SentFrom,
+    pub plan: crate::pull::Plan<crate::pull::Forward>,
 }
 
 pub fn changes(ctx: &Context, reference: &str) -> Result<Pulled, ClientError> {
@@ -1095,23 +1134,46 @@ pub fn changes(ctx: &Context, reference: &str) -> Result<Pulled, ClientError> {
         )?
         .into_job()
         .map_err(|other| link.unexpected("a job", *other))?;
+    let from = sent_from(ctx, &machine.name, &job.spec.id)?;
     let mut payload = Vec::new();
     link.stream(&Request::Changes { job: job_ref }, &mut payload)?
         .into_stream()
         .map_err(|other| link.unexpected("changes", *other))?;
-    let (changes, contents) = unpack(&payload).map_err(|why| ClientError::Unpacked {
+    let plan = unpack(&payload, &from.manifest).map_err(|why| ClientError::Unpacked {
         machine: machine.name.clone(),
         why,
     })?;
     Ok(Pulled {
         machine,
         job,
-        changes,
-        contents,
+        from,
+        plan,
     })
 }
 
-type Unpacked = (Vec<snapshot::Change>, BTreeMap<RelPath, Vec<u8>>);
+pub fn recorded(ctx: &Context, text: &str) -> Result<(MachineName, JobId), ClientError> {
+    let (machine, reference) = locate(ctx, text)?;
+    index(ctx)?
+        .into_iter()
+        .rev()
+        .find(|entry| entry.machine == machine.name && entry.job.matches(&reference))
+        .map(|entry| (entry.machine, entry.job))
+        .ok_or_else(|| ClientError::Unknown(text.to_owned()))
+}
+
+#[must_use]
+pub fn pulls(ctx: &Context) -> PathBuf {
+    ctx.dirs.state.join("client").join("pulls")
+}
+
+fn sent_from(ctx: &Context, machine: &MachineName, job: &JobId) -> Result<SentFrom, ClientError> {
+    index(ctx)?
+        .into_iter()
+        .rev()
+        .find(|entry| &entry.job == job && &entry.machine == machine)
+        .and_then(|entry| entry.from)
+        .ok_or_else(|| ClientError::NotSent { job: job.clone() })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Unpacking {
@@ -1119,47 +1181,55 @@ pub enum Unpacking {
     NoList,
     #[error("the list of changes is not valid: {0}")]
     List(serde_json::Error),
+    #[error("the list of what was sent is cut short")]
+    NoManifest,
     #[error("{0} is too large for this machine")]
     TooLarge(RelPath),
     #[error("{0} was cut short")]
     Short(RelPath),
-    #[error("{0} does not match its digest")]
-    Damaged(RelPath),
     #[error("more arrived than the list of changes describes")]
     Extra,
+    #[error(transparent)]
+    Malformed(#[from] crate::pull::Malformed),
 }
 
-fn unpack(payload: &[u8]) -> Result<Unpacked, Unpacking> {
+fn unpack(
+    payload: &[u8],
+    recorded: &BlobId,
+) -> Result<crate::pull::Plan<crate::pull::Forward>, Unpacking> {
     let end = payload
         .iter()
         .position(|b| *b == b'\n')
         .ok_or(Unpacking::NoList)?;
-    let (list, rest) = payload.split_at(end);
-    let mut rest = rest.get(1..).unwrap_or_default();
-    let changes: Vec<snapshot::Change> = crate::ingress::json(list).map_err(Unpacking::List)?;
+    let (list, after_list) = payload.split_at(end);
+    let after_list = after_list.get(1..).unwrap_or_default();
+    let header: snapshot::Changed = crate::ingress::json(list).map_err(Unpacking::List)?;
+    let split = match usize::try_from(header.sent) {
+        Ok(size) => after_list.split_at_checked(size),
+        Err(_too_large) => None,
+    };
+    let (raw, mut rest) = split.ok_or(Unpacking::NoManifest)?;
+    let sent = crate::pull::SentManifest::verified(raw, recorded)?;
     let mut contents = BTreeMap::new();
-    for change in &changes {
-        if let Some(Entry::File { blob, size, .. }) = &change.after {
+    for left in &header.left {
+        if let Some(Entry::File { size, .. }) = &left.now {
             let wanted = usize::try_from(*size)
-                .map_err(|_too_large| Unpacking::TooLarge(change.path.clone()))?;
+                .map_err(|_too_large| Unpacking::TooLarge(left.path.clone()))?;
             let (bytes, next) = rest
                 .split_at_checked(wanted)
-                .ok_or_else(|| Unpacking::Short(change.path.clone()))?;
-            if BlobId::of(bytes) != *blob {
-                return Err(Unpacking::Damaged(change.path.clone()));
-            }
-            contents.insert(change.path.clone(), bytes.to_vec());
+                .ok_or_else(|| Unpacking::Short(left.path.clone()))?;
+            contents.insert(left.path.clone(), bytes.to_vec());
             rest = next;
         }
     }
-    if rest.is_empty() {
-        Ok((changes, contents))
-    } else {
-        Err(Unpacking::Extra)
+    if !rest.is_empty() {
+        return Err(Unpacking::Extra);
     }
+    Ok(crate::pull::Plan::new(&sent, header.left, contents)?)
 }
 
 impl crate::ingress::Ingress for IndexEntry {}
+impl crate::ingress::Ingress for EarlierEntry {}
 
 #[cfg(test)]
 mod tests {
@@ -1174,54 +1244,73 @@ mod tests {
     }
 
     #[test]
-    fn changes_unpack_only_when_every_file_arrives_whole_and_as_described() {
+    fn changes_unpack_only_against_the_list_this_machine_sent() {
         let entry = |text: &[u8]| Entry::File {
             blob: BlobId::of(text),
             size: crate::domain::len_u64(text.len()),
             mode: snapshot::Mode::Regular,
         };
-        let changes = vec![
-            snapshot::Change {
-                path: "a.txt".parse().unwrap(),
-                before: None,
-                after: Some(entry(b"alpha")),
-            },
-            snapshot::Change {
-                path: "gone.txt".parse().unwrap(),
-                before: Some(entry(b"x")),
-                after: None,
-            },
-            snapshot::Change {
-                path: "b.txt".parse().unwrap(),
-                before: None,
-                after: Some(entry(b"beta")),
-            },
-        ];
-        let payload = |tail: &[u8]| {
-            let mut bytes = serde_json::to_vec(&changes).unwrap();
+        let sent = snapshot::Manifest {
+            entries: BTreeMap::from([
+                ("gone.txt".parse().unwrap(), entry(b"x")),
+                ("same.txt".parse().unwrap(), entry(b"same")),
+            ]),
+        };
+        let (recorded, raw) = sent.encode().unwrap();
+        let left = |path: &str, now: Option<Entry>| snapshot::Left {
+            path: path.parse().unwrap(),
+            now,
+        };
+        let changed = snapshot::Changed {
+            sent: crate::domain::len_u64(raw.len()),
+            left: vec![
+                left("a.txt", Some(entry(b"alpha"))),
+                left("b.txt", Some(entry(b"beta"))),
+                left("gone.txt", None),
+                left("same.txt", Some(entry(b"same"))),
+            ],
+        };
+        let payload = |header: &snapshot::Changed, listed: &[u8], tail: &[u8]| {
+            let mut bytes = serde_json::to_vec(header).unwrap();
             bytes.push(b'\n');
+            bytes.extend_from_slice(listed);
             bytes.extend_from_slice(tail);
             bytes
         };
-        let (listed, contents) = unpack(&payload(b"alphabeta")).unwrap();
-        assert_eq!(listed, changes);
-        assert_eq!(contents.get(&"b.txt".parse().unwrap()).unwrap(), b"beta");
-        assert_eq!(contents.len(), 2);
+        let plan = unpack(&payload(&changed, &raw, b"alphabetasame"), &recorded).unwrap();
+        let kinds: String = plan.steps().iter().map(|s| s.kind().letter()).collect();
+        assert_eq!(kinds, "AAD");
         assert!(matches!(
-            unpack(&payload(b"alphabeta!")),
+            unpack(&payload(&changed, &raw, b"alphabetasame!"), &recorded),
             Err(Unpacking::Extra)
         ));
         assert!(matches!(
-            unpack(&payload(b"alphabet")),
+            unpack(&payload(&changed, &raw, b"alphabet"), &recorded),
             Err(Unpacking::Short(_))
         ));
         assert!(matches!(
-            unpack(&payload(b"alphaBETA")),
-            Err(Unpacking::Damaged(_))
+            unpack(&payload(&changed, &raw, b"alphaBETAsame"), &recorded),
+            Err(Unpacking::Malformed(crate::pull::Malformed::Damaged(_)))
         ));
-        assert!(matches!(unpack(b"[]"), Err(Unpacking::NoList)));
-        assert!(matches!(unpack(b"{\n"), Err(Unpacking::List(_))));
-        assert!(unpack(b"[]\n").unwrap().0.is_empty());
+        assert!(matches!(
+            unpack(
+                &payload(&changed, &raw, b"alphabetasame"),
+                &BlobId::of(b"other")
+            ),
+            Err(Unpacking::Malformed(crate::pull::Malformed::OtherManifest))
+        ));
+        let mut twice = changed.clone();
+        twice.left.swap(0, 1);
+        assert!(matches!(
+            unpack(&payload(&twice, &raw, b"betaalphasame"), &recorded),
+            Err(Unpacking::Malformed(crate::pull::Malformed::Unordered(_)))
+        ));
+        assert!(matches!(
+            unpack(&payload(&changed, raw.get(..3).unwrap(), b""), &recorded),
+            Err(Unpacking::NoManifest)
+        ));
+        assert!(matches!(unpack(b"{}", &recorded), Err(Unpacking::NoList)));
+        assert!(matches!(unpack(b"{\n", &recorded), Err(Unpacking::List(_))));
     }
 
     #[test]

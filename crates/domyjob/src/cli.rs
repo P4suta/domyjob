@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -19,7 +19,7 @@ use crate::template::Arg;
     name = "domyjob",
     version,
     about = "Send your work to any machine you can reach, run it there, and walk away",
-    long_about = "Send your work to any machine you can reach, run it there, and walk away.\n\nThe directory is sent as it is, uncommitted edits included, and the command keeps running on the machine whether or not you stay. Any host your ssh config knows works as it is; domyjob installs itself there the first time.",
+    long_about = "Send your work to any machine you can reach, run it there, and walk away.\n\nThe directory is sent as it is, uncommitted edits included, and the command keeps running on the machine whether or not you stay. Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as ssh:HOST; domyjob installs itself there the first time.",
     after_long_help = AFTER_LONG_HELP
 )]
 struct Cli {
@@ -431,11 +431,8 @@ struct CleanArgs {
 struct PullArgs {
     #[arg(help = "A job id, a unique prefix of one, a name, or MACHINE:ID")]
     job: String,
-    #[arg(
-        long,
-        help = "The project directory the job was sent from [default: the one containing this directory]"
-    )]
-    root: Option<PathBuf>,
+    #[arg(long, help = "Put back what an earlier pull of this job changed")]
+    undo: bool,
     #[arg(long, help = "List the changes without writing anything")]
     dry_run: bool,
     #[arg(long, help = "Print machine-readable JSON")]
@@ -520,6 +517,12 @@ struct RemoveArgs {
         help = "With --wipe, stop jobs still running there instead of refusing"
     )]
     kill_running: bool,
+    #[arg(
+        long,
+        requires = "wipe",
+        help = "With --wipe, remove without showing what would go first"
+    )]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -810,12 +813,8 @@ const fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
             kind: Kind::Unreachable,
             hint: Some("each machine's own error is printed above it"),
         },
-        CliError::Pull(crate::pull::PullError::Diverged(_)) => Diagnosis {
-            kind: Kind::Usage,
-            hint: Some("commit or set aside your own edits to those files, then pull again"),
-        },
-        CliError::Pull(_)
-        | CliError::Node(_)
+        CliError::Pull(error) => crate::diagnosis::of_pull(error),
+        CliError::Node(_)
         | CliError::Output(_)
         | CliError::Mcp(_)
         | CliError::Serve(_)
@@ -1162,7 +1161,12 @@ fn follow_through_as(
     }
     let notify = notify_targets(ctx, &common.notify);
     if common.wait {
-        let code = finish(ctx, &submitted, &notify, (common, &board, keep.as_ref()));
+        let code = finish(
+            ctx,
+            &submitted,
+            (&notify, rejected.len()),
+            (common, &board, keep.as_ref()),
+        );
         board.clear();
         return code;
     }
@@ -1353,10 +1357,29 @@ impl Watching<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Tally {
-    all_ok: bool,
-    single_code: Option<i32>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Succeeded,
+    Failed(Option<i32>),
+    Unknown,
+    NotRun,
+}
+
+fn exit_for(verdicts: &[Verdict]) -> u8 {
+    match verdicts {
+        [Verdict::Failed(Some(code))] => match u8::try_from((*code).clamp(1, 255)) {
+            Ok(byte) => byte,
+            Err(_out_of_range) => FAILED_JOB,
+        },
+        [_, ..]
+            if verdicts
+                .iter()
+                .all(|verdict| *verdict == Verdict::Succeeded) =>
+        {
+            0
+        }
+        _ => FAILED_JOB,
+    }
 }
 
 struct Settling<'a> {
@@ -1375,21 +1398,18 @@ fn settle(
     }: &Settling<'_>,
     item: &Submitted,
     outcome: Result<Job, ClientError>,
-    tally: &mut Tally,
-) -> Result<(), CliError> {
+) -> Result<Verdict, CliError> {
     let json = common.json;
     let job = match outcome {
         Ok(job) => job,
         Err(error) => {
-            tally.all_ok = false;
-            tally.single_code = None;
             eprintln!(
                 "domyjob: {}: lost track of {} ({error}); it may still be running there, and `domyjob status {}` asks again",
                 item.machine.name,
                 item.job.spec.id,
                 reference(item)
             );
-            return Ok(());
+            return Ok(Verdict::Unknown);
         }
     };
     if common.digest {
@@ -1403,20 +1423,22 @@ fn settle(
     } else {
         report_final(&item.machine, &job, (json, board))?;
     }
-    tally.all_ok &= job.succeeded();
-    tally.single_code = job.exit_code();
     for target in *notify {
         if let Err(error) = crate::notify::send(&ctx.config, target, &item.machine.name, &job) {
             eprintln!("domyjob: {error}");
         }
     }
-    Ok(())
+    Ok(if job.succeeded() {
+        Verdict::Succeeded
+    } else {
+        Verdict::Failed(job.exit_code())
+    })
 }
 
 fn finish(
     ctx: &Context,
     submitted: &[Submitted],
-    notify: &[NotifyTarget],
+    (notify, not_run): (&[NotifyTarget], usize),
     (common, board, keep): (&Common, &crate::board::Board, Option<&regex::Regex>),
 ) -> Result<ExitCode, CliError> {
     let stdout = std::sync::Mutex::new(std::io::stdout());
@@ -1434,10 +1456,7 @@ fn finish(
         keep,
         destination: crate::terminal::Destination::of_stdout(),
     };
-    let mut tally = Tally {
-        all_ok: true,
-        single_code: None,
-    };
+    let mut verdicts = vec![Verdict::Unknown; submitted.len()];
     let settling = Settling {
         ctx,
         notify,
@@ -1462,7 +1481,9 @@ fn finish(
             if let Some(slot) = waiting.get_mut(index) {
                 *slot = false;
             }
-            settle(&settling, item, outcome, &mut tally)?;
+            if let Some(verdict) = verdicts.get_mut(index) {
+                *verdict = settle(&settling, item, outcome)?;
+            }
             let still: Vec<String> = submitted
                 .iter()
                 .zip(&waiting)
@@ -1475,14 +1496,8 @@ fn finish(
         }
         Ok(())
     })?;
-    Ok(match (tally.all_ok, watching.many, tally.single_code) {
-        (true, _, _) => ExitCode::SUCCESS,
-        (false, false, Some(code)) => match u8::try_from(code.clamp(1, 255)) {
-            Ok(byte) => ExitCode::from(byte),
-            Err(_out_of_range) => ExitCode::from(FAILED_JOB),
-        },
-        (false, _, _) => ExitCode::from(FAILED_JOB),
-    })
+    verdicts.extend(std::iter::repeat_n(Verdict::NotRun, not_run));
+    Ok(ExitCode::from(exit_for(&verdicts)))
 }
 
 const DIGEST_TAIL: u32 = 40;
@@ -2195,74 +2210,113 @@ fn get(args: &GetArgs) -> Result<ExitCode, CliError> {
 
 fn pull(args: &PullArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let pulled = client::changes(&ctx, &args.job)?;
-    let (root, here) = client::project_here(&ctx, &current_dir()?, args.root.as_deref())?;
-    let sent_from = match &pulled.job.spec.location {
-        crate::protocol::Location::Snapshot { source, .. } => Some(&source.project),
-        crate::protocol::Location::Home => None,
-    };
-    if sent_from != Some(&here) {
-        return Err(ClientError::OtherProject {
-            job: pulled.job.spec.id,
-        }
-        .into());
+    if args.undo {
+        return pull_undo(&ctx, args);
     }
+    let pulled = client::changes(&ctx, &args.job)?;
+    let reference = format!("{}:{}", pulled.machine.name, pulled.job.spec.id);
+    let tree = crate::pull::Tree::open(&pulled.from.root)?;
+    let steps = pulled.plan.steps().to_vec();
+    let checked = pulled.plan.check(&tree)?;
+    let applied = if args.dry_run {
+        None
+    } else {
+        let journal = crate::pull::Journal::open(
+            &client::pulls(&ctx),
+            &format!("{}-{}", pulled.machine.name, pulled.job.spec.id),
+        )?;
+        Some(checked.keep(&tree, &journal)?.apply(&tree, &journal)?)
+    };
+    show_pulled(
+        &steps,
+        (&reference, tree.root()),
+        (applied, Pulling::Forward),
+        args.json,
+    )?;
+    if applied.is_some_and(|applied| applied.changed > 0) {
+        eprintln!("domyjob: `domyjob pull --undo {reference}` puts them back");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn pull_undo(ctx: &Context, args: &PullArgs) -> Result<ExitCode, CliError> {
+    let (machine, job) = client::recorded(ctx, &args.job)?;
+    let reference = format!("{machine}:{job}");
+    let journal =
+        crate::pull::Journal::find(&client::pulls(ctx), &format!("{machine}-{job}"), &reference)?;
+    let (tree, plan) = journal.undo()?;
+    let steps = plan.steps().to_vec();
+    let checked = plan.check(&tree)?;
+    let applied = if args.dry_run {
+        None
+    } else {
+        Some(checked.apply(&tree, &journal)?)
+    };
+    show_pulled(
+        &steps,
+        (&reference, tree.root()),
+        (applied, Pulling::Back),
+        args.json,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pulling {
+    Forward,
+    Back,
+}
+
+fn show_pulled(
+    steps: &[crate::pull::Step],
+    (reference, root): (&str, &Path),
+    (applied, pulling): (Option<crate::pull::Applied>, Pulling),
+    json: bool,
+) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
-    if args.json {
-        let listed: Vec<serde_json::Value> = pulled
-            .changes
+    if json {
+        let listed: Vec<serde_json::Value> = steps
             .iter()
-            .map(|change| {
-                serde_json::json!({
-                    "path": change.path,
-                    "change": match crate::pull::kind(change) {
-                        crate::pull::Kind::Added => "added",
-                        crate::pull::Kind::Modified => "modified",
-                        crate::pull::Kind::Removed => "removed",
-                    },
-                })
-            })
+            .map(|step| serde_json::json!({"path": step.path, "change": step.kind().word()}))
             .collect();
         writeln!(
             out,
             "{}",
             serde_json::json!({
                 "schema": crate::view::JSON_SCHEMA,
-                "job": format!("{}:{}", pulled.machine.name, pulled.job.spec.id),
-                "applied": !args.dry_run,
+                "job": reference,
+                "root": root,
+                "applied": applied.is_some(),
                 "changes": listed,
             })
         )
         .map_err(CliError::Output)?;
     } else {
-        for change in &pulled.changes {
-            writeln!(
-                out,
-                "{} {}",
-                crate::pull::kind(change).letter(),
-                change.path
-            )
-            .map_err(CliError::Output)?;
+        for step in steps {
+            writeln!(out, "{} {}", step.kind().letter(), step.path).map_err(CliError::Output)?;
         }
     }
     drop(out);
-    let reference = format!("{}:{}", pulled.machine.name, pulled.job.spec.id);
-    if pulled.changes.is_empty() {
-        eprintln!("domyjob: {reference} changed no files");
-    } else if args.dry_run {
-        let diverged = crate::pull::diverged(&root, &pulled.changes)?;
-        if !diverged.is_empty() {
-            return Err(crate::pull::PullError::Diverged(diverged).into());
+    let root = root.display();
+    match (applied, pulling) {
+        _ if steps.is_empty() => eprintln!("domyjob: {reference} changed no files"),
+        (None, _) => {}
+        (Some(applied), Pulling::Forward) if applied.changed == 0 => {
+            eprintln!("domyjob: {root} already matches {reference}");
         }
-    } else {
-        crate::pull::apply(&root, &pulled.changes, &pulled.contents)?;
-        eprintln!(
-            "domyjob: brought {} changed files back from {reference} into {}",
-            pulled.changes.len(),
-            root.display()
-        );
+        (Some(applied), Pulling::Back) if applied.changed == 0 => {
+            eprintln!("domyjob: {root} is already as it was before pulling {reference}");
+        }
+        (Some(applied), Pulling::Forward) => eprintln!(
+            "domyjob: changed {} files in {root} to match {reference}",
+            applied.changed
+        ),
+        (Some(applied), Pulling::Back) => eprintln!(
+            "domyjob: put back {} files in {root} as they were before pulling {reference}",
+            applied.changed
+        ),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
@@ -2276,7 +2330,7 @@ fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
     };
     crate::config::add_machine(&path, &machine).map_err(ClientError::from)?;
     let ctx = Context::load()?;
-    let configured = ctx.config.machine(&args.name);
+    let configured = ctx.config.machine(&args.name).map_err(ClientError::from)?;
     match crate::remote::Link::open(&ctx.config, &ctx.dirs, &configured) {
         Ok(_) => {
             let facts =
@@ -2304,21 +2358,32 @@ fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
 fn machines_remove(args: &RemoveArgs) -> Result<ExitCode, CliError> {
     let dirs = Dirs::from_env();
     if args.wipe {
-        wipe(&args.name, args.kill_running)?;
+        let ctx = Context::load()?;
+        let remote = ctx.config.remote(&args.name).map_err(ClientError::from)?;
+        if !args.yes {
+            println!(
+                "would remove from {} ({}): domyjob's jobs, workspaces, logs, key, service, and copy of domyjob",
+                args.name,
+                remote.machine().host
+            );
+            println!(
+                "run `domyjob machines remove {} --wipe --yes` to remove them",
+                args.name
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        wipe(&ctx, &remote, args.kill_running)?;
     }
     crate::remote::forget_witness(&dirs, &args.name).map_err(ClientError::from)?;
-    match crate::config::remove_machine(&crate::config::path(&dirs), &args.name) {
-        Ok(()) => {}
-        Err(crate::config::ConfigError::NotConfigured(_)) if args.wipe => {}
-        Err(other) => return Err(ClientError::from(other).into()),
-    }
+    crate::config::remove_machine(&crate::config::path(&dirs), &args.name)
+        .map_err(ClientError::from)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn wipe(name: &MachineName, kill_running: bool) -> Result<(), CliError> {
-    let ctx = Context::load()?;
-    let machine = ctx.config.machine(name);
-    let (jobs, rejected) = client::list(&ctx, std::slice::from_ref(&machine), u32::MAX);
+fn wipe(ctx: &Context, remote: &crate::config::Remote, kill_running: bool) -> Result<(), CliError> {
+    let machine = remote.machine();
+    let name = &machine.name;
+    let (jobs, rejected) = client::list(ctx, std::slice::from_ref(machine), u32::MAX);
     if let Some(item) = rejected.into_iter().next() {
         return Err(ClientError::from(item.error).into());
     }
@@ -2339,10 +2404,10 @@ fn wipe(name: &MachineName, kill_running: bool) -> Result<(), CliError> {
     }
     for still in running {
         let reference = format!("{name}:{}", still.spec.id);
-        client::job_request(&ctx, &reference, |job| Request::Kill { job })?;
+        client::job_request(ctx, &reference, |job| Request::Kill { job })?;
     }
     let link =
-        crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
+        crate::remote::Link::open(&ctx.config, &ctx.dirs, machine).map_err(ClientError::from)?;
     let report = link.wipe().map_err(ClientError::from)?;
     if !report.is_empty() {
         eprintln!("{report}");
@@ -2386,13 +2451,13 @@ fn self_uninstall(
         node.stop(&id)?;
     }
     drop(node);
-    match crate::service::uninstall(&dirs) {
-        Ok(()) | Err(_) => {}
+    let mut kept = Vec::new();
+    if let Err(error) = crate::service::uninstall(&dirs) {
+        kept.push(format!("the service ({error})"));
     }
     dirs.keys
         .forget(&dirs.state, "identity")
         .map_err(|e| CliError::Declined(e.to_string()))?;
-    let mut kept = Vec::new();
     for dir in [&dirs.state, &dirs.cache] {
         if let Err(error) = crate::state_file::remove_tree_forcibly(dir) {
             kept.push(format!("{} ({error})", dir.display()));
@@ -2400,13 +2465,14 @@ fn self_uninstall(
     }
     if kept.is_empty() {
         println!("removed domyjob's service, key, state, and cache from this machine");
+        Ok(ExitCode::SUCCESS)
     } else {
         println!(
-            "removed domyjob's service, key, and what could go; still here: {}",
+            "removed domyjob's key and what else could go; still here: {}",
             kept.join(", ")
         );
+        Ok(ExitCode::from(DOMYJOB_ERROR))
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
@@ -2430,7 +2496,7 @@ fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     crate::remote::forget_witness(&ctx.dirs, &args.name).map_err(ClientError::from)?;
-    let machine = ctx.config.machine(&args.name);
+    let machine = ctx.config.machine(&args.name).map_err(ClientError::from)?;
     crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
     match crate::remote::witnessed(&ctx.dirs, &args.name) {
         Some(head) => eprintln!(
@@ -2459,8 +2525,14 @@ fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     if matches!(args.service, Some(ServiceAction::Uninstall)) {
-        crate::service::uninstall(&dirs)?;
-        println!("domyjob serve no longer starts with your session");
+        match crate::service::uninstall(&dirs)? {
+            crate::service::Uninstalled::Service => {
+                println!("domyjob serve no longer starts with your session");
+            }
+            crate::service::Uninstalled::Nothing => {
+                println!("domyjob serve was not set to start with your session");
+            }
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let exposure = match &args.expose {
@@ -2574,7 +2646,10 @@ fn pair(args: &PairArgs) -> Result<ExitCode, CliError> {
         Err(error) => return Err(ClientError::from(error).into()),
     }
     let ctx = Context::load()?;
-    let machine = ctx.config.machine(&paired.name);
+    let machine = ctx
+        .config
+        .machine(&paired.name)
+        .map_err(ClientError::from)?;
     crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
     println!("try it:  domyjob run {} -- echo hello", paired.name);
     Ok(ExitCode::SUCCESS)
@@ -3005,6 +3080,25 @@ fn note_watch(ctx: &Context, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_every_machine_running_and_succeeding_exits_zero() {
+        use Verdict::{Failed, NotRun, Succeeded, Unknown};
+        assert_eq!(exit_for(&[Succeeded, Succeeded]), 0);
+        assert_eq!(exit_for(&[Failed(Some(3))]), 3);
+        assert_eq!(exit_for(&[Failed(Some(-9))]), 1);
+        for verdicts in [
+            &[][..],
+            &[Succeeded, NotRun],
+            &[NotRun],
+            &[Unknown],
+            &[Succeeded, Unknown],
+            &[Failed(Some(3)), Succeeded],
+            &[Failed(None)],
+        ] {
+            assert_eq!(exit_for(verdicts), FAILED_JOB, "{verdicts:?}");
+        }
+    }
 
     #[test]
     fn a_grep_on_the_stream_shows_only_the_matching_lines() {

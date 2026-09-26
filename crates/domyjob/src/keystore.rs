@@ -426,7 +426,7 @@ mod tests {
     fn a_key_that_cannot_be_written_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
-        let _read_only = state_file::ReadOnly::make(&state).unwrap();
+        let _read_only = crate::platform::ReadOnly::make(&state).unwrap();
         KeyStore::OwnerOnlyFile
             .store(&state, "identity", &[7u8; 32])
             .unwrap_err();
@@ -536,7 +536,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
         write_file(&file(&state, "identity"), &[1u8; 32]).unwrap();
-        let _read_only = state_file::ReadOnly::make(&state).unwrap();
+        let _read_only = crate::platform::ReadOnly::make(&state).unwrap();
         migrate(&Fake::holding(None, Refuses::Nothing), &state, "identity")
             .map(drop)
             .unwrap_err();

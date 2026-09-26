@@ -408,7 +408,6 @@ struct Supervisor {
     store: Store,
     cas: Cas,
     spec: Spec,
-    launch: crate::store::LaunchEnv,
     shared: Arc<Shared>,
 }
 
@@ -448,7 +447,6 @@ fn take_charge(
         store.publish(id)?;
     }
     let spec = store.spec(id)?;
-    let launch = store.launch_env(id)?;
     let log_path = store.log_path(id);
     let file = crate::state_file::open_append(&log_path)?;
     let len = file
@@ -481,7 +479,6 @@ fn take_charge(
         store,
         cas,
         spec,
-        launch,
         shared,
     };
     Ok((supervisor, alive, received))
@@ -634,11 +631,6 @@ impl Supervisor {
                 "recording that the job runs failed ({error}); it runs regardless"
             ));
         }
-        if let Err(error) = self.store.forget_launch_env(&self.spec.id) {
-            self.shared.say(&format!(
-                "removing the saved launch environment failed: {error}"
-            ));
-        }
         Ok(self.watch(&group, collecting))
     }
 
@@ -654,18 +646,12 @@ impl Supervisor {
         };
         let mut command =
             crate::shell::process(&self.spec.command, self.spec.shell.as_deref()).command();
-        command
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&self.launch.vars);
-        for name in &self.launch.not_unicode {
+        command.current_dir(&cwd);
+        for name in self.store.take_launch(&self.spec.id)?.apply(&mut command) {
             self.shared.say(&format!(
                 "the environment variable {} was not passed on because it is not Unicode",
-                crate::terminal::neutralize(name)
+                crate::terminal::neutralize(&name)
             ));
-        }
-        for (key, value) in self.store.env(&self.spec.id)? {
-            command.env(key.as_str(), value);
         }
         command
             .env("DOMYJOB", "1")
@@ -734,11 +720,13 @@ impl Supervisor {
 
     fn fill(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
         match self.fill_once(root, manifest_id) {
-            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Io {
-                action,
-                path,
-                source,
-            })) => {
+            Err(NodeError::Workspace(crate::workspace::WorkspaceError::Tree(
+                crate::tree::TreeError::Io {
+                    action,
+                    path,
+                    source,
+                },
+            ))) => {
                 self.shared.say(&format!(
                     "the workspace could not be updated ({action} {}: {source}); moving it aside and filling it afresh",
                     path.display()

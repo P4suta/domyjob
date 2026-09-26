@@ -456,17 +456,17 @@ pub fn unreachable_card(
 pub fn first_run() -> Result<String, std::fmt::Error> {
     let mut out = String::new();
     writeln!(out, "{}", ui::paint(Tone::Strong, "No machines yet."))?;
-    writeln!(out, "  Any host your ssh config knows works as it is:")?;
-    writeln!(
-        out,
-        "    {}",
-        ui::paint(Tone::Hint, "domyjob run myhost -- uname -a")
-    )?;
-    writeln!(out, "  Or give one a name and labels:")?;
+    writeln!(out, "  Add a host your ssh config knows:")?;
     writeln!(
         out,
         "    {}",
         ui::paint(Tone::Hint, "domyjob machines add linux --label gpu")
+    )?;
+    writeln!(out, "  Or reach one directly:")?;
+    writeln!(
+        out,
+        "    {}",
+        ui::paint(Tone::Hint, "domyjob run ssh:myhost -- uname -a")
     )?;
     writeln!(
         out,

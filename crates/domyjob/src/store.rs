@@ -89,6 +89,33 @@ impl LaunchEnv {
     }
 }
 
+const ENV: &str = "env.json";
+const LAUNCH_ENV: &str = "launch-env.json";
+
+pub struct Launch {
+    vars: BTreeMap<String, zeroize::Zeroizing<String>>,
+    not_unicode: Vec<String>,
+}
+
+impl std::fmt::Debug for Launch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Launch")
+            .field("names", &self.vars.keys().collect::<Vec<_>>())
+            .field("not_unicode", &self.not_unicode)
+            .finish()
+    }
+}
+
+impl Launch {
+    pub fn apply(self, command: &mut std::process::Command) -> Vec<String> {
+        command.env_clear();
+        for (key, value) in &self.vars {
+            command.env(key, value.as_str());
+        }
+        self.not_unicode
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Sequence {
@@ -175,8 +202,8 @@ impl Store {
         }
         crate::state_file::private_dir(&dir)?;
         crate::state_file::write_json(&dir.join("spec.json"), spec)?;
-        crate::state_file::write_json(&dir.join("env.json"), env)?;
-        crate::state_file::write_json(&dir.join("launch-env.json"), launch)?;
+        crate::state_file::write_json(&dir.join(ENV), env)?;
+        crate::state_file::write_json(&dir.join(LAUNCH_ENV), launch)?;
         crate::state_file::write_json(&dir.join("phase.json"), &Phase::Queued)?;
         crate::state_file::create_empty(&dir.join("log"))?;
         crate::state_file::write_bytes(&dir.join("outcome"), &[b' '; OUTCOME_RESERVED])?;
@@ -283,25 +310,38 @@ impl Store {
         read_json(&self.job_dir(id).join("spec.json"))
     }
 
-    pub fn launch_env(&self, id: &JobId) -> Result<LaunchEnv, StoreError> {
-        read_json(&self.job_dir(id).join("launch-env.json"))
+    pub fn take_launch(&self, id: &JobId) -> Result<Launch, StoreError> {
+        let dir = self.job_dir(id);
+        let base: LaunchEnv = read_json(&dir.join(LAUNCH_ENV))?;
+        let env: BTreeMap<EnvName, String> = read_json(&dir.join(ENV))?;
+        self.purge_secrets(id)?;
+        let mut vars: BTreeMap<String, zeroize::Zeroizing<String>> = base
+            .vars
+            .into_iter()
+            .map(|(key, value)| (key, zeroize::Zeroizing::new(value)))
+            .collect();
+        for (key, value) in env {
+            vars.insert(key.as_str().to_owned(), zeroize::Zeroizing::new(value));
+        }
+        Ok(Launch {
+            vars,
+            not_unicode: base.not_unicode,
+        })
     }
 
-    pub fn forget_launch_env(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::remove_file(
-            &self.job_dir(id).join("launch-env.json"),
-        )?)
-    }
-
-    pub fn env(&self, id: &JobId) -> Result<BTreeMap<EnvName, String>, StoreError> {
-        read_json(&self.job_dir(id).join("env.json"))
+    fn purge_secrets(&self, id: &JobId) -> Result<(), StoreError> {
+        for name in [ENV, LAUNCH_ENV] {
+            crate::state_file::remove_file(&self.job_dir(id).join(name))?;
+        }
+        Ok(())
     }
 
     pub fn set_phase(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
-        Ok(crate::state_file::write_json(
-            &self.job_dir(id).join("phase.json"),
-            phase,
-        )?)
+        crate::state_file::write_json(&self.job_dir(id).join("phase.json"), phase)?;
+        match phase {
+            Phase::Finished { .. } => self.purge_secrets(id),
+            Phase::Queued | Phase::Preparing { .. } | Phase::Running { .. } => Ok(()),
+        }
     }
 
     pub fn phase(&self, id: &JobId) -> Result<Phase, StoreError> {
@@ -336,19 +376,14 @@ impl Store {
             }));
         }
         bytes.resize(OUTCOME_RESERVED, b' ');
-        Ok(crate::state_file::overwrite_in_place(
-            &self.job_dir(id).join("outcome"),
-            &bytes,
-        )?)
+        crate::state_file::overwrite_in_place(&self.job_dir(id).join("outcome"), &bytes)?;
+        self.purge_secrets(id)
     }
 
     fn supervisor(&self, id: &JobId) -> Result<Supervisor, StoreError> {
-        match OsLock::try_exclusive(&self.alive_path(id))? {
-            Some(free) => {
-                free.release()?;
-                Ok(Supervisor::Gone)
-            }
-            None => Ok(Supervisor::Alive),
+        match OsLock::probe(&self.alive_path(id))? {
+            crate::lock::Probe::Held => Ok(Supervisor::Alive),
+            crate::lock::Probe::Absent | crate::lock::Probe::Free => Ok(Supervisor::Gone),
         }
     }
 
@@ -729,7 +764,7 @@ mod tests {
         store.ids().unwrap_err();
         let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
         let staged = store.stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()));
-        if cfg!(unix) {
+        if crate::platform::MODES {
             assert!(
                 matches!(
                     staged,

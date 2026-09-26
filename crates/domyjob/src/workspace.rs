@@ -1,21 +1,15 @@
-use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cap_std::fs::{Dir, OpenOptions};
-
 use crate::cas::{Applied, Cas, CasError};
 use crate::domain::RelPath;
-use crate::snapshot::{Entry, Manifest, Mode};
+use crate::snapshot::{Entry, Left, Manifest};
+use crate::tree::{Blockers, Contents, Placed, Removed, Rooted, TreeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
-    #[error("{action} {path} inside the workspace: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Tree(#[from] TreeError),
     #[error(transparent)]
     Cas(#[from] CasError),
     #[error(transparent)]
@@ -24,26 +18,14 @@ pub enum WorkspaceError {
     Stopped,
     #[error("{0} is a directory; get copies one file, so name a file inside it")]
     NotAFile(PathBuf),
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> WorkspaceError + use<> {
-    let path = path.to_path_buf();
-    move |source| WorkspaceError::Io {
-        action,
-        path,
-        source,
-    }
-}
-
-fn relative(rel: &RelPath) -> PathBuf {
-    rel.parts().collect()
+    #[error("the workspace {0} is gone")]
+    Gone(PathBuf),
+    #[error(transparent)]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
 }
 
 #[derive(Debug)]
-pub struct Workspace {
-    dir: Dir,
-    root: PathBuf,
-}
+pub struct Workspace(Rooted);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Plan<'a> {
@@ -60,177 +42,39 @@ pub struct Changes {
 
 impl Workspace {
     pub fn open(root: &Path) -> Result<Self, WorkspaceError> {
+        Self::open_as(root, crate::platform::FAMILY)
+    }
+
+    pub fn open_as(root: &Path, family: crate::paths::Family) -> Result<Self, WorkspaceError> {
         crate::state_file::private_dir(root)?;
-        let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority())
-            .map_err(io("opening", root))?;
-        Ok(Self {
-            dir,
-            root: root.to_path_buf(),
-        })
+        Rooted::open_as(root, family)?
+            .map(Self)
+            .ok_or_else(|| WorkspaceError::Gone(root.to_path_buf()))
     }
 
     pub fn open_existing(root: &Path) -> Result<Option<Self>, WorkspaceError> {
-        match Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
-            Ok(dir) => Ok(Some(Self {
-                dir,
-                root: root.to_path_buf(),
-            })),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io("opening", root)(e)),
-        }
+        Ok(Rooted::open(root)?.map(Self))
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        self.0.root()
     }
 
-    fn content_is(
-        &self,
-        path: &Path,
-        blob: &crate::domain::BlobId,
-    ) -> Result<bool, WorkspaceError> {
-        let mut file = self.dir.open(path).map_err(io("opening", path))?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).map_err(io("reading", path))?;
-            match buffer.get(..read) {
-                Some([]) | None => break,
-                Some(chunk) => {
-                    hasher.update(chunk);
-                }
-            }
-        }
-        Ok(&crate::domain::BlobId::from_hash(&hasher.finalize()) == blob)
+    fn holds(&self, rel: &RelPath, entry: &Entry) -> Result<bool, WorkspaceError> {
+        Ok(self.0.holds(rel, Some(entry), &Removed::new())?)
     }
 
-    fn holds(&self, path: &Path, entry: &Entry) -> Result<bool, WorkspaceError> {
-        let meta = match self.dir.symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
-                return Ok(false);
-            }
-            Err(e) => return Err(io("checking", path)(e)),
-        };
+    fn place(&self, cas: &Cas, rel: &RelPath, entry: &Entry) -> Result<(), WorkspaceError> {
+        self.0.make_parents(rel, Blockers::Replace)?;
+        self.0.clear(rel, Contents::Anything)?;
         match entry {
-            Entry::File { blob, size, mode } => {
-                if !meta.is_file() || meta.len() != *size || mode_of(&meta) != *mode {
-                    return Ok(false);
-                }
-                self.content_is(path, blob)
+            Entry::File { blob, mode, .. } => {
+                self.0.create(rel, Placed::File(&cas.get(blob)?, *mode))?;
             }
-            Entry::Symlink { target } => self.holds_link(path, &meta, target),
-        }
-    }
-
-    #[cfg(unix)]
-    fn holds_link(
-        &self,
-        path: &Path,
-        meta: &cap_std::fs::Metadata,
-        target: &str,
-    ) -> Result<bool, WorkspaceError> {
-        if !meta.is_symlink() {
-            return Ok(false);
-        }
-        let found = self.dir.read_link(path).map_err(io("reading", path))?;
-        Ok(found.as_os_str() == target)
-    }
-
-    #[cfg(not(unix))]
-    fn holds_link(
-        &self,
-        path: &Path,
-        meta: &cap_std::fs::Metadata,
-        target: &str,
-    ) -> Result<bool, WorkspaceError> {
-        if !meta.is_file() || meta.len() != crate::domain::len_u64(target.len()) {
-            return Ok(false);
-        }
-        self.content_is(path, &crate::domain::BlobId::of(target.as_bytes()))
-    }
-
-    fn clear(&self, path: &Path) -> Result<(), WorkspaceError> {
-        match self.dir.symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() => {
-                self.dir.remove_dir_all(path).map_err(io("removing", path))
-            }
-            Ok(_) => self.dir.remove_file(path).map_err(io("removing", path)),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(io("checking", path)(e)),
-        }
-    }
-
-    fn prepare_parent(&self, path: &Path) -> Result<(), WorkspaceError> {
-        let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
-            return Ok(());
-        };
-        let mut walked = PathBuf::new();
-        for component in parent.components() {
-            walked.push(component);
-            match self.dir.symlink_metadata(&walked) {
-                Ok(meta) if meta.is_dir() => {}
-                Ok(_) => {
-                    self.dir
-                        .remove_file(&walked)
-                        .map_err(io("replacing", &walked))?;
-                    self.dir
-                        .create_dir(&walked)
-                        .map_err(io("creating", &walked))?;
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    self.dir
-                        .create_dir(&walked)
-                        .map_err(io("creating", &walked))?;
-                }
-                Err(e) => return Err(io("checking", &walked)(e)),
-            }
+            Entry::Symlink { target } => self.0.create(rel, Placed::Link(target))?,
         }
         Ok(())
-    }
-
-    fn write_file(&self, path: &Path, bytes: &[u8], mode: Mode) -> Result<(), WorkspaceError> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        set_mode(&mut options, mode);
-        let mut file = self
-            .dir
-            .open_with(path, &options)
-            .map_err(io("creating", path))?;
-        file.write_all(bytes).map_err(io("writing", path))
-    }
-
-    fn place(&self, cas: &Cas, path: &Path, entry: &Entry) -> Result<(), WorkspaceError> {
-        self.prepare_parent(path)?;
-        self.clear(path)?;
-        match entry {
-            Entry::File { blob, mode, .. } => self.write_file(path, &cas.get(blob)?, *mode),
-            Entry::Symlink { target } => self.place_symlink(target, path),
-        }
-    }
-
-    #[cfg(unix)]
-    fn place_symlink(&self, target: &str, path: &Path) -> Result<(), WorkspaceError> {
-        self.dir.symlink(target, path).map_err(io("linking", path))
-    }
-
-    #[cfg(not(unix))]
-    fn place_symlink(&self, target: &str, path: &Path) -> Result<(), WorkspaceError> {
-        self.write_file(path, target.as_bytes(), Mode::Regular)
-    }
-
-    fn remove_emptied(&self, path: &Path) {
-        for ancestor in path
-            .ancestors()
-            .skip(1)
-            .filter(|a| !a.as_os_str().is_empty())
-        {
-            match self.dir.remove_dir(ancestor) {
-                Ok(()) => {}
-                Err(_not_empty_or_gone) => break,
-            }
-        }
     }
 
     pub fn materialize(
@@ -245,9 +89,8 @@ impl Workspace {
             .paths()
             .filter(|rel| !manifest.entries.contains_key(*rel))
         {
-            let path = relative(rel);
-            self.clear(&path)?;
-            self.remove_emptied(&path);
+            self.0.clear(rel, Contents::Anything)?;
+            self.0.prune(rel);
             changes.removed = changes.removed.saturating_add(1);
         }
         let mut next = Applied::default();
@@ -255,11 +98,10 @@ impl Workspace {
             if stop.load(Ordering::SeqCst) {
                 return Err(WorkspaceError::Stopped);
             }
-            let path = relative(rel);
-            if self.holds(&path, entry)? {
+            if self.holds(rel, entry)? {
                 changes.kept = changes.kept.saturating_add(1);
             } else {
-                self.place(cas, &path, entry)?;
+                self.place(cas, rel, entry)?;
                 changes.written = changes.written.saturating_add(1);
             }
             next.insert(rel.clone());
@@ -267,42 +109,35 @@ impl Workspace {
         Ok((next, changes))
     }
 
-    pub fn open_file(&self, rel: &RelPath) -> Result<std::fs::File, WorkspaceError> {
-        let path = relative(rel);
-        let meta = self.dir.metadata(&path).map_err(io("opening", &path))?;
-        if meta.is_dir() {
-            return Err(WorkspaceError::NotAFile(path));
+    pub fn left(&self, sent: &Manifest) -> Result<Vec<Left>, WorkspaceError> {
+        let mut left = Vec::new();
+        for (rel, entry) in &sent.entries {
+            if !self.holds(rel, entry)? {
+                left.push(Left {
+                    path: rel.clone(),
+                    now: self.0.entry(rel, Some(entry))?,
+                });
+            }
         }
-        let file = self.dir.open(&path).map_err(io("opening", &path))?;
-        Ok(file.into_std())
+        for rel in crate::snapshot::inside_paths(self.root())? {
+            if !sent.entries.contains_key(&rel)
+                && let Some(now) = self.0.entry(&rel, None)?
+            {
+                left.push(Left {
+                    path: rel,
+                    now: Some(now),
+                });
+            }
+        }
+        left.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(left)
     }
-}
 
-#[cfg(unix)]
-fn set_mode(options: &mut OpenOptions, mode: Mode) {
-    use cap_std::fs::OpenOptionsExt;
-    options.mode(match mode {
-        Mode::Regular => 0o644,
-        Mode::Executable => 0o755,
-    });
-}
-
-#[cfg(not(unix))]
-const fn set_mode(_options: &mut OpenOptions, _mode: Mode) {}
-
-#[cfg(unix)]
-fn mode_of(meta: &cap_std::fs::Metadata) -> Mode {
-    use cap_std::fs::PermissionsExt;
-    if meta.permissions().mode() & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
+    pub fn open_file(&self, rel: &RelPath) -> Result<std::fs::File, WorkspaceError> {
+        self.0
+            .open_file(rel)?
+            .ok_or_else(|| WorkspaceError::NotAFile(rel.to_local()))
     }
-}
-
-#[cfg(not(unix))]
-const fn mode_of(_meta: &cap_std::fs::Metadata) -> Mode {
-    Mode::Regular
 }
 
 #[cfg(test)]
@@ -312,7 +147,9 @@ const fn mode_of(_meta: &cap_std::fs::Metadata) -> Mode {
 )]
 mod tests {
     use super::*;
+    use crate::snapshot::Mode;
     use crate::snapshot::from_directory;
+    use std::io::ErrorKind;
 
     #[test]
     fn a_fill_cut_short_leaves_nothing_behind_once_its_intent_was_recorded() {
@@ -424,15 +261,97 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn what_a_family_writes_it_reads_back_unchanged_whatever_system_runs_the_test() {
+        for family in [crate::platform::FAMILY, crate::paths::Family::Windows] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cas = Cas::open(tmp.path().join("cas")).unwrap();
+            let stored = |text: &[u8], mode| {
+                let blob = crate::domain::BlobId::of(text);
+                cas.put(&blob, text).unwrap();
+                Entry::File {
+                    blob,
+                    size: crate::domain::len_u64(text.len()),
+                    mode,
+                }
+            };
+            let manifest = Manifest {
+                entries: std::collections::BTreeMap::from([
+                    ("run.sh".parse().unwrap(), stored(b"echo", Mode::Executable)),
+                    (
+                        "notes.txt".parse().unwrap(),
+                        stored(b"notes", Mode::Regular),
+                    ),
+                    (
+                        "latest".parse().unwrap(),
+                        Entry::Symlink {
+                            target: "notes.txt".to_owned(),
+                        },
+                    ),
+                ]),
+            };
+            let ws = Workspace::open_as(&tmp.path().join("ws"), family).unwrap();
+            let fill = |previous: &Applied| {
+                ws.materialize(
+                    &cas,
+                    Plan {
+                        manifest: &manifest,
+                        previous,
+                    },
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+            };
+            let (applied, _) = fill(&Applied::default());
+            assert_eq!(ws.left(&manifest).unwrap(), Vec::new(), "{family:?}");
+            let (_, again) = fill(&applied);
+            assert_eq!((again.written, again.kept), (0, 3), "{family:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_to_an_absolute_target_is_placed_and_then_recognised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("cas")).unwrap();
+        let manifest = Manifest {
+            entries: std::collections::BTreeMap::from([(
+                "hosts".parse().unwrap(),
+                Entry::Symlink {
+                    target: "/etc/hosts".to_owned(),
+                },
+            )]),
+        };
+        let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
+        let fill = |previous: &Applied| {
+            ws.materialize(
+                &cas,
+                Plan {
+                    manifest: &manifest,
+                    previous,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let (applied, first) = fill(&Applied::default());
+        assert_eq!(first.written, 1);
+        let (_, second) = fill(&applied);
+        assert_eq!((second.written, second.kept), (0, 1));
+        assert!(ws.left(&manifest).unwrap().is_empty());
+    }
+
     #[test]
     fn symlinks_left_by_a_job_cannot_carry_writes_or_reads_outside() {
+        if !crate::platform::LINKS {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret"), "private").unwrap();
         let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
-        std::os::unix::fs::symlink(&outside, ws.root().join("escape")).unwrap();
+        crate::platform::make_link(&outside.display().to_string(), &ws.root().join("escape"))
+            .unwrap();
         ws.open_file(&"escape/secret".parse().unwrap()).unwrap_err();
 
         let cas = Cas::open(tmp.path().join("cas")).unwrap();

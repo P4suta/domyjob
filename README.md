@@ -19,7 +19,8 @@ Nothing to host: one binary on your machine, and any host you can ssh into.
 $ cargo install --git https://github.com/P4suta/domyjob domyjob
 ```
 
-Any host your ssh config knows works as it is; `domyjob doctor` checks them, and the first contact installs domyjob there.
+Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as `ssh:HOST`.
+`domyjob doctor` checks them, and the first contact installs domyjob there.
 
 ## Use
 

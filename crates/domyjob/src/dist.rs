@@ -514,7 +514,7 @@ pub fn binary_for(
     os: &str,
     arch: &str,
 ) -> Result<Deliverable, DistError> {
-    if os == std::env::consts::OS && arch == std::env::consts::ARCH {
+    if os == crate::platform::OS && arch == crate::platform::ARCH {
         return Ok(Deliverable::Verified(running()?));
     }
     let exe = if os == "windows" { ".exe" } else { "" };
@@ -552,7 +552,7 @@ pub fn self_update(
         return Ok(None);
     };
     let target = TargetTriple::try_from(OWN_TARGET.to_owned())?;
-    let exe = if cfg!(windows) { ".exe" } else { "" };
+    let exe = crate::platform::EXE_SUFFIX;
     let dir = dirs.cache.join("update");
     let manifest = fetch_manifest(
         distribution,

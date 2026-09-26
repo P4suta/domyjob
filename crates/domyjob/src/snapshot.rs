@@ -10,9 +10,7 @@ use crate::domain::{BlobId, Invalid, RelPath};
 use crate::protocol::Revision;
 use crate::template::{Arg, Bindings, TemplateError};
 
-pub const METADATA_DIRS: &[&str] = &[
-    ".git", ".jj", ".hg", ".svn", ".pijul", "_darcs", ".bzr", "CVS",
-];
+use crate::domain::METADATA_DIRS;
 pub const IGNORE_FILE: &str = ".domyjobignore";
 const SHOW_THREADS: usize = 8;
 
@@ -62,45 +60,38 @@ pub enum SnapshotError {
     Encode(serde_json::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     Regular,
     Executable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
     File { blob: BlobId, size: u64, mode: Mode },
     Symlink { target: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Change {
+pub struct Left {
     pub path: RelPath,
-    pub before: Option<Entry>,
-    pub after: Option<Entry>,
+    pub now: Option<Entry>,
 }
 
-impl crate::ingress::Ingress for Vec<Change> {}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Changed {
+    pub sent: u64,
+    pub left: Vec<Left>,
+}
 
-#[must_use]
-pub fn changes(before: &Manifest, after: &Manifest) -> Vec<Change> {
-    let paths: std::collections::BTreeSet<&RelPath> =
-        before.entries.keys().chain(after.entries.keys()).collect();
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let (was, now) = (before.entries.get(path), after.entries.get(path));
-            (was != now).then(|| Change {
-                path: path.clone(),
-                before: was.cloned(),
-                after: now.cloned(),
-            })
-        })
-        .collect()
+impl crate::ingress::Ingress for Changed {}
+
+fn metadata(name: &str) -> bool {
+    METADATA_DIRS.contains(&name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,21 +162,6 @@ pub struct Snapshot {
     pub revision: Revision,
 }
 
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> Mode {
-    use std::os::unix::fs::PermissionsExt;
-    if meta.permissions().mode() & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
-    }
-}
-
-#[cfg(not(unix))]
-const fn mode_of(_meta: &std::fs::Metadata) -> Mode {
-    Mode::Regular
-}
-
 pub fn relative(root: &Path, path: &Path) -> Result<RelPath, SnapshotError> {
     let unportable = || SnapshotError::Unportable(path.to_path_buf());
     let inner = path.strip_prefix(root).map_err(|_outside| unportable())?;
@@ -211,15 +187,22 @@ struct Pending {
     mode: Mode,
 }
 
-fn walker(root: &Path) -> ignore::Walk {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rules {
+    Everywhere,
+    InsideOnly,
+}
+
+fn walker(root: &Path, rules: Rules) -> ignore::Walk {
+    let everywhere = rules == Rules::Everywhere;
     let mut walker = ignore::WalkBuilder::new(root);
     walker
         .hidden(false)
-        .parents(true)
+        .parents(false)
         .ignore(true)
         .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
+        .git_global(everywhere)
+        .git_exclude(everywhere)
         .require_git(false)
         .follow_links(false)
         .add_custom_ignore_filename(IGNORE_FILE)
@@ -227,9 +210,23 @@ fn walker(root: &Path) -> ignore::Walk {
             entry
                 .file_name()
                 .to_str()
-                .is_none_or(|name| !METADATA_DIRS.contains(&name))
+                .is_none_or(|name| !metadata(name))
         });
     walker.build()
+}
+
+pub fn inside_paths(root: &Path) -> Result<Vec<RelPath>, SnapshotError> {
+    let mut paths = Vec::new();
+    for item in walker(root, Rules::InsideOnly) {
+        let item = item.map_err(|source| SnapshotError::Walk {
+            root: root.to_path_buf(),
+            source,
+        })?;
+        if item.file_type().is_some_and(|kind| !kind.is_dir()) {
+            paths.push(relative(root, item.path())?);
+        }
+    }
+    Ok(paths)
 }
 
 enum Found {
@@ -259,7 +256,7 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     Ok(Found::Hash(Pending {
         rel,
         path: path.to_path_buf(),
-        mode: mode_of(&meta),
+        mode: crate::platform::Moded::mode(&meta),
     }))
 }
 
@@ -278,7 +275,7 @@ fn disk_origins(root: &Path, manifest: &Manifest) -> BTreeMap<BlobId, Origin> {
 pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
     let mut entries = BTreeMap::new();
     let mut pending = Vec::new();
-    for item in walker(root) {
+    for item in walker(root, Rules::Everywhere) {
         let item = item.map_err(|source| SnapshotError::Walk {
             root: root.to_path_buf(),
             source,
@@ -636,6 +633,7 @@ mod tests {
         reason = "the test builds a fixture repository with the real git"
     )]
     fn run(dir: &Path, program: &str, args: &[&str]) {
+        let no_settings = tempfile::NamedTempFile::new().unwrap();
         let out = std::process::Command::new(program)
             .current_dir(dir)
             .args(args)
@@ -643,10 +641,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", no_settings.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -672,9 +667,10 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_directory_needs_no_version_control() {
+    fn a_plain_directory_needs_no_version_control_and_ignores_nothing_from_outside() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        std::fs::write(tmp.path().join(".gitignore"), "*\n").unwrap();
+        let root = &tmp.path().join("project");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
@@ -765,53 +761,6 @@ mod tests {
             std::fs::canonicalize(other_id).unwrap(),
             std::fs::canonicalize(main_id).unwrap()
         );
-    }
-
-    #[test]
-    fn changes_are_what_was_added_altered_or_removed_and_nothing_else() {
-        let file = |text: &[u8], mode| Entry::File {
-            blob: BlobId::of(text),
-            size: crate::domain::len_u64(text.len()),
-            mode,
-        };
-        let manifest = |entries: &[(&str, Entry)]| Manifest {
-            entries: entries
-                .iter()
-                .map(|(path, entry)| (path.parse().unwrap(), entry.clone()))
-                .collect(),
-        };
-        let sent = manifest(&[
-            ("same.txt", file(b"same", Mode::Regular)),
-            ("edited.txt", file(b"old", Mode::Regular)),
-            ("run.sh", file(b"echo", Mode::Regular)),
-            ("gone.txt", file(b"bye", Mode::Regular)),
-        ]);
-        let now = manifest(&[
-            ("same.txt", file(b"same", Mode::Regular)),
-            ("edited.txt", file(b"new", Mode::Regular)),
-            ("run.sh", file(b"echo", Mode::Executable)),
-            ("born.txt", file(b"hi", Mode::Regular)),
-        ]);
-        let found: Vec<(String, bool, bool)> = changes(&sent, &now)
-            .into_iter()
-            .map(|change| {
-                (
-                    change.path.to_string(),
-                    change.before.is_some(),
-                    change.after.is_some(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            found,
-            [
-                ("born.txt".to_owned(), false, true),
-                ("edited.txt".to_owned(), true, true),
-                ("gone.txt".to_owned(), true, false),
-                ("run.sh".to_owned(), true, true),
-            ]
-        );
-        assert!(changes(&sent, &sent).is_empty());
     }
 
     #[test]

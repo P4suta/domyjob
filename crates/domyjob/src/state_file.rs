@@ -8,9 +8,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-#[cfg(unix)]
-const GROUP_AND_OTHER_BITS: u32 = 6;
-
 static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
@@ -32,8 +29,6 @@ pub enum StateError {
     Exposed { path: PathBuf, mode: u32 },
     #[error("{path} belongs to another user; refusing to trust it")]
     Foreign { path: PathBuf },
-    #[error("securing {path} failed: {detail}")]
-    Acl { path: PathBuf, detail: String },
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> StateError + use<> {
@@ -45,126 +40,21 @@ fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> State
     }
 }
 
-#[cfg(unix)]
 fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateError> {
-    use std::os::unix::fs::MetadataExt;
-    if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Err(StateError::Foreign {
+    match crate::platform::ownership(meta) {
+        crate::platform::Ownership::Private => Ok(()),
+        crate::platform::Ownership::OtherOwner => Err(StateError::Foreign {
             path: path.to_path_buf(),
-        });
-    }
-    let mode = meta.mode() & 0o777;
-    if mode.trailing_zeros() >= GROUP_AND_OTHER_BITS {
-        Ok(())
-    } else {
-        Err(StateError::Exposed {
+        }),
+        crate::platform::Ownership::Exposed(mode) => Err(StateError::Exposed {
             path: path.to_path_buf(),
             mode,
-        })
+        }),
     }
 }
 
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the Unix signature; Windows confines the directory with an ACL when it is created"
-)]
-const fn check_owner_only(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), StateError> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn create_private_dir(path: &Path) -> Result<(), StateError> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .map_err(io("creating", path))
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "reading the current user's SID from the process token needs the token API"
-)]
-fn current_user_sid(path: &Path) -> Result<crate::domain::WindowsSid, StateError> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let refuse = |detail: &str| StateError::Acl {
-        path: path.to_path_buf(),
-        detail: detail.to_owned(),
-    };
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(refuse("the process token cannot be opened"));
-    }
-    let mut needed = 0u32;
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed) };
-    let Ok(capacity) = usize::try_from(needed) else {
-        return Err(refuse("the token is too large"));
-    };
-    let mut buffer = vec![0u8; capacity];
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    if asked == 0 || buffer.len() < size_of::<TOKEN_USER>() {
-        return Err(refuse("the token has no user"));
-    }
-    let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
-    let mut wide: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut wide) } == 0 || wide.is_null() {
-        return Err(refuse("the SID cannot be rendered"));
-    }
-    let mut len = 0usize;
-    while unsafe { *wide.add(len) } != 0 {
-        len = len.saturating_add(1);
-    }
-    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    unsafe { LocalFree(wide.cast()) };
-    crate::domain::WindowsSid::try_from(text).map_err(|e| refuse(&e.to_string()))
-}
-
-#[cfg(windows)]
-fn create_private_dir(path: &Path) -> Result<(), StateError> {
-    use crate::template::Arg;
-    std::fs::create_dir_all(path).map_err(io("creating", path))?;
-    let sid = current_user_sid(path)?;
-    let args = vec![
-        Arg::path(path),
-        Arg::literal("/inheritance:r"),
-        Arg::literal("/grant:r"),
-        Arg::concat(&[
-            Arg::literal("*"),
-            Arg::word(&sid),
-            Arg::literal(":(OI)(CI)F"),
-        ]),
-        Arg::literal("/grant:r"),
-        Arg::literal("*S-1-5-18:(OI)(CI)F"),
-        Arg::literal("/Q"),
-    ];
-    let status = crate::spawn::Invocation::new(Arg::literal("icacls"), args)
-        .command()
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map_err(io("running icacls on", path))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(StateError::Acl {
-            path: path.to_path_buf(),
-            detail: format!("icacls exited with {status}"),
-        })
-    }
+    crate::platform::create_private_dir(path).map_err(io("securing", path))
 }
 
 pub fn private_dir(path: &Path) -> Result<(), StateError> {
@@ -204,22 +94,8 @@ pub fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, S
     }
 }
 
-#[cfg(unix)]
 fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    private_options().write(true).create_new(true).open(path)
 }
 
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
@@ -238,33 +114,12 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     sync_dir(dir)
 }
 
-#[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<(), StateError> {
-    std::fs::File::open(dir)
-        .and_then(|handle| handle.sync_all())
-        .map_err(io("syncing", dir))
+    crate::platform::sync_dir(dir).map_err(io("syncing", dir))
 }
 
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the Unix signature; Windows has no directory handle to sync"
-)]
-const fn sync_dir(_dir: &Path) -> Result<(), StateError> {
-    Ok(())
-}
-
-#[cfg(unix)]
 fn private_options() -> std::fs::OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = std::fs::OpenOptions::new();
-    options.mode(0o600);
-    options
-}
-
-#[cfg(not(unix))]
-fn private_options() -> std::fs::OpenOptions {
-    std::fs::OpenOptions::new()
+    crate::platform::private_options()
 }
 
 fn prepared_parent(path: &Path) -> Result<(), StateError> {
@@ -315,6 +170,15 @@ pub fn open_lock(path: &Path) -> Result<std::fs::File, StateError> {
         .truncate(false)
         .open(path)
         .map_err(io("opening", path))
+}
+
+pub fn open_existing_lock(path: &Path) -> Result<Option<std::fs::File>, StateError> {
+    crate::faults::at("state_file::lock", path).map_err(io("opening", path))?;
+    match private_options().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io("opening", path)(error)),
+    }
 }
 
 pub fn create_empty(path: &Path) -> Result<(), StateError> {
@@ -442,19 +306,7 @@ fn make_removable(path: &Path) {
         return;
     }
     let mut perms = meta.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o700);
-    }
-    #[cfg(not(unix))]
-    #[expect(
-        clippy::permissions_set_readonly_false,
-        reason = "clearing the read-only attribute a job left is exactly what removing its files needs"
-    )]
-    {
-        perms.set_readonly(false);
-    }
+    crate::platform::let_owner_change(&mut perms);
     match std::fs::set_permissions(path, perms) {
         Ok(()) | Err(_) => {}
     }
@@ -500,57 +352,24 @@ where
     Ok(result)
 }
 
-#[cfg(all(test, unix))]
-pub(crate) struct ReadOnly(PathBuf);
-
-#[cfg(all(test, unix))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests make a directory read-only and must give it back even when they panic"
-)]
-impl ReadOnly {
-    pub(crate) fn make(dir: &Path) -> std::io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500))?;
-        Ok(Self(dir.to_path_buf()))
-    }
-}
-
-#[cfg(all(test, unix))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests make a directory read-only and must give it back even when they panic"
-)]
-impl Drop for ReadOnly {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
-        match std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)) {
-            Ok(()) | Err(_) => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     #[expect(
         clippy::disallowed_methods,
         reason = "the test locks a job's directory the way a careless job would"
     )]
     fn a_tree_a_job_locked_down_is_still_removed() {
-        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let tree = tmp.path().join("trash").join("job");
         let locked = tree.join("target").join("locked");
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::write(locked.join("file"), b"x").unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        std::fs::set_permissions(tree.join("target"), std::fs::Permissions::from_mode(0o500))
-            .unwrap();
+        crate::platform::lock_down(&locked.join("file")).unwrap();
+        crate::platform::lock_down(&locked).unwrap();
+        crate::platform::lock_down(&tree.join("target")).unwrap();
         remove_tree_forcibly(&tree).unwrap();
         assert!(!tree.exists());
     }
@@ -567,12 +386,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(total, 4);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            crate::platform::ownership(&meta),
+            crate::platform::Ownership::Private
+        );
+        if crate::platform::expose(&path).unwrap() {
             assert!(matches!(
                 read_json::<Vec<u8>>(&path),
                 Err(StateError::Exposed { .. })

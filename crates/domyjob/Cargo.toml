@@ -30,6 +30,7 @@ sysinfo.workspace = true
 notify.workspace = true
 schemars.workspace = true
 semver.workspace = true
+strsim.workspace = true
 terminal_size.workspace = true
 unicode-width.workspace = true
 vte.workspace = true
@@ -68,6 +69,7 @@ rustix.workspace = true
 security-framework.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+uds_windows.workspace = true
 windows-spawn.workspace = true
 windows-sys.workspace = true
 

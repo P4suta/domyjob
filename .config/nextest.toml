@@ -3,3 +3,4 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 fail-fast = false
 status-level = "fail"
 final-status-level = "fail"
+leak-timeout = { period = "1s", result = "fail" }

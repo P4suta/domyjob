@@ -17,6 +17,11 @@ fn var(name: &str) -> Option<OsString> {
 impl Dirs {
     #[must_use]
     pub fn from_env() -> Self {
+        Self::of(crate::platform::FAMILY, &var)
+    }
+
+    #[must_use]
+    pub fn of(family: Family, var: &dyn Fn(&str) -> Option<OsString>) -> Self {
         let home = var("HOME")
             .or_else(|| var("USERPROFILE"))
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
@@ -24,7 +29,7 @@ impl Dirs {
             if let Some(explicit) = var(own) {
                 return PathBuf::from(explicit);
             }
-            if cfg!(windows)
+            if family == Family::Windows
                 && let Some(base) = var(windows)
             {
                 return PathBuf::from(base).join("domyjob").join(windows_sub);
@@ -73,6 +78,31 @@ pub enum Family {
 
 impl Family {
     #[must_use]
+    pub const fn links(self) -> bool {
+        matches!(self, Self::Unix)
+    }
+
+    #[must_use]
+    pub const fn modes(self) -> bool {
+        matches!(self, Self::Unix)
+    }
+
+    #[must_use]
+    pub const fn load_average(self) -> bool {
+        matches!(self, Self::Unix)
+    }
+
+    #[must_use]
+    pub const fn agent_socket(self) -> bool {
+        matches!(self, Self::Unix)
+    }
+
+    #[must_use]
+    pub const fn replaces_running_executables(self) -> bool {
+        matches!(self, Self::Unix)
+    }
+
+    #[must_use]
     pub fn remote_bin(self) -> crate::template::Arg {
         use crate::protocol::VERSION;
         match self {
@@ -104,6 +134,41 @@ impl Family {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_family_finds_its_own_places_whatever_system_runs_the_test() {
+        let set = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let windows = Dirs::of(
+            Family::Windows,
+            &set(&[
+                ("USERPROFILE", "C:/Users/me"),
+                ("LOCALAPPDATA", "C:/Users/me/AppData/Local"),
+                ("APPDATA", "C:/Users/me/AppData/Roaming"),
+            ]),
+        );
+        assert_eq!(
+            windows.state,
+            PathBuf::from("C:/Users/me/AppData/Local/domyjob/state")
+        );
+        assert_eq!(
+            windows.config,
+            PathBuf::from("C:/Users/me/AppData/Roaming/domyjob/config")
+        );
+        let unix = Dirs::of(
+            Family::Unix,
+            &set(&[("HOME", "/home/me"), ("LOCALAPPDATA", "/ignored")]),
+        );
+        assert_eq!(unix.state, PathBuf::from("/home/me/.local/state/domyjob"));
+        let chosen = Dirs::of(Family::Unix, &set(&[("DOMYJOB_STATE", "/srv/dj")]));
+        assert_eq!(chosen.state, PathBuf::from("/srv/dj"));
+    }
 
     #[test]
     fn remote_invocations_suit_each_shell_family() {

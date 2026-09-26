@@ -25,7 +25,35 @@ fn open(path: &Path) -> Result<File, LockError> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    Absent,
+    Free,
+    Held,
+}
+
 impl OsLock {
+    pub fn probe(path: &Path) -> Result<Probe, LockError> {
+        let opened =
+            crate::state_file::open_existing_lock(path).map_err(|error| LockError::Io {
+                action: "opening",
+                path: path.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            })?;
+        let Some(file) = opened else {
+            return Ok(Probe::Absent);
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Probe::Free),
+            Err(TryLockError::WouldBlock) => Ok(Probe::Held),
+            Err(TryLockError::Error(source)) => Err(LockError::Io {
+                action: "locking",
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, LockError> {
         let file = open(path)?;
         match file.try_lock() {
