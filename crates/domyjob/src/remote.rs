@@ -205,12 +205,8 @@ pub enum RemoteError {
     Unbuilt { machine: String, was: String },
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -898,10 +894,12 @@ impl<'a> Link<'a> {
 
     fn command_from(&self, template: &Argv, remote: &Remote) -> Result<Command, RemoteError> {
         let transport = self.config.transport(&self.machine.transport)?;
-        let exe = std::env::current_exe().map_err(|source| RemoteError::Io {
-            action: "locating",
-            path: PathBuf::from("domyjob"),
-            source,
+        let exe = std::env::current_exe().map_err(|source| {
+            RemoteError::Io(crate::failure::IoFailure {
+                action: "locating",
+                path: PathBuf::from("domyjob"),
+                source,
+            })
         })?;
         let remote_argv = match (transport.binary, remote) {
             (Binary::Itself, Remote::Node(..)) => vec![Arg::path(&exe), Arg::literal("node")],
@@ -1046,10 +1044,12 @@ impl<'a> Link<'a> {
 
     fn install_for(&mut self, deliverable: &Deliverable) -> Result<Hello, RemoteError> {
         let binary = deliverable.binary();
-        let bytes = std::fs::read(binary.path()).map_err(|source| RemoteError::Io {
-            action: "reading",
-            path: binary.path().to_path_buf(),
-            source,
+        let bytes = std::fs::read(binary.path()).map_err(|source| {
+            RemoteError::Io(crate::failure::IoFailure {
+                action: "reading",
+                path: binary.path().to_path_buf(),
+                source,
+            })
         })?;
         let payload = match self.family {
             Family::Unix => bytes,

@@ -1,5 +1,6 @@
+use crate::failure::io;
 use std::io::{ErrorKind, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -8,12 +9,8 @@ use crate::snapshot::Manifest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("blob {expected} arrived as {actual}")]
     Corrupt { expected: BlobId, actual: BlobId },
     #[error("blob {blob} announces {size} bytes, more than a blob may hold")]
@@ -35,15 +32,6 @@ pub enum CasError {
     },
     #[error("encoding workspace state: {0}")]
     Encode(serde_json::Error),
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> CasError + use<> {
-    let path = path.to_path_buf();
-    move |source| CasError::Io {
-        action,
-        path,
-        source,
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +56,7 @@ impl Cas {
         match std::fs::metadata(&path) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(io("checking", &path)(e)),
+            Err(e) => Err(io("checking", &path)(e).into()),
         }
     }
 
@@ -111,15 +99,15 @@ impl Cas {
         match (copied, &actual == blob) {
             (Ok(()), true) => Ok(staged.commit()?),
             (Ok(()), false) => {
-                staged.discard()?;
+                staged.discard();
                 Err(CasError::Corrupt {
                     expected: blob.clone(),
                     actual,
                 })
             }
             (Err(error), _) => {
-                staged.discard()?;
-                Err(io("receiving", &path)(error))
+                staged.discard();
+                Err(io("receiving", &path)(error).into())
             }
         }
     }
@@ -132,7 +120,7 @@ impl Cas {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(CasError::Missing(blob.clone()));
             }
-            Err(e) => return Err(io("reading", &path)(e)),
+            Err(e) => return Err(io("reading", &path)(e).into()),
         };
         if &BlobId::of(&bytes) != blob {
             crate::state_file::remove_file(&path)?;
@@ -147,7 +135,7 @@ impl Cas {
         let fans = match std::fs::read_dir(&self.root) {
             Ok(fans) => fans,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(io("listing", &self.root)(e)),
+            Err(e) => return Err(io("listing", &self.root)(e).into()),
         };
         for fan in fans {
             let fan = fan.map_err(io("listing", &self.root))?;

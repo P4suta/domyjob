@@ -569,6 +569,32 @@ mod tests {
         Identity::load_or_create(&dirs).unwrap()
     }
 
+    fn parties() -> (tempfile::TempDir, std::path::PathBuf, Identity, PublicKey) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let client = identity(&root, "a");
+        let server_key = *identity(&root, "b").public();
+        (tmp, root, client, server_key)
+    }
+
+    fn serve_one<T: Send + 'static>(
+        root: std::path::PathBuf,
+        work: impl FnOnce(TcpStream, Identity) -> T + Send + 'static,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<T>) {
+        let (listener, address) = bound();
+        let serving = std::thread::spawn(move || {
+            let server = identity(&root, "b");
+            let (stream, _) = listener.accept().unwrap();
+            work(stream, server)
+        });
+        (address, serving)
+    }
+
+    fn accepted(mut stream: TcpStream, server: &Identity) -> Channel<TcpStream> {
+        read_route(&mut stream).unwrap();
+        accept(stream, server, |_| Some(())).unwrap().0
+    }
+
     fn bound() -> (std::net::TcpListener, std::net::SocketAddr) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -582,11 +608,7 @@ mod tests {
         let client = identity(&root, "a");
         let client_key = *client.public();
         let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let server_root = root.clone();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
             assert_eq!(read_route(&mut stream).unwrap(), Some(Purpose::Connect));
             let (mut accepted, who) = accept(stream, &server, |key| {
                 (key == &client_key).then_some("known")
@@ -792,17 +814,13 @@ mod tests {
 
     #[test]
     fn every_frame_on_the_wire_is_sealed_under_a_fresh_nonce() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, root, client, server_key) = parties();
         let (listener, address) = bound();
         let server_root = root;
         let serving = std::thread::spawn(move || {
             let server = identity(&server_root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
-            read_route(&mut stream).unwrap();
-            let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut channel = accepted(stream, &server);
             let mut received = Vec::new();
             channel.reader.read_to_end(&mut received).unwrap();
             received
@@ -824,10 +842,7 @@ mod tests {
 
     #[test]
     fn a_handshake_cut_anywhere_fails_cleanly_on_both_sides() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, root, client, server_key) = parties();
         let cuts = [
             0usize, 1, 2, 3, 700, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1100, 1186, 1187, 1188,
             1189, 1190, 1200, 1283,
@@ -1161,10 +1176,7 @@ mod tests {
 
     #[test]
     fn a_fault_while_talking_is_reported_on_both_ends() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, root, client, server_key) = parties();
         for extra in 0..9usize {
             let (listener, address) = bound();
             let server_root = root.clone();
@@ -1206,11 +1218,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let client = identity(&root, "a");
         let expected = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let server_root = root.clone();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
             read_route(&mut stream).unwrap();
             accept(stream, &server, |_| None::<()>).map(|_| ())
         });
@@ -1298,10 +1306,7 @@ mod tests {
     fn a_malformed_post_quantum_key_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root, move |mut stream, server| {
             read_route(&mut stream).unwrap();
             accept(stream, &server, |_| Some(())).map(drop)
         });
@@ -1313,10 +1318,7 @@ mod tests {
 
     #[test]
     fn a_malformed_post_quantum_ciphertext_is_an_error_never_a_panic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, _root, client, server_key) = parties();
         let (listener, address) = bound();
         let faking = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1334,10 +1336,7 @@ mod tests {
     fn a_malformed_pairing_message_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root, move |mut stream, server| {
             read_route(&mut stream).unwrap();
             let code = pairing_code();
             let attempt = Attempt {
@@ -1354,10 +1353,7 @@ mod tests {
 
     #[test]
     fn a_forged_frame_or_a_failing_read_is_an_error_never_a_clean_close() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, root, client, server_key) = parties();
         for (forged, cut, expected) in [
             (true, None, std::io::ErrorKind::Other),
             (false, None, std::io::ErrorKind::Other),
@@ -1413,16 +1409,9 @@ mod tests {
 
     #[test]
     fn closing_stops_the_writer_and_half_closes_the_stream() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
-            read_route(&mut stream).unwrap();
-            let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
+        let (_tmp, root, client, server_key) = parties();
+        let (address, serving) = serve_one(root, move |stream, server| {
+            let mut channel = accepted(stream, &server);
             let mut received = Vec::new();
             channel.reader.read_to_end(&mut received).unwrap();
             received
@@ -1444,16 +1433,9 @@ mod tests {
 
     #[test]
     fn a_peer_that_echoes_the_wrong_confirmation_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
-            read_route(&mut stream).unwrap();
-            let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
+        let (_tmp, root, client, server_key) = parties();
+        let (address, serving) = serve_one(root, move |stream, server| {
+            let mut channel = accepted(stream, &server);
             let mut mark = [0u8; 16];
             channel.reader.read_exact(&mut mark).unwrap();
             channel.writer.write_all(b"domyjob/2 wrong!").unwrap();
@@ -1470,10 +1452,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_cannot_be_split_fails_every_handshake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, root, client, server_key) = parties();
         for refusing in [Side::Initiator, Side::Responder] {
             let (listener, address) = bound();
             let server_root = root.clone();
@@ -1499,11 +1478,7 @@ mod tests {
             }
         }
 
-        let (listener, address) = bound();
-        let server_root = root.clone();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
             read_route(&mut stream).unwrap();
             let code = pairing_code();
             let attempt = Attempt {
@@ -1527,16 +1502,9 @@ mod tests {
 
     #[test]
     fn a_session_that_runs_out_of_nonces_stops_instead_of_reusing_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
-            read_route(&mut stream).unwrap();
-            let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
+        let (_tmp, root, client, server_key) = parties();
+        let (address, serving) = serve_one(root, move |stream, server| {
+            let mut channel = accepted(stream, &server);
             channel.reader.nonce = u64::MAX;
             let mut byte = [0u8; 1];
             channel.reader.read(&mut byte).unwrap_err().kind()
@@ -1551,16 +1519,9 @@ mod tests {
 
     #[test]
     fn a_sealed_frame_of_an_unknown_kind_is_refused_and_flushing_reaches_the_stream() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
-            read_route(&mut stream).unwrap();
-            let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
+        let (_tmp, root, client, server_key) = parties();
+        let (address, serving) = serve_one(root, move |stream, server| {
+            let mut channel = accepted(stream, &server);
             let mut received = Vec::new();
             channel
                 .reader
@@ -1578,10 +1539,7 @@ mod tests {
     }
 
     fn what_the_initiator_sends_after_both_exchanges(purpose: Purpose) -> Vec<u8> {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
-        let server_key = *identity(&root, "b").public();
+        let (_tmp, _root, client, server_key) = parties();
         let (listener, address) = bound();
         let listening = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -1628,10 +1586,7 @@ mod tests {
     fn a_pairing_responder_answers_the_route_with_its_code_message_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (listener, address) = bound();
-        let responding = std::thread::spawn(move || {
-            let server = identity(&root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, responding) = serve_one(root, move |mut stream, server| {
             read_route(&mut stream).unwrap();
             let code = pairing_code();
             let attempt = Attempt {

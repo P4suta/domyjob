@@ -143,222 +143,30 @@ pub enum Reply {
     Refused(Refusal),
 }
 
+macro_rules! into_variant {
+    ($name:ident, $out:ty, $pattern:pat => $value:expr) => {
+        pub fn $name(self) -> Result<$out, Box<Self>> {
+            match self {
+                $pattern => Ok($value),
+                other => Err(Box::new(other)),
+            }
+        }
+    };
+}
+
 impl Reply {
-    pub fn into_report(self) -> Result<Report, Box<Self>> {
-        match self {
-            Self::Report(report) => Ok(*report),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_cleaned(self) -> Result<Cleaned, Box<Self>> {
-        match self {
-            Self::Cleaned(cleaned) => Ok(*cleaned),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_hello(self) -> Result<Hello, Box<Self>> {
-        match self {
-            Self::Hello(hello) => Ok(hello),
-            other @ (Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_missing(self) -> Result<Vec<BlobId>, Box<Self>> {
-        match self {
-            Self::Missing { blobs } => Ok(blobs),
-            other @ (Self::Hello(_)
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_stored(self) -> Result<u64, Box<Self>> {
-        match self {
-            Self::Stored { count } => Ok(count),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_job(self) -> Result<Job, Box<Self>> {
-        match self {
-            Self::Job(job) => Ok(*job),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_jobs(self) -> Result<(Vec<Job>, Vec<Unreadable>), Box<Self>> {
-        match self {
-            Self::Jobs { jobs, unreadable } => Ok((jobs, unreadable)),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_stream(self) -> Result<(), Box<Self>> {
-        match self {
-            Self::Stream => Ok(()),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_audit_at(self) -> Result<Option<ChainHash>, Box<Self>> {
-        match self {
-            Self::AuditAt { hash } => Ok(hash),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_audit_head(self) -> Result<crate::audit::Head, Box<Self>> {
-        match self {
-            Self::AuditHead(head) => Ok(head),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::Found(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_digest(self) -> Result<Digest, Box<Self>> {
-        match self {
-            Self::Digest(digest) => Ok(*digest),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Found(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
-
-    pub fn into_found(self) -> Result<Found, Box<Self>> {
-        match self {
-            Self::Found(found) => Ok(found),
-            other @ (Self::Hello(_)
-            | Self::Missing { .. }
-            | Self::Stored { .. }
-            | Self::Job(_)
-            | Self::Jobs { .. }
-            | Self::Stream
-            | Self::AuditAt { .. }
-            | Self::Digest(_)
-            | Self::AuditHead(_)
-            | Self::Report(_)
-            | Self::Cleaned(_)
-            | Self::Refused(_)) => Err(Box::new(other)),
-        }
-    }
+    into_variant!(into_report, Report, Self::Report(report) => *report);
+    into_variant!(into_cleaned, Cleaned, Self::Cleaned(cleaned) => *cleaned);
+    into_variant!(into_hello, Hello, Self::Hello(hello) => hello);
+    into_variant!(into_missing, Vec<BlobId>, Self::Missing { blobs } => blobs);
+    into_variant!(into_stored, u64, Self::Stored { count } => count);
+    into_variant!(into_job, Job, Self::Job(job) => *job);
+    into_variant!(into_jobs, (Vec<Job>, Vec<Unreadable>), Self::Jobs { jobs, unreadable } => (jobs, unreadable));
+    into_variant!(into_stream, (), Self::Stream => ());
+    into_variant!(into_audit_at, Option<ChainHash>, Self::AuditAt { hash } => hash);
+    into_variant!(into_audit_head, crate::audit::Head, Self::AuditHead(head) => head);
+    into_variant!(into_digest, Digest, Self::Digest(digest) => *digest);
+    into_variant!(into_found, Found, Self::Found(found) => found);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

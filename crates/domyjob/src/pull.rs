@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Write as _};
 use std::marker::PhantomData;
@@ -24,12 +25,8 @@ pub enum PullError {
     NeverPulled(String),
     #[error("the original of {0} was not kept when it was pulled")]
     NotKept(RelPath),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error(transparent)]
     State(#[from] crate::state_file::StateError),
     #[error(transparent)]
@@ -62,15 +59,6 @@ fn list(paths: &[RelPath]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> PullError + use<> {
-    let path = path.to_path_buf();
-    move |source| PullError::Io {
-        action,
-        path,
-        source,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,7 +494,7 @@ impl Journal {
         let listing = match std::fs::read_dir(pulls) {
             Ok(listing) => listing,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(io("listing", pulls)(error)),
+            Err(error) => return Err(io("listing", pulls)(error).into()),
         };
         let mut found = Vec::new();
         for item in listing {

@@ -11,6 +11,8 @@ pub mod control;
 pub mod diagnosis;
 pub mod dist;
 pub mod domain;
+pub mod durable;
+pub mod failure;
 pub mod faults;
 pub mod framed;
 pub mod history;

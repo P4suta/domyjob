@@ -37,6 +37,23 @@ pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
     }
 }
 
+pub fn line_unread_past(reader: &mut dyn Read, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            return Ok(out);
+        }
+        if crate::domain::len_u64(out.len()) >= limit {
+            return Err(too_long(limit));
+        }
+        out.extend_from_slice(&byte);
+        if byte == *b"\n" {
+            return Ok(out);
+        }
+    }
+}
+
 pub fn exactly(
     reader: &mut dyn Read,
     size: u64,
@@ -66,6 +83,28 @@ pub fn exactly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn both_line_readers_agree_and_the_unbuffered_one_reads_nothing_past_its_line(
+            input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            limit in 0u64..40,
+        ) {
+            let buffered = line(&mut std::io::Cursor::new(&input), limit);
+            let mut raw = std::io::Cursor::new(&input);
+            let unbuffered = line_unread_past(&mut raw, limit);
+            match (&buffered, &unbuffered) {
+                (Ok(a), Ok(b)) => {
+                    proptest::prop_assert_eq!(a, b);
+                    proptest::prop_assert_eq!(raw.position(), crate::domain::len_u64(b.len()));
+                }
+                (Err(a), Err(b)) => proptest::prop_assert_eq!(a.kind(), b.kind()),
+                (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+                    proptest::prop_assert!(false, "{buffered:?} vs {unbuffered:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn lines_stop_at_the_limit() {

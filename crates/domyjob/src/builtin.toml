@@ -83,7 +83,7 @@ list = [
   "-r",
   "{commit}",
   "-T",
-  'path ++ "\t" ++ file_type ++ "\t" ++ executable ++ "\0"',
+  'executable ++ " " ++ file_type ++ "\t" ++ path ++ "\0"',
 ]
 show = [
   "jj",
@@ -104,17 +104,7 @@ detect = ".git"
 priority = 10
 separator = "nul"
 resolve = ["git", "-C", "{root}", "rev-parse", "--verify", "--end-of-options", "{rev}^{{commit}}"]
-list = [
-  "git",
-  "-C",
-  "{root}",
-  "ls-tree",
-  "-r",
-  "-z",
-  "--full-tree",
-  "--format=%(path)%x09%(objecttype)%x09%(objectmode)",
-  "{commit}",
-]
+list = ["git", "-C", "{root}", "ls-tree", "-r", "-z", "--full-tree", "{commit}"]
 show = ["git", "-C", "{root}", "cat-file", "blob", "{commit}:{path}"]
 identity = ["git", "-C", "{root}", "rev-parse", "--path-format=absolute", "--git-common-dir"]
 unset = [
