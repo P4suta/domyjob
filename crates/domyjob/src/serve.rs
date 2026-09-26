@@ -234,12 +234,7 @@ fn send_line<T: Serialize>(writer: &mut dyn Write, value: &T) -> Result<(), Serv
 }
 
 fn read_line<T: crate::ingress::Ingress>(reader: &mut dyn Read) -> Result<T, ServeError> {
-    let mut line = Vec::new();
-    let mut limited = reader.take(GREETING_LIMIT);
-    let mut byte = [0u8; 1];
-    while limited.read(&mut byte)? == 1 && byte != *b"\n" {
-        line.extend_from_slice(&byte);
-    }
+    let line = crate::bounded::line_unread_past(reader, GREETING_LIMIT)?;
     crate::ingress::json(&line).map_err(|_malformed| ServeError::Exchange)
 }
 
