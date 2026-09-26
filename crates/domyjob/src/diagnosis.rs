@@ -134,7 +134,7 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
             "the machine runs a different domyjob; `domyjob setup {machine}` installs the matching one",
         ),
         RemoteError::Refused { refusal, .. } => of_refusal(refusal.code),
-        RemoteError::Dist(_) => plain(Kind::Distribution),
+        RemoteError::Dist(_) | RemoteError::BuildMismatch { .. } => plain(Kind::Distribution),
         RemoteError::Newer { .. } => hinted(
             Kind::Protocol,
             "this machine has the older domyjob; `domyjob self update` here, or install the matching build, then try again",

@@ -25,6 +25,7 @@ fn next_step(machine: &MachineName, job: &Job) -> Option<String> {
         State::Running | State::Preparing | State::Queued => {
             Some(format!("domyjob logs {target} -f"))
         }
+        State::RestartPending => Some(format!("domyjob retry {target}")),
         State::Succeeded | State::Errored | State::Killed | State::Lost => None,
     }
 }
@@ -289,19 +290,30 @@ fn attention(
     let hint = ui::paint(Tone::Hint, ui::symbol(Symbol::Hint));
     if let Some(last) = jobs
         .iter()
-        .filter(|job| job.is_settled())
+        .filter(|job| job.is_settled() || job.state() == State::RestartPending)
         .max_by_key(|job| job.spec.sequence)
         && !last.succeeded()
     {
         let id = last.spec.id.as_str();
+        let (symbol, tone) = ui::state_look(last.state());
+        let next = if last.state() == State::RestartPending {
+            format!(
+                "domyjob retry {machine}:{}",
+                id.get(..ui::SHORT_ID).unwrap_or(id)
+            )
+        } else {
+            format!(
+                "domyjob digest {machine}:{}",
+                id.get(..ui::SHORT_ID).unwrap_or(id)
+            )
+        };
         writeln!(
             out,
-            "  {} {} {} {}  {hint} domyjob digest {machine}:{}",
-            ui::paint(Tone::Bad, ui::symbol(Symbol::Failed)),
+            "  {} {} {} {}  {hint} {next}",
+            ui::paint(tone, ui::symbol(symbol)),
             ui::fit(&ui::label(last), 24),
-            ui::paint(Tone::Bad, last.state().as_str()),
-            ui::paint(Tone::Dim, &ui::ago(last.spec.submitted_at, now)),
-            id.get(..ui::SHORT_ID).unwrap_or(id)
+            ui::paint(tone, last.state().as_str()),
+            ui::paint(Tone::Dim, &ui::ago(last.spec.submitted_at, now))
         )?;
     }
     if report.paused {
@@ -601,12 +613,13 @@ pub fn doctor_reached(
     let hello = &facts.hello;
     writeln!(
         out,
-        "  {} {}{}  {:<16}  {} {}  {}",
+        "  {} {}{}  {:<16}  {} {}  {}  {}",
         ui::paint(Tone::Good, ui::symbol(Symbol::Succeeded)),
         ui::machine(name),
         " ".repeat(widest.saturating_sub(name.as_str().len())),
         format!("{}/{}", hello.os, hello.arch),
         hello.version,
+        ui::paint(Tone::Dim, &format!("build {}", hello.build)),
         ui::paint(Tone::Dim, &format!("wire {}", hello.wire)),
         ui::paint(Tone::Dim, &hello.shell.to_string())
     )?;
@@ -663,9 +676,8 @@ pub mod tests {
         assert!(listed.starts_with("win  1 job\n"), "{listed}");
     }
 
-    #[test]
-    fn a_machine_card_says_what_runs_what_failed_and_what_needs_doing() {
-        let report = crate::protocol::Report {
+    fn busy_report() -> crate::protocol::Report {
+        crate::protocol::Report {
             host: crate::terminal::RemoteText::new("box".to_owned()),
             os: crate::terminal::RemoteText::new("Linux".to_owned()),
             cores: 16,
@@ -680,7 +692,12 @@ pub mod tests {
             uptime_seconds: 60,
             paused: true,
             max_jobs: crate::domain::Concurrency::DEFAULT,
-        };
+        }
+    }
+
+    #[test]
+    fn a_machine_card_says_what_runs_what_failed_and_what_needs_doing() {
+        let report = busy_report();
         let running = {
             let mut job = sample();
             job.spec.id = "0BBBBBBBBBBBBBBB".parse().unwrap();
@@ -724,6 +741,16 @@ pub mod tests {
         ] {
             assert!(card.contains(wanted), "{wanted} missing from\n{card}");
         }
+        let mut pending = sample();
+        pending.supervisor = Supervisor::Gone;
+        let pending_card = crate::terminal::clean(
+            &machine_card(&machine, &report, &[pending], Timestamp::observe()).unwrap(),
+        );
+        assert!(pending_card.contains("restart_pending"), "{pending_card}");
+        assert!(
+            pending_card.contains("domyjob retry linux:0AAAAAAA"),
+            "{pending_card}"
+        );
         let idle = crate::protocol::Report {
             disk: crate::protocol::DiskSpace::Measured {
                 total: 500_000_000_000,

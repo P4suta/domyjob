@@ -213,13 +213,20 @@ mod tests {
     use super::*;
 
     fn dirs(root: &std::path::Path) -> Dirs {
-        Dirs {
-            home: root.into(),
-            state: root.join("s"),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
+        Dirs::for_test(root)
+    }
+
+    fn observed(key: PublicKey) -> Grant {
+        Grant {
+            label: "mac".parse().unwrap(),
+            public_key: key,
+            capabilities: BTreeSet::from([Capability::Observe]),
+            granted_at: Timestamp::at_millis(1),
         }
+    }
+
+    fn add_observer(dirs: &Dirs, key: PublicKey) -> Result<(), TrustError> {
+        Trust::update(dirs, |trust| trust.grants.push(observed(key)))
     }
 
     #[test]
@@ -240,15 +247,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
         let key = *Identity::load_or_create(&d).unwrap().public();
-        Trust::update(&d, |trust| {
-            trust.grants.push(Grant {
-                label: "mac".parse().unwrap(),
-                public_key: key,
-                capabilities: BTreeSet::from([Capability::Observe]),
-                granted_at: Timestamp::at_millis(1),
-            });
-        })
-        .unwrap();
+        add_observer(&d, key).unwrap();
         state_file::remove_file(&d.state.join("identity.json")).unwrap();
         assert!(matches!(
             Identity::load_or_create(&d),
@@ -263,19 +262,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
         let key = *Identity::load_or_create(&d).unwrap().public();
-        Trust::update(&d, |trust| {
-            trust.grants.push(Grant {
-                label: "mac".parse().unwrap(),
-                public_key: key,
-                capabilities: BTreeSet::from([Capability::Observe]),
-                granted_at: Timestamp::at_millis(1),
-            });
-        })
-        .unwrap();
+        add_observer(&d, key).unwrap();
         let trust = Trust::load(&d).unwrap();
         assert!(trust.grant_for(&key).is_some());
         Trust::update(&d, |all| all.grants.clear()).unwrap();
         assert!(Trust::load(&d).unwrap().grant_for(&key).is_none());
+    }
+
+    #[test]
+    fn a_crash_while_changing_trust_leaves_the_old_or_new_whole_file() {
+        let key = PublicKey::from_slice(&[7; 32]).unwrap();
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = dirs(tmp.path());
+            Trust::update(&d, |_| {}).unwrap();
+            let crashing = crate::faults::crash_after(tmp.path(), None);
+            add_observer(&d, key).unwrap();
+            crashing.steps()
+        };
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = dirs(tmp.path());
+            Trust::update(&d, |_| {}).unwrap();
+            {
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                match add_observer(&d, key) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            let trust = Trust::load(&d).unwrap();
+            assert!(matches!(trust.grants.len(), 0 | 1));
+        }
     }
 
     #[test]

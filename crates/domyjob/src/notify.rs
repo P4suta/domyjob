@@ -45,6 +45,7 @@ pub fn summary(machine: &MachineName, job: &Job) -> String {
         }
         | Phase::Queued
         | Phase::Preparing { .. }
+        | Phase::Starting { .. }
         | Phase::Running { .. } => String::new(),
     };
     let state = job.state();

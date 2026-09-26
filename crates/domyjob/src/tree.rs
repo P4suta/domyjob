@@ -297,6 +297,8 @@ impl Rooted {
     }
 
     fn create_dir(&self, rel: &RelPath) -> Result<(), TreeError> {
+        crate::faults::at("tree::create_dir", &self.shown(rel))
+            .map_err(io("creating", &self.shown(rel)))?;
         self.dir
             .create_dir(rel.to_local())
             .map_err(io("creating", &self.shown(rel)))
@@ -313,16 +315,21 @@ impl Rooted {
 
     pub fn clear_directory(&self, rel: &RelPath, contents: Contents) -> Result<(), TreeError> {
         match (self.lstat(rel)?, contents) {
-            (Some(meta), Contents::Anything) if meta.is_dir() => self
-                .dir
-                .remove_dir_all(rel.to_local())
-                .map_err(io("removing", &self.shown(rel)))
-                .map_err(Into::into),
+            (Some(meta), Contents::Anything) if meta.is_dir() => self.remove_tree(rel),
             (Some(meta), Contents::EmptyDirectoriesOnly) if meta.is_dir() => {
                 self.remove_empty_tree(rel)
             }
             (Some(_) | None, _) => Ok(()),
         }
+    }
+
+    fn remove_tree(&self, rel: &RelPath) -> Result<(), TreeError> {
+        crate::faults::at("tree::remove_tree", &self.shown(rel))
+            .map_err(io("removing", &self.shown(rel)))?;
+        self.dir
+            .remove_dir_all(rel.to_local())
+            .map_err(io("removing", &self.shown(rel)))
+            .map_err(Into::into)
     }
 
     fn remove_empty_tree(&self, rel: &RelPath) -> Result<(), TreeError> {
@@ -338,6 +345,8 @@ impl Rooted {
                 Some(_) | None => return Err(TreeError::Occupied(rel.clone())),
             }
         }
+        crate::faults::at("tree::remove_dir", &self.shown(rel))
+            .map_err(io("removing", &self.shown(rel)))?;
         self.dir
             .remove_dir(rel.to_local())
             .map_err(io("removing", &self.shown(rel)))
@@ -345,6 +354,8 @@ impl Rooted {
     }
 
     pub fn remove_file(&self, rel: &RelPath) -> Result<(), TreeError> {
+        crate::faults::at("tree::remove_file", &self.shown(rel))
+            .map_err(io("removing", &self.shown(rel)))?;
         match self.dir.remove_file(rel.to_local()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -363,6 +374,8 @@ impl Rooted {
     pub fn create(&self, rel: &RelPath, placed: Placed<'_>) -> Result<(), TreeError> {
         match placed {
             Placed::Link(target) if self.family.links() => {
+                crate::faults::at("tree::link", &self.shown(rel))
+                    .map_err(io("linking", &self.shown(rel)))?;
                 crate::platform::link(&self.dir, target, &rel.to_local())
                     .map_err(io("linking", &self.shown(rel)))
                     .map_err(Into::into)
@@ -381,16 +394,22 @@ impl Rooted {
             Mode::Regular
         };
         crate::platform::create_as(&mut options, kept);
+        crate::faults::at("tree::create", &self.shown(rel))
+            .map_err(io("creating", &self.shown(rel)))?;
         let mut file = self
             .dir
             .open_with(rel.to_local(), &options)
             .map_err(io("creating", &self.shown(rel)))?;
+        crate::faults::at("tree::write", &self.shown(rel))
+            .map_err(io("writing", &self.shown(rel)))?;
         file.write_all(bytes)
             .map_err(io("writing", &self.shown(rel)))
             .map_err(Into::into)
     }
 
     pub fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), TreeError> {
+        crate::faults::at("tree::rename", &self.shown(to))
+            .map_err(io("replacing", &self.shown(to)))?;
         self.dir
             .rename(from.to_local(), &self.dir, to.to_local())
             .map_err(io("replacing", &self.shown(to)))

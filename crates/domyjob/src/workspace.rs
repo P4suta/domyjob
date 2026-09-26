@@ -154,6 +154,17 @@ impl Workspace {
 )]
 mod tests {
     use super::*;
+
+    fn fill(
+        workspace: &Workspace,
+        cas: &Cas,
+        manifest: &Manifest,
+        previous: &Applied,
+    ) -> (Applied, Changes) {
+        workspace
+            .materialize(cas, Plan { manifest, previous }, &AtomicBool::new(false))
+            .unwrap()
+    }
     use crate::snapshot::Mode;
     use crate::snapshot::from_directory;
     use std::io::ErrorKind;
@@ -301,20 +312,9 @@ mod tests {
                 ]),
             };
             let ws = Workspace::open_as(&tmp.path().join("ws"), family).unwrap();
-            let fill = |previous: &Applied| {
-                ws.materialize(
-                    &cas,
-                    Plan {
-                        manifest: &manifest,
-                        previous,
-                    },
-                    &AtomicBool::new(false),
-                )
-                .unwrap()
-            };
-            let (applied, _) = fill(&Applied::default());
+            let (applied, _) = fill(&ws, &cas, &manifest, &Applied::default());
             assert_eq!(ws.left(&manifest).unwrap(), Vec::new(), "{family:?}");
-            let (_, again) = fill(&applied);
+            let (_, again) = fill(&ws, &cas, &manifest, &applied);
             assert_eq!((again.written, again.kept), (0, 3), "{family:?}");
         }
     }
@@ -332,20 +332,9 @@ mod tests {
             )]),
         };
         let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
-        let fill = |previous: &Applied| {
-            ws.materialize(
-                &cas,
-                Plan {
-                    manifest: &manifest,
-                    previous,
-                },
-                &AtomicBool::new(false),
-            )
-            .unwrap()
-        };
-        let (applied, first) = fill(&Applied::default());
+        let (applied, first) = fill(&ws, &cas, &manifest, &Applied::default());
         assert_eq!(first.written, 1);
-        let (_, second) = fill(&applied);
+        let (_, second) = fill(&ws, &cas, &manifest, &applied);
         assert_eq!((second.written, second.kept), (0, 1));
         assert!(ws.left(&manifest).unwrap().is_empty());
     }

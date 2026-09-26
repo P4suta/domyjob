@@ -10,6 +10,7 @@ use crate::paths::Dirs;
 use crate::state_file::{self, StateError};
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const ACTIVE_LIMIT: u64 = 8 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
@@ -40,8 +41,9 @@ pub enum Verdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, from = "StoredEntry")]
 pub struct Entry {
+    pub epoch: u64,
     pub seq: u64,
     pub at: Timestamp,
     pub prev: String,
@@ -51,16 +53,65 @@ pub struct Entry {
     pub verdict: Verdict,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredEntry {
+    epoch: Option<u64>,
+    seq: u64,
+    at: Timestamp,
+    prev: String,
+    principal: String,
+    action: String,
+    subject: Option<String>,
+    verdict: Verdict,
+}
+
+impl From<StoredEntry> for Entry {
+    fn from(stored: StoredEntry) -> Self {
+        Self {
+            epoch: stored.epoch.unwrap_or(0),
+            seq: stored.seq,
+            at: stored.at,
+            prev: stored.prev,
+            principal: stored.principal,
+            action: stored.action,
+            subject: stored.subject,
+            verdict: stored.verdict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, from = "StoredHead")]
+#[schemars(!from)]
 pub struct Head {
+    pub epoch: u64,
     pub seq: u64,
     pub hash: ChainHash,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredHead {
+    epoch: Option<u64>,
+    seq: u64,
+    hash: ChainHash,
+}
+
+impl From<StoredHead> for Head {
+    fn from(stored: StoredHead) -> Self {
+        Self {
+            epoch: stored.epoch.unwrap_or(0),
+            seq: stored.seq,
+            hash: stored.hash,
+        }
+    }
 }
 
 impl Head {
     fn genesis() -> Result<Self, AuditError> {
         Ok(Self {
+            epoch: 0,
             seq: 0,
             hash: GENESIS.parse().map_err(AuditError::Invalid)?,
         })
@@ -78,6 +129,22 @@ pub struct Event<'a> {
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
+    active_limit: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rotation {
+    from: Head,
+    next: Head,
+}
+
+struct WalkBytes<'a> {
+    path: &'a Path,
+    bytes: &'a [u8],
+    base: Head,
+    stop_at: u64,
+    expected: Option<&'a Head>,
 }
 
 fn digest(line: &[u8]) -> Result<ChainHash, AuditError> {
@@ -93,11 +160,28 @@ impl AuditLog {
     pub fn at(dirs: &Dirs) -> Self {
         Self {
             path: dirs.state.join("audit.jsonl"),
+            active_limit: ACTIVE_LIMIT,
         }
     }
 
     fn head_path(&self) -> PathBuf {
         self.path.with_extension("head")
+    }
+
+    fn base_path(&self) -> PathBuf {
+        self.path.with_extension("base")
+    }
+
+    fn rotation_path(&self) -> PathBuf {
+        self.path.with_extension("rotation")
+    }
+
+    fn archive_path(&self, epoch: u64) -> PathBuf {
+        self.path.with_file_name(format!("audit-{epoch}.jsonl"))
+    }
+
+    fn archive_base_path(&self, epoch: u64) -> PathBuf {
+        self.path.with_file_name(format!("audit-{epoch}.base"))
     }
 
     #[must_use]
@@ -122,44 +206,102 @@ impl AuditLog {
                 })
             }
         };
-        let lock = self.lock()?;
-        let head = match self.repair()? {
-            Some(advanced) => {
-                state_file::write_json(&self.head_path(), &advanced)?;
-                advanced
+        self.with_lock(|| {
+            self.finish_rotation()?;
+            let mut head = match self.repair()? {
+                Some(advanced) => {
+                    state_file::write_json(&self.head_path(), &advanced)?;
+                    advanced
+                }
+                None => match state_file::read_json::<Head>(&self.head_path())? {
+                    Some(head) => head,
+                    None => Head::genesis()?,
+                },
+            };
+            if self.active_len()? >= self.active_limit && head.seq > self.base()?.seq {
+                head = self.rotate(&head)?;
             }
-            None => match state_file::read_json::<Head>(&self.head_path())? {
-                Some(head) => head,
-                None => Head::genesis()?,
-            },
+            let entry = Entry {
+                epoch: head.epoch,
+                seq: head.seq.saturating_add(1),
+                at: Timestamp::observe(),
+                prev: head.hash.to_string(),
+                principal: principal.to_owned(),
+                action: action.to_owned(),
+                subject,
+                verdict,
+            };
+            let line = serde_json::to_vec(&entry).map_err(AuditError::Encode)?;
+            let mut file = state_file::open_append(&self.path)?;
+            crate::faults::at("audit::append", &self.path)
+                .and_then(|()| file.write_all(&line))
+                .and_then(|()| file.write_all(b"\n"))
+                .map_err(io("appending to"))?;
+            crate::faults::at("audit::sync", &self.path)
+                .and_then(|()| file.sync_all())
+                .map_err(io("syncing"))?;
+            state_file::write_json(
+                &self.head_path(),
+                &Head {
+                    epoch: entry.epoch,
+                    seq: entry.seq,
+                    hash: digest(&line)?,
+                },
+            )?;
+            Ok(())
+        })
+    }
+
+    fn active_len(&self) -> Result<u64, AuditError> {
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(source) => Err(AuditError::Io(crate::failure::IoFailure {
+                action: "measuring",
+                path: self.path.clone(),
+                source,
+            })),
+        }
+    }
+
+    fn base(&self) -> Result<Head, AuditError> {
+        Ok(state_file::read_json(&self.base_path())?.unwrap_or(Head::genesis()?))
+    }
+
+    fn rotate(&self, from: &Head) -> Result<Head, AuditError> {
+        let next = Head {
+            epoch: from.epoch.saturating_add(1),
+            seq: from.seq,
+            hash: from.hash.clone(),
         };
-        let entry = Entry {
-            seq: head.seq.saturating_add(1),
-            at: Timestamp::observe(),
-            prev: head.hash.to_string(),
-            principal: principal.to_owned(),
-            action: action.to_owned(),
-            subject,
-            verdict,
-        };
-        let line = serde_json::to_vec(&entry).map_err(AuditError::Encode)?;
-        let mut file = state_file::open_append(&self.path)?;
-        crate::faults::at("audit::append", &self.path)
-            .and_then(|()| file.write_all(&line))
-            .and_then(|()| file.write_all(b"\n"))
-            .map_err(io("appending to"))?;
-        crate::faults::at("audit::sync", &self.path)
-            .and_then(|()| file.sync_all())
-            .map_err(io("syncing"))?;
         state_file::write_json(
-            &self.head_path(),
-            &Head {
-                seq: entry.seq,
-                hash: digest(&line)?,
+            &self.rotation_path(),
+            &Rotation {
+                from: from.clone(),
+                next: next.clone(),
             },
         )?;
-        lock.release()
-            .map_err(|e| io("unlocking")(std::io::Error::other(e.to_string())))
+        self.finish_rotation()?;
+        Ok(next)
+    }
+
+    fn finish_rotation(&self) -> Result<(), AuditError> {
+        let Some(rotation) = state_file::read_json::<Rotation>(&self.rotation_path())? else {
+            return Ok(());
+        };
+        let archive = self.archive_path(rotation.from.epoch);
+        if state_file::read_bytes(&archive)?.is_none() {
+            let active = state_file::read_bytes(&self.path)?.unwrap_or_default();
+            state_file::write_bytes(&archive, &active)?;
+        }
+        let archive_base = self.archive_base_path(rotation.from.epoch);
+        if state_file::read_bytes(&archive_base)?.is_none() {
+            state_file::write_json(&archive_base, &self.base()?)?;
+        }
+        state_file::write_bytes(&self.path, b"")?;
+        state_file::write_json(&self.base_path(), &rotation.next)?;
+        state_file::write_json(&self.head_path(), &rotation.next)?;
+        Ok(state_file::remove_file(&self.rotation_path())?)
     }
 
     fn lock(&self) -> Result<OsLock, AuditError> {
@@ -172,6 +314,26 @@ impl AuditLog {
                 source: std::io::Error::other(e.to_string()),
             })
         })
+    }
+
+    fn unlock(&self, lock: OsLock) -> Result<(), AuditError> {
+        lock.release().map_err(|error| {
+            AuditError::Io(crate::failure::IoFailure {
+                action: "unlocking",
+                path: self.path.clone(),
+                source: std::io::Error::other(error.to_string()),
+            })
+        })
+    }
+
+    fn with_lock<T>(&self, work: impl FnOnce() -> Result<T, AuditError>) -> Result<T, AuditError> {
+        let lock = self.lock()?;
+        let result = work();
+        let released = self.unlock(lock);
+        match (result, released) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
     }
 
     fn repair(&self) -> Result<Option<Head>, AuditError> {
@@ -188,14 +350,20 @@ impl AuditLog {
         }
         let head = match state_file::read_json::<Head>(&self.head_path()) {
             Ok(Some(head)) => head,
-            Ok(None) => Head::genesis()?,
+            Ok(None) => self.base()?,
             Err(_unreadable_head_is_for_walk_to_report) => return Ok(None),
         };
+        let base = self.base()?;
+        if head.epoch != base.epoch || head.seq < base.seq {
+            return Ok(None);
+        }
         let lines: Vec<&[u8]> = bytes
             .split(|b| *b == b'\n')
             .filter(|l| !l.is_empty())
             .collect();
-        if crate::domain::len_u64(lines.len()) != head.seq.saturating_add(1) {
+        if crate::domain::len_u64(lines.len())
+            != head.seq.saturating_sub(base.seq).saturating_add(1)
+        {
             return Ok(None);
         }
         let Some(last) = lines.last() else {
@@ -204,8 +372,12 @@ impl AuditLog {
         let Ok(entry) = crate::ingress::json::<Entry>(last) else {
             return Ok(None);
         };
-        if entry.seq == head.seq.saturating_add(1) && entry.prev == head.hash.as_str() {
+        if entry.epoch == head.epoch
+            && entry.seq == head.seq.saturating_add(1)
+            && entry.prev == head.hash.as_str()
+        {
             return Ok(Some(Head {
+                epoch: entry.epoch,
                 seq: entry.seq,
                 hash: digest(last)?,
             }));
@@ -214,20 +386,87 @@ impl AuditLog {
     }
 
     pub fn verify(&self) -> Result<u64, AuditError> {
-        Ok(self.walk(u64::MAX)?.0.seq)
+        self.with_lock(|| {
+            self.finish_rotation()?;
+            let current = self.walk_locked(u64::MAX)?.0;
+            let base = self.base()?;
+            let mut expected = Head::genesis()?;
+            for epoch in 0..base.epoch {
+                let archive_base: Head = state_file::read_json(&self.archive_base_path(epoch))?
+                    .ok_or_else(|| AuditError::Broken {
+                        path: self.archive_base_path(epoch),
+                        line: expected.seq,
+                        why: "an archive base is missing",
+                    })?;
+                if archive_base != expected {
+                    return Err(AuditError::Broken {
+                        path: self.archive_base_path(epoch),
+                        line: expected.seq,
+                        why: "an archive does not extend the previous epoch",
+                    });
+                }
+                let next = if epoch.saturating_add(1) == base.epoch {
+                    base.clone()
+                } else {
+                    state_file::read_json(&self.archive_base_path(epoch.saturating_add(1)))?
+                        .ok_or_else(|| AuditError::Broken {
+                            path: self.archive_base_path(epoch.saturating_add(1)),
+                            line: expected.seq,
+                            why: "an archive base is missing",
+                        })?
+                };
+                self.walk_archive(epoch, u64::MAX, &next)?;
+                expected = next;
+            }
+            if expected.hash != base.hash || expected.seq != base.seq {
+                return Err(AuditError::Broken {
+                    path: self.base_path(),
+                    line: base.seq,
+                    why: "the active epoch does not extend its archives",
+                });
+            }
+            Ok(current.seq)
+        })
     }
 
     pub fn head(&self) -> Result<Head, AuditError> {
         Ok(self.walk(u64::MAX)?.0)
     }
 
-    pub fn hash_at(&self, seq: u64) -> Result<Option<ChainHash>, AuditError> {
-        let (reached, _) = self.walk(seq)?;
-        Ok((reached.seq == seq).then_some(reached.hash))
+    pub fn hash_at(&self, epoch: u64, seq: u64) -> Result<Option<ChainHash>, AuditError> {
+        self.with_lock(|| {
+            self.finish_rotation()?;
+            let base = self.base()?;
+            let reached = match epoch.cmp(&base.epoch) {
+                std::cmp::Ordering::Equal => self.walk_repaired(seq, None)?.0,
+                std::cmp::Ordering::Less => {
+                    let next = if epoch.saturating_add(1) == base.epoch {
+                        base
+                    } else {
+                        let Some(next) = state_file::read_json(
+                            &self.archive_base_path(epoch.saturating_add(1)),
+                        )?
+                        else {
+                            return Ok(None);
+                        };
+                        next
+                    };
+                    self.walk_archive(epoch, seq, &next)?.0
+                }
+                std::cmp::Ordering::Greater => base,
+            };
+            Ok((reached.epoch == epoch && reached.seq == seq).then_some(reached.hash))
+        })
     }
 
     fn walk(&self, stop_at: u64) -> Result<(Head, u64), AuditError> {
-        let lock = self.lock()?;
+        self.with_lock(|| {
+            self.finish_rotation()?;
+            self.walk_locked(stop_at)
+        })
+    }
+
+    fn walk_locked(&self, stop_at: u64) -> Result<(Head, u64), AuditError> {
         let unrecorded = match self.repair()? {
             Some(advanced) => match state_file::write_json(&self.head_path(), &advanced) {
                 Ok(()) => None,
@@ -235,15 +474,7 @@ impl AuditLog {
             },
             None => None,
         };
-        let walked = self.walk_repaired(stop_at, unrecorded.as_ref());
-        lock.release().map_err(|e| {
-            AuditError::Io(crate::failure::IoFailure {
-                action: "unlocking",
-                path: self.path.clone(),
-                source: std::io::Error::other(e.to_string()),
-            })
-        })?;
-        walked
+        self.walk_repaired(stop_at, unrecorded.as_ref())
     }
 
     fn walk_repaired(
@@ -251,41 +482,94 @@ impl AuditLog {
         stop_at: u64,
         unrecorded: Option<&Head>,
     ) -> Result<(Head, u64), AuditError> {
-        let genesis = Head::genesis()?;
+        let base = self.base()?;
         let recorded = || match unrecorded {
             Some(head) => Ok(Some(head.clone())),
             None => state_file::read_json::<Head>(&self.head_path()),
         };
         let Some(bytes) = state_file::read_bytes(&self.path)? else {
             return match recorded()? {
-                None => Ok((genesis, 0)),
+                None if base == Head::genesis()? => Ok((base, 0)),
                 Some(_) => Err(AuditError::Broken {
                     path: self.path.clone(),
                     line: 0,
                     why: "entries were removed from the end",
                 }),
+                None => Err(AuditError::Broken {
+                    path: self.path.clone(),
+                    line: base.seq,
+                    why: "the active epoch is missing",
+                }),
             };
         };
+        let recorded = recorded()?;
+        Self::walk_bytes(WalkBytes {
+            path: &self.path,
+            bytes: &bytes,
+            base,
+            stop_at,
+            expected: recorded.as_ref(),
+        })
+    }
+
+    fn walk_archive(
+        &self,
+        epoch: u64,
+        stop_at: u64,
+        expected: &Head,
+    ) -> Result<(Head, u64), AuditError> {
+        let path = self.archive_path(epoch);
+        let bytes = state_file::read_bytes(&path)?.ok_or_else(|| AuditError::Broken {
+            path: path.clone(),
+            line: expected.seq,
+            why: "an archive is missing",
+        })?;
+        let base: Head =
+            state_file::read_json(&self.archive_base_path(epoch))?.ok_or_else(|| {
+                AuditError::Broken {
+                    path: self.archive_base_path(epoch),
+                    line: expected.seq,
+                    why: "an archive base is missing",
+                }
+            })?;
+        Self::walk_bytes(WalkBytes {
+            path: &path,
+            bytes: &bytes,
+            base,
+            stop_at,
+            expected: Some(expected),
+        })
+    }
+
+    fn walk_bytes(walk: WalkBytes<'_>) -> Result<(Head, u64), AuditError> {
+        let WalkBytes {
+            path,
+            bytes,
+            base,
+            stop_at,
+            expected,
+        } = walk;
         let broken = |line: u64, why| AuditError::Broken {
-            path: self.path.clone(),
+            path: path.to_path_buf(),
             line,
             why,
         };
-        let mut reached = genesis;
-        if stop_at == 0 {
-            return Ok((reached, 0));
+        let mut reached = base;
+        if stop_at == reached.seq {
+            return Ok((reached.clone(), reached.seq));
         }
         for raw in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
             let next = reached.seq.saturating_add(1);
             let entry: Entry =
                 crate::ingress::json(raw).map_err(|_malformed| broken(next, "malformed entry"))?;
-            if entry.seq != next {
+            if entry.epoch != reached.epoch || entry.seq != next {
                 return Err(broken(next, "sequence gap"));
             }
             if entry.prev != reached.hash.as_str() {
                 return Err(broken(next, "hash chain mismatch"));
             }
             reached = Head {
+                epoch: entry.epoch,
                 seq: next,
                 hash: digest(raw)?,
             };
@@ -294,40 +578,61 @@ impl AuditLog {
             }
         }
         let count = reached.seq;
-        match recorded()? {
-            Some(head) if head == reached => Ok((reached, count)),
-            None if count == 0 => Ok((reached, 0)),
+        match expected {
+            Some(head)
+                if head.seq == reached.seq
+                    && head.hash == reached.hash
+                    && matches!(
+                        head.epoch,
+                        epoch if epoch == reached.epoch
+                            || epoch == reached.epoch.saturating_add(1)
+                    ) =>
+            {
+                Ok((reached, count))
+            }
+            None if bytes.is_empty() => Ok((reached, count)),
             Some(_) | None => Err(broken(count, "entries were removed from the end")),
         }
     }
 
     pub fn tail(&self, lines: usize) -> Result<Vec<Entry>, AuditError> {
-        let Some(bytes) = state_file::read_bytes(&self.path)? else {
+        if lines == 0 {
             return Ok(Vec::new());
-        };
-        let mut entries = std::collections::VecDeque::with_capacity(lines);
-        for (index, raw) in bytes
-            .split(|b| *b == b'\n')
-            .filter(|l| !l.is_empty())
-            .enumerate()
-        {
-            let entry: Entry =
-                crate::ingress::json(raw).map_err(|_malformed| AuditError::Broken {
-                    path: self.path.clone(),
-                    line: crate::domain::len_u64(index.saturating_add(1)),
-                    why: "malformed entry",
-                })?;
-            if entries.len() == lines {
-                entries.pop_front();
-            }
-            entries.push_back(entry);
         }
-        Ok(entries.into_iter().collect())
+        self.with_lock(|| {
+            self.finish_rotation()?;
+            let mut entries = std::collections::VecDeque::with_capacity(lines);
+            let base = self.base()?;
+            for epoch in 0..=base.epoch {
+                let path = if epoch == base.epoch {
+                    self.path.clone()
+                } else {
+                    self.archive_path(epoch)
+                };
+                let Some(bytes) = state_file::read_bytes(&path)? else {
+                    continue;
+                };
+                for raw in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                    let entry: Entry =
+                        crate::ingress::json(raw).map_err(|_malformed| AuditError::Broken {
+                            path: path.clone(),
+                            line: 0,
+                            why: "malformed entry",
+                        })?;
+                    if entries.len() == lines {
+                        entries.pop_front();
+                    }
+                    entries.push_back(entry);
+                }
+            }
+            Ok(entries.into_iter().collect())
+        })
     }
 }
 
 impl crate::ingress::Ingress for Entry {}
 impl crate::ingress::Ingress for Head {}
+impl crate::ingress::Ingress for Rotation {}
 
 #[cfg(test)]
 #[expect(
@@ -338,13 +643,7 @@ mod tests {
     use super::*;
 
     fn dirs(root: &Path) -> Dirs {
-        Dirs {
-            home: root.into(),
-            state: root.join("s"),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        }
+        Dirs::for_test(root)
     }
 
     fn event(action: &str) -> Event<'_> {
@@ -354,6 +653,39 @@ mod tests {
             subject: None,
             verdict: Verdict::Allowed,
         }
+    }
+
+    fn recorded(actions: &[&str]) -> (tempfile::TempDir, AuditLog) {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::at(&dirs(tmp.path()));
+        for action in actions {
+            log.record(event(action)).unwrap();
+        }
+        (tmp, log)
+    }
+
+    #[test]
+    fn records_from_before_epochs_existed_belong_to_the_first_epoch() {
+        let head: Head = serde_json::from_value(serde_json::json!({
+            "seq": 0,
+            "hash": GENESIS
+        }))
+        .unwrap();
+        assert_eq!(head.epoch, 0);
+        let mut value = serde_json::to_value(Entry {
+            epoch: 0,
+            seq: 1,
+            at: Timestamp::at_millis(1),
+            prev: GENESIS.to_owned(),
+            principal: "owner".to_owned(),
+            action: "list".to_owned(),
+            subject: None,
+            verdict: Verdict::Allowed,
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("epoch");
+        let entry: Entry = serde_json::from_value(value).unwrap();
+        assert_eq!(entry.epoch, 0);
     }
 
     #[test]
@@ -374,11 +706,12 @@ mod tests {
         assert_eq!(log.verify().unwrap(), 3);
         let head = log.head().unwrap();
         assert_eq!(head.seq, 3);
-        assert_eq!(log.hash_at(3).unwrap().unwrap(), head.hash);
-        let at_one = log.hash_at(1).unwrap().unwrap();
+        assert_eq!(log.hash_at(0, 3).unwrap().unwrap(), head.hash);
+        let at_one = log.hash_at(0, 1).unwrap().unwrap();
         assert_ne!(at_one, head.hash);
-        assert!(log.hash_at(4).unwrap().is_none());
-        assert_eq!(log.hash_at(0).unwrap().unwrap().as_str(), GENESIS);
+        assert!(log.hash_at(0, 4).unwrap().is_none());
+        assert_eq!(log.hash_at(0, 0).unwrap().unwrap().as_str(), GENESIS);
+        assert!(log.tail(0).unwrap().is_empty());
         assert_eq!(log.tail(2).unwrap().len(), 2);
         let text = std::fs::read_to_string(log.path()).unwrap();
         std::fs::write(log.path(), text.replacen("\"kill\"", "\"list\"", 1)).unwrap();
@@ -395,7 +728,7 @@ mod tests {
     #[test]
     fn a_removed_entry_is_caught_even_when_the_chain_and_head_are_relinked() {
         let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
+        let log = AuditLog::at(&Dirs::for_test(tmp.path()));
         for action in ["submit", "kill", "get"] {
             log.record(event(action)).unwrap();
         }
@@ -415,6 +748,7 @@ mod tests {
         state_file::write_json(
             &log.head_path(),
             &Head {
+                epoch: 0,
                 seq: 2,
                 hash: digest(&relinked).unwrap(),
             },
@@ -444,17 +778,41 @@ mod tests {
         state_file::write_bytes(&log.head_path(), b"not a head").unwrap();
         log.verify().unwrap_err();
         log.head().unwrap_err();
-        log.hash_at(5).unwrap_err();
+        log.hash_at(0, 5).unwrap_err();
 
+        std::fs::remove_file(log.head_path()).unwrap();
         state_file::write_bytes(log.path(), b"not an entry\n").unwrap();
-        assert!(matches!(
-            log.verify(),
-            Err(AuditError::Broken {
-                why: "malformed entry",
-                ..
-            })
-        ));
+        let damaged = log.verify();
+        assert!(
+            matches!(
+                damaged,
+                Err(AuditError::Broken {
+                    why: "malformed entry",
+                    ..
+                })
+            ),
+            "{damaged:?}"
+        );
         log.tail(1).unwrap_err();
+    }
+
+    #[test]
+    fn a_full_active_log_starts_a_verifiable_archive_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut log = AuditLog::at(&dirs(tmp.path()));
+        log.active_limit = 1;
+        for action in ["submit", "kill", "get"] {
+            log.record(event(action)).unwrap();
+        }
+        let head = log.head().unwrap();
+        assert_eq!((head.epoch, head.seq), (2, 3));
+        assert!(log.archive_path(0).is_file());
+        assert!(log.archive_path(1).is_file());
+        assert!(log.hash_at(0, 1).unwrap().is_some());
+        assert!(log.hash_at(1, 2).unwrap().is_some());
+        assert_eq!(log.hash_at(2, 3).unwrap(), Some(head.hash));
+        assert_eq!(log.verify().unwrap(), 3);
+        assert_eq!(log.tail(3).unwrap().len(), 3);
     }
 
     #[test]
@@ -513,9 +871,7 @@ mod tests {
 
     #[test]
     fn a_crash_between_the_entry_and_the_head_heals_on_the_next_read_or_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
-        log.record(event("submit")).unwrap();
+        let (_tmp, log) = recorded(&["submit"]);
         let head_after_one = std::fs::read(log.head_path()).unwrap();
         log.record(event("kill")).unwrap();
         std::fs::write(log.head_path(), &head_after_one).unwrap();
@@ -532,10 +888,7 @@ mod tests {
 
     #[test]
     fn a_crash_partway_through_an_entry_heals_and_loses_nothing_recorded() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
-        log.record(event("submit")).unwrap();
-        log.record(event("kill")).unwrap();
+        let (_tmp, log) = recorded(&["submit", "kill"]);
         let whole = std::fs::read(log.path()).unwrap();
         let mut torn = whole.clone();
         torn.extend_from_slice(br#"{"seq":3,"at":"#);
@@ -548,9 +901,7 @@ mod tests {
 
     #[test]
     fn an_entry_that_does_not_extend_the_head_is_never_taken_as_the_new_head() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
-        log.record(event("submit")).unwrap();
+        let (_tmp, log) = recorded(&["submit"]);
         let head_after_one = std::fs::read(log.head_path()).unwrap();
         log.record(event("kill")).unwrap();
         let text = std::fs::read_to_string(log.path()).unwrap();
@@ -599,7 +950,7 @@ mod tests {
         let unreadable = crate::faults::inject(&[("state_file::read", &tag)]);
         log.verify().unwrap_err();
         log.head().unwrap_err();
-        log.hash_at(1).unwrap_err();
+        log.hash_at(0, 1).unwrap_err();
         drop(unreadable);
         let entries = log.path().display().to_string();
         let unreadable_on_the_walk = crate::faults::inject_after("state_file::read", 2, &entries);
@@ -623,9 +974,7 @@ mod tests {
 
     #[test]
     fn a_read_that_cannot_lock_fails_and_one_on_a_full_disk_still_reads_and_heals_later() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
-        log.record(event("submit")).unwrap();
+        let (_tmp, log) = recorded(&["submit"]);
         let head_after_one = std::fs::read(log.head_path()).unwrap();
         log.record(event("kill")).unwrap();
         let lock = format!("{}.lock", log.path().display());
@@ -638,7 +987,7 @@ mod tests {
         {
             let _faults = crate::faults::inject(&[("state_file::write", &head)]);
             assert_eq!(log.verify().unwrap(), 2);
-            assert_eq!(log.hash_at(2).unwrap(), Some(log.head().unwrap().hash));
+            assert_eq!(log.hash_at(0, 2).unwrap(), Some(log.head().unwrap().hash));
             assert_eq!(std::fs::read(log.head_path()).unwrap(), head_after_one);
             log.record(event("get")).unwrap_err();
         }
@@ -651,9 +1000,7 @@ mod tests {
 
     #[test]
     fn two_entries_past_the_head_are_not_healed_but_reported() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = AuditLog::at(&dirs(tmp.path()));
-        log.record(event("submit")).unwrap();
+        let (_tmp, log) = recorded(&["submit"]);
         let head_after_one = std::fs::read(log.head_path()).unwrap();
         log.record(event("kill")).unwrap();
         log.record(event("get")).unwrap();

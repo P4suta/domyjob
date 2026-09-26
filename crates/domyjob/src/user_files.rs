@@ -1,6 +1,7 @@
 use std::path::Path;
 
 pub fn present(path: &Path) -> Result<bool, crate::failure::IoFailure> {
+    crate::faults::at("user_files::check", path).map_err(crate::failure::io("checking", path))?;
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -23,6 +24,8 @@ pub struct Staged(crate::durable::Staged);
 pub fn parents(path: &Path) -> Result<(), crate::failure::IoFailure> {
     match path.parent().filter(|p| !p.as_os_str().is_empty()) {
         Some(parent) => {
+            crate::faults::at("user_files::parents", parent)
+                .map_err(crate::failure::io("creating", parent))?;
             std::fs::create_dir_all(parent).map_err(crate::failure::io("creating", parent))
         }
         None => Ok(()),
@@ -52,6 +55,7 @@ impl Staged {
     reason = "removing a file the user asked to uninstall"
 )]
 pub fn remove(path: &Path) -> Result<(), crate::failure::IoFailure> {
+    crate::faults::at("user_files::remove", path).map_err(crate::failure::io("removing", path))?;
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -65,10 +69,16 @@ pub fn remove(path: &Path) -> Result<(), crate::failure::IoFailure> {
 )]
 pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), crate::failure::IoFailure> {
     let staged = crate::durable::beside(current, "new")?;
+    crate::faults::at("user_files::copy", &staged)
+        .map_err(crate::failure::io("staging", &staged))?;
     std::fs::copy(fresh, &staged).map_err(crate::failure::io("staging", &staged))?;
     if !crate::platform::FAMILY.replaces_running_executables() {
         let retired = crate::durable::beside(current, "old")?;
+        crate::faults::at("user_files::retire", current)
+            .map_err(crate::failure::io("retiring", current))?;
         std::fs::rename(current, &retired).map_err(crate::failure::io("retiring", current))?;
+        crate::faults::at("user_files::install", current)
+            .map_err(crate::failure::io("installing", current))?;
         if let Err(error) = std::fs::rename(&staged, current) {
             match std::fs::rename(&retired, current) {
                 Ok(()) | Err(_) => {}
@@ -78,6 +88,8 @@ pub fn replace_executable(fresh: &Path, current: &Path) -> Result<(), crate::fai
         sweep_retired(current);
         return Ok(());
     }
+    crate::faults::at("user_files::install", current)
+        .map_err(crate::failure::io("installing", current))?;
     std::fs::rename(&staged, current).map_err(crate::failure::io("installing", current))
 }
 
@@ -138,6 +150,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_user_file_can_be_written_again_after_a_crash_at_every_step() {
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = tmp.path().join("out").join("report.json");
+            let crashing = crate::faults::crash_after(tmp.path(), None);
+            write(&destination, b"new").unwrap();
+            crashing.steps()
+        };
+        assert!(steps > 0);
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = tmp.path().join("out").join("report.json");
+            write(&destination, b"old").unwrap();
+            {
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                match write(&destination, b"new") {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            write(&destination, b"new").unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        }
     }
 
     #[test]

@@ -15,14 +15,15 @@ use crate::lock::OsLock;
 use crate::node::NodeError;
 use crate::paths::Dirs;
 use crate::proc::{self, Group, Readiness};
-use crate::protocol::{Location, Outcome, Phase, Spec, Workspace};
+use crate::protocol::{Location, Outcome, Phase, Settings, Spec, Workspace};
 use crate::store::Store;
 use crate::terminal::RemoteText;
 
 #[derive(Debug)]
 enum Event {
-    Slot(OsLock),
-    NoSlot(crate::lock::LockError),
+    Changed,
+    Released(PathBuf),
+    LockFailed(crate::lock::LockError),
     Kill,
 }
 
@@ -48,7 +49,7 @@ impl Stop {
             Self::Ended => (
                 Ending::Returned,
                 format!(
-                    "the machine told domyjob to stop while the job was {when}; it starts again when the machine is next given a command, such as a new job"
+                    "the machine told domyjob to stop while the job was {when}; it waits for an explicit `domyjob retry`"
                 ),
             ),
         }
@@ -69,6 +70,10 @@ impl Stop {
 
 const LOG_HEAD: u64 = 256 << 20;
 const LOG_TAIL: usize = 8 << 20;
+
+fn slot_is_available(settings: Settings, held: usize, has_earlier_waiter: bool) -> bool {
+    !settings.paused && !has_earlier_waiter && held < settings.max_jobs.slots()
+}
 
 #[derive(Debug)]
 struct Log {
@@ -436,6 +441,7 @@ fn beside(root: &Path, suffix: &str) -> PathBuf {
 struct Held {
     slot: Option<OsLock>,
     workspace: Option<OsLock>,
+    store: Store,
 }
 
 impl Held {
@@ -445,6 +451,7 @@ impl Held {
         }
         if let Some(slot) = self.slot {
             slot.release()?;
+            self.store.signal_queue()?;
         }
         Ok(())
     }
@@ -474,9 +481,21 @@ struct Supervisor {
     shared: Arc<Shared>,
 }
 
-pub fn supervise(dirs: Dirs, id: &JobId, readiness: Readiness) -> Result<(), NodeError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stops {
+    Heard,
+    Unheard,
+}
+
+pub fn supervise(
+    dirs: Dirs,
+    id: &JobId,
+    readiness: Readiness,
+    stops: Stops,
+) -> Result<(), NodeError> {
     let store = Store::open(&dirs)?;
-    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, readiness) {
+    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, (readiness, stops))
+    {
         Ok(taken) => taken,
         Err(error) => {
             store.record_start_failure(id, &error.to_string())?;
@@ -485,15 +504,17 @@ pub fn supervise(dirs: Dirs, id: &JobId, readiness: Readiness) -> Result<(), Nod
     };
     let finished = supervisor.conclude(&events);
     let released = alive.release();
+    let signaled = supervisor.store.signal_queue();
     finished?;
-    Ok(released?)
+    released?;
+    Ok(signaled?)
 }
 
 fn take_charge(
     dirs: Dirs,
     store: Store,
     id: &JobId,
-    readiness: Readiness,
+    (readiness, stops): (Readiness, Stops),
 ) -> Result<(Supervisor, OsLock, Receiver<Event>), NodeError> {
     let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
         return Err(NodeError::AlreadySupervised(id.clone()));
@@ -511,6 +532,7 @@ fn take_charge(
     if !store.is_published(id)? {
         store.publish(id)?;
     }
+    store.record_supervisor_boot(id)?;
     let spec = store.spec(id)?;
     let log_path = store.log_path(id);
     let file = crate::state_file::open_append(&log_path)?;
@@ -539,11 +561,13 @@ fn take_charge(
     });
     serve_control(listener, Arc::clone(&shared));
     let told = Arc::clone(&shared);
-    if let Err(error) = ctrlc::set_handler(move || {
-        if let Err(error) = told.kill(Stop::Ended) {
-            told.say(&format!("stopping the job failed: {error}"));
-        }
-    }) {
+    if stops == Stops::Heard
+        && let Err(error) = ctrlc::set_handler(move || {
+            if let Err(error) = told.kill(Stop::Ended) {
+                told.say(&format!("stopping the job failed: {error}"));
+            }
+        })
+    {
         shared.say(&format!(
             "a shutdown will read as a vanished supervisor, because the machine's requests to stop cannot be heard: {error}"
         ));
@@ -568,6 +592,7 @@ impl Supervisor {
         let mut held = Held {
             slot: None,
             workspace: None,
+            store: self.store.clone(),
         };
         let mut started = None;
         let result = self.run(events, &mut held, &mut started);
@@ -624,49 +649,82 @@ impl Supervisor {
 
     fn queue(&self, events: &Receiver<Event>) -> Result<Option<OsLock>, NodeError> {
         let slots = self.store.area("slots");
-        let count = self.spec.concurrency.slots();
-        if count > 1 {
-            for index in (0..count).rev() {
-                if let Some(lock) = OsLock::try_exclusive(&slots.join(format!("{index}.lock")))? {
-                    return Ok(Some(lock));
-                }
-            }
-        }
-        let won = Arc::new(AtomicBool::new(false));
-        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for index in 0..count {
-            let path = slots.join(format!("{index}.lock"));
-            let won = Arc::clone(&won);
-            let failed = Arc::clone(&failed);
-            let sender = self.shared.events.clone();
-            std::thread::spawn(move || {
-                let lock = match OsLock::exclusive(&path) {
-                    Ok(lock) => lock,
-                    Err(error) => {
-                        if failed.fetch_add(1, Ordering::SeqCst).saturating_add(1) == count {
-                            match sender.send(Event::NoSlot(error)) {
-                                Ok(()) | Err(_) => {}
-                            }
-                        }
-                        return;
-                    }
-                };
-                if won.swap(true, Ordering::SeqCst) {
-                    match lock.release() {
+        let watched = self.store.area("");
+        let changed = self.shared.events.clone();
+        let queue_changed = self.store.queue_changed_path();
+        let settings_path = self.store.settings_path();
+        let mut notifier =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| path == &queue_changed || path == &settings_path)
+                {
+                    match changed.send(Event::Changed) {
                         Ok(()) | Err(_) => {}
                     }
-                    return;
                 }
-                match sender.send(Event::Slot(lock)) {
-                    Ok(()) | Err(_) => {}
+            })
+            .map_err(|error| crate::node::watching(&watched, &error))?;
+        notify::Watcher::watch(&mut notifier, &watched, notify::RecursiveMode::NonRecursive)
+            .map_err(|error| crate::node::watching(&watched, &error))?;
+        let mut watched_locks = std::collections::BTreeSet::new();
+        loop {
+            let admission = OsLock::exclusive(&self.store.admission_lock_path())?;
+            let settings = self.store.settings()?;
+            let mut held = Vec::new();
+            for index in 0..crate::domain::Concurrency::MOST {
+                let path = slots.join(format!("{index}.lock"));
+                if matches!(OsLock::probe(&path)?, crate::lock::Probe::Held) {
+                    held.push(path);
                 }
-            });
-        }
-        match events.recv() {
-            Ok(Event::Slot(lock)) => Ok(Some(lock)),
-            Ok(Event::NoSlot(error)) => Err(NodeError::Lock(error)),
-            Ok(Event::Kill) => Ok(None),
-            Err(_disconnected) => Err(NodeError::QueueClosed),
+            }
+            let earlier = self.store.earlier_waiters(&self.spec)?;
+            let slot = if slot_is_available(settings, held.len(), !earlier.is_empty()) {
+                OsLock::first_free(
+                    &slots,
+                    crate::domain::to_usize(crate::domain::Concurrency::MOST),
+                )?
+                .map(|(_, lock)| lock)
+            } else {
+                None
+            };
+            admission.release()?;
+            if slot.is_some() {
+                return Ok(slot);
+            }
+            let blockers = held
+                .into_iter()
+                .chain(earlier.into_iter().map(|id| self.store.alive_path(&id)));
+            for path in blockers {
+                if !watched_locks.insert(path.clone()) {
+                    continue;
+                }
+                let sender = self.shared.events.clone();
+                std::thread::spawn(move || match OsLock::exclusive(&path) {
+                    Ok(lock) => {
+                        match lock.release() {
+                            Ok(()) | Err(_) => {}
+                        }
+                        match sender.send(Event::Released(path)) {
+                            Ok(()) | Err(_) => {}
+                        }
+                    }
+                    Err(error) => match sender.send(Event::LockFailed(error)) {
+                        Ok(()) | Err(_) => {}
+                    },
+                });
+            }
+            match events.recv() {
+                Ok(Event::Changed) => {}
+                Ok(Event::Released(path)) => {
+                    watched_locks.remove(&path);
+                }
+                Ok(Event::LockFailed(error)) => return Err(NodeError::Lock(error)),
+                Ok(Event::Kill) => return Ok(None),
+                Err(_disconnected) => return Err(NodeError::QueueClosed),
+            }
         }
     }
 
@@ -690,6 +748,7 @@ impl Supervisor {
         *started = Some(started_at);
         self.store
             .set_phase(&self.spec.id, &Phase::Preparing { started_at })?;
+        self.store.signal_queue()?;
         let (root, workspace_lock) = match self.prepare() {
             Ok(prepared) => prepared,
             Err(NodeError::Workspace(crate::workspace::WorkspaceError::Stopped)) => {
@@ -701,6 +760,13 @@ impl Supervisor {
         if self.shared.killed() {
             return Ok(self.shared.before_start("preparing"));
         }
+        self.store.set_phase(
+            &self.spec.id,
+            &Phase::Starting {
+                started_at,
+                workspace: root.display().to_string(),
+            },
+        )?;
         let (group, collecting) = self.start(&root)?;
         let group = Arc::new(group);
         if self.shared.group.set(Arc::clone(&group)).is_err() {
@@ -912,13 +978,38 @@ mod tests {
         );
         let (ending, note) = Stop::Ended.before_start("preparing");
         assert_eq!(ending, Ending::Returned);
-        assert!(note.contains("while the job was preparing") && note.contains("starts again"));
+        assert!(note.contains("while the job was preparing") && note.contains("domyjob retry"));
         assert_eq!(Stop::Asked.while_running(), Outcome::Killed);
         let ended = Stop::Ended.while_running();
         assert!(
             matches!(&ended, Outcome::Errored { reason } if reason.as_raw_str().contains("told domyjob to stop")),
             "{ended:?}"
         );
+    }
+
+    #[test]
+    fn each_dequeue_uses_the_current_pause_limit_and_waiter_order() {
+        let two = Settings {
+            paused: false,
+            max_jobs: crate::domain::Concurrency::try_from(2).unwrap(),
+        };
+        assert!(slot_is_available(two, 1, false));
+        assert!(!slot_is_available(two, 2, false));
+        assert!(!slot_is_available(
+            Settings {
+                paused: true,
+                ..two
+            },
+            0,
+            false
+        ));
+        assert!(!slot_is_available(two, 0, true));
+
+        let three = Settings {
+            max_jobs: crate::domain::Concurrency::try_from(3).unwrap(),
+            ..two
+        };
+        assert!(slot_is_available(three, 2, false));
     }
 
     #[test]

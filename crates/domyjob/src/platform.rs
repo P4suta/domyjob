@@ -27,6 +27,67 @@ pub const RUNNING_EXECUTABLE: Option<&str> = if cfg!(target_os = "linux") {
 };
 pub const MODES: bool = FAMILY.modes();
 
+#[cfg(unix)]
+#[must_use]
+pub fn numeric_user_id() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub const fn numeric_user_id() -> u32 {
+    0
+}
+
+#[must_use]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn boot_identity() -> Option<String> {
+    boot_identity_on_this_system()
+}
+
+#[must_use]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn boot_identity() -> Option<String> {
+    boot_identity_on_this_system()
+}
+
+#[cfg(target_os = "linux")]
+fn boot_identity_on_this_system() -> Option<String> {
+    let Ok(identity) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return None;
+    };
+    let identity = identity.trim().to_owned();
+    (!identity.is_empty()).then_some(identity)
+}
+
+#[cfg(target_os = "macos")]
+fn boot_identity_on_this_system() -> Option<String> {
+    let Ok(output) = crate::spawn::Invocation::new(
+        crate::template::Arg::literal("sysctl"),
+        vec![
+            crate::template::Arg::literal("-n"),
+            crate::template::Arg::literal("kern.bootsessionuuid"),
+        ],
+    )
+    .command()
+    .output() else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let Ok(identity) = String::from_utf8(output.stdout) else {
+        return None;
+    };
+    let identity = identity.trim().to_owned();
+    (!identity.is_empty()).then_some(identity)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn boot_identity_on_this_system() -> Option<String> {
+    None
+}
+
 const fn bits(mode: Mode) -> u32 {
     mode.unix_bits()
 }

@@ -1,13 +1,13 @@
 [tools]
-rust = "1.98.0"
+rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
 typos = "1.50.1"
 lefthook = "2.1.9"
-"cargo:cargo-nextest" = "0.9.140"
-"cargo:cargo-deny" = "0.19.7"
-"cargo:cargo-audit" = "0.22.2"
-"cargo:committed" = "1.1.11"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.140"
+"aqua:EmbarkStudios/cargo-deny" = "0.19.7"
+"aqua:rustsec/rustsec/cargo-audit" = "0.22.2"
+"aqua:crate-ci/committed" = "1.1.11"
 "npm:jscpd" = "5.3.2"
 "aqua:axodotdev/cargo-dist" = "0.33.0"
 
@@ -40,8 +40,9 @@ run = ["typos", "actionlint", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
 description = "Run every test"
+env = { DOMYJOB_CI_CANARY = "must-not-reach-a-job" }
 run = [
-  "cargo nextest run --locked --workspace --all-targets",
+  "cargo nextest run --locked --workspace --all-targets --features failpoints",
   "cargo test --locked --workspace --doc",
 ]
 

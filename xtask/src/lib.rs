@@ -47,7 +47,6 @@ const PLATFORM: &str = "crates/domyjob/src/platform.rs";
 const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
     ("crates/domyjob/src/keystore.rs", 5),
     ("crates/domyjob/src/proc.rs", 5),
-    ("crates/domyjob/src/service.rs", 6),
     ("crates/domyjob/src/spawn.rs", 1),
     ("xtask/src/release.rs", 1),
 ];
