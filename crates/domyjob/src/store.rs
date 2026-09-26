@@ -90,6 +90,7 @@ fn allowed_launch_variable(name: &str) -> bool {
                 | "HOME"
                 | "USER"
                 | "USERNAME"
+                | "USERPROFILE"
                 | "LOGNAME"
                 | "SHELL"
                 | "TMPDIR"
@@ -101,6 +102,15 @@ fn allowed_launch_variable(name: &str) -> bool {
                 | "PATHEXT"
                 | "HOMEDRIVE"
                 | "HOMEPATH"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+                | "PROGRAMDATA"
+                | "PROGRAMFILES"
+                | "PROGRAMFILES(X86)"
+                | "PROGRAMW6432"
+                | "COMMONPROGRAMFILES"
+                | "COMMONPROGRAMFILES(X86)"
+                | "COMMONPROGRAMW6432"
                 | "LANG"
                 | "LANGUAGE"
                 | "TZ"
@@ -643,11 +653,21 @@ mod tests {
         let launch = LaunchEnv::from_vars([
             ("PATH".into(), "/bin".into()),
             ("LC_ALL".into(), "C".into()),
+            ("ProgramFiles(x86)".into(), "C:/Program Files (x86)".into()),
+            ("USERPROFILE".into(), "C:/Users/me".into()),
             ("DOMYJOB_CI_CANARY".into(), "must-not-leak".into()),
             ("SSH_CONNECTION".into(), "secret-session-detail".into()),
         ]);
         assert_eq!(launch.vars.get("PATH").map(String::as_str), Some("/bin"));
         assert_eq!(launch.vars.get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(
+            launch.vars.get("ProgramFiles(x86)").map(String::as_str),
+            Some("C:/Program Files (x86)")
+        );
+        assert_eq!(
+            launch.vars.get("USERPROFILE").map(String::as_str),
+            Some("C:/Users/me")
+        );
         assert!(!launch.vars.contains_key("DOMYJOB_CI_CANARY"));
         assert!(!launch.vars.contains_key("SSH_CONNECTION"));
         if std::env::var_os("DOMYJOB_CI_CANARY").is_some() {

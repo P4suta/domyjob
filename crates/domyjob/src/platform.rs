@@ -40,7 +40,14 @@ pub const fn numeric_user_id() -> u32 {
 }
 
 #[must_use]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn boot_identity() -> Option<String> {
+    boot_identity_on_this_system()
+}
+
+#[must_use]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub const fn boot_identity() -> Option<String> {
     boot_identity_on_this_system()
 }
 
