@@ -534,7 +534,8 @@ mod platform {
     impl Readiness {
         #[must_use]
         pub fn from_parent(event: Option<&BlobId>) -> Option<Self> {
-            event.map(|token| Self(token.clone()))
+            let token = event?;
+            Some(Self(token.clone()))
         }
 
         pub fn announce(self) -> Result<(), ProcError> {
