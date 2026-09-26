@@ -58,6 +58,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 
 - By the name you gave with `--name`: `tests`, or `win:tests` for the one on that machine.
 - The newest job you started: `latest`, or `win:latest`.
+- Names and `latest` mean jobs sent from the project you are in, so two worktrees never answer for each other; an id works from anywhere.
 - By id or any unique prefix of it: `3KX9`, or `win:3KX9`.
 
 ## Choosing machines

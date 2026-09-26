@@ -189,6 +189,10 @@ pub fn of_client(error: &ClientError) -> Diagnosis {
             Kind::Protocol,
             "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",
         ),
+        ClientError::Elsewhere { .. } => hinted(
+            Kind::NotFound,
+            "names and `latest` mean jobs sent from this project; run it from there, or use the job's id",
+        ),
         ClientError::NotSent { .. } => hinted(
             Kind::Usage,
             "pull brings back jobs `domyjob run` sent with a directory from this machine; `domyjob get JOB PATH` copies one file",

@@ -64,6 +64,8 @@ pub enum ClientError {
     },
     #[error("this machine has no note of a directory sent with {job}")]
     NotSent { job: JobId },
+    #[error("{reference} means a job sent from here, and the one by that name was sent from {}", .root.display())]
+    Elsewhere { reference: String, root: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -226,31 +228,50 @@ fn newest<'a>(
 }
 
 pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientError> {
+    let here = match std::env::current_dir().and_then(std::fs::canonicalize) {
+        Ok(start) => Some(root_of(&start, None, &ctx.config)?),
+        Err(_no_directory) => None,
+    };
+    let (machine, reference) = resolve(&index(ctx)?, here.as_deref(), text)?;
+    Ok((ctx.config.machine(&machine)?, reference))
+}
+
+fn resolve(
+    entries: &[IndexEntry],
+    here: Option<&Path>,
+    text: &str,
+) -> Result<(MachineName, JobRef), ClientError> {
     let (machine, rest) = match text.rsplit_once(':') {
         Some((machine, rest)) => (Some(machine.parse::<MachineName>()?), rest),
         None => (None, text),
     };
-    let entries = index(ctx)?;
-    let found = |entry: Option<&IndexEntry>| -> Result<(Machine, JobRef), ClientError> {
-        let entry = entry.ok_or_else(|| ClientError::Unknown(text.to_owned()))?;
-        Ok((
-            ctx.config.machine(&entry.machine)?,
-            entry.job.clone().into(),
-        ))
-    };
-    if let Ok(name) = rest.parse::<JobName>()
-        && let Some(entry) = newest(&entries, machine.as_ref(), |e| {
-            e.name.as_ref() == Some(&name)
+    let scoped: Vec<IndexEntry> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .from
+                .as_ref()
+                .is_some_and(|from| here.is_some_and(|here| from.root == here))
         })
+        .cloned()
+        .collect();
+    let found = |entry: Option<&IndexEntry>| -> Result<(MachineName, JobRef), ClientError> {
+        match entry {
+            Some(entry) => Ok((entry.machine.clone(), entry.job.clone().into())),
+            None => Err(elsewhere(entries, rest, text)),
+        }
+    };
+    let named =
+        |name: &JobName| newest(&scoped, machine.as_ref(), |e| e.name.as_ref() == Some(name));
+    if let Ok(name) = rest.parse::<JobName>()
+        && let Some(entry) = named(&name)
     {
         return found(Some(entry));
     }
-    match (wanted(rest)?, machine) {
-        (Wanted::Latest, machine) => found(newest(&entries, machine.as_ref(), |_| true)),
-        (Wanted::Named(name), machine) => found(newest(&entries, machine.as_ref(), |e| {
-            e.name.as_ref() == Some(&name)
-        })),
-        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine)?, reference)),
+    match (wanted(rest)?, machine.clone()) {
+        (Wanted::Latest, machine) => found(newest(&scoped, machine.as_ref(), |_| true)),
+        (Wanted::Named(name), _) => found(named(&name)),
+        (Wanted::Id(reference), Some(machine)) => Ok((machine, reference)),
         (Wanted::Id(reference), None) => {
             let mut matches: Vec<&IndexEntry> = entries
                 .iter()
@@ -258,9 +279,9 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 .collect();
             matches.dedup_by(|a, b| a.machine == b.machine);
             match matches.as_slice() {
-                [only] => Ok((ctx.config.machine(&only.machine)?, reference)),
+                [only] => Ok((only.machine.clone(), reference)),
                 [] => match rest.parse::<JobName>() {
-                    Ok(name) => found(newest(&entries, None, |e| e.name.as_ref() == Some(&name))),
+                    Ok(name) => found(named(&name)),
                     Err(_not_a_name) => Err(ClientError::Unknown(text.to_owned())),
                 },
                 many => Err(ClientError::Ambiguous {
@@ -280,6 +301,21 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 }),
             }
         }
+    }
+}
+
+fn elsewhere(entries: &[IndexEntry], rest: &str, text: &str) -> ClientError {
+    let named = rest.parse::<JobName>();
+    let other = entries.iter().rev().find(|entry| match &named {
+        Ok(name) => entry.name.as_ref() == Some(name),
+        Err(_not_a_name) => rest == "latest",
+    });
+    match other.and_then(|entry| entry.from.as_ref()) {
+        Some(from) => ClientError::Elsewhere {
+            reference: text.to_owned(),
+            root: from.root.clone(),
+        },
+        None => ClientError::Unknown(text.to_owned()),
     }
 }
 
@@ -1241,6 +1277,58 @@ impl crate::ingress::Ingress for EarlierEntry {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(job: usize, root: Option<&str>, name: Option<&str>) -> IndexEntry {
+        IndexEntry {
+            job: format!("0{job:015}").replace('0', "A").parse().unwrap(),
+            machine: "linux".parse().unwrap(),
+            name: name.map(|name| name.parse().unwrap()),
+            from: root.map(|root| SentFrom {
+                root: PathBuf::from(root),
+                manifest: BlobId::of(b"m"),
+            }),
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn names_and_latest_never_reach_outside_the_project_asked_from(
+            picks in proptest::collection::vec((0usize..3, 0usize..3), 0..12),
+            here in 0usize..3,
+            ask in 0usize..3,
+        ) {
+            let roots = [Some("/a"), Some("/b"), None];
+            let names = ["tests", "build", "lint"];
+            let entries: Vec<IndexEntry> = picks
+                .iter()
+                .enumerate()
+                .map(|(n, (root, name))| {
+                    entry(n, *roots.get(*root).unwrap(), Some(names.get(*name).unwrap()))
+                })
+                .collect();
+            let here_root = roots.get(here).unwrap().map(Path::new);
+            for asked in [*names.get(ask).unwrap(), "latest"] {
+                if let Ok((_, reference)) = resolve(&entries, here_root, asked) {
+                    let chosen = entries
+                        .iter()
+                        .find(|e| JobRef::from(e.job.clone()) == reference)
+                        .unwrap();
+                    let from = chosen.from.as_ref().map(|f| f.root.as_path());
+                    proptest::prop_assert_eq!(from, here_root);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_id_reaches_any_project_and_a_name_from_elsewhere_says_where() {
+        let entries = vec![entry(1, Some("/a"), Some("tests")), entry(2, None, None)];
+        let other = resolve(&entries, Some(Path::new("/b")), "tests").unwrap_err();
+        assert!(matches!(other, ClientError::Elsewhere { .. }), "{other}");
+        let id = entries.first().unwrap().job.to_string();
+        resolve(&entries, Some(Path::new("/b")), &id).unwrap();
+        resolve(&entries, None, "latest").unwrap_err();
+    }
 
     #[test]
     fn a_torn_or_foreign_index_line_is_skipped_not_fatal() {
