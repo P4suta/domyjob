@@ -16,7 +16,7 @@ use crate::protocol::{
     Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
     Submission, VERSION,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{Publication, Store, StoreError};
 use crate::terminal::RemoteText;
 
 pub trait Input: BufRead + Send + 'static {}
@@ -735,12 +735,13 @@ impl Node {
         };
         let id: JobId = String::from_utf8_lossy(&earlier).trim().parse()?;
         let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&id))?;
-        let job = if self.store.is_published(&id)? {
-            Some(self.store.job(&id)?)
-        } else {
-            self.store.discard_staged(&id)?;
-            crate::state_file::remove_file(nonce_path)?;
-            None
+        let job = match self.store.publication(&id)? {
+            Publication::Published => Some(self.store.job(&id)?),
+            Publication::Unpublished => {
+                self.store.discard_staged(&id)?;
+                crate::state_file::remove_file(nonce_path)?;
+                None
+            }
         };
         staging.release()?;
         self.store.forget_staging_lock(&id)?;
@@ -886,7 +887,10 @@ impl Node {
             None => return Ok(true),
         };
         match String::from_utf8_lossy(&last).trim().parse::<JobId>() {
-            Ok(id) => Ok(!self.store.is_published(&id)?),
+            Ok(id) => Ok(matches!(
+                self.store.publication(&id)?,
+                Publication::Unpublished
+            )),
             Err(_foreign) => Ok(true),
         }
     }
@@ -1084,7 +1088,7 @@ impl Node {
                 continue;
             };
             let gone = match String::from_utf8_lossy(&bytes).trim().parse::<JobId>() {
-                Ok(id) => !self.store.is_published(&id)?,
+                Ok(id) => matches!(self.store.publication(&id)?, Publication::Unpublished),
                 Err(_foreign) => true,
             };
             if gone {

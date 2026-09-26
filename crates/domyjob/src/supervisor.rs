@@ -16,7 +16,7 @@ use crate::node::NodeError;
 use crate::paths::Dirs;
 use crate::proc::{self, Group, Readiness};
 use crate::protocol::{Location, Outcome, Phase, Settings, Spec, Workspace};
-use crate::store::Store;
+use crate::store::{Publication, QueueMode, Store};
 use crate::terminal::RemoteText;
 
 #[derive(Debug)]
@@ -555,7 +555,7 @@ fn take_charge(
         })
     })?;
     let cas = Cas::open(dirs.state.join("objects"))?;
-    if !store.is_published(id)? {
+    if matches!(store.publication(id)?, Publication::Unpublished) {
         store.publish(id)?;
     }
     store.record_supervisor_boot(id)?;
@@ -759,7 +759,7 @@ impl Supervisor {
         held: &mut Held,
         started: &mut Option<Timestamp>,
     ) -> Result<Ending, NodeError> {
-        if !self.store.skips_the_queue(&self.spec.id)? {
+        if matches!(self.store.queue_mode(&self.spec.id)?, QueueMode::Ordinary) {
             let Some(slot) = self.queue(events)? else {
                 return Ok(self.shared.before_start("queued"));
             };

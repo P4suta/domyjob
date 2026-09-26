@@ -212,11 +212,32 @@ fn is_test_module(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
+fn type_carries_bool(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.path.is_ident("bool") {
+        return true;
+    }
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Result" && segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    if let Some(syn::GenericArgument::Type(inner)) = arguments.args.first() {
+        type_carries_bool(inner)
+    } else {
+        false
+    }
+}
+
 fn returns_bool(output: &syn::ReturnType) -> bool {
     match output {
-        syn::ReturnType::Type(_, ty) => {
-            matches!(&**ty, syn::Type::Path(p) if p.path.is_ident("bool"))
-        }
+        syn::ReturnType::Type(_, ty) => type_carries_bool(ty),
         syn::ReturnType::Default => false,
     }
 }
@@ -583,13 +604,18 @@ mod tests {
             "src/serve.rs",
             "src/store.rs",
         ] {
-            assert_eq!(
-                check_file("pub fn allowed() -> bool { true }", file)
-                    .unwrap()
-                    .len(),
-                1,
-                "{file}"
-            );
+            for signature in [
+                "fn answer() -> bool { true }",
+                "fn answer() -> Result<bool, Error> { Ok(true) }",
+                "fn answer() -> Option<bool> { Some(true) }",
+                "fn answer() -> Result<Option<bool>, Error> { Ok(Some(true)) }",
+            ] {
+                assert_eq!(
+                    check_file(signature, file).unwrap().len(),
+                    1,
+                    "{file}: {signature}"
+                );
+            }
         }
         assert!(
             check_file("pub fn allowed() -> bool { true }", "src/shell.rs")

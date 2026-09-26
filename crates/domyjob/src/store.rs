@@ -41,6 +41,24 @@ pub enum StoreError {
     Invalid(#[from] Invalid),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publication {
+    Published,
+    Unpublished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMode {
+    Immediate,
+    Ordinary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocker {
+    Active,
+    Cleared,
+}
+
 fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<T, StoreError> {
     crate::state_file::read_json(path)?
         .ok_or_else(|| io("reading", path)(ErrorKind::NotFound.into()).into())
@@ -304,8 +322,13 @@ impl Store {
         )?)
     }
 
-    pub fn skips_the_queue(&self, id: &JobId) -> Result<bool, StoreError> {
-        Ok(crate::state_file::read_bytes(&self.job_dir(id).join("now"))?.is_some())
+    pub fn queue_mode(&self, id: &JobId) -> Result<QueueMode, StoreError> {
+        Ok(
+            match crate::state_file::read_bytes(&self.job_dir(id).join("now"))? {
+                Some(_) => QueueMode::Immediate,
+                None => QueueMode::Ordinary,
+            },
+        )
     }
 
     pub fn publish(&self, id: &JobId) -> Result<(), StoreError> {
@@ -315,15 +338,19 @@ impl Store {
         )?)
     }
 
-    pub fn is_published(&self, id: &JobId) -> Result<bool, StoreError> {
-        Ok(crate::state_file::read_bytes(&self.job_dir(id).join("spec.json"))?.is_some())
+    pub fn publication(&self, id: &JobId) -> Result<Publication, StoreError> {
+        Ok(
+            match crate::state_file::read_bytes(&self.job_dir(id).join("spec.json"))? {
+                Some(_) => Publication::Published,
+                None => Publication::Unpublished,
+            },
+        )
     }
 
     fn failure_path(&self, id: &JobId) -> Result<PathBuf, StoreError> {
-        Ok(if self.is_published(id)? {
-            self.job_dir(id).join("failure")
-        } else {
-            self.staged_dir(id).join("failure")
+        Ok(match self.publication(id)? {
+            Publication::Published => self.job_dir(id).join("failure"),
+            Publication::Unpublished => self.staged_dir(id).join("failure"),
         })
     }
 
@@ -510,7 +537,7 @@ impl Store {
     pub fn earlier_waiters(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
         let mut earlier = Vec::new();
         for id in self.ids()? {
-            if id == waiting.id || self.skips_the_queue(&id)? {
+            if id == waiting.id || matches!(self.queue_mode(&id)?, QueueMode::Immediate) {
                 continue;
             }
             let spec = self.spec(&id)?;
@@ -598,7 +625,7 @@ impl Store {
             let holder = String::from_utf8_lossy(bytes.trim_ascii())
                 .parse::<JobId>()
                 .map_err(|_invalid| StoreError::InvalidHolder { path })?;
-            if holder != waiting.id && self.holds_on(&holder)? {
+            if holder != waiting.id && matches!(self.holds_on(&holder)?, Blocker::Active) {
                 holders.push(holder);
             }
         }
@@ -607,12 +634,20 @@ impl Store {
         Ok(holders)
     }
 
-    fn holds_on(&self, holder: &JobId) -> Result<bool, StoreError> {
-        if !self.is_published(holder)? {
-            return Ok(false);
+    fn holds_on(&self, holder: &JobId) -> Result<Blocker, StoreError> {
+        if matches!(self.publication(holder)?, Publication::Unpublished) {
+            return Ok(Blocker::Cleared);
         }
-        Ok(matches!(self.supervisor(holder)?, Supervisor::Alive)
-            && !matches!(self.phase(holder)?, Phase::Finished { .. }))
+        Ok(match self.supervisor(holder)? {
+            Supervisor::Gone => Blocker::Cleared,
+            Supervisor::Alive => match self.phase(holder)? {
+                Phase::Finished { .. } => Blocker::Cleared,
+                Phase::Queued
+                | Phase::Preparing { .. }
+                | Phase::Starting { .. }
+                | Phase::Running { .. } => Blocker::Active,
+            },
+        })
     }
 
     pub fn ids(&self) -> Result<Vec<JobId>, StoreError> {
@@ -861,7 +896,7 @@ mod tests {
                 ("state_file::overwrite", &tag),
                 ("state_file::remove", &tag),
             ]);
-            store.is_published(&id).unwrap_err();
+            store.publication(&id).unwrap_err();
             store.record_start_failure(&id, "x").unwrap_err();
             store.start_failure(&id).unwrap_err();
             store.phase(&id).unwrap_err();
@@ -917,14 +952,14 @@ mod tests {
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id: JobId = "0JJJJJJJJJJJJJJJ".parse().unwrap();
         staged(&store, &id, 1);
-        assert!(!store.is_published(&id).unwrap());
+        assert_eq!(store.publication(&id).unwrap(), Publication::Unpublished);
         store.record_start_failure(&id, "no shell").unwrap();
         assert_eq!(
             store.start_failure(&id).unwrap().as_deref(),
             Some("no shell")
         );
         store.publish(&id).unwrap();
-        assert!(store.is_published(&id).unwrap());
+        assert_eq!(store.publication(&id).unwrap(), Publication::Published);
         assert_eq!(
             store.start_failure(&id).unwrap().as_deref(),
             Some("no shell")
@@ -1040,8 +1075,8 @@ mod tests {
         for id in [&now, &queued] {
             store.publish(id).unwrap();
         }
-        assert!(store.skips_the_queue(&now).unwrap());
-        assert!(!store.skips_the_queue(&queued).unwrap());
+        assert_eq!(store.queue_mode(&now).unwrap(), QueueMode::Immediate);
+        assert_eq!(store.queue_mode(&queued).unwrap(), QueueMode::Ordinary);
     }
 
     #[test]

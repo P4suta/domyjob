@@ -44,7 +44,7 @@ Changing a label requires a named function that states why, such as `Peer -> Loc
 
 **Mechanism.** Decisions are enums (`Decision`, `Access`, `Verdict`), never `bool`; state machines (job lifecycle, pairing, connections) are typestates or enums whose transitions are functions from one state to the next.
 
-**Check.** `wildcard_enum_match_arm` is denied crate-wide; the gate refuses `-> bool` in the authorization, trust, audit, supervisor, pairing, and state-store modules.
+**Check.** `wildcard_enum_match_arm` is denied crate-wide; the gate refuses `bool`, including values wrapped in `Result` or `Option`, as a return type in the authorization, trust, audit, supervisor, pairing, and state-store modules.
 
 ## 5. Time decides nothing
 
