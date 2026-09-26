@@ -106,6 +106,13 @@ impl Workspace {
             }
             next.insert(rel.clone());
         }
+        for rel in crate::snapshot::inside_paths(self.root())? {
+            if !manifest.entries.contains_key(&rel) {
+                self.0.clear(&rel, Contents::Anything)?;
+                self.0.prune(&rel);
+                changes.removed = changes.removed.saturating_add(1);
+            }
+        }
         Ok((next, changes))
     }
 
@@ -191,12 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn workspaces_follow_manifests_and_keep_untracked_build_output() {
+    fn a_filled_workspace_is_exactly_what_was_sent_plus_ignored_build_output() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("lib")).unwrap();
         std::fs::write(src.join("lib/a.rs"), "a").unwrap();
         std::fs::write(src.join("gone.txt"), "bye").unwrap();
+        std::fs::write(src.join(".gitignore"), "target/\n").unwrap();
         let cas = Cas::open(tmp.path().join("cas")).unwrap();
         let upload = |snapshot: &crate::snapshot::Snapshot| {
             for blob in cas.missing(&snapshot.manifest.blobs()).unwrap() {
@@ -220,13 +228,14 @@ mod tests {
         assert_eq!(
             changes,
             Changes {
-                written: 2,
+                written: 3,
                 kept: 0,
                 removed: 0
             }
         );
         std::fs::create_dir_all(ws.root().join("target")).unwrap();
         std::fs::write(ws.root().join("target/cache"), "warm").unwrap();
+        std::fs::write(ws.root().join("made-by-a-job.txt"), "leftover").unwrap();
 
         std::fs::remove_file(src.join("gone.txt")).unwrap();
         std::fs::write(src.join("lib/a.rs"), "changed").unwrap();
@@ -247,10 +256,11 @@ mod tests {
             second_changes,
             Changes {
                 written: 2,
-                kept: 0,
-                removed: 1
+                kept: 1,
+                removed: 2
             }
         );
+        assert!(!ws.root().join("made-by-a-job.txt").exists());
         assert_eq!(
             std::fs::read_to_string(ws.root().join("lib/a.rs")).unwrap(),
             "changed"

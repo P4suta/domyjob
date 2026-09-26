@@ -155,6 +155,15 @@ impl Store {
     }
 
     #[must_use]
+    pub fn left_path(&self, id: &JobId) -> PathBuf {
+        self.job_dir(id).join("left.json")
+    }
+
+    pub fn left(&self, id: &JobId) -> Result<Option<Vec<crate::snapshot::Left>>, StoreError> {
+        Ok(crate::state_file::read_json(&self.left_path(id))?)
+    }
+
+    #[must_use]
     pub fn alive_path(&self, id: &JobId) -> PathBuf {
         self.root.join("live").join(format!("{id}.lock"))
     }

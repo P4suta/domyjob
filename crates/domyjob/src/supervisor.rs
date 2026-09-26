@@ -511,6 +511,11 @@ impl Supervisor {
                 }
             }
         };
+        if let Err(error) = self.record_left() {
+            self.shared.say(&format!(
+                "what the job changed could not be kept, so pull needs its workspace: {error}"
+            ));
+        }
         if let Err(error) = self.cleanup() {
             self.shared.say(&format!("cleaning up: {error}"));
         }
@@ -767,6 +772,35 @@ impl Supervisor {
         crate::state_file::write_json(&state, &applied)?;
         crate::state_file::write_bytes(&filled_by_path(root), self.spec.id.as_str().as_bytes())?;
         Ok(())
+    }
+
+    fn record_left(&self) -> Result<(), NodeError> {
+        let Location::Snapshot { source, .. } = &self.spec.location else {
+            return Ok(());
+        };
+        let Some(root) =
+            crate::state_file::read_bytes(&self.store.workspace_record(&self.spec.id))?
+        else {
+            return Ok(());
+        };
+        let root = PathBuf::from(String::from_utf8_lossy(&root).trim());
+        let Some(workspace) = crate::workspace::Workspace::open_existing(&root)? else {
+            return Ok(());
+        };
+        let sent = self.cas.manifest(&source.manifest)?;
+        let left = workspace.left(&sent)?;
+        for item in &left {
+            if let Some(crate::snapshot::Entry::File { blob, size, .. }) = &item.now
+                && !self.cas.has(blob)?
+            {
+                let mut file = workspace.open_file(&item.path)?;
+                self.cas.receive(&mut file, blob, *size)?;
+            }
+        }
+        Ok(crate::state_file::write_json(
+            &self.store.left_path(&self.spec.id),
+            &left,
+        )?)
     }
 
     fn cleanup(&self) -> Result<(), NodeError> {

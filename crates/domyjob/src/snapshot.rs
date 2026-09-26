@@ -129,6 +129,7 @@ pub struct Changed {
 }
 
 impl crate::ingress::Ingress for Changed {}
+impl crate::ingress::Ingress for Left {}
 
 fn metadata(name: &str) -> bool {
     METADATA_DIRS.contains(&name)
