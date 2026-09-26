@@ -372,9 +372,10 @@ fn fetch(
 }
 
 struct ArchiveRequest<'a> {
+    manifest: &'a Verified<Manifest>,
+    target: &'a TargetTriple,
     bindings: &'a Bindings,
     dir: &'a Path,
-    expected_sha256: &'a str,
     failures: [String; 2],
 }
 
@@ -383,11 +384,18 @@ fn fetch_archive(
     request: ArchiveRequest<'_>,
 ) -> Result<PathBuf, DistError> {
     let ArchiveRequest {
+        manifest,
+        target,
         bindings,
         dir,
-        expected_sha256,
         failures: [download_failure, unpack_failure],
     } = request;
+    let expected_sha256 = &manifest
+        .get()
+        .targets
+        .get(target)
+        .ok_or_else(|| DistError::NoTarget(target.clone()))?
+        .archive_sha256;
     let archive = dir.join("archive");
     if !fetch(
         distribution,
@@ -502,17 +510,13 @@ fn download(
         Err(DistError::Io { .. } | DistError::Digest { .. }) => {}
         Err(other) => return Err(other),
     }
-    let digests = manifest
-        .get()
-        .targets
-        .get(target)
-        .ok_or_else(|| DistError::NoTarget(target.clone()))?;
     fetch_archive(
         distribution,
         ArchiveRequest {
+            manifest: &manifest,
+            target,
             bindings: &bindings,
             dir: &dir,
-            expected_sha256: &digests.archive_sha256,
             failures: [
                 format!("downloading the {target} archive"),
                 format!("unpacking {}", dir.join("archive").display()),
@@ -611,17 +615,13 @@ pub fn self_update(
         .with("version", Arg::version(&found))
         .with("target", Arg::word(&target))
         .with("exe", Arg::literal(exe));
-    let digests = manifest
-        .get()
-        .targets
-        .get(&target)
-        .ok_or_else(|| DistError::NoTarget(target.clone()))?;
     fetch_archive(
         distribution,
         ArchiveRequest {
+            manifest: &manifest,
+            target: &target,
             bindings: &bindings,
             dir: &dir,
-            expected_sha256: &digests.archive_sha256,
             failures: [
                 "downloading the update".to_owned(),
                 "unpacking the update".to_owned(),

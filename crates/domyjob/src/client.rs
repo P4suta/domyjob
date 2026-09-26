@@ -402,20 +402,28 @@ fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBu
     Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
 }
 
+fn snapshot_at(
+    config: &Config,
+    root: &Path,
+    rev: Option<&crate::domain::Revision>,
+) -> Result<Snapshot, ClientError> {
+    Ok(match rev {
+        None => snapshot::from_directory(root)?,
+        Some(rev) => {
+            let detected = snapshot::detect(config, root)?
+                .ok_or_else(|| SnapshotError::NoSource(root.to_path_buf()))?;
+            snapshot::from_revision(&detected, rev)?
+        }
+    })
+}
+
 pub fn source_archive(
     ctx: &Context,
     start: &Path,
     rev: Option<&crate::domain::Revision>,
 ) -> Result<Vec<u8>, ClientError> {
     let root = root_of(start, None, &ctx.config)?;
-    let snapshot = match rev {
-        None => snapshot::from_directory(&root)?,
-        Some(rev) => {
-            let detected = snapshot::detect(&ctx.config, &root)?
-                .ok_or_else(|| SnapshotError::NoSource(root.clone()))?;
-            snapshot::from_revision(&detected, rev)?
-        }
-    };
+    let snapshot = snapshot_at(&ctx.config, &root, rev)?;
     Ok(snapshot::archive(&snapshot)?)
 }
 
@@ -535,14 +543,7 @@ pub fn prepare(ctx: &Context, order: &Order) -> Result<Option<Prepared>, ClientE
     };
     let root = std::fs::canonicalize(project_root(&order, &ctx.config)?)
         .map_err(io("resolving", &order.start))?;
-    let snapshot = match &order.rev {
-        None => snapshot::from_directory(&root)?,
-        Some(rev) => {
-            let detected = snapshot::detect(&ctx.config, &root)?
-                .ok_or_else(|| SnapshotError::NoSource(root.clone()))?;
-            snapshot::from_revision(&detected, rev)?
-        }
-    };
+    let snapshot = snapshot_at(&ctx.config, &root, order.rev.as_ref())?;
     let subdir = match order.start.strip_prefix(&root) {
         Ok(inner) if inner.as_os_str().is_empty() => None,
         Ok(_) => Some(snapshot::relative(&root, &order.start)?),
