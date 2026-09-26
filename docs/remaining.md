@@ -50,7 +50,7 @@ Not covered yet:
 
 ## Duplication
 
-jscpd's threshold is 1.58%.
+jscpd's threshold is 1.46%.
 Groups still duplicated: running a process and reading its status and output, retry loops, directory listings, digests, lock naming, submit then wait then notify, hex and random and versions, name coercion, test fixtures, the remote layout.
 
 ## Operations

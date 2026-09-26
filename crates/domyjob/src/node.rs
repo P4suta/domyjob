@@ -1455,13 +1455,12 @@ mod tests {
         }
     }
 
-    fn published(root: &Path, log: &[u8]) -> (Node, JobRef) {
+    fn staged(root: &Path, id: &JobId, script: &str) -> Store {
         let store = Store::open(&dirs(root)).unwrap();
-        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         let spec = Spec {
             id: id.clone(),
             name: None,
-            command: Command::Script("true".into()),
+            command: Command::Script(script.into()),
             location: Location::Home,
             env_names: std::collections::BTreeSet::new(),
             shell: None,
@@ -1476,6 +1475,12 @@ mod tests {
                 (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
             )
             .unwrap();
+        store
+    }
+
+    fn published(root: &Path, log: &[u8]) -> (Node, JobRef) {
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let store = staged(root, &id, "true");
         store.publish(&id).unwrap();
         store
             .set_phase(
@@ -2591,25 +2596,7 @@ mod tests {
     const SUPERVISED: &str = "0BBBBBBBBBBBBBBB";
 
     fn one_queued_job(root: &Path) {
-        let store = Store::open(&dirs(root)).unwrap();
-        let spec = Spec {
-            id: SUPERVISED.parse().unwrap(),
-            name: None,
-            command: Command::Script("exit 0".into()),
-            location: Location::Home,
-            env_names: std::collections::BTreeSet::new(),
-            shell: None,
-            concurrency: Concurrency::DEFAULT,
-            sequence: 1,
-            submitted_by: authz::Submitter::Owner,
-            submitted_at: Timestamp::observe(),
-        };
-        store
-            .stage(
-                &spec,
-                (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
-            )
-            .unwrap();
+        staged(root, &SUPERVISED.parse().unwrap(), "exit 0");
     }
 
     fn supervise_the_queued_job(node: &Node) {
@@ -2643,19 +2630,10 @@ mod tests {
     #[test]
     fn a_job_whose_supervisor_vanished_while_running_is_closed_not_rerun() {
         let tmp = tempfile::tempdir().unwrap();
-        let (node, job) = published(tmp.path(), b"");
+        one_running_job(tmp.path());
+        let node = Node::open(dirs(tmp.path())).unwrap();
         let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id = store.resolve(&job).unwrap();
-        store
-            .set_phase(
-                &id,
-                &Phase::Running {
-                    started_at: Timestamp::at_millis(1),
-                    pid: 1,
-                    workspace: "w".into(),
-                },
-            )
-            .unwrap();
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         node.upkeep(&Commanded(()));
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
