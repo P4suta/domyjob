@@ -103,6 +103,7 @@ schemars = "1"
 semver = "1"
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
+tar = { version = "0.4", default-features = false }
 uds_windows = "1.2"
 sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
 fs4 = { version = "1", default-features = false, features = ["sync"] }

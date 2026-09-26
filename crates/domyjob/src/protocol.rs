@@ -30,6 +30,12 @@ pub fn wire() -> &'static str {
 }
 
 #[must_use]
+pub fn build_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| format!("{VERSION}-{}", wire()))
+}
+
+#[must_use]
 pub fn is_newer(theirs: &str) -> bool {
     match (
         semver::Version::parse(theirs),

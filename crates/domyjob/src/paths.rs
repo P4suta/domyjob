@@ -104,27 +104,25 @@ impl Family {
 
     #[must_use]
     pub fn remote_bin(self) -> crate::template::Arg {
-        use crate::protocol::VERSION;
+        let key = crate::protocol::build_key();
         match self {
-            Self::Unix => {
-                crate::template::Arg::joined(&[".cache/domyjob/bin/", VERSION, "/domyjob"])
-            }
+            Self::Unix => crate::template::Arg::joined(&[".cache/domyjob/bin/", key, "/domyjob"]),
             Self::Windows => {
-                crate::template::Arg::joined(&[".cache/domyjob/bin/", VERSION, "/domyjob.exe"])
+                crate::template::Arg::joined(&[".cache/domyjob/bin/", key, "/domyjob.exe"])
             }
         }
     }
 
     #[must_use]
     pub fn invoke(self) -> crate::template::Arg {
-        use crate::protocol::VERSION;
+        let key = crate::protocol::build_key();
         match self {
             Self::Unix => {
-                crate::template::Arg::joined(&["./.cache/domyjob/bin/", VERSION, "/domyjob node"])
+                crate::template::Arg::joined(&["./.cache/domyjob/bin/", key, "/domyjob node"])
             }
             Self::Windows => crate::template::Arg::joined(&[
                 ".\\.cache\\domyjob\\bin\\",
-                VERSION,
+                key,
                 "\\domyjob.exe node",
             ]),
         }
@@ -172,14 +170,15 @@ mod tests {
 
     #[test]
     fn remote_invocations_suit_each_shell_family() {
-        let version = crate::protocol::VERSION;
+        let key = crate::protocol::build_key();
+        assert!(key.starts_with(crate::protocol::VERSION));
         assert_eq!(
             Family::Unix.invoke().as_arg_str(),
-            format!("./.cache/domyjob/bin/{version}/domyjob node")
+            format!("./.cache/domyjob/bin/{key}/domyjob node")
         );
         assert_eq!(
             Family::Windows.invoke().as_arg_str(),
-            format!(".\\.cache\\domyjob\\bin\\{version}\\domyjob.exe node")
+            format!(".\\.cache\\domyjob\\bin\\{key}\\domyjob.exe node")
         );
     }
 }

@@ -22,14 +22,8 @@ pub const FAMILY: Family = if cfg!(windows) {
 pub const LINKS: bool = FAMILY.links();
 pub const MODES: bool = FAMILY.modes();
 
-const REGULAR: u32 = 0o644;
-const EXECUTABLE: u32 = 0o755;
-
 const fn bits(mode: Mode) -> u32 {
-    match mode {
-        Mode::Regular => REGULAR,
-        Mode::Executable => EXECUTABLE,
-    }
+    mode.unix_bits()
 }
 
 const fn mode_from(bits: u32) -> Mode {
@@ -63,7 +57,7 @@ fn std_bits(meta: &std::fs::Metadata) -> u32 {
 
 #[cfg(not(unix))]
 const fn std_bits(_meta: &std::fs::Metadata) -> u32 {
-    REGULAR
+    Mode::Regular.unix_bits()
 }
 
 #[cfg(unix)]
@@ -73,7 +67,7 @@ fn cap_bits(meta: &cap_std::fs::Metadata) -> u32 {
 
 #[cfg(not(unix))]
 const fn cap_bits(_meta: &cap_std::fs::Metadata) -> u32 {
-    REGULAR
+    Mode::Regular.unix_bits()
 }
 
 pub fn create_as(options: &mut cap_std::fs::OpenOptions, mode: Mode) {

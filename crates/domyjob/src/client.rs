@@ -372,6 +372,23 @@ fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBu
     Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
 }
 
+pub fn source_archive(
+    ctx: &Context,
+    start: &Path,
+    rev: Option<&crate::domain::Revision>,
+) -> Result<Vec<u8>, ClientError> {
+    let root = root_of(start, None, &ctx.config)?;
+    let snapshot = match rev {
+        None => snapshot::from_directory(&root)?,
+        Some(rev) => {
+            let detected = snapshot::detect(&ctx.config, &root)?
+                .ok_or_else(|| SnapshotError::NoSource(root.clone()))?;
+            snapshot::from_revision(&detected, rev)?
+        }
+    };
+    Ok(snapshot::archive(&snapshot)?)
+}
+
 pub fn project_here(
     ctx: &Context,
     start: &Path,

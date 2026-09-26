@@ -21,32 +21,46 @@ pub enum Kind {
     Internal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnosis {
     pub kind: Kind,
-    pub hint: Option<&'static str>,
+    pub hint: Option<String>,
+}
+
+const SLOT: &str = "{machine}";
+
+impl Diagnosis {
+    #[must_use]
+    pub fn about(self, machine: Option<&str>) -> Self {
+        Self {
+            kind: self.kind,
+            hint: self
+                .hint
+                .map(|hint| hint.replace(SLOT, machine.unwrap_or("<machine>"))),
+        }
+    }
 }
 
 const fn plain(kind: Kind) -> Diagnosis {
     Diagnosis { kind, hint: None }
 }
 
-const fn hinted(kind: Kind, hint: &'static str) -> Diagnosis {
+fn hinted(kind: Kind, hint: &'static str) -> Diagnosis {
     Diagnosis {
         kind,
-        hint: Some(hint),
+        hint: Some(hint.to_owned()),
     }
 }
 
 #[must_use]
-pub const fn of_refusal(code: RefusalCode) -> Diagnosis {
+pub fn of_refusal(code: RefusalCode) -> Diagnosis {
     match code {
         RefusalCode::NoSuchJob => hinted(
             Kind::NotFound,
             "`domyjob ls` lists the jobs each machine has",
         ),
         RefusalCode::AmbiguousJob => {
-            hinted(Kind::Ambiguous, "give more of the job id, or MACHINE:ID")
+            hinted(Kind::Ambiguous, "give more of the job id, or {machine}:ID")
         }
         RefusalCode::Forbidden => hinted(
             Kind::Forbidden,
@@ -59,7 +73,7 @@ pub const fn of_refusal(code: RefusalCode) -> Diagnosis {
         ),
         RefusalCode::NoSuchPath => hinted(
             Kind::NotFound,
-            "paths are relative to the directory the job ran in; `domyjob run MACHINE -- ls` shows what is there",
+            "paths are relative to the directory the job ran in; `domyjob run {machine} -- ls` shows what is there",
         ),
         RefusalCode::NotAFile => hinted(
             Kind::Usage,
@@ -67,7 +81,7 @@ pub const fn of_refusal(code: RefusalCode) -> Diagnosis {
         ),
         RefusalCode::Paused => hinted(
             Kind::Remote,
-            "the machine is paused for maintenance; `domyjob machines resume MACHINE` lets it take jobs again",
+            "the machine is paused for maintenance; `domyjob machines resume {machine}` lets it take jobs again",
         ),
         RefusalCode::DiskFull => hinted(
             Kind::Remote,
@@ -80,7 +94,11 @@ pub const fn of_refusal(code: RefusalCode) -> Diagnosis {
 }
 
 #[must_use]
-pub const fn of_remote(error: &RemoteError) -> Diagnosis {
+pub fn of_remote(error: &RemoteError) -> Diagnosis {
+    remote_template(error).about(error.machine())
+}
+
+fn remote_template(error: &RemoteError) -> Diagnosis {
     match error {
         RemoteError::Config(_) | RemoteError::Template { .. } | RemoteError::Empty { .. } => {
             plain(Kind::Config)
@@ -88,13 +106,13 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
         RemoteError::Start { .. } | RemoteError::Pipe { .. } | RemoteError::Exited { .. } => {
             hinted(
                 Kind::Unreachable,
-                "check that `ssh MACHINE` works on its own, or that the paired machine is serving",
+                "check that `ssh {machine}` works on its own, or that the paired machine is serving",
             )
         }
         RemoteError::Probe { .. } => plain(Kind::Unreachable),
         RemoteError::Silent { .. } => hinted(
             Kind::Unreachable,
-            "`ssh MACHINE domyjob node` shows whether it starts at all; an overloaded or wedged machine answers ssh but runs nothing",
+            "an overloaded or wedged machine answers ssh but runs nothing; `domyjob doctor {machine}` checks it again",
         ),
         RemoteError::Unreadable { .. } => plain(Kind::Remote),
         RemoteError::Stream { problem, .. } => match problem {
@@ -113,7 +131,7 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
         | RemoteError::Unexpected { .. }
         | RemoteError::Protocol { .. } => hinted(
             Kind::Protocol,
-            "the machine runs a different domyjob; `domyjob setup MACHINE` installs the matching one",
+            "the machine runs a different domyjob; `domyjob setup {machine}` installs the matching one",
         ),
         RemoteError::Refused { refusal, .. } => of_refusal(refusal.code),
         RemoteError::Dist(_) => plain(Kind::Distribution),
@@ -123,11 +141,11 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
         ),
         RemoteError::Unbuilt { .. } => hinted(
             Kind::Distribution,
-            "build this version on that machine and run `domyjob setup MACHINE --from PATH --insecure-unsigned`",
+            "from domyjob's own source checkout, `domyjob setup {machine} --build` builds and installs the matching one there",
         ),
         RemoteError::Outdated { .. } => hinted(
             Kind::Protocol,
-            "build this version for that machine and run `domyjob setup MACHINE --from PATH --insecure-unsigned`, or install a signed release",
+            "from domyjob's own source checkout, `domyjob setup {machine} --build` builds and installs the matching one there, or install a signed release",
         ),
         RemoteError::Tampered { .. }
         | RemoteError::AuditRolledBack { .. }
@@ -139,7 +157,7 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
 }
 
 #[must_use]
-pub const fn of_client(error: &ClientError) -> Diagnosis {
+pub fn of_client(error: &ClientError) -> Diagnosis {
     match error {
         ClientError::Remote(remote) => of_remote(remote),
         ClientError::Config(crate::config::ConfigError::Unknown { .. }) => hinted(
@@ -160,7 +178,7 @@ pub const fn of_client(error: &ClientError) -> Diagnosis {
         ),
         ClientError::Ambiguous { .. } => hinted(
             Kind::Ambiguous,
-            "name one of them as MACHINE:ID, for example the first one listed",
+            "name one of them as {machine}:ID, for example the first one listed",
         ),
         ClientError::Snapshot(_)
         | ClientError::Io { .. }
@@ -179,7 +197,7 @@ pub const fn of_client(error: &ClientError) -> Diagnosis {
 }
 
 #[must_use]
-pub const fn of_pull(error: &crate::pull::PullError) -> Diagnosis {
+pub fn of_pull(error: &crate::pull::PullError) -> Diagnosis {
     use crate::pull::PullError;
     let (kind, hint) = match error {
         PullError::Diverged(_) => (
@@ -207,5 +225,27 @@ pub const fn of_pull(error: &crate::pull::PullError) -> Diagnosis {
         | PullError::Lock(_)
         | PullError::Tree(_) => (Kind::Local, None),
     };
-    Diagnosis { kind, hint }
+    Diagnosis {
+        kind,
+        hint: hint.map(str::to_owned),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hint_names_the_machine_it_is_about_and_leaves_no_placeholder() {
+        let unbuilt = RemoteError::Unbuilt {
+            machine: "linux".to_owned(),
+            was: String::new(),
+        };
+        let hint = of_remote(&unbuilt).hint.unwrap();
+        assert!(hint.contains("domyjob setup linux --build"), "{hint}");
+        let unknown = of_refusal(RefusalCode::Paused).about(None).hint.unwrap();
+        assert!(unknown.contains("<machine>"), "{unknown}");
+        let placeholder = "machine".to_uppercase();
+        assert!(!include_str!("diagnosis.rs").contains(&placeholder));
+    }
 }
