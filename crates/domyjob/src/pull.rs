@@ -237,7 +237,9 @@ impl<Towards: Direction> Plan<Towards> {
         let unplaceable: Vec<RelPath> = self
             .steps
             .iter()
-            .filter(|step| !cfg!(unix) && matches!(step.after, Some(Entry::Symlink { .. })))
+            .filter(|step| {
+                !crate::platform::LINKS && matches!(step.after, Some(Entry::Symlink { .. }))
+            })
             .map(|step| step.path.clone())
             .collect();
         if !unplaceable.is_empty() {
@@ -662,7 +664,7 @@ impl Tree {
     fn write_new(&self, staging: &Path, bytes: &[u8], mode: Mode) -> Result<(), PullError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        set_mode(&mut options, mode);
+        crate::platform::create_as(&mut options, mode);
         let mut file = self
             .dir
             .open_with(staging, &options)
@@ -671,18 +673,9 @@ impl Tree {
             .map_err(io("writing", &self.root.join(staging)))
     }
 
-    #[cfg(unix)]
     fn symlink(&self, target: &str, staging: &Path) -> Result<(), PullError> {
-        self.dir
-            .symlink_contents(target, staging)
+        crate::platform::link(&self.dir, target, staging)
             .map_err(io("linking", &self.root.join(staging)))
-    }
-
-    #[cfg(not(unix))]
-    fn symlink(&self, target: &str, staging: &Path) -> Result<(), PullError> {
-        Err(io("linking", &self.root.join(staging))(
-            std::io::Error::other(format!("a symbolic link to {target} cannot be made here")),
-        ))
     }
 
     fn replace(&self, staging: &Path, rel: &RelPath) -> Result<(), PullError> {
@@ -692,28 +685,8 @@ impl Tree {
     }
 }
 
-#[cfg(unix)]
-fn set_mode(options: &mut OpenOptions, mode: Mode) {
-    use cap_std::fs::OpenOptionsExt as _;
-    options.mode(match mode {
-        Mode::Regular => 0o644,
-        Mode::Executable => 0o755,
-    });
-}
-
-#[cfg(not(unix))]
-const fn set_mode(_options: &mut OpenOptions, _mode: Mode) {}
-
-#[cfg(unix)]
 fn same_mode(meta: &cap_std::fs::Metadata, mode: Mode) -> bool {
-    use cap_std::fs::PermissionsExt as _;
-    let executable = meta.permissions().mode() & 0o111 != 0;
-    executable == (mode == Mode::Executable)
-}
-
-#[cfg(not(unix))]
-const fn same_mode(_meta: &cap_std::fs::Metadata, _mode: Mode) -> bool {
-    true
+    !crate::platform::MODES || crate::platform::Moded::mode(meta) == mode
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,9 +891,10 @@ mod tests {
     type Layout = BTreeMap<RelPath, Node>;
 
     fn node() -> impl Strategy<Value = Node> {
-        let file = (0..CONTENTS.len(), any::<bool>())
-            .prop_map(|(content, executable)| Node::File(content, cfg!(unix) && executable));
-        if cfg!(unix) {
+        let file = (0..CONTENTS.len(), any::<bool>()).prop_map(|(content, executable)| {
+            Node::File(content, crate::platform::MODES && executable)
+        });
+        if crate::platform::LINKS {
             prop_oneof![3 => file, 1 => (0..TARGETS.len()).prop_map(Node::Link)].boxed()
         } else {
             file.boxed()
@@ -972,19 +946,15 @@ mod tests {
             match node {
                 Node::File(content, executable) => {
                     std::fs::write(&at, CONTENTS.get(*content).unwrap()).unwrap();
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt as _;
-                        let bits = if *executable { 0o755 } else { 0o644 };
-                        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(bits))
-                            .unwrap();
-                    }
+                    let mode = if *executable {
+                        Mode::Executable
+                    } else {
+                        Mode::Regular
+                    };
+                    crate::platform::set_mode(&at, mode).unwrap();
                 }
                 Node::Link(target) => {
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(TARGETS.get(*target).unwrap(), &at).unwrap();
-                    #[cfg(not(unix))]
-                    let _ = target;
+                    crate::platform::make_link(TARGETS.get(*target).unwrap(), &at).unwrap();
                 }
             }
         }
@@ -1024,15 +994,8 @@ mod tests {
         found
     }
 
-    #[cfg(unix)]
     fn executable(meta: &std::fs::Metadata) -> bool {
-        use std::os::unix::fs::PermissionsExt as _;
-        meta.permissions().mode() & 0o111 != 0
-    }
-
-    #[cfg(not(unix))]
-    fn executable(_meta: &std::fs::Metadata) -> bool {
-        false
+        crate::platform::Moded::mode(meta) == Mode::Executable
     }
 
     fn expected(layout: &Layout) -> BTreeMap<String, Found> {
@@ -1169,7 +1132,7 @@ mod tests {
         let file = |content: usize| Node::File(content, false);
         let sent: Layout = [("a".parse().unwrap(), file(1))].into();
         let mut local = sent.clone();
-        if cfg!(unix) {
+        if crate::platform::LINKS {
             local.insert("l".parse().unwrap(), Node::Link(0));
         }
         lay_out(&root, &local);
@@ -1201,7 +1164,7 @@ mod tests {
         ]
         .into();
         let after: Layout = [
-            ("a".parse().unwrap(), Node::File(1, cfg!(unix))),
+            ("a".parse().unwrap(), Node::File(1, crate::platform::MODES)),
             ("d/x".parse().unwrap(), Node::File(3, false)),
         ]
         .into();
@@ -1210,7 +1173,7 @@ mod tests {
             .iter()
             .map(|step| step.kind().letter())
             .collect();
-        assert_eq!(kinds, if cfg!(unix) { "MDA" } else { "DA" });
+        assert_eq!(kinds, if crate::platform::MODES { "MDA" } else { "DA" });
         assert!(plan(&sent, &sent).steps().is_empty());
     }
 }

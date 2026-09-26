@@ -124,7 +124,10 @@ impl Workspace {
         };
         match entry {
             Entry::File { blob, size, mode } => {
-                if !meta.is_file() || meta.len() != *size || mode_of(&meta) != *mode {
+                if !meta.is_file()
+                    || meta.len() != *size
+                    || crate::platform::Moded::mode(&meta) != *mode
+                {
                     return Ok(false);
                 }
                 self.content_is(path, blob)
@@ -133,13 +136,19 @@ impl Workspace {
         }
     }
 
-    #[cfg(unix)]
     fn holds_link(
         &self,
         path: &Path,
         meta: &cap_std::fs::Metadata,
         target: &str,
     ) -> Result<bool, WorkspaceError> {
+        if !crate::platform::LINKS {
+            return if meta.is_file() && meta.len() == crate::domain::len_u64(target.len()) {
+                self.content_is(path, &crate::domain::BlobId::of(target.as_bytes()))
+            } else {
+                Ok(false)
+            };
+        }
         if !meta.is_symlink() {
             return Ok(false);
         }
@@ -148,19 +157,6 @@ impl Workspace {
             .read_link_contents(path)
             .map_err(io("reading", path))?;
         Ok(found.as_os_str() == target)
-    }
-
-    #[cfg(not(unix))]
-    fn holds_link(
-        &self,
-        path: &Path,
-        meta: &cap_std::fs::Metadata,
-        target: &str,
-    ) -> Result<bool, WorkspaceError> {
-        if !meta.is_file() || meta.len() != crate::domain::len_u64(target.len()) {
-            return Ok(false);
-        }
-        self.content_is(path, &crate::domain::BlobId::of(target.as_bytes()))
     }
 
     fn clear(&self, path: &Path) -> Result<(), WorkspaceError> {
@@ -205,7 +201,7 @@ impl Workspace {
     fn write_file(&self, path: &Path, bytes: &[u8], mode: Mode) -> Result<(), WorkspaceError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        set_mode(&mut options, mode);
+        crate::platform::create_as(&mut options, mode);
         let mut file = self
             .dir
             .open_with(path, &options)
@@ -222,16 +218,12 @@ impl Workspace {
         }
     }
 
-    #[cfg(unix)]
     fn place_symlink(&self, target: &str, path: &Path) -> Result<(), WorkspaceError> {
-        self.dir
-            .symlink_contents(target, path)
-            .map_err(io("linking", path))
-    }
-
-    #[cfg(not(unix))]
-    fn place_symlink(&self, target: &str, path: &Path) -> Result<(), WorkspaceError> {
-        self.write_file(path, target.as_bytes(), Mode::Regular)
+        if crate::platform::LINKS {
+            crate::platform::link(&self.dir, target, path).map_err(io("linking", path))
+        } else {
+            self.write_file(path, target.as_bytes(), Mode::Regular)
+        }
     }
 
     fn remove_emptied(&self, path: &Path) {
@@ -347,7 +339,7 @@ impl Workspace {
         Ok(Some(Entry::File {
             blob: self.digest(path)?,
             size: meta.len(),
-            mode: mode_of(&meta),
+            mode: crate::platform::Moded::mode(&meta),
         }))
     }
 
@@ -360,33 +352,6 @@ impl Workspace {
         let file = self.dir.open(&path).map_err(io("opening", &path))?;
         Ok(file.into_std())
     }
-}
-
-#[cfg(unix)]
-fn set_mode(options: &mut OpenOptions, mode: Mode) {
-    use cap_std::fs::OpenOptionsExt;
-    options.mode(match mode {
-        Mode::Regular => 0o644,
-        Mode::Executable => 0o755,
-    });
-}
-
-#[cfg(not(unix))]
-const fn set_mode(_options: &mut OpenOptions, _mode: Mode) {}
-
-#[cfg(unix)]
-fn mode_of(meta: &cap_std::fs::Metadata) -> Mode {
-    use cap_std::fs::PermissionsExt;
-    if meta.permissions().mode() & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
-    }
-}
-
-#[cfg(not(unix))]
-const fn mode_of(_meta: &cap_std::fs::Metadata) -> Mode {
-    Mode::Regular
 }
 
 #[cfg(test)]
@@ -508,7 +473,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_link_to_an_absolute_target_is_placed_and_then_recognised() {
         let tmp = tempfile::tempdir().unwrap();
@@ -540,15 +504,18 @@ mod tests {
         assert!(ws.left(&manifest).unwrap().is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinks_left_by_a_job_cannot_carry_writes_or_reads_outside() {
+        if !crate::platform::LINKS {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret"), "private").unwrap();
         let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
-        std::os::unix::fs::symlink(&outside, ws.root().join("escape")).unwrap();
+        crate::platform::make_link(&outside.display().to_string(), &ws.root().join("escape"))
+            .unwrap();
         ws.open_file(&"escape/secret".parse().unwrap()).unwrap_err();
 
         let cas = Cas::open(tmp.path().join("cas")).unwrap();

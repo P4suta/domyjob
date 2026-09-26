@@ -162,21 +162,6 @@ pub struct Snapshot {
     pub revision: Revision,
 }
 
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> Mode {
-    use std::os::unix::fs::PermissionsExt;
-    if meta.permissions().mode() & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
-    }
-}
-
-#[cfg(not(unix))]
-const fn mode_of(_meta: &std::fs::Metadata) -> Mode {
-    Mode::Regular
-}
-
 pub fn relative(root: &Path, path: &Path) -> Result<RelPath, SnapshotError> {
     let unportable = || SnapshotError::Unportable(path.to_path_buf());
     let inner = path.strip_prefix(root).map_err(|_outside| unportable())?;
@@ -271,7 +256,7 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     Ok(Found::Hash(Pending {
         rel,
         path: path.to_path_buf(),
-        mode: mode_of(&meta),
+        mode: crate::platform::Moded::mode(&meta),
     }))
 }
 
@@ -648,6 +633,7 @@ mod tests {
         reason = "the test builds a fixture repository with the real git"
     )]
     fn run(dir: &Path, program: &str, args: &[&str]) {
+        let no_settings = tempfile::NamedTempFile::new().unwrap();
         let out = std::process::Command::new(program)
             .current_dir(dir)
             .args(args)
@@ -655,10 +641,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", no_settings.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
