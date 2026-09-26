@@ -364,9 +364,8 @@ fn fetch(
     url: crate::template::Rendered,
     output: &Path,
 ) -> Result<bool, DistError> {
-    let mut partial = output.as_os_str().to_owned();
-    partial.push(".part");
-    let partial = PathBuf::from(partial);
+    let partial =
+        crate::durable::beside(output, "part").map_err(crate::state_file::StateError::from)?;
     let bindings = Bindings::new()
         .with("url", Arg::rendered(url))
         .with("output", Arg::path(&partial));
