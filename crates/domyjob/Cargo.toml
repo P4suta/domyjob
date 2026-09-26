@@ -17,6 +17,9 @@ name = "domyjob"
 path = "src/main.rs"
 doc = false
 
+[features]
+failpoints = ["dep:fail", "fail/failpoints"]
+
 [dependencies]
 anstream.workspace = true
 anstyle.workspace = true
@@ -38,7 +41,7 @@ terminal_size.workspace = true
 unicode-width.workspace = true
 vte.workspace = true
 data-encoding.workspace = true
-fail.workspace = true
+fail = { workspace = true, optional = true }
 fs4.workspace = true
 data-encoding-macro.workspace = true
 jiff.workspace = true
@@ -77,8 +80,12 @@ windows-spawn.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+fail = { workspace = true, features = ["failpoints"] }
 proptest.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+blake3.workspace = true
 
 [lints]
 workspace = true

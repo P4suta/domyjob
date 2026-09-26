@@ -120,7 +120,7 @@ terminal_size = "0.4"
 unicode-width = "0.2"
 vte = "0.15"
 clap_mangen = "0.3"
-fail = { version = "0.5", features = ["failpoints"] }
+fail = "0.5"
 data-encoding = "2.11"
 data-encoding-macro = "0.1"
 shlex = "2"

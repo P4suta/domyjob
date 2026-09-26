@@ -170,3 +170,126 @@ fetch = [
 ]
 unpack = ["tar", "-xzf", "{archive}", "-C", "{dir}"]
 binary = "domyjob-{target}/domyjob{exe}"
+
+[services.linux]
+file = "{home}/.config/systemd/user/domyjob.service"
+contents = '''[Unit]
+Description=domyjob serve
+After=network-online.target
+
+[Service]
+ExecStart="{exe}" serve {arguments}
+Restart=on-failure
+KillMode=process
+
+[Install]
+WantedBy=default.target
+'''
+install = [
+  { run = [
+    "systemctl",
+    "--user",
+    "daemon-reload",
+  ], tolerate_failure = false },
+  { run = [
+    "systemctl",
+    "--user",
+    "enable",
+    "--now",
+    "domyjob.service",
+  ], tolerate_failure = false },
+]
+uninstall = [
+  { run = [
+    "systemctl",
+    "--user",
+    "disable",
+    "--now",
+    "domyjob.service",
+  ], tolerate_failure = false },
+]
+installed = "systemd user unit {home}/.config/systemd/user/domyjob.service; `loginctl enable-linger` keeps it running without a login"
+
+[services.macos]
+file = "{home}/Library/LaunchAgents/dev.domyjob.serve.plist"
+contents = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>dev.domyjob.serve</string>
+<key>ProgramArguments</key><array><string>{exe_xml}</string><string>serve</string>{plist_arguments}</array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>{log_xml}</string>
+<key>StandardErrorPath</key><string>{log_xml}</string>
+</dict></plist>
+'''
+install = [
+  { run = [
+    "launchctl",
+    "bootout",
+    "gui/{uid}",
+    "{home}/Library/LaunchAgents/dev.domyjob.serve.plist",
+  ], tolerate_failure = true, note = "no earlier agent was loaded" },
+  { run = [
+    "launchctl",
+    "bootstrap",
+    "gui/{uid}",
+    "{home}/Library/LaunchAgents/dev.domyjob.serve.plist",
+  ], tolerate_failure = false },
+]
+uninstall = [
+  { run = [
+    "launchctl",
+    "bootout",
+    "gui/{uid}",
+    "{home}/Library/LaunchAgents/dev.domyjob.serve.plist",
+  ], tolerate_failure = false },
+]
+installed = "launch agent {home}/Library/LaunchAgents/dev.domyjob.serve.plist, logging to {log}"
+
+[services.windows]
+probe = ["schtasks", "/Query", "/TN", "domyjob-serve"]
+install = [
+  { run = [
+    "schtasks",
+    "/Create",
+    "/F",
+    "/SC",
+    "ONLOGON",
+    "/RL",
+    "LIMITED",
+    "/TN",
+    "domyjob-serve",
+    "/TR",
+    "{action}",
+  ], tolerate_failure = false },
+  { run = [
+    "powershell",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Set-ScheduledTask -TaskName domyjob-serve -Settings $s | Out-Null",
+  ], tolerate_failure = true, note = "the task may stop after 72 hours or on battery, because relaxing its limits failed" },
+  { run = [
+    "schtasks",
+    "/Run",
+    "/TN",
+    "domyjob-serve",
+  ], tolerate_failure = false },
+]
+uninstall = [
+  { run = [
+    "schtasks",
+    "/End",
+    "/TN",
+    "domyjob-serve",
+  ], tolerate_failure = true, note = "the task was not running" },
+  { run = [
+    "schtasks",
+    "/Delete",
+    "/F",
+    "/TN",
+    "domyjob-serve",
+  ], tolerate_failure = false },
+]
+installed = "scheduled task domyjob-serve; Windows Defender Firewall will ask before the port is reachable"

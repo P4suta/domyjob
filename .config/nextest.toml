@@ -4,3 +4,12 @@ fail-fast = false
 status-level = "fail"
 final-status-level = "fail"
 leak-timeout = { period = "1s", result = "fail" }
+
+[test-groups]
+crash-matrix = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "test(/a_crash_at_any_step/)"
+test-group = "crash-matrix"
+priority = 100
+slow-timeout = { period = "60s", terminate-after = 10 }

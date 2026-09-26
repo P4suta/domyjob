@@ -44,4 +44,9 @@ Add a host your ssh config knows with `domyjob machines add NAME`, or reach it d
 
 `domyjob --help` and `domyjob COMMAND --help` explain the rest; `domyjob man` prints the manual page.
 
+For a pipeline whose status must include domyjob's result, enable the shell's pipefail behavior first, for example `set -o pipefail; domyjob run linux --wait -- make check | tee check.log`.
+
+Granting a paired peer `submit` lets that peer run commands as your account on this machine.
+Grant only the capabilities that peer needs, and revoke the pairing if it is lost or compromised.
+
 Licensed under Apache-2.0 or MIT, at your option.

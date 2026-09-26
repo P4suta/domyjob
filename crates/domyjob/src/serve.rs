@@ -17,8 +17,8 @@ use crate::trust::{Grant, Identity, PublicKey, Server, Trust, TrustError};
 pub const DEFAULT_PORT: u16 = 4747;
 pub const SERVICE: &str = "_domyjob._tcp.local.";
 const PAIRING_TRIES: u8 = 5;
-const MAX_CONNECTIONS: usize = 64;
-const MAX_PER_SOURCE: usize = 16;
+const MAX_CONNECTIONS: usize = 8;
+const MAX_PER_SOURCE: usize = 8;
 const GREETING_LIMIT: u64 = 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -922,12 +922,57 @@ mod tests {
             permits.admit(one).unwrap();
         }
         permits.admit(one).unwrap_err();
-        for n in 0..(MAX_CONNECTIONS - MAX_PER_SOURCE) {
-            let other = IpAddr::from([10, 0, 1, u8::try_from(n % 250).unwrap()]);
+        for _ in 0..MAX_PER_SOURCE {
+            permits.release(one);
+        }
+        for n in 0..MAX_CONNECTIONS {
+            let other = IpAddr::from([10, 0, 1, u8::try_from(n.saturating_add(1)).unwrap()]);
             permits.admit(other).unwrap();
         }
         permits.admit("10.0.2.1".parse().unwrap()).unwrap_err();
-        permits.release(one);
+        permits.release("10.0.1.1".parse().unwrap());
         permits.admit("10.0.2.1".parse().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_burst_of_connections_never_crosses_the_budget() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CONTENDERS: usize = 64;
+        const ROUNDS: usize = 64;
+        let permits = Arc::new(Permits::default());
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for number in 0..CONTENDERS {
+                let permits = Arc::clone(&permits);
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                scope.spawn(move || {
+                    let last = u8::try_from(number.saturating_add(1)).unwrap();
+                    let source = IpAddr::from([10, 1, 0, last]);
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        let admitted = permits.admit(source).is_ok();
+                        if admitted {
+                            let now = active.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+                            peak.fetch_max(now, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                        assert!(active.load(Ordering::SeqCst) <= MAX_CONNECTIONS);
+                        if admitted {
+                            permits.release(source);
+                            active.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_CONNECTIONS);
     }
 }

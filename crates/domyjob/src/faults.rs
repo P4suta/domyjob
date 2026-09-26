@@ -1,5 +1,6 @@
 use std::path::Path;
 
+#[cfg(any(test, feature = "failpoints"))]
 #[must_use]
 pub fn from_environment() -> Option<&'static mut fail::FailScenario<'static>> {
     std::env::var_os("FAILPOINTS")
@@ -7,11 +8,23 @@ pub fn from_environment() -> Option<&'static mut fail::FailScenario<'static>> {
         .then(|| Box::leak(Box::new(fail::FailScenario::setup())))
 }
 
+#[cfg(not(any(test, feature = "failpoints")))]
+#[must_use]
+pub const fn from_environment() -> Option<()> {
+    None
+}
+
+#[cfg(any(test, feature = "failpoints"))]
 const FULL: &str = "full:";
 
 pub fn at(site: &'static str, path: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     crashing(path)?;
+    #[cfg(feature = "failpoints")]
+    if std::env::var_os("DOMYJOB_ABORT_AT").is_some_and(|wanted| wanted == site) {
+        std::process::abort();
+    }
+    #[cfg(any(test, feature = "failpoints"))]
     let hit = fail::eval(site, |tag| {
         tag.map(|tag| {
             let (kind, wanted) = match tag.strip_prefix(FULL) {
@@ -21,6 +34,8 @@ pub fn at(site: &'static str, path: &Path) -> std::io::Result<()> {
             (kind, path.as_os_str().to_string_lossy().contains(&wanted))
         })
     });
+    #[cfg(not(any(test, feature = "failpoints")))]
+    let hit: Option<Option<(std::io::ErrorKind, bool)>> = None;
     match hit {
         Some(Some((kind, true))) => Err(std::io::Error::new(
             kind,

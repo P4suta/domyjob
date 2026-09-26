@@ -40,8 +40,9 @@ run = ["typos", "actionlint", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
 description = "Run every test"
+env = { DOMYJOB_CI_CANARY = "must-not-reach-a-job" }
 run = [
-  "cargo nextest run --locked --workspace --all-targets",
+  "cargo nextest run --locked --workspace --all-targets --features failpoints",
   "cargo test --locked --workspace --doc",
 ]
 

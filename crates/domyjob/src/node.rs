@@ -13,8 +13,8 @@ use crate::lock::LockError;
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request,
-    Settings, Spec, Submission, VERSION,
+    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
+    Submission, VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::terminal::RemoteText;
@@ -75,6 +75,10 @@ pub enum NodeError {
     NotStarted(RemoteText),
     #[error("job {0} already has a supervisor")]
     AlreadySupervised(JobId),
+    #[error(
+        "job {0} may already have run, so it cannot be retried automatically; submit a new job only after checking its effects"
+    )]
+    UnsafeRetry(JobId),
     #[error("the queue lost every slot it was waiting for")]
     QueueClosed,
     #[error("the {0} thread panicked")]
@@ -107,7 +111,8 @@ impl NodeError {
             | Self::Scan(
                 crate::logscan::ScanError::Pattern(..) | crate::logscan::ScanError::PatternTooLong,
             )
-            | Self::Misrouted(_) => RefusalCode::BadRequest,
+            | Self::Misrouted(_)
+            | Self::UnsafeRetry(_) => RefusalCode::BadRequest,
             Self::Proc(_) | Self::AlreadySupervised(_) | Self::NotStarted(_) => RefusalCode::Spawn,
             Self::Store(_)
             | Self::Workspace(_)
@@ -134,7 +139,7 @@ fn telling(jobs: &Path, path: &Path) -> bool {
             .is_some_and(|name| name == "phase.json" || name == "outcome")
 }
 
-fn watching(jobs: &Path, error: &notify::Error) -> NodeError {
+pub(crate) fn watching(jobs: &Path, error: &notify::Error) -> NodeError {
     NodeError::Io(crate::failure::IoFailure {
         action: "watching",
         path: jobs.to_path_buf(),
@@ -281,6 +286,7 @@ pub fn hello(dirs: &Dirs) -> Hello {
     Hello {
         wire: RemoteText::new(crate::protocol::wire().to_owned()),
         version: RemoteText::new(VERSION.to_owned()),
+        build: RemoteText::new(crate::protocol::BUILD_STAMP.to_owned()),
         os: RemoteText::new(crate::platform::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),
         home: RemoteText::new(dirs.home.display().to_string()),
@@ -301,12 +307,48 @@ const ROOM_SHARE: u64 = 10;
 
 const DISCARDED: &[u8] = b"domyjob: this log was discarded to free disk space on this machine\n";
 
-fn retire_old_binaries() {
-    if cfg!(test) {
-        return;
-    }
+const KEPT_BINARIES: usize = 3;
+
+fn retire_old_binaries(dirs: &Dirs) {
     if let Ok(exe) = std::env::current_exe() {
         crate::user_files::sweep_retired(&exe);
+    }
+    retire_cached_binaries(dirs, crate::protocol::build_key());
+}
+
+fn retire_cached_binaries(dirs: &Dirs, current: &str) {
+    let bin = dirs.cache.join("bin");
+    let Ok(entries) = std::fs::read_dir(&bin) else {
+        return;
+    };
+    let mut versions = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if kind.is_dir() && !kind.is_symlink() {
+            versions.push((name, entry.path()));
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut kept_others = 0usize;
+    for (name, path) in versions {
+        if name == current {
+            continue;
+        }
+        if kept_others < KEPT_BINARIES.saturating_sub(1) {
+            kept_others = kept_others.saturating_add(1);
+            continue;
+        }
+        match crate::state_file::remove_dir_all(&path) {
+            Ok(()) | Err(_) => {}
+        }
     }
 }
 
@@ -345,6 +387,7 @@ fn subject(request: &Request) -> Option<String> {
         Request::Kill { job }
         | Request::Status { job }
         | Request::Wait { job, .. }
+        | Request::Retry { job }
         | Request::Logs { job, .. }
         | Request::Tail { job, .. }
         | Request::Digest { job, .. }
@@ -447,6 +490,11 @@ impl Node {
         let (principal, request) = authorized.into_parts();
         let request = match route(request) {
             Routed::Query(request) => request,
+            Routed::Command(Request::Configure { change }, commanded) => {
+                self.configure(change)?;
+                self.upkeep(&commanded);
+                return send(output, &Reply::Report(Box::new(self.report()?)));
+            }
             Routed::Command(request, commanded) => {
                 self.upkeep(&commanded);
                 if let Request::Submit { submission } = request {
@@ -484,6 +532,7 @@ impl Node {
             | Request::List { .. }
             | Request::Status { .. }
             | Request::Wait { .. }
+            | Request::Retry { .. }
             | Request::Kill { .. }) => {
                 let reply = self.reply(&principal, single, input)?;
                 send(output, &reply)
@@ -505,16 +554,16 @@ impl Node {
     ) -> Result<Reply, NodeError> {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
-            Request::Report => Reply::Report(Box::new(self.report())),
+            Request::Report => Reply::Report(Box::new(self.report()?)),
             Request::Configure { change } => {
                 self.configure(change)?;
-                Reply::Report(Box::new(self.report()))
+                Reply::Report(Box::new(self.report()?))
             }
             Request::Clean { apply, logs, idle } => {
                 Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
             }
-            Request::AuditAt { seq } => Reply::AuditAt {
-                hash: self.audit.hash_at(seq)?,
+            Request::AuditAt { epoch, seq } => Reply::AuditAt {
+                hash: self.audit.hash_at(epoch, seq)?,
             },
             Request::AuditHead => Reply::AuditHead(self.audit.head()?),
             Request::Digest { job, tail } => {
@@ -548,6 +597,11 @@ impl Node {
                 Order::Wait,
                 input,
             )?)),
+            Request::Retry { job } => {
+                let id = self.own(principal, &job)?;
+                self.retry(&id)?;
+                Reply::Job(Box::new(self.settle(&id, Order::Wait, input)?))
+            }
             Request::Kill { job } => Reply::Job(Box::new(self.settle(
                 &self.own(principal, &job)?,
                 Order::Kill,
@@ -590,7 +644,7 @@ impl Node {
         submission: Submission,
         commanded: &Commanded,
     ) -> Result<Job, NodeError> {
-        let settings = self.settings();
+        let settings = self.store.settings()?;
         if submission.queue == crate::protocol::Queue::Slot && settings.paused {
             return Err(NodeError::Paused);
         }
@@ -729,11 +783,11 @@ impl Node {
             Ok(()) | Err(_) => {}
         }
         self.empty_trash();
-        retire_old_binaries();
+        retire_old_binaries(&self.dirs);
     }
 
-    fn report(&self) -> crate::protocol::Report {
-        let settings = self.settings();
+    fn report(&self) -> Result<crate::protocol::Report, NodeError> {
+        let settings = self.store.settings()?;
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let load = sysinfo::System::load_average();
@@ -744,7 +798,7 @@ impl Node {
             Ok(stats) => (stats.total_space(), stats.available_space()),
             Err(_unmeasurable) => (0, 0),
         };
-        crate::protocol::Report {
+        Ok(crate::protocol::Report {
             host: RemoteText::new(sysinfo::System::host_name().unwrap_or_default()),
             os: RemoteText::new(sysinfo::System::long_os_version().unwrap_or_default()),
             cores: cores(),
@@ -757,24 +811,17 @@ impl Node {
             uptime_seconds: sysinfo::System::uptime(),
             paused: settings.paused,
             max_jobs: settings.max_jobs,
-        }
-    }
-
-    fn settings_path(&self) -> PathBuf {
-        self.store.area("settings.json")
-    }
-
-    fn settings(&self) -> Settings {
-        match crate::state_file::read_json(&self.settings_path()) {
-            Ok(Some(settings)) => settings,
-            Ok(None) | Err(_) => Settings::default(),
-        }
+        })
     }
 
     fn configure(&self, change: Change) -> Result<(), NodeError> {
-        let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
-        crate::state_file::write_json(&self.settings_path(), &self.settings().with(change))?;
-        Ok(collecting.release()?)
+        let admission = crate::lock::OsLock::exclusive(&self.store.admission_lock_path())?;
+        crate::state_file::write_json(
+            &self.store.settings_path(),
+            &self.store.settings()?.with(change),
+        )?;
+        self.store.signal_queue()?;
+        Ok(admission.release()?)
     }
 
     fn short_of_room(&self) -> bool {
@@ -1070,7 +1117,7 @@ impl Node {
 
     fn recover(&self, id: &JobId) -> Result<(), NodeError> {
         let phase = self.store.phase(id)?;
-        if matches!(phase, Phase::Finished { .. }) {
+        if matches!(&phase, Phase::Finished { .. }) {
             return Ok(());
         }
         let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
@@ -1079,14 +1126,23 @@ impl Node {
         let failure = self.store.start_failure(id)?;
         let (started_at, reason) = match (&phase, failure) {
             (_, Some(why)) => (None, format!("the job could not start: {why}")),
-            (Phase::Queued | Phase::Preparing { .. }, None) => {
-                alive.release()?;
-                return self.launch_supervisor(id);
+            (Phase::Queued | Phase::Preparing { .. }, None) => return Ok(alive.release()?),
+            (Phase::Starting { started_at, .. } | Phase::Running { started_at, .. }, None) => {
+                let rebooted = match (
+                    self.store.supervisor_boot(id)?,
+                    crate::platform::boot_identity(),
+                ) {
+                    (Some(before), Some(now)) if before != now => " when the machine restarted",
+                    (Some(_), Some(_)) => " without the machine restarting",
+                    (Some(_) | None, Some(_) | None) => "",
+                };
+                (
+                    Some(*started_at),
+                    format!(
+                        "its supervisor vanished{rebooted} after the command may have started; it was not run again because it may already have had effects"
+                    ),
+                )
             }
-            (Phase::Running { started_at, .. }, None) => (
-                Some(*started_at),
-                "its supervisor vanished while it ran (the machine may have restarted); it was not run again because it may already have had effects".to_owned(),
-            ),
             (Phase::Finished { .. }, None) => return Ok(()),
         };
         let finished = Phase::Finished {
@@ -1103,6 +1159,28 @@ impl Node {
             crate::supervisor::discard_workspace(&root)?;
         }
         Ok(alive.release()?)
+    }
+
+    fn retry(&self, id: &JobId) -> Result<(), NodeError> {
+        let phase = self.store.phase(id)?;
+        if matches!(phase, Phase::Finished { .. }) {
+            return Ok(());
+        }
+        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
+            return Ok(());
+        };
+        match phase {
+            Phase::Queued | Phase::Preparing { .. } => {
+                alive.release()?;
+                self.launch_supervisor(id)?;
+                Ok(())
+            }
+            Phase::Starting { .. } | Phase::Running { .. } => {
+                alive.release()?;
+                Err(NodeError::UnsafeRetry(id.clone()))
+            }
+            Phase::Finished { .. } => Ok(()),
+        }
     }
 
     fn abandon_staging(&self, id: &JobId) -> Result<(), NodeError> {
@@ -1379,7 +1457,7 @@ impl Node {
             loop {
                 let (listed, _unreadable) = self.list(principal, 50)?;
                 let survey = crate::protocol::Survey {
-                    report: self.report(),
+                    report: self.report()?,
                     jobs: listed,
                 };
                 let mut line =
@@ -1446,13 +1524,7 @@ mod tests {
     use crate::store::LaunchEnv;
 
     fn dirs(root: &Path) -> Dirs {
-        Dirs {
-            home: root.into(),
-            state: root.join("state"),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        }
+        Dirs::for_test(root)
     }
 
     fn staged(root: &Path, id: &JobId, script: &str) -> Store {
@@ -1718,6 +1790,7 @@ mod tests {
             Request::List { limit: 10 },
             Request::Status { job: job.clone() },
             Request::Wait { job: job.clone() },
+            Request::Retry { job: job.clone() },
             Request::Kill { job: job.clone() },
             logs_of(job),
             Request::Tail {
@@ -1739,7 +1812,7 @@ mod tests {
             Request::Configure {
                 change: Change::default(),
             },
-            Request::AuditAt { seq: 0 },
+            Request::AuditAt { epoch: 0, seq: 0 },
             Request::AuditHead,
             Request::Digest {
                 job: job.clone(),
@@ -2001,6 +2074,23 @@ mod tests {
     }
 
     #[test]
+    fn only_the_current_and_two_other_binary_builds_are_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs(tmp.path());
+        let bin = dirs.cache.join("bin");
+        for name in ["current", "100", "200", "300", "400"] {
+            crate::state_file::private_dir(&bin.join(name)).unwrap();
+        }
+        retire_cached_binaries(&dirs, "current");
+        let mut kept: Vec<String> = std::fs::read_dir(bin)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["300", "400", "current"]);
+    }
+
+    #[test]
     fn a_roomy_disk_keeps_every_log_and_small_ones_are_never_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
@@ -2225,7 +2315,7 @@ mod tests {
     fn a_report_describes_the_machine_and_a_paused_one_refuses_new_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, _) = published(tmp.path(), b"");
-        let report = node.report();
+        let report = node.report().unwrap();
         assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
         assert!(!report.paused);
         let pause = |paused| Request::Configure {
@@ -2252,7 +2342,7 @@ mod tests {
             max_jobs: Some(five),
         })
         .unwrap();
-        let resumed = node.report();
+        let resumed = node.report().unwrap();
         assert!(!resumed.paused && resumed.max_jobs == five);
     }
 
@@ -2486,7 +2576,7 @@ mod tests {
             let reply = reply_to(&node, line_of(&submission(nonce, Location::Home)));
             assert!(
                 matches!(&reply, Reply::Job(_))
-                    || matches!(&reply, Reply::Refused(refusal) if refusal.code == RefusalCode::Spawn),
+                    || matches!(&reply, Reply::Refused(refusal) if matches!(refusal.code, RefusalCode::Spawn | RefusalCode::Paused)),
                 "{}",
                 at(&format!("a submission answered {reply:?}"))
             );

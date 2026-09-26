@@ -19,6 +19,13 @@ fn witness_path(dirs: &Dirs, machine: &MachineName) -> PathBuf {
         .join(format!("{}.json", tag.get(..32).unwrap_or(tag.as_str())))
 }
 
+fn save_witness(
+    path: &std::path::Path,
+    head: &crate::audit::Head,
+) -> Result<(), crate::state_file::StateError> {
+    crate::state_file::write_json(path, head)
+}
+
 impl RemoteError {
     #[must_use]
     pub fn machine(&self) -> Option<&str> {
@@ -37,6 +44,7 @@ impl RemoteError {
             | Self::Newer { machine, .. }
             | Self::Probe { machine, .. }
             | Self::Tampered { machine, .. }
+            | Self::BuildMismatch { machine, .. }
             | Self::AuditRolledBack { machine, .. }
             | Self::AuditRewritten { machine, .. }
             | Self::Outdated { machine, .. }
@@ -209,6 +217,14 @@ pub enum RemoteError {
     Tampered {
         machine: String,
         expected: String,
+        reported: crate::terminal::RemoteText,
+    },
+    #[error(
+        "{machine} built source stamp {reported}, not the expected {expected}; the staged binary was not installed"
+    )]
+    BuildMismatch {
+        machine: String,
+        expected: &'static str,
         reported: crate::terminal::RemoteText,
     },
     #[error(
@@ -801,19 +817,25 @@ impl<'a> Link<'a> {
             if *seen == known {
                 return Ok(());
             }
-            if seen.seq < known.seq {
+            if (seen.epoch, seen.seq) < (known.epoch, known.seq) {
                 return Err(RemoteError::AuditRolledBack {
                     machine: self.name(),
                     known: known.seq,
                     now: seen.seq,
                 });
             }
-            let then = if seen.seq == known.seq {
+            let then = if seen.epoch == known.epoch && seen.seq == known.seq {
                 Some(seen.hash.clone())
             } else {
-                self.call(&Request::AuditAt { seq: known.seq }, &[])?
-                    .into_audit_at()
-                    .map_err(|other| self.unexpected("an audit chain hash", *other))?
+                self.call(
+                    &Request::AuditAt {
+                        epoch: known.epoch,
+                        seq: known.seq,
+                    },
+                    &[],
+                )?
+                .into_audit_at()
+                .map_err(|other| self.unexpected("an audit chain hash", *other))?
             };
             if then.as_ref() != Some(&known.hash) {
                 return Err(RemoteError::AuditRewritten {
@@ -822,7 +844,7 @@ impl<'a> Link<'a> {
                 });
             }
         }
-        if let Err(error) = crate::state_file::write_json(&path, seen) {
+        if let Err(error) = save_witness(&path, seen) {
             eprintln!(
                 "domyjob: {}: its audit log checks out, but the new position could not be recorded ({error}); the next check starts from the last recorded one",
                 self.name()
@@ -1188,6 +1210,15 @@ impl<'a> Link<'a> {
                 reported: hello.binary,
             });
         }
+        if matches!(deliverable, Deliverable::Source { .. })
+            && hello.build.as_raw_str() != crate::protocol::BUILD_STAMP
+        {
+            return Err(RemoteError::BuildMismatch {
+                machine: self.name(),
+                expected: crate::protocol::BUILD_STAMP,
+                reported: hello.build,
+            });
+        }
         let promoted = self.capture(&Remote::Promote(self.family), &[])?;
         if !promoted.status.success() {
             return Err(RemoteError::Exited {
@@ -1510,6 +1541,43 @@ impl crate::ingress::Ingress for Facts {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dirs(root: &std::path::Path) -> Dirs {
+        Dirs::isolated_for_test(root)
+    }
+
+    #[test]
+    fn a_crash_while_advancing_a_witness_leaves_an_exact_position() {
+        let machine: MachineName = "linux".parse().unwrap();
+        let head = |seq: u64, byte: u8| crate::audit::Head {
+            epoch: 0,
+            seq,
+            hash: byte.to_string().repeat(64).parse().unwrap(),
+        };
+        let old = head(1, 0);
+        let new = head(2, 1);
+        let steps = {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = witness_path(&dirs(tmp.path()), &machine);
+            save_witness(&path, &old).unwrap();
+            let crashing = crate::faults::crash_after(tmp.path(), None);
+            save_witness(&path, &new).unwrap();
+            crashing.steps()
+        };
+        for step in 0..steps {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = witness_path(&dirs(tmp.path()), &machine);
+            save_witness(&path, &old).unwrap();
+            {
+                let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
+                match save_witness(&path, &new) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            let found: crate::audit::Head = crate::state_file::read_json(&path).unwrap().unwrap();
+            assert!(found == old || found == new);
+        }
+    }
 
     #[test]
     fn what_a_machine_said_is_its_last_lines_without_ssh_noise_or_escapes() {

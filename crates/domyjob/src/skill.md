@@ -72,7 +72,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
   Every worktree of one repository shares that workspace on each machine, so a new worktree builds incrementally too; `--fresh` is only for when you need an empty directory.
 - Windows runs the command with PowerShell unless you pass `--shell`; write PowerShell there, not sh.
 - A single argument after `--` is a script for that shell; several arguments run as a program and its arguments without any shell.
-- Jobs keep the environment of the ssh session that started them, but anything that lived only in that session, such as a forwarded ssh agent, is gone once it closes.
+- Jobs receive a small base environment allowlist plus variables passed explicitly with `--env`; ssh-session variables and forwarded credentials are not inherited.
   Clone private repositories with credentials the machine itself holds.
 - `.gitignore`, `.ignore`, and `.domyjobignore` decide what is sent; everything else goes, whether or not it is committed.
 - Tools that ask before trusting a directory, such as mise or direnv, see each workspace as a new one: trust domyjob's work area once in that machine's own settings.
@@ -88,6 +88,9 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## When the network or a machine misbehaves
 
 - A job keeps running when your connection drops; ask again with `domyjob status JOB` or `domyjob wait JOB`.
+- A `restart_pending` job is known not to have started; run `domyjob retry JOB` explicitly.
+- In a shell pipeline that must fail when domyjob fails, enable pipefail, for example `set -o pipefail; domyjob wait JOB | tee result.log`.
+- Granting a paired peer `submit` lets it run commands as your account on that machine.
 - A machine that stops answering is reported as "went silent"; `domyjob doctor` says what to try.
 - If you reset or reinstalled a machine yourself and domyjob reports its audit log changed, `domyjob machines rewitness NAME --accept` accepts it.
 

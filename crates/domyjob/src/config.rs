@@ -26,6 +26,18 @@ pub const URL_VARS: &[&str] = &["version", "target", "exe"];
 pub const FETCH_VARS: &[&str] = &["url", "output"];
 pub const UNPACK_VARS: &[&str] = &["archive", "dir"];
 pub const NOTIFIER_VARS: &[&str] = &["target"];
+pub const SERVICE_VARS: &[&str] = &[
+    "home",
+    "state",
+    "exe",
+    "exe_xml",
+    "arguments",
+    "plist_arguments",
+    "log",
+    "log_xml",
+    "uid",
+    "action",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -107,6 +119,7 @@ struct File {
     distribution: Option<Distribution>,
     triggers: Option<BTreeMap<String, TriggerConf>>,
     mcp: Option<McpPolicy>,
+    services: Option<BTreeMap<String, ServiceConf>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -191,6 +204,26 @@ pub struct Config {
     pub distribution: Option<Distribution>,
     pub triggers: BTreeMap<String, TriggerConf>,
     pub mcp: McpPolicy,
+    pub services: BTreeMap<String, ServiceConf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConf {
+    pub file: Option<Text>,
+    pub contents: Option<Text>,
+    pub probe: Option<Argv>,
+    pub install: Vec<ServiceAction>,
+    pub uninstall: Vec<ServiceAction>,
+    pub installed: Text,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceAction {
+    pub run: Argv,
+    pub tolerate_failure: bool,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -248,6 +281,7 @@ impl File {
             distribution: self.distribution,
             triggers: self.triggers.unwrap_or_default(),
             mcp: self.mcp.unwrap_or_else(McpPolicy::read_only),
+            services: self.services.unwrap_or_default(),
         }
     }
 }
@@ -440,6 +474,31 @@ impl Config {
         Ok(merged)
     }
 
+    fn validate_service(name: &str, service: &ServiceConf) -> Result<(), ConfigError> {
+        let invalid = |source| ConfigError::Template {
+            kind: "service",
+            name: name.to_owned(),
+            source,
+        };
+        for text in service
+            .file
+            .iter()
+            .chain(&service.contents)
+            .chain(std::iter::once(&service.installed))
+        {
+            text.check(SERVICE_VARS).map_err(&invalid)?;
+        }
+        for argv in service
+            .probe
+            .iter()
+            .chain(service.install.iter().map(|action| &action.run))
+            .chain(service.uninstall.iter().map(|action| &action.run))
+        {
+            argv.check(SERVICE_VARS).map_err(&invalid)?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let template = |kind: &'static str, name: &str| {
             let name = name.to_owned();
@@ -478,6 +537,9 @@ impl Config {
                 argv.check(NOTIFIER_VARS)
                     .map_err(template("notifier", name))?;
             }
+        }
+        for (name, service) in &self.services {
+            Self::validate_service(name, service)?;
         }
         if let Some(distribution) = &self.distribution {
             for (field, text) in [

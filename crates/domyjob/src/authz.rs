@@ -160,6 +160,7 @@ pub const fn nature(request: &Request) -> Nature {
         Request::Search { .. } => nature_of("search", Needs(Observe), Query, Unaudited),
         Request::Status { .. } => nature_of("status", Needs(Observe), Query, Unaudited),
         Request::Wait { .. } => nature_of("wait", Needs(Observe), Query, Unaudited),
+        Request::Retry { .. } => nature_of("retry", Needs(Submit), Command, Audited),
         Request::Logs { .. } => nature_of("logs", Needs(Observe), Query, Unaudited),
         Request::Tail { .. } => nature_of("tail", Needs(Observe), Query, Unaudited),
         Request::Kill { .. } => nature_of("kill", Needs(Kill), Command, Audited),

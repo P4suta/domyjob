@@ -13,6 +13,8 @@ pub enum Access {
 }
 
 pub fn beside(destination: &Path, tag: &str) -> Result<PathBuf, crate::failure::IoFailure> {
+    crate::faults::at("durable::name", destination)
+        .map_err(crate::failure::io("naming a file beside", destination))?;
     let mut random = [0u8; 8];
     getrandom::fill(&mut random).map_err(|error| {
         crate::failure::io("naming a file beside", destination)(std::io::Error::other(
@@ -41,6 +43,8 @@ impl Staged {
             Access::Private => crate::platform::private_options(),
             Access::Shared => std::fs::OpenOptions::new(),
         };
+        crate::faults::at("durable::create", &temporary)
+            .map_err(crate::failure::io("creating", &temporary))?;
         let file = options
             .write(true)
             .create_new(true)
@@ -59,18 +63,25 @@ impl Staged {
     }
 
     pub fn commit(mut self) -> Result<u64, crate::failure::IoFailure> {
+        crate::faults::at("durable::sync", &self.temporary)
+            .map_err(crate::failure::io("syncing", &self.temporary))?;
         self.file
             .sync_all()
             .map_err(crate::failure::io("syncing", &self.temporary))?;
+        crate::faults::at("durable::measure", &self.temporary)
+            .map_err(crate::failure::io("measuring", &self.temporary))?;
         let bytes = self
             .file
             .metadata()
             .map_err(crate::failure::io("measuring", &self.temporary))?
             .len();
+        crate::faults::at("durable::replace", &self.destination)
+            .map_err(crate::failure::io("replacing", &self.destination))?;
         std::fs::rename(&self.temporary, &self.destination)
             .map_err(crate::failure::io("replacing", &self.destination))?;
         self.committed = true;
         let dir = self.destination.parent().unwrap_or_else(|| Path::new("."));
+        crate::faults::at("durable::sync_dir", dir).map_err(crate::failure::io("syncing", dir))?;
         crate::platform::sync_dir(dir).map_err(crate::failure::io("syncing", dir))?;
         Ok(bytes)
     }
@@ -92,6 +103,8 @@ pub fn write(
     access: Access,
 ) -> Result<(), crate::failure::IoFailure> {
     let mut staged = Staged::beside(destination, access)?;
+    crate::faults::at("durable::write", destination)
+        .map_err(crate::failure::io("writing", destination))?;
     staged
         .file()
         .write_all(bytes)

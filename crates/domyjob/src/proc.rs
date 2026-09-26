@@ -630,9 +630,7 @@ mod platform {
             .stdin(Nothing::null())
             .stdout(Nothing::null())
             .stderr(Nothing::null());
-        let flags = CreationFlags::DETACHED_PROCESS
-            | CreationFlags::NEW_PROCESS_GROUP
-            | CreationFlags::BREAKAWAY_FROM_JOB;
+        let flags = CreationFlags::NEW_PROCESS_GROUP | CreationFlags::BREAKAWAY_FROM_JOB;
         let child = command
             .spawn_with(SpawnOptions::new().creation_flags(flags))
             .map_err(spawn_error)?;

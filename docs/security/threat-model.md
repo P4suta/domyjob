@@ -37,6 +37,7 @@ Whoever controls a domyjob connection controls those machines, so every boundary
 - **Confidentiality and integrity with forward secrecy** for every byte after the handshake, with the connection purpose bound into the handshake transcript.
 - **Pairing that resists offline guessing**, where an on-path attacker gets at most one online guess per attempt, and the offer closes after one success, a fixed number of attempts, or when `serve --pair` stops.
 - **Least privilege**: a peer holds explicit capabilities, and every request is checked against them by an exhaustive match.
+  The `submit` capability is deliberately equivalent to allowing that peer to run commands as the local account.
 - **Revocation and rotation** that take effect on the next connection, and are visible.
 - **Bounded pre-authentication cost** and bounded per-request resources.
 - **Confinement of materialized files** to the job workspace regardless of manifest content.
@@ -53,8 +54,9 @@ An idle attacker on the network can therefore exhaust those counts until the own
 
 Control of a running job goes through a local socket in the owner-only state directory, so the kernel's file permissions decide who may stop or follow a job, and another local user cannot even occupy its connections.
 
-When a supervisor dies without finishing, for example because it was killed, its job is reported as lost from the moment its lock is free.
-On Unix the job's own processes may outlive it until they next write output; on Windows the Job Object ends them with the supervisor.
+When a supervisor dies before starting the command, its queued or preparing job becomes `restart_pending` and waits for an explicit `domyjob retry`.
+When a supervisor dies after recording that the command is starting, the job becomes errored because its effects may already have happened and domyjob will not run it again automatically.
+On Unix the job's own processes may outlive the supervisor until they next write output; on Windows the Job Object ends them with the supervisor.
 
 A paired machine allowed to observe may search a job's log with a regular expression it chooses.
 The search runs on the serving machine with the `regex` crate, whose matching time grows linearly with the log, never exponentially with the pattern; patterns are limited to 1024 bytes and their compiled forms to one mebibyte, and a search returns at most a thousand matches with at most twenty lines of context each.

@@ -579,13 +579,13 @@ mod tests {
 
     fn serve_one<T: Send + 'static>(
         root: std::path::PathBuf,
-        work: impl FnOnce(TcpStream, Identity) -> T + Send + 'static,
+        work: impl FnOnce(TcpStream, &Identity) -> T + Send + 'static,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<T>) {
         let (listener, address) = bound();
         let serving = std::thread::spawn(move || {
             let server = identity(&root, "b");
             let (stream, _) = listener.accept().unwrap();
-            work(stream, server)
+            work(stream, &server)
         });
         (address, serving)
     }
@@ -593,6 +593,17 @@ mod tests {
     fn accepted(mut stream: TcpStream, server: &Identity) -> Channel<TcpStream> {
         read_route(&mut stream).unwrap();
         accept(stream, server, |_| Some(())).unwrap().0
+    }
+
+    fn accept_known(mut stream: TcpStream, server: &Identity) -> Result<(), SecureError> {
+        read_route(&mut stream)?;
+        accept(stream, server, |_| Some(())).map(drop)
+    }
+
+    fn read_all(stream: TcpStream, server: &Identity) -> std::io::Result<Vec<u8>> {
+        let mut channel = accepted(stream, server);
+        let mut received = Vec::new();
+        channel.reader.read_to_end(&mut received).map(|_| received)
     }
 
     fn bound() -> (std::net::TcpListener, std::net::SocketAddr) {
@@ -603,14 +614,11 @@ mod tests {
 
     #[test]
     fn connections_authenticate_both_ends_and_detect_truncation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
+        let (_tmp, root, client, server_key) = parties();
         let client_key = *client.public();
-        let server_key = *identity(&root, "b").public();
         let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
             assert_eq!(read_route(&mut stream).unwrap(), Some(Purpose::Connect));
-            let (mut accepted, who) = accept(stream, &server, |key| {
+            let (mut accepted, who) = accept(stream, server, |key| {
                 (key == &client_key).then_some("known")
             })
             .unwrap();
@@ -674,18 +682,11 @@ mod tests {
 
     #[test]
     fn tampering_with_the_post_quantum_exchange_breaks_the_handshake() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let client = identity(&root, "a");
+        let (_tmp, root, client, server_key) = parties();
         let client_key = *client.public();
-        let server_key = *identity(&root, "b").public();
-        let (listener, address) = bound();
-        let server_root = root;
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (mut stream, _) = listener.accept().unwrap();
+        let (address, serving) = serve_one(root, move |mut stream, server| {
             read_route(&mut stream).unwrap();
-            accept(stream, &server, |key| (key == &client_key).then_some(())).map(|_| ())
+            accept(stream, server, |key| (key == &client_key).then_some(())).map(|_| ())
         });
         let (relay, relay_address) = bound();
         let relaying = std::thread::spawn(move || {
@@ -815,23 +816,14 @@ mod tests {
     #[test]
     fn every_frame_on_the_wire_is_sealed_under_a_fresh_nonce() {
         let (_tmp, root, client, server_key) = parties();
-        let (listener, address) = bound();
-        let server_root = root;
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (stream, _) = listener.accept().unwrap();
-            let mut channel = accepted(stream, &server);
-            let mut received = Vec::new();
-            channel.reader.read_to_end(&mut received).unwrap();
-            received
-        });
+        let (address, serving) = serve_one(root, read_all);
         let (via, relaying) = relay(address, None);
         let mut channel = connect(TcpStream::connect(via).unwrap(), &client, &server_key).unwrap();
         channel.writer.write_all(b"same words").unwrap();
         channel.writer.write_all(b"same words").unwrap();
         channel.writer.close().unwrap();
         channel.writer.write_all(b"after close").unwrap_err();
-        assert_eq!(serving.join().unwrap(), b"same wordssame words");
+        assert_eq!(serving.join().unwrap().unwrap(), b"same wordssame words");
         let (upward, _) = relaying.join().unwrap();
         let sent = frames(upward.get(1..).unwrap());
         let [_, _, first, second, _] = sent.as_slice() else {
@@ -849,14 +841,10 @@ mod tests {
         ];
         for toward in [Toward::Client, Toward::Server] {
             for at in cuts {
-                let (listener, address) = bound();
-                let server_root = root.clone();
-                let serving = std::thread::spawn(move || {
-                    let server = identity(&server_root, "b");
-                    let (mut stream, _) = listener.accept().unwrap();
+                let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
                     match read_route(&mut stream) {
                         Ok(Some(Purpose::Connect)) => {
-                            accept(stream, &server, |_| Some(())).map(drop)
+                            accept(stream, server, |_| Some(())).map(drop)
                         }
                         Ok(Some(Purpose::Pair) | None) => Err(SecureError::Handshake),
                         Err(error) => Err(error),
@@ -891,16 +879,12 @@ mod tests {
         let code_text = format!("{}-{}-{}-{}", words[0], words[1], words[2], words[3]);
         for toward in [Toward::Client, Toward::Server] {
             for at in [0usize, 1, 2, 20, 35, 36, 37, 38, 60, 1100, 1200, 1300] {
-                let (listener, address) = bound();
-                let server_root = root.clone();
                 let server_code = PairingCode::parse(&code_text).unwrap();
-                let serving = std::thread::spawn(move || {
-                    let server = identity(&server_root, "b");
-                    let (mut stream, _) = listener.accept().unwrap();
+                let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
                     read_route(&mut stream)?;
                     pair(
                         stream,
-                        &server,
+                        server,
                         Attempt {
                             code: &server_code,
                             side: Side::Responder,
@@ -976,6 +960,20 @@ mod tests {
         }
     }
 
+    type Reading = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+    fn connected_faulty(
+        root: std::path::PathBuf,
+        client: &Identity,
+        server_key: &PublicKey,
+    ) -> (Channel<Faulty>, Faulty, Reading) {
+        let (address, reading) = serve_one(root, read_all);
+        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
+        let probe = wrapped.split().unwrap();
+        let channel = connect(wrapped, client, server_key).unwrap();
+        (channel, probe, reading)
+    }
+
     impl Read for Faulty {
         fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
             self.spend()?;
@@ -1019,43 +1017,70 @@ mod tests {
         Server(usize),
     }
 
+    fn budget(faults: Faults, server: bool) -> usize {
+        match (faults, server) {
+            (Faults::Client(n), false) | (Faults::Server(n), true) => n,
+            (Faults::Client(_), true) | (Faults::Server(_), false) => usize::MAX,
+        }
+    }
+
+    fn faulty_connection(address: std::net::SocketAddr, faults: Faults) -> (Faulty, Faulty, usize) {
+        let budget = budget(faults, false);
+        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), budget);
+        let probe = wrapped.split().unwrap();
+        (wrapped, probe, budget)
+    }
+
+    type FaultOutcome = (Result<usize, SecureError>, Result<usize, SecureError>);
+
+    fn every_fault_fails(
+        root: &std::path::Path,
+        limit: usize,
+        run: fn(Faults, &std::path::Path) -> FaultOutcome,
+        roles: (&str, &str),
+    ) {
+        let (client_name, server_name) = roles;
+        let (client_ops, server_ops) = {
+            let (client, server) = run(Faults::Client(usize::MAX), root);
+            (client.unwrap(), server.unwrap())
+        };
+        for at in 0..client_ops.min(limit) {
+            let (client, _) = run(Faults::Client(at), root);
+            assert!(
+                client.is_err(),
+                "the {client_name} survived a fault at operation {at}"
+            );
+        }
+        for at in 0..server_ops.min(limit) {
+            let (_, server) = run(Faults::Server(at), root);
+            assert!(
+                server.is_err(),
+                "the {server_name} survived a fault at operation {at}"
+            );
+        }
+    }
+
     fn connect_with(
         faults: Faults,
         root: &std::path::Path,
     ) -> (Result<usize, SecureError>, Result<usize, SecureError>) {
         let client = identity(root, "a");
         let server_key = *identity(root, "b").public();
-        let (listener, address) = bound();
-        let server_root = root.to_path_buf();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (stream, _) = listener.accept().unwrap();
-            let budget = match faults {
-                Faults::Server(n) => n,
-                Faults::Client(_) => usize::MAX,
-            };
+        let (address, serving) = serve_one(root.to_path_buf(), move |stream, server| {
+            let budget = budget(faults, true);
             let mut wrapped = Faulty::new(stream, budget);
-            let outcome = read_route(&mut wrapped).and_then(|_| {
+            read_route(&mut wrapped).and_then(|_| {
                 let probe = wrapped.split()?;
-                accept(wrapped, &server, |_| Some(())).map(|(mut channel, ())| {
+                accept(wrapped, server, |_| Some(())).map(|(mut channel, ())| {
                     let spent = probe.spent(budget);
                     match channel.writer.close() {
                         Ok(()) | Err(_) => {}
                     }
                     spent
                 })
-            });
-            if outcome.is_err() {
-                drop(listener);
-            }
-            outcome
+            })
         });
-        let budget = match faults {
-            Faults::Client(n) => n,
-            Faults::Server(_) => usize::MAX,
-        };
-        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), budget);
-        let probe = wrapped.split().unwrap();
+        let (wrapped, probe, budget) = faulty_connection(address, faults);
         let connected = connect(wrapped, &client, &server_key).map(|mut channel| {
             let spent = probe.spent(budget);
             match channel.writer.close() {
@@ -1085,25 +1110,7 @@ mod tests {
     #[test]
     fn a_fault_at_any_step_of_a_connection_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let (client_ops, server_ops) = {
-            let (connected, served) = connect_with(Faults::Client(usize::MAX), &root);
-            (connected.unwrap(), served.unwrap())
-        };
-        for at in 0..client_ops.min(64) {
-            let (connected, _) = connect_with(Faults::Client(at), &root);
-            assert!(
-                connected.is_err(),
-                "the client survived a fault at operation {at}"
-            );
-        }
-        for at in 0..server_ops.min(64) {
-            let (_, served) = connect_with(Faults::Server(at), &root);
-            assert!(
-                served.is_err(),
-                "the server survived a fault at operation {at}"
-            );
-        }
+        every_fault_fails(tmp.path(), 64, connect_with, ("client", "server"));
     }
 
     fn pair_with(
@@ -1112,34 +1119,20 @@ mod tests {
     ) -> (Result<usize, SecureError>, Result<usize, SecureError>) {
         let words = crate::words::WORDS;
         let code_text = format!("{}-{}-{}-{}", words[0], words[1], words[2], words[3]);
-        let (listener, address) = bound();
-        let server_root = root.to_path_buf();
         let server_code = PairingCode::parse(&code_text).unwrap();
-        let serving = std::thread::spawn(move || {
-            let server = identity(&server_root, "b");
-            let (stream, _) = listener.accept().unwrap();
-            let budget = match faults {
-                Faults::Server(n) => n,
-                Faults::Client(_) => usize::MAX,
-            };
+        let (address, serving) = serve_one(root.to_path_buf(), move |stream, server| {
+            let budget = budget(faults, true);
             let mut wrapped = Faulty::new(stream, budget);
             let probe = wrapped.split().unwrap();
             let attempt = Attempt {
                 code: &server_code,
                 side: Side::Responder,
             };
-            let outcome = read_route(&mut wrapped)
-                .and_then(|_| pair(wrapped, &server, attempt))
-                .map(|_| probe.spent(budget));
-            drop(listener);
-            outcome
+            read_route(&mut wrapped)
+                .and_then(|_| pair(wrapped, server, attempt))
+                .map(|_| probe.spent(budget))
         });
-        let budget = match faults {
-            Faults::Client(n) => n,
-            Faults::Server(_) => usize::MAX,
-        };
-        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), budget);
-        let probe = wrapped.split().unwrap();
+        let (wrapped, probe, budget) = faulty_connection(address, faults);
         let code = PairingCode::parse(&code_text).unwrap();
         let attempt = Attempt {
             code: &code,
@@ -1153,41 +1146,14 @@ mod tests {
     #[test]
     fn a_fault_at_any_step_of_a_pairing_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let (initiator_ops, responder_ops) = {
-            let (paired, served) = pair_with(Faults::Client(usize::MAX), &root);
-            (paired.unwrap(), served.unwrap())
-        };
-        for at in 0..initiator_ops.min(96) {
-            let (paired, _) = pair_with(Faults::Client(at), &root);
-            assert!(
-                paired.is_err(),
-                "the initiator survived a fault at operation {at}"
-            );
-        }
-        for at in 0..responder_ops.min(96) {
-            let (_, served) = pair_with(Faults::Server(at), &root);
-            assert!(
-                served.is_err(),
-                "the responder survived a fault at operation {at}"
-            );
-        }
+        every_fault_fails(tmp.path(), 96, pair_with, ("initiator", "responder"));
     }
 
     #[test]
     fn a_fault_while_talking_is_reported_on_both_ends() {
         let (_tmp, root, client, server_key) = parties();
         for extra in 0..9usize {
-            let (listener, address) = bound();
-            let server_root = root.clone();
-            let serving = std::thread::spawn(move || {
-                let server = identity(&server_root, "b");
-                let (mut stream, _) = listener.accept().unwrap();
-                read_route(&mut stream).unwrap();
-                let (mut channel, ()) = accept(stream, &server, |_| Some(())).unwrap();
-                let mut received = Vec::new();
-                channel.reader.read_to_end(&mut received).map(|_| received)
-            });
+            let (address, serving) = serve_one(root.clone(), read_all);
             let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
             let probe = wrapped.split().unwrap();
             let mut channel = connect(wrapped, &client, &server_key).unwrap();
@@ -1220,7 +1186,7 @@ mod tests {
         let expected = *identity(&root, "b").public();
         let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
             read_route(&mut stream).unwrap();
-            accept(stream, &server, |_| None::<()>).map(|_| ())
+            accept(stream, server, |_| None::<()>).map(|_| ())
         });
         connect(TcpStream::connect(address).unwrap(), &client, &expected).unwrap_err();
         assert!(matches!(serving.join().unwrap(), Err(SecureError::Unknown)));
@@ -1302,17 +1268,32 @@ mod tests {
         .unwrap()
     }
 
+    fn respond_to_pairing(mut stream: TcpStream, server: &Identity) -> Result<(), SecureError> {
+        read_route(&mut stream)?;
+        let code = pairing_code();
+        pair(
+            stream,
+            server,
+            Attempt {
+                code: &code,
+                side: Side::Responder,
+            },
+        )
+        .map(drop)
+    }
+
+    fn send_short(address: std::net::SocketAddr, purpose: Purpose) {
+        let mut raw = TcpStream::connect(address).unwrap();
+        start_route(&mut raw, purpose).unwrap();
+        send_frame(&mut raw, b"short").unwrap();
+    }
+
     #[test]
     fn a_malformed_post_quantum_key_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (address, serving) = serve_one(root, move |mut stream, server| {
-            read_route(&mut stream).unwrap();
-            accept(stream, &server, |_| Some(())).map(drop)
-        });
-        let mut raw = TcpStream::connect(address).unwrap();
-        start_route(&mut raw, Purpose::Connect).unwrap();
-        send_frame(&mut raw, b"short").unwrap();
+        let (address, serving) = serve_one(root, accept_known);
+        send_short(address, Purpose::Connect);
         serving.join().unwrap().unwrap_err();
     }
 
@@ -1336,18 +1317,8 @@ mod tests {
     fn a_malformed_pairing_message_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (address, serving) = serve_one(root, move |mut stream, server| {
-            read_route(&mut stream).unwrap();
-            let code = pairing_code();
-            let attempt = Attempt {
-                code: &code,
-                side: Side::Responder,
-            };
-            pair(stream, &server, attempt).map(drop)
-        });
-        let mut raw = TcpStream::connect(address).unwrap();
-        start_route(&mut raw, Purpose::Pair).unwrap();
-        send_frame(&mut raw, b"short").unwrap();
+        let (address, serving) = serve_one(root, respond_to_pairing);
+        send_short(address, Purpose::Pair);
         serving.join().unwrap().unwrap_err();
     }
 
@@ -1368,15 +1339,11 @@ mod tests {
                 std::io::ErrorKind::UnexpectedEof,
             ),
         ] {
-            let (listener, address) = bound();
-            let server_root = root.clone();
-            let serving = std::thread::spawn(move || {
-                let server = identity(&server_root, "b");
-                let (stream, _) = listener.accept().unwrap();
+            let (address, serving) = serve_one(root.clone(), move |stream, server| {
                 let mut wrapped = Faulty::new(stream, usize::MAX);
                 let probe = wrapped.split().unwrap();
                 read_route(&mut wrapped).unwrap();
-                let (mut channel, ()) = accept(wrapped, &server, |_| Some(())).unwrap();
+                let (mut channel, ()) = accept(wrapped, server, |_| Some(())).unwrap();
                 if !forged {
                     *probe.cut.lock().unwrap() = cut;
                     probe.left.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -1410,15 +1377,7 @@ mod tests {
     #[test]
     fn closing_stops_the_writer_and_half_closes_the_stream() {
         let (_tmp, root, client, server_key) = parties();
-        let (address, serving) = serve_one(root, move |stream, server| {
-            let mut channel = accepted(stream, &server);
-            let mut received = Vec::new();
-            channel.reader.read_to_end(&mut received).unwrap();
-            received
-        });
-        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
-        let probe = wrapped.split().unwrap();
-        let mut channel = connect(wrapped, &client, &server_key).unwrap();
+        let (mut channel, probe, serving) = connected_faulty(root, &client, &server_key);
         channel.writer.close().unwrap();
         let before = probe.spent(usize::MAX);
         channel.writer.write_all(b"after close").unwrap_err();
@@ -1428,14 +1387,14 @@ mod tests {
             "a closed writer still reached the stream"
         );
         (&probe.stream).write(b"x").unwrap_err();
-        assert!(serving.join().unwrap().is_empty());
+        assert!(serving.join().unwrap().unwrap().is_empty());
     }
 
     #[test]
     fn a_peer_that_echoes_the_wrong_confirmation_is_refused() {
         let (_tmp, root, client, server_key) = parties();
         let (address, serving) = serve_one(root, move |stream, server| {
-            let mut channel = accepted(stream, &server);
+            let mut channel = accepted(stream, server);
             let mut mark = [0u8; 16];
             channel.reader.read_exact(&mut mark).unwrap();
             channel.writer.write_all(b"domyjob/2 wrong!").unwrap();
@@ -1454,17 +1413,13 @@ mod tests {
     fn a_stream_that_cannot_be_split_fails_every_handshake() {
         let (_tmp, root, client, server_key) = parties();
         for refusing in [Side::Initiator, Side::Responder] {
-            let (listener, address) = bound();
-            let server_root = root.clone();
-            let serving = std::thread::spawn(move || {
-                let server = identity(&server_root, "b");
-                let (stream, _) = listener.accept().unwrap();
+            let (address, serving) = serve_one(root.clone(), move |stream, server| {
                 let mut wrapped = Faulty::new(stream, usize::MAX);
                 if refusing == Side::Responder {
                     wrapped.refuse_splits();
                 }
                 read_route(&mut wrapped).unwrap();
-                accept(wrapped, &server, |_| Some(())).map(drop)
+                accept(wrapped, server, |_| Some(())).map(drop)
             });
             let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
             if refusing == Side::Initiator {
@@ -1478,15 +1433,7 @@ mod tests {
             }
         }
 
-        let (address, serving) = serve_one(root.clone(), move |mut stream, server| {
-            read_route(&mut stream).unwrap();
-            let code = pairing_code();
-            let attempt = Attempt {
-                code: &code,
-                side: Side::Responder,
-            };
-            pair(stream, &server, attempt).map(drop)
-        });
+        let (address, serving) = serve_one(root.clone(), respond_to_pairing);
         let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
         wrapped.refuse_splits();
         let code = pairing_code();
@@ -1504,7 +1451,7 @@ mod tests {
     fn a_session_that_runs_out_of_nonces_stops_instead_of_reusing_one() {
         let (_tmp, root, client, server_key) = parties();
         let (address, serving) = serve_one(root, move |stream, server| {
-            let mut channel = accepted(stream, &server);
+            let mut channel = accepted(stream, server);
             channel.reader.nonce = u64::MAX;
             let mut byte = [0u8; 1];
             channel.reader.read(&mut byte).unwrap_err().kind()
@@ -1520,20 +1467,12 @@ mod tests {
     #[test]
     fn a_sealed_frame_of_an_unknown_kind_is_refused_and_flushing_reaches_the_stream() {
         let (_tmp, root, client, server_key) = parties();
-        let (address, serving) = serve_one(root, move |stream, server| {
-            let mut channel = accepted(stream, &server);
-            let mut received = Vec::new();
-            channel
-                .reader
-                .read_to_end(&mut received)
-                .unwrap_err()
-                .to_string()
-        });
-        let wrapped = Faulty::new(TcpStream::connect(address).unwrap(), usize::MAX);
-        let probe = wrapped.split().unwrap();
-        let mut channel = connect(wrapped, &client, &server_key).unwrap();
+        let (mut channel, probe, serving) = connected_faulty(root, &client, &server_key);
         channel.writer.seal(7, b"").unwrap();
-        assert_eq!(serving.join().unwrap(), "a frame had an unknown kind");
+        assert_eq!(
+            serving.join().unwrap().unwrap_err().to_string(),
+            "a frame had an unknown kind"
+        );
         probe.left.store(0, std::sync::atomic::Ordering::SeqCst);
         channel.writer.flush().unwrap_err();
     }
@@ -1586,15 +1525,7 @@ mod tests {
     fn a_pairing_responder_answers_the_route_with_its_code_message_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let (address, responding) = serve_one(root, move |mut stream, server| {
-            read_route(&mut stream).unwrap();
-            let code = pairing_code();
-            let attempt = Attempt {
-                code: &code,
-                side: Side::Responder,
-            };
-            pair(stream, &server, attempt).map(drop)
-        });
+        let (address, responding) = serve_one(root, respond_to_pairing);
         let mut raw = TcpStream::connect(address).unwrap();
         start_route(&mut raw, Purpose::Pair).unwrap();
         let mut length = [0u8; 2];
