@@ -26,6 +26,7 @@ pub mod mcp;
 pub mod node;
 pub mod notify;
 pub mod paths;
+pub mod platform;
 pub mod pq;
 pub mod proc;
 pub mod project;

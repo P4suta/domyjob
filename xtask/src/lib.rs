@@ -49,7 +49,6 @@ const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
     ("crates/domyjob/src/config.rs", 2),
     ("crates/domyjob/src/dist.rs", 2),
     ("crates/domyjob/src/keystore.rs", 5),
-    ("crates/domyjob/src/local_socket.rs", 3),
     ("crates/domyjob/src/node.rs", 4),
     ("crates/domyjob/src/paths.rs", 1),
     ("crates/domyjob/src/proc.rs", 6),
@@ -65,7 +64,6 @@ const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
     ("crates/domyjob/src/trust.rs", 1),
     ("crates/domyjob/src/user_files.rs", 1),
     ("crates/domyjob/src/workspace.rs", 10),
-    ("crates/domyjob/tests/local_socket.rs", 1),
     ("xtask/src/release.rs", 1),
 ];
 
