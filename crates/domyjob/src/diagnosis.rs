@@ -158,7 +158,7 @@ pub const fn of_client(error: &ClientError) -> Diagnosis {
         | ClientError::Io { .. }
         | ClientError::Index { .. }
         | ClientError::State(_) => plain(Kind::Local),
-        ClientError::Panicked => plain(Kind::Internal),
+        ClientError::NoFacts(_) | ClientError::Panicked => plain(Kind::Internal),
         ClientError::Unpacked { .. } => hinted(
             Kind::Protocol,
             "what arrived does not match what was sent; pull again, and `domyjob doctor` if it repeats",

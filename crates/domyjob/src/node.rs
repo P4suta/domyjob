@@ -148,29 +148,54 @@ fn watching(jobs: &std::path::Path, error: &notify::Error) -> NodeError {
     }
 }
 
-fn size_of(path: &std::path::Path) -> u64 {
+fn io(
+    action: &'static str,
+    path: &std::path::Path,
+) -> impl FnOnce(std::io::Error) -> NodeError + use<> {
+    let path = path.to_path_buf();
+    move |source| NodeError::Io {
+        action,
+        path,
+        source,
+    }
+}
+
+fn entries(path: &std::path::Path) -> Result<Option<std::fs::ReadDir>, NodeError> {
+    crate::faults::at("node::list", path).map_err(io("listing", path))?;
+    match std::fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io("listing", path)(error)),
+    }
+}
+
+fn size_of(path: &std::path::Path) -> Result<u64, NodeError> {
     let mut total = 0u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(next) = pending.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&next) else {
-            continue;
+        crate::faults::at("node::measure", &next).map_err(io("checking", &next))?;
+        let meta = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io("checking", &next)(error)),
         };
         if meta.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&next) {
-                pending.extend(entries.flatten().map(|entry| entry.path()));
+            if let Some(entries) = entries(&next)? {
+                for entry in entries {
+                    pending.push(entry.map_err(io("listing", &next))?.path());
+                }
             }
         } else {
             total = total.saturating_add(meta.len());
         }
     }
-    total
+    Ok(total)
 }
 
-fn disk_is_short(area: &std::path::Path) -> bool {
-    match fs4::statvfs(area) {
-        Ok(stats) => short(stats.available_space(), stats.total_space()),
-        Err(_unmeasurable) => false,
-    }
+fn disk_is_short(area: &std::path::Path) -> Result<bool, NodeError> {
+    crate::faults::at("node::disk", area).map_err(io("measuring disk space in", area))?;
+    let stats = fs4::statvfs(area).map_err(io("measuring disk space in", area))?;
+    Ok(short(stats.available_space(), stats.total_space()))
 }
 
 fn cores() -> u32 {
@@ -279,7 +304,7 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
-    short: fn(&std::path::Path) -> bool,
+    short: fn(&std::path::Path) -> Result<bool, NodeError>,
 }
 
 #[must_use]
@@ -537,10 +562,10 @@ impl Node {
     ) -> Result<Reply, NodeError> {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
-            Request::Report => Reply::Report(Box::new(self.report())),
+            Request::Report => Reply::Report(Box::new(self.report()?)),
             Request::Pause { paused } => {
                 self.pause(paused)?;
-                Reply::Report(Box::new(self.report()))
+                Reply::Report(Box::new(self.report()?))
             }
             Request::Clean { apply, logs, idle } => {
                 Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
@@ -619,7 +644,7 @@ impl Node {
     }
 
     fn accept(&self, principal: &Principal, submission: Submission) -> Result<Job, NodeError> {
-        if submission.queue == crate::protocol::Queue::Slot && self.paused() {
+        if submission.queue == crate::protocol::Queue::Slot && self.paused()? {
             return Err(NodeError::Paused);
         }
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
@@ -698,20 +723,19 @@ impl Node {
         Ok(proc::launch(&invocation)?)
     }
 
-    #[must_use]
-    pub fn running(&self) -> Vec<JobId> {
-        let Ok(ids) = self.store.ids() else {
-            return Vec::new();
-        };
-        ids.into_iter()
-            .filter(|id| {
-                !matches!(self.store.phase(id), Ok(Phase::Finished { .. }))
-                    && matches!(
-                        crate::lock::OsLock::try_exclusive(&self.store.alive_path(id)),
-                        Ok(None)
-                    )
-            })
-            .collect()
+    pub fn running(&self) -> Result<Vec<JobId>, NodeError> {
+        let mut running = Vec::new();
+        for id in self.store.ids()? {
+            match self.store.phase(&id)? {
+                Phase::Finished { .. } => continue,
+                Phase::Queued | Phase::Preparing { .. } | Phase::Running { .. } => {}
+            }
+            match crate::lock::OsLock::try_exclusive(&self.store.alive_path(&id))? {
+                Some(idle) => idle.release()?,
+                None => running.push(id),
+            }
+        }
+        Ok(running)
     }
 
     pub fn stop(&self, id: &JobId) -> Result<Job, NodeError> {
@@ -736,7 +760,9 @@ impl Node {
         match self.retire(KEEP_FINISHED) {
             Ok(()) | Err(_) => {}
         }
-        self.empty_trash();
+        match self.empty_trash() {
+            Ok(()) | Err(_) => {}
+        }
         retire_old_binaries();
         let short = || self.short_of_room();
         match self.make_room(&short) {
@@ -744,40 +770,42 @@ impl Node {
         }
     }
 
-    fn report(&self) -> crate::protocol::Report {
+    fn report(&self) -> Result<crate::protocol::Report, NodeError> {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let load = sysinfo::System::load_average();
         let load_hundredths =
             (!cfg!(windows)).then(|| [load.one, load.five, load.fifteen].map(hundredths));
-        let (disk_total, disk_available) = match fs4::statvfs(self.store.area("jobs")) {
-            Ok(stats) => (stats.total_space(), stats.available_space()),
-            Err(_unmeasurable) => (0, 0),
+        let jobs = self.store.area("jobs");
+        let disk = match crate::faults::at("node::disk", &jobs).and_then(|()| fs4::statvfs(&jobs)) {
+            Ok(stats) => crate::protocol::DiskSpace::Measured {
+                total: stats.total_space(),
+                available: stats.available_space(),
+                short: short(stats.available_space(), stats.total_space()),
+            },
+            Err(error) => crate::protocol::DiskSpace::Unavailable {
+                reason: RemoteText::new(error.to_string()),
+            },
         };
-        crate::protocol::Report {
+        Ok(crate::protocol::Report {
             host: RemoteText::new(sysinfo::System::host_name().unwrap_or_default()),
             os: RemoteText::new(sysinfo::System::long_os_version().unwrap_or_default()),
             cores: cores(),
             load_hundredths,
             memory_total: system.total_memory(),
             memory_available: system.available_memory(),
-            disk_total,
-            disk_available,
-            disk_short: short(disk_available, disk_total),
+            disk,
             uptime_seconds: sysinfo::System::uptime(),
-            paused: self.paused(),
-        }
+            paused: self.paused()?,
+        })
     }
 
     fn pause_path(&self) -> PathBuf {
         self.store.area("paused")
     }
 
-    fn paused(&self) -> bool {
-        matches!(
-            crate::state_file::read_bytes(&self.pause_path()),
-            Ok(Some(_))
-        )
+    fn paused(&self) -> Result<bool, NodeError> {
+        Ok(crate::state_file::read_bytes(&self.pause_path())?.is_some())
     }
 
     fn pause(&self, paused: bool) -> Result<(), NodeError> {
@@ -789,37 +817,36 @@ impl Node {
         Ok(())
     }
 
-    fn short_of_room(&self) -> bool {
+    fn short_of_room(&self) -> Result<bool, NodeError> {
         (self.short)(&self.store.area("jobs"))
     }
 
-    fn make_room(&self, short: &impl Fn() -> bool) -> Result<(), NodeError> {
-        if !short() {
+    fn make_room(&self, short: &impl Fn() -> Result<bool, NodeError>) -> Result<(), NodeError> {
+        if !short()? {
             return Ok(());
         }
-        for (workspace, lock) in self.idle_workspaces() {
-            if self.evict(&workspace, &lock)? && !short() {
+        for (workspace, lock) in self.idle_workspaces()? {
+            if self.evict(&workspace, &lock)? && !short()? {
                 return Ok(());
             }
         }
         for id in self.finished_largest_log_first()? {
-            if self.discard_log(&id)? && !short() {
+            if self.discard_log(&id)? && !short()? {
                 return Ok(());
             }
         }
         self.collect(Keep::Unfinished)
     }
 
-    fn stale(&self, workspace: &std::path::Path) -> bool {
+    fn stale(&self, workspace: &std::path::Path) -> Result<bool, NodeError> {
         let filled_by = crate::supervisor::filled_by_path(workspace);
-        let last = match crate::state_file::read_bytes(&filled_by) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return true,
-            Err(_unreadable) => return false,
+        let last = match crate::state_file::read_bytes(&filled_by)? {
+            Some(bytes) => bytes,
+            None => return Ok(true),
         };
         match String::from_utf8_lossy(&last).trim().parse::<JobId>() {
-            Ok(id) => matches!(self.store.is_published(&id), Ok(false)),
-            Err(_foreign) => true,
+            Ok(id) => Ok(!self.store.is_published(&id)?),
+            Err(_foreign) => Ok(true),
         }
     }
 
@@ -858,12 +885,12 @@ impl Node {
     ) -> Result<crate::protocol::Cleaned, NodeError> {
         let work = self.store.area("work");
         let mut items = Vec::new();
-        for (workspace, lock) in self.idle_workspaces() {
-            let stale = self.stale(&workspace);
+        for (workspace, lock) in self.idle_workspaces()? {
+            let stale = self.stale(&workspace)?;
             if !stale && !idle {
                 continue;
             }
-            let bytes = size_of(&workspace);
+            let bytes = size_of(&workspace)?;
             if apply && !self.evict(&workspace, &lock)? {
                 continue;
             }
@@ -885,7 +912,7 @@ impl Node {
             let mut bytes = 0u64;
             let mut count = 0u64;
             for id in &finished {
-                let size = size_of(&self.store.log_path(id));
+                let size = size_of(&self.store.log_path(id))?;
                 if apply && !self.discard_log(id)? {
                     continue;
                 }
@@ -900,7 +927,7 @@ impl Node {
                 });
             }
         }
-        let trash = size_of(&self.store.area("trash"));
+        let trash = size_of(&self.store.area("trash"))?;
         if trash > 0 {
             items.push(crate::protocol::Freeable {
                 what: RemoteText::new("things set aside to remove".to_owned()),
@@ -908,7 +935,7 @@ impl Node {
             });
         }
         if apply {
-            self.empty_trash();
+            self.empty_trash()?;
             self.collect(Keep::Every)?;
         }
         Ok(crate::protocol::Cleaned {
@@ -917,20 +944,24 @@ impl Node {
         })
     }
 
-    fn idle_workspaces(&self) -> Vec<(PathBuf, PathBuf)> {
+    fn idle_workspaces(&self) -> Result<Vec<(PathBuf, PathBuf)>, NodeError> {
         let mut found = Vec::new();
-        let Ok(scopes) = std::fs::read_dir(self.store.area("work")) else {
-            return found;
+        let work = self.store.area("work");
+        let Some(scopes) = entries(&work)? else {
+            return Ok(found);
         };
-        for scope in scopes.flatten() {
-            let Ok(projects) = std::fs::read_dir(scope.path()) else {
+        for scope in scopes {
+            let scope = scope.map_err(io("listing", &work))?;
+            let Some(projects) = entries(&scope.path())? else {
                 continue;
             };
-            for project in projects.flatten() {
-                let Ok(slots) = std::fs::read_dir(project.path()) else {
+            for project in projects {
+                let project = project.map_err(io("listing", &scope.path()))?;
+                let Some(slots) = entries(&project.path())? else {
                     continue;
                 };
-                for slot in slots.flatten() {
+                for slot in slots {
+                    let slot = slot.map_err(io("listing", &project.path()))?;
                     let name = slot.file_name();
                     let Some(index) = name.to_str().filter(|n| n.parse::<usize>().is_ok()) else {
                         continue;
@@ -940,27 +971,29 @@ impl Node {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
-    fn empty_trash(&self) {
+    fn empty_trash(&self) -> Result<(), NodeError> {
         let trash = self.store.area("trash");
-        let Ok(entries) = std::fs::read_dir(&trash) else {
-            return;
+        let Some(entries) = entries(&trash)? else {
+            return Ok(());
         };
-        for entry in entries.flatten() {
-            match crate::state_file::remove_tree_forcibly(&entry.path()) {
-                Ok(()) | Err(_) => {}
-            }
+        for entry in entries {
+            let entry = entry.map_err(io("listing", &trash))?;
+            crate::state_file::remove_tree_forcibly(&entry.path())?;
         }
+        Ok(())
     }
 
     fn finished_largest_log_first(&self) -> Result<Vec<JobId>, NodeError> {
         let mut logs = Vec::new();
         for id in self.finished_oldest_first()? {
-            let size = match std::fs::symlink_metadata(self.store.log_path(&id)) {
+            let path = self.store.log_path(&id);
+            let size = match std::fs::symlink_metadata(&path) {
                 Ok(meta) => meta.len(),
-                Err(_absent) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(io("checking", &path)(error)),
             };
             if size > crate::domain::len_u64(DISCARDED.len()) {
                 logs.push((std::cmp::Reverse(size), id));
@@ -973,10 +1006,9 @@ impl Node {
     fn finished_oldest_first(&self) -> Result<Vec<JobId>, NodeError> {
         let mut finished = Vec::new();
         for id in self.store.ids()? {
-            if let (Ok(Phase::Finished { .. }), Ok(spec)) =
-                (self.store.phase(&id), self.store.spec(&id))
-            {
-                finished.push((spec.sequence, id));
+            match self.store.phase(&id)? {
+                Phase::Finished { .. } => finished.push((self.store.spec(&id)?.sequence, id)),
+                Phase::Queued | Phase::Preparing { .. } | Phase::Running { .. } => {}
             }
         }
         finished.sort();
@@ -1002,10 +1034,11 @@ impl Node {
 
     fn forget_stale_nonces(&self) -> Result<(), NodeError> {
         let dir = self.store.area("nonces");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(entries) = entries(&dir)? else {
             return Ok(());
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(io("listing", &dir))?;
             let path = entry.path();
             let Some(bytes) = crate::state_file::read_bytes(&path)? else {
                 continue;
@@ -1026,11 +1059,8 @@ impl Node {
         let mut needed = Vec::new();
         let mut spent = Vec::new();
         for id in self.store.ids()? {
-            let Ok(spec) = self.store.spec(&id) else {
-                return Ok(collecting.release()?);
-            };
-            if keep == Keep::Unfinished
-                && matches!(self.store.phase(&id), Ok(Phase::Finished { .. }))
+            let spec = self.store.spec(&id)?;
+            if keep == Keep::Unfinished && matches!(self.store.phase(&id)?, Phase::Finished { .. })
             {
                 spent.push(spec);
             } else {
@@ -1038,10 +1068,7 @@ impl Node {
             }
         }
         for id in self.store.staged_ids()? {
-            let Ok(spec) = self.store.staged_spec(&id) else {
-                return Ok(collecting.release()?);
-            };
-            needed.push(spec);
+            needed.push(self.store.staged_spec(&id)?);
         }
         let mut reachable = self.reachable(&needed)?;
         reachable.extend(spent.iter().filter_map(|spec| match &spec.location {
@@ -1065,11 +1092,7 @@ impl Node {
         for spec in specs {
             if let Location::Snapshot { source, .. } = &spec.location {
                 reachable.insert(source.manifest.clone());
-                match self.cas.manifest(&source.manifest) {
-                    Ok(manifest) => reachable.extend(manifest.blobs()),
-                    Err(CasError::Missing(_) | CasError::Damaged(_)) => {}
-                    Err(other) => return Err(other.into()),
-                }
+                reachable.extend(self.cas.manifest(&source.manifest)?.blobs());
             }
         }
         Ok(reachable)
@@ -1366,7 +1389,7 @@ impl Node {
             loop {
                 let (listed, _unreadable) = self.list(principal, 50)?;
                 let survey = crate::protocol::Survey {
-                    report: self.report(),
+                    report: self.report()?,
                     jobs: listed,
                 };
                 let mut line =
@@ -1477,7 +1500,7 @@ mod tests {
         crate::state_file::write_bytes(&store.log_path(&id), log).unwrap();
         (
             Node {
-                short: |_| false,
+                short: |_| Ok(false),
                 ..Node::open(dirs(root)).unwrap()
             },
             id.as_str().parse().unwrap(),
@@ -1746,12 +1769,12 @@ mod tests {
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| Ok(false)).unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), [b'x'; 10_000]);
         let same_size = vec![b'z'; DISCARDED.len()];
         for log in [b"tiny".to_vec(), same_size] {
             crate::state_file::write_bytes(&store.log_path(&id), &log).unwrap();
-            node.make_room(&|| true).unwrap();
+            node.make_room(&|| Ok(true)).unwrap();
             assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), log);
         }
     }
@@ -1942,8 +1965,12 @@ mod tests {
     fn a_report_describes_the_machine_and_a_paused_one_refuses_new_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, _) = published(tmp.path(), b"");
-        let report = node.report();
-        assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
+        let report = node.report().unwrap();
+        assert!(report.cores > 0 && report.memory_total > 0);
+        assert!(matches!(
+            report.disk,
+            crate::protocol::DiskSpace::Measured { total, .. } if total > 0
+        ));
         assert!(!report.paused);
         let wire = ask(&node, &Request::Pause { paused: true });
         let paused = crate::remote::receive("m", &mut wire.as_slice(), &mut Vec::new()).unwrap();
@@ -1958,7 +1985,7 @@ mod tests {
             "{reply:?}"
         );
         node.pause(false).unwrap();
-        assert!(!node.report().paused);
+        assert!(!node.report().unwrap().paused);
     }
 
     #[test]
@@ -2000,6 +2027,71 @@ mod tests {
         assert!(!recent.join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
         busy.release().unwrap();
+    }
+
+    #[test]
+    fn cleaning_reports_unreadable_workspaces_instead_of_a_partial_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let work = node.store.area("work");
+        let file = work.join("owner").join("project").join("0").join("file");
+        crate::state_file::write_bytes(&file, b"kept").unwrap();
+        for (site, path) in [
+            ("node::list", work.as_path()),
+            ("node::measure", file.as_path()),
+        ] {
+            let tag = path.display().to_string();
+            let _faults = crate::faults::inject(&[(site, &tag)]);
+            assert!(matches!(
+                node.clean((false, false, true)),
+                Err(NodeError::Io { .. })
+            ));
+        }
+        assert_eq!(std::fs::read(file).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn an_unmeasurable_disk_is_not_reported_as_roomy_or_zero_bytes_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let tag = node.store.area("jobs").display().to_string();
+        let _faults = crate::faults::inject(&[("node::disk", &tag)]);
+        disk_is_short(&node.store.area("jobs")).unwrap_err();
+        assert!(matches!(
+            node.report().unwrap().disk,
+            crate::protocol::DiskSpace::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_pause_record_cannot_allow_a_job_or_report_the_machine_as_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let tag = node.pause_path().display().to_string();
+        let _faults = crate::faults::inject(&[("state_file::read", &tag)]);
+        for request in [
+            Request::Report,
+            submission(crate::domain::Nonce::generate().unwrap(), Location::Home),
+        ] {
+            let reply = ask(&node, &request);
+            let received = crate::remote::receive("m", &mut reply.as_slice(), &mut Vec::new());
+            assert!(matches!(
+                received,
+                Ok(Reply::Refused(Refusal {
+                    code: RefusalCode::Storage,
+                    ..
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn uninstall_cannot_treat_unreadable_job_state_as_no_running_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let tag = node.store.area("jobs").display().to_string();
+        let _faults = crate::faults::inject(&[("store::list", &tag)]);
+        assert!(matches!(node.running(), Err(NodeError::Store(_))));
     }
 
     struct Tell(std::sync::mpsc::Sender<Vec<u8>>);
@@ -2330,7 +2422,7 @@ mod tests {
             ("state_file::overwrite", text(&log)),
         ] {
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.make_room(&|| true).unwrap_err();
+            node.make_room(&|| Ok(true)).unwrap_err();
         }
     }
 
@@ -2441,9 +2533,9 @@ mod tests {
         let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
         let running = crate::lock::OsLock::exclusive(&store.alive_path(&oldest)).unwrap();
 
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| Ok(false)).unwrap();
         assert!(there("0") && there("2"));
-        let until_one_workspace_is_gone = || there("0") && there("2");
+        let until_one_workspace_is_gone = || Ok(there("0") && there("2"));
         node.make_room(&until_one_workspace_is_gone).unwrap();
         assert_ne!(there("0"), there("2"));
         assert!(project.join("1").join("file").try_exists().unwrap());
@@ -2454,7 +2546,7 @@ mod tests {
         crate::state_file::write_bytes(&store.log_path(big), &[b'x'; 10_000]).unwrap();
         crate::state_file::write_bytes(&store.log_path(small), &[b'y'; 9_000]).unwrap();
         let until_the_biggest_log_is_gone =
-            || std::fs::read(store.log_path(big)).unwrap() != DISCARDED;
+            || Ok(std::fs::read(store.log_path(big)).unwrap() != DISCARDED);
         node.make_room(&until_the_biggest_log_is_gone).unwrap();
         assert_eq!(std::fs::read(store.log_path(big)).unwrap(), DISCARDED);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), [b'y'; 9_000]);
@@ -2478,7 +2570,7 @@ mod tests {
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
             .unwrap();
-        node.make_room(&|| true).unwrap();
+        node.make_room(&|| Ok(true)).unwrap();
         assert!(!there("0") && !there("2"));
         assert_eq!(store.ids().unwrap().len(), 3);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), DISCARDED);
@@ -2487,7 +2579,7 @@ mod tests {
         assert!(kept.contains(&needed) && kept.contains(&spent));
         assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| Ok(false)).unwrap();
         busy.release().unwrap();
         running.release().unwrap();
     }

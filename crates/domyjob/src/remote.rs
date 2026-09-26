@@ -19,12 +19,11 @@ fn witness_path(dirs: &Dirs, machine: &MachineName) -> PathBuf {
         .join(format!("{}.json", tag.get(..32).unwrap_or(tag.as_str())))
 }
 
-#[must_use]
-pub fn witnessed(dirs: &Dirs, machine: &MachineName) -> Option<crate::audit::Head> {
-    match crate::state_file::read_json(&witness_path(dirs, machine)) {
-        Ok(known) => known,
-        Err(_unreadable) => None,
-    }
+pub fn witnessed(
+    dirs: &Dirs,
+    machine: &MachineName,
+) -> Result<Option<crate::audit::Head>, RemoteError> {
+    Ok(crate::state_file::read_json(&witness_path(dirs, machine))?)
 }
 
 pub fn forget_witness(dirs: &Dirs, machine: &MachineName) -> Result<(), RemoteError> {
@@ -1360,6 +1359,25 @@ impl crate::ingress::Ingress for Facts {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_broken_audit_witness_is_not_reported_as_no_witness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            home: tmp.path().to_path_buf(),
+            state: tmp.path().join("state"),
+            config: tmp.path().join("config"),
+            cache: tmp.path().join("cache"),
+            keys: crate::keystore::KeyStore::OwnerOnlyFile,
+        };
+        let machine: MachineName = "linux".parse().unwrap();
+        assert!(witnessed(&dirs, &machine).unwrap().is_none());
+        crate::state_file::write_bytes(&witness_path(&dirs, &machine), b"broken").unwrap();
+        assert!(matches!(
+            witnessed(&dirs, &machine),
+            Err(RemoteError::State(_))
+        ));
+    }
 
     #[test]
     fn what_a_machine_said_is_its_last_lines_without_ssh_noise_or_escapes() {

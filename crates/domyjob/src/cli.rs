@@ -1088,9 +1088,11 @@ fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
 fn run_named(args: &DoArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let start = current_dir()?;
-    let root = crate::project::find_root(&start).ok_or_else(|| {
-        ClientError::from(crate::project::ProjectError::NoSuchJob(args.job.clone()))
-    })?;
+    let root = crate::project::find_root(&start)
+        .map_err(ClientError::from)?
+        .ok_or_else(|| {
+            ClientError::from(crate::project::ProjectError::NoSuchJob(args.job.clone()))
+        })?;
     let project = crate::project::Project::load(&root)
         .map_err(ClientError::from)?
         .ok_or_else(|| {
@@ -2374,7 +2376,7 @@ fn self_uninstall(
         return Ok(ExitCode::SUCCESS);
     }
     let node = crate::node::Node::open(dirs.clone())?;
-    let running = node.running();
+    let running = node.running()?;
     if !running.is_empty() && !kill_running {
         let ids: Vec<String> = running.iter().map(ToString::to_string).collect();
         return Err(CliError::Declined(format!(
@@ -2411,7 +2413,7 @@ fn self_uninstall(
 
 fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let known = crate::remote::witnessed(&ctx.dirs, &args.name);
+    let known = crate::remote::witnessed(&ctx.dirs, &args.name).map_err(ClientError::from)?;
     match &known {
         Some(head) => eprintln!(
             "domyjob: this machine last saw {} entries in {}'s audit log, ending in {}",
@@ -2432,7 +2434,7 @@ fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
     crate::remote::forget_witness(&ctx.dirs, &args.name).map_err(ClientError::from)?;
     let machine = ctx.config.machine(&args.name);
     crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
-    match crate::remote::witnessed(&ctx.dirs, &args.name) {
+    match crate::remote::witnessed(&ctx.dirs, &args.name).map_err(ClientError::from)? {
         Some(head) => eprintln!(
             "domyjob: now trusting {}'s audit log as it stands: {} entries, ending in {}",
             args.name, head.seq, head.hash

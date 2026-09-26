@@ -448,11 +448,22 @@ pub struct Report {
     pub load_hundredths: Option<[u32; 3]>,
     pub memory_total: u64,
     pub memory_available: u64,
-    pub disk_total: u64,
-    pub disk_available: u64,
-    pub disk_short: bool,
+    pub disk: DiskSpace,
     pub uptime_seconds: u64,
     pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "state")]
+pub enum DiskSpace {
+    Measured {
+        total: u64,
+        available: u64,
+        short: bool,
+    },
+    Unavailable {
+        reason: RemoteText,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

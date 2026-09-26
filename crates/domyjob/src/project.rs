@@ -22,6 +22,8 @@ pub enum ProjectError {
     },
     #[error("no job named {0} in {FILE}")]
     NoSuchJob(JobName),
+    #[error("{0} exists but is not a file")]
+    NotFile(PathBuf),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,11 +85,21 @@ impl Project {
     }
 }
 
-pub fn find_root(start: &Path) -> Option<PathBuf> {
-    start
-        .ancestors()
-        .find(|dir| std::fs::metadata(dir.join(FILE)).is_ok_and(|m| m.is_file()))
-        .map(Path::to_path_buf)
+pub fn find_root(start: &Path) -> Result<Option<PathBuf>, ProjectError> {
+    for dir in start.ancestors() {
+        let path = dir.join(FILE);
+        crate::faults::at("project::stat", &path).map_err(|source| ProjectError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => return Ok(Some(dir.to_path_buf())),
+            Ok(_) => return Err(ProjectError::NotFile(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ProjectError::Read { path, source }),
+        }
+    }
+    Ok(None)
 }
 
 impl crate::ingress::Ingress for File {}
@@ -130,5 +142,23 @@ workspace = "fresh"
         assert!(glob("*", ""));
         assert!(glob("a*b*c", "aXbYc"));
         assert!(!glob("a*b", "ac"));
+    }
+
+    #[test]
+    fn a_project_marker_that_cannot_be_checked_does_not_select_an_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        crate::state_file::write_bytes(&root.join(FILE), SAMPLE.as_bytes()).unwrap();
+        let child = root.join("child");
+        crate::state_file::private_dir(&child).unwrap();
+        assert_eq!(find_root(&child).unwrap(), Some(root));
+        let marker = child.join(FILE);
+        let tag = marker.display().to_string();
+        {
+            let _faults = crate::faults::inject(&[("project::stat", &tag)]);
+            assert!(matches!(find_root(&child), Err(ProjectError::Read { .. })));
+        }
+        crate::state_file::private_dir(&marker).unwrap();
+        assert!(matches!(find_root(&child), Err(ProjectError::NotFile(_))));
     }
 }

@@ -36,6 +36,8 @@ pub enum StoreError {
     Lock(#[from] LockError),
     #[error("job {0} already exists")]
     Exists(JobId),
+    #[error("{path} does not name a job occupying the slot")]
+    InvalidHolder { path: PathBuf },
     #[error(transparent)]
     Invalid(#[from] Invalid),
 }
@@ -357,7 +359,7 @@ impl Store {
         let spec = self.spec(id)?;
         let phase = self.phase(id)?;
         let behind = match (&phase, supervisor) {
-            (Phase::Queued, Supervisor::Alive) => self.slot_holders(&spec),
+            (Phase::Queued, Supervisor::Alive) => self.slot_holders(&spec)?,
             _ => Vec::new(),
         };
         Ok(Job {
@@ -373,13 +375,17 @@ impl Store {
         slot_lock.with_extension("holder")
     }
 
-    fn slot_holders(&self, waiting: &Spec) -> Vec<JobId> {
+    fn slot_holders(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
         let slots = self.area("slots");
-        let Ok(entries) = std::fs::read_dir(&slots) else {
-            return Vec::new();
+        let entries = match std::fs::read_dir(&slots) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io("listing", &slots)(error)),
         };
-        let mut names: Vec<std::ffi::OsString> =
-            entries.flatten().map(|entry| entry.file_name()).collect();
+        let mut names = Vec::new();
+        for entry in entries {
+            names.push(entry.map_err(io("listing", &slots))?.file_name());
+        }
         names.sort();
         let mut holders = Vec::new();
         for name in names {
@@ -392,24 +398,28 @@ impl Store {
             if index >= waiting.concurrency.slots() {
                 continue;
             }
-            let Ok(Some(bytes)) = crate::state_file::read_bytes(&slots.join(&name)) else {
+            let path = slots.join(&name);
+            let Some(bytes) = crate::state_file::read_bytes(&path)? else {
                 continue;
             };
-            let Ok(holder) = String::from_utf8_lossy(bytes.trim_ascii()).parse::<JobId>() else {
-                continue;
-            };
-            if holder != waiting.id && self.holds_on(&holder) {
+            let holder = String::from_utf8_lossy(bytes.trim_ascii())
+                .parse::<JobId>()
+                .map_err(|_invalid| StoreError::InvalidHolder { path })?;
+            if holder != waiting.id && self.holds_on(&holder)? {
                 holders.push(holder);
             }
         }
         holders.sort();
         holders.dedup();
-        holders
+        Ok(holders)
     }
 
-    fn holds_on(&self, holder: &JobId) -> bool {
-        matches!(self.supervisor(holder), Ok(Supervisor::Alive))
-            && !matches!(self.phase(holder), Ok(Phase::Finished { .. }) | Err(_))
+    fn holds_on(&self, holder: &JobId) -> Result<bool, StoreError> {
+        if !self.is_published(holder)? {
+            return Ok(false);
+        }
+        Ok(matches!(self.supervisor(holder)?, Supervisor::Alive)
+            && !matches!(self.phase(holder)?, Phase::Finished { .. }))
     }
 
     pub fn ids(&self) -> Result<Vec<JobId>, StoreError> {
@@ -824,6 +834,16 @@ mod tests {
         .unwrap();
         holder("4.holder", outside.as_str().as_bytes());
         holder("x.holder", outside.as_str().as_bytes());
+        assert!(matches!(
+            store.job(&waiting),
+            Err(StoreError::State(crate::state_file::StateError::Io { .. }))
+        ));
+        crate::state_file::remove_tree_forcibly(&slots.join("01.holder")).unwrap();
+        assert!(matches!(
+            store.job(&waiting),
+            Err(StoreError::InvalidHolder { .. })
+        ));
+        crate::state_file::remove_file(&slots.join("1.holder")).unwrap();
         assert_eq!(
             store.job(&waiting).unwrap().behind,
             std::slice::from_ref(&holding)

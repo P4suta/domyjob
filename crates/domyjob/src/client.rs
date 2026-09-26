@@ -67,6 +67,8 @@ pub enum ClientError {
     },
     #[error("this directory is not the project job {job} was sent from")]
     OtherProject { job: JobId },
+    #[error("machine {0} answered but left no facts for label selection")]
+    NoFacts(MachineName),
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> ClientError + use<> {
@@ -91,26 +93,18 @@ impl Context {
         Ok(Self { config, dirs })
     }
 
-    fn facts(&self, machine: &Machine) -> Vec<String> {
-        match cached_facts(&self.dirs, machine) {
-            Ok(Some(facts)) => facts.labels(),
-            Ok(None) | Err(_) => match Link::open(&self.config, &self.dirs, machine) {
-                Ok(_) => match cached_facts(&self.dirs, machine) {
-                    Ok(Some(facts)) => facts.labels(),
-                    Ok(None) | Err(_) => Vec::new(),
-                },
-                Err(error) => {
-                    eprintln!("domyjob: {}: {error}", machine.name);
-                    Vec::new()
-                }
-            },
+    fn facts(&self, machine: &Machine) -> Result<Vec<String>, ClientError> {
+        if let Some(facts) = cached_facts(&self.dirs, machine)? {
+            return Ok(facts.labels());
         }
+        Link::open(&self.config, &self.dirs, machine)?;
+        let facts = cached_facts(&self.dirs, machine)?
+            .ok_or_else(|| ClientError::NoFacts(machine.name.clone()))?;
+        Ok(facts.labels())
     }
 
     pub fn select(&self, selector: &str) -> Result<Vec<Machine>, ClientError> {
-        Ok(self
-            .config
-            .select(selector, &|machine| self.facts(machine))?)
+        self.config.select(selector, &|machine| self.facts(machine))
     }
 
     fn index_path(&self) -> PathBuf {
@@ -345,7 +339,7 @@ fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBu
     if let Some(given) = given {
         return Ok(given.to_path_buf());
     }
-    if let Some(found) = project::find_root(start) {
+    if let Some(found) = project::find_root(start)? {
         return Ok(found);
     }
     Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
@@ -359,7 +353,7 @@ pub fn project_here(
     let start = std::fs::canonicalize(start).map_err(io("resolving", start))?;
     let found = root_of(&start, root, &ctx.config)?;
     let found = std::fs::canonicalize(&found).map_err(io("resolving", &found))?;
-    let (place, named) = repository_place(ctx, &found);
+    let (place, named) = repository_place(ctx, &found)?;
     let key = project_key(&ctx.origin()?, &place, &named)?;
     Ok((found, key))
 }
@@ -398,25 +392,28 @@ pub fn env_map(
     Ok(out)
 }
 
-fn repository_place(ctx: &Context, root: &Path) -> (PathBuf, std::ffi::OsString) {
+fn repository_place(
+    ctx: &Context,
+    root: &Path,
+) -> Result<(PathBuf, std::ffi::OsString), ClientError> {
     let plain = || {
         (
             root.to_path_buf(),
             root.file_name().unwrap_or(root.as_os_str()).to_owned(),
         )
     };
-    let Ok(Some(detected)) = snapshot::detect(&ctx.config, root) else {
-        return plain();
+    let Some(detected) = snapshot::detect(&ctx.config, root)? else {
+        return Ok(plain());
     };
-    let Some(shared) = snapshot::identity(&detected) else {
-        return plain();
+    let Some(shared) = snapshot::identity(&detected)? else {
+        return Ok(plain());
     };
     let named = repository_name(&shared).unwrap_or_else(|| root.as_os_str().to_owned());
     let place = match root.strip_prefix(&detected.root) {
         Ok(inner) if !inner.as_os_str().is_empty() => shared.join(inner),
         Ok(_) | Err(_) => shared,
     };
-    (place, named)
+    Ok((place, named))
 }
 
 fn repository_name(shared: &Path) -> Option<std::ffi::OsString> {
@@ -436,7 +433,7 @@ pub fn prepared(
     snapshot: Snapshot,
     subdir: Option<RelPath>,
 ) -> Result<Prepared, ClientError> {
-    let (place, named) = repository_place(ctx, root);
+    let (place, named) = repository_place(ctx, root)?;
     let project = project_key(&ctx.origin()?, &place, &named)?;
     let manifest = snapshot.manifest.encode()?;
     let source = Source {
@@ -1164,6 +1161,34 @@ impl crate::ingress::Ingress for IndexEntry {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_machine_facts_are_an_error_to_label_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            config: Config::builtin().unwrap(),
+            dirs: Dirs {
+                home: tmp.path().to_path_buf(),
+                state: tmp.path().join("state"),
+                config: tmp.path().join("config"),
+                cache: tmp.path().join("cache"),
+                keys: crate::keystore::KeyStore::OwnerOnlyFile,
+            },
+        };
+        let machine = ctx.config.machine(&"linux".parse().unwrap());
+        let tag = ctx
+            .dirs
+            .cache
+            .join("machines")
+            .join("linux.json")
+            .display()
+            .to_string();
+        let _faults = crate::faults::inject(&[("state_file::read", &tag)]);
+        assert!(matches!(
+            ctx.facts(&machine),
+            Err(ClientError::Remote(RemoteError::State(_)))
+        ));
+    }
 
     #[test]
     fn a_torn_or_foreign_index_line_is_skipped_not_fatal() {

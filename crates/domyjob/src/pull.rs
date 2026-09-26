@@ -133,8 +133,12 @@ fn remove(path: &Path) -> Result<(), PullError> {
 }
 
 fn write(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), PullError> {
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
-        remove(path)?;
+    crate::faults::at("pull::check", path).map_err(io("checking", path))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => remove(path)?,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io("checking", path)(error)),
     }
     let mut staged = crate::user_files::Staged::beside(path)?;
     staged
@@ -203,6 +207,21 @@ mod tests {
             before,
             after,
         }
+    }
+
+    #[test]
+    fn a_destination_that_cannot_be_checked_is_not_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("new.txt");
+        let change = change("new.txt", None, Some(file(b"new", Mode::Regular)));
+        let contents = BTreeMap::from([(change.path.clone(), b"new".to_vec())]);
+        let tag = destination.display().to_string();
+        let _faults = crate::faults::inject(&[("pull::check", &tag)]);
+        assert!(matches!(
+            apply(tmp.path(), &[change], &contents),
+            Err(PullError::Io { .. })
+        ));
+        assert!(!destination.try_exists().unwrap());
     }
 
     #[test]

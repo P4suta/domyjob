@@ -151,15 +151,21 @@ impl Cas {
         };
         for fan in fans {
             let fan = fan.map_err(io("listing", &self.root))?;
-            let Ok(inner) = std::fs::read_dir(fan.path()) else {
+            let fan_name = fan.file_name();
+            let Some(prefix) = fan_name.to_str().filter(|name| {
+                name.len() == 2
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) else {
                 continue;
             };
-            for blob in inner.flatten() {
-                let name = format!(
-                    "{}{}",
-                    fan.file_name().to_string_lossy(),
-                    blob.file_name().to_string_lossy()
-                );
+            let path = fan.path();
+            crate::faults::at("cas::list", &path).map_err(io("listing", &path))?;
+            let inner = std::fs::read_dir(&path).map_err(io("listing", &path))?;
+            for blob in inner {
+                let blob = blob.map_err(io("listing", &path))?;
+                let name = format!("{}{}", prefix, blob.file_name().to_string_lossy());
                 match name.parse::<BlobId>() {
                     Ok(id) => out.push(id),
                     Err(_staging_or_foreign) => {}
@@ -250,6 +256,17 @@ mod tests {
             cas.manifest(&arriving),
             Err(CasError::Manifest { .. })
         ));
+    }
+
+    #[test]
+    fn an_unreadable_fan_cannot_make_a_partial_blob_list_look_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("objects")).unwrap();
+        let blob = BlobId::of(b"kept");
+        cas.put(&blob, b"kept").unwrap();
+        let tag = cas.root.join(blob.split().0).display().to_string();
+        let _faults = crate::faults::inject(&[("cas::list", &tag)]);
+        assert!(matches!(cas.stored(), Err(CasError::Io { .. })));
     }
 
     #[test]

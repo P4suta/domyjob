@@ -162,7 +162,11 @@ pub fn machine_card(
     let mut out = String::new();
     let health = if report.paused {
         ui::paint(Tone::Stopped, ui::symbol(Symbol::Stopped))
-    } else if report.disk_short {
+    } else if matches!(
+        report.disk,
+        crate::protocol::DiskSpace::Measured { short: true, .. }
+            | crate::protocol::DiskSpace::Unavailable { .. }
+    ) {
         ui::paint(Tone::Bad, ui::symbol(Symbol::Warning))
     } else {
         ui::paint(Tone::Good, ui::symbol(Symbol::Running))
@@ -200,14 +204,27 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
         ui::bytes(report.memory_total.saturating_sub(report.memory_available)),
         ui::bytes(report.memory_total)
     ));
-    let disk = format!("disk {} free", ui::bytes(report.disk_available));
-    facts.push(if report.disk_short {
-        ui::paint(
+    facts.push(match &report.disk {
+        crate::protocol::DiskSpace::Measured {
+            available,
+            short: true,
+            ..
+        } => ui::paint(
             Tone::Bad,
-            &format!("{disk} {} low", ui::symbol(Symbol::Warning)),
-        )
-    } else {
-        disk
+            &format!(
+                "disk {} free {} low",
+                ui::bytes(*available),
+                ui::symbol(Symbol::Warning)
+            ),
+        ),
+        crate::protocol::DiskSpace::Measured {
+            available,
+            short: false,
+            ..
+        } => format!("disk {} free", ui::bytes(*available)),
+        crate::protocol::DiskSpace::Unavailable { reason } => {
+            ui::paint(Tone::Bad, &format!("disk space unavailable: {reason}"))
+        }
     });
     Ok(facts)
 }
@@ -292,12 +309,18 @@ fn attention(
             ui::paint(Tone::Stopped, ui::symbol(Symbol::Stopped)),
         )?;
     }
-    if report.disk_short {
-        writeln!(
+    match &report.disk {
+        crate::protocol::DiskSpace::Measured { short: true, .. } => writeln!(
             out,
             "  {} the disk is nearly full  {hint} domyjob clean {machine}",
             ui::paint(Tone::Bad, ui::symbol(Symbol::Warning)),
-        )?;
+        )?,
+        crate::protocol::DiskSpace::Unavailable { .. } => writeln!(
+            out,
+            "  {} the disk space could not be measured",
+            ui::paint(Tone::Bad, ui::symbol(Symbol::Warning)),
+        )?,
+        crate::protocol::DiskSpace::Measured { short: false, .. } => {}
     }
     Ok(())
 }
@@ -678,9 +701,11 @@ pub mod tests {
             load_hundredths: Some([320, 250, 100]),
             memory_total: 32_000_000_000,
             memory_available: 20_000_000_000,
-            disk_total: 500_000_000_000,
-            disk_available: 3_000_000_000,
-            disk_short: true,
+            disk: crate::protocol::DiskSpace::Measured {
+                total: 500_000_000_000,
+                available: 3_000_000_000,
+                short: true,
+            },
             uptime_seconds: 60,
             paused: true,
         };
@@ -728,7 +753,11 @@ pub mod tests {
             assert!(card.contains(wanted), "{wanted} missing from\n{card}");
         }
         let idle = crate::protocol::Report {
-            disk_short: false,
+            disk: crate::protocol::DiskSpace::Measured {
+                total: 500_000_000_000,
+                available: 300_000_000_000,
+                short: false,
+            },
             paused: false,
             load_hundredths: None,
             ..report
@@ -737,6 +766,30 @@ pub mod tests {
             &machine_card(&machine, &idle, &[], Timestamp::observe()).unwrap(),
         );
         assert!(quiet.contains("idle") && !quiet.contains("clean") && !quiet.contains("load"));
+    }
+
+    #[test]
+    fn a_machine_card_distinguishes_unmeasurable_disk_space_from_a_roomy_disk() {
+        let machine: MachineName = "linux".parse().unwrap();
+        let unknown = crate::protocol::Report {
+            host: crate::terminal::RemoteText::new("box".to_owned()),
+            os: crate::terminal::RemoteText::new("Linux".to_owned()),
+            cores: 4,
+            load_hundredths: None,
+            memory_total: 100,
+            memory_available: 50,
+            disk: crate::protocol::DiskSpace::Unavailable {
+                reason: crate::terminal::RemoteText::new("permission denied".to_owned()),
+            },
+            uptime_seconds: 60,
+            paused: false,
+        };
+        let unreadable = crate::terminal::clean(
+            &machine_card(&machine, &unknown, &[], Timestamp::observe()).unwrap(),
+        );
+        assert!(unreadable.contains("disk space unavailable: permission denied"));
+        assert!(unreadable.contains("disk space could not be measured"));
+        assert!(!unreadable.contains("0 B free"));
     }
 
     #[test]

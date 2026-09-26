@@ -60,6 +60,8 @@ pub enum ConfigError {
     NoLabel(String),
     #[error("{0:?} is neither a machine, a label, nor a host name")]
     BadTerm(String),
+    #[error("a worker checking machine {0}'s labels panicked")]
+    FactWorkerPanicked(MachineName),
     #[error("no {kind} named {name}")]
     Missing { kind: &'static str, name: String },
     #[error("{path} is not valid TOML: {source}")]
@@ -573,26 +575,32 @@ impl Config {
         sources
     }
 
-    pub fn select(
+    pub fn select<E>(
         &self,
         selector: &str,
-        facts: &(dyn Fn(&Machine) -> Vec<String> + Sync),
-    ) -> Result<Vec<Machine>, ConfigError> {
+        facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
+    ) -> Result<Vec<Machine>, E>
+    where
+        E: From<ConfigError> + Send,
+    {
         let out = self.select_at(selector, facts, 0)?;
         if out.is_empty() {
-            return Err(ConfigError::NoMatch {
+            return Err(E::from(ConfigError::NoMatch {
                 selector: selector.to_owned(),
-            });
+            }));
         }
         Ok(out)
     }
 
-    fn select_at(
+    fn select_at<E>(
         &self,
         selector: &str,
-        facts: &(dyn Fn(&Machine) -> Vec<String> + Sync),
+        facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
         depth: u8,
-    ) -> Result<Vec<Machine>, ConfigError> {
+    ) -> Result<Vec<Machine>, E>
+    where
+        E: From<ConfigError> + Send,
+    {
         let mut out: Vec<Machine> = Vec::new();
         for term in selector.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             for machine in self.term(term, facts, depth)? {
@@ -604,12 +612,15 @@ impl Config {
         Ok(out)
     }
 
-    fn term(
+    fn term<E>(
         &self,
         term: &str,
-        facts: &(dyn Fn(&Machine) -> Vec<String> + Sync),
+        facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
         depth: u8,
-    ) -> Result<Vec<Machine>, ConfigError> {
+    ) -> Result<Vec<Machine>, E>
+    where
+        E: From<ConfigError> + Send,
+    {
         if let Some(group) = term.strip_prefix('@') {
             if group == "all" {
                 return Ok(self.configured());
@@ -617,11 +628,11 @@ impl Config {
             let members = self
                 .groups
                 .get(group)
-                .ok_or_else(|| ConfigError::UnknownGroup(group.to_owned()))?;
+                .ok_or_else(|| E::from(ConfigError::UnknownGroup(group.to_owned())))?;
             let deeper = depth
                 .checked_add(1)
                 .filter(|d| *d <= 8)
-                .ok_or_else(|| ConfigError::TooDeep(group.to_owned()))?;
+                .ok_or_else(|| E::from(ConfigError::TooDeep(group.to_owned())))?;
             return self.select_at(&members.join(","), facts, deeper);
         }
         if let Ok(name) = term.parse::<MachineName>()
@@ -633,7 +644,7 @@ impl Config {
         let needs_facts = wanted.iter().any(|w| w.contains('='));
         let configured = self.configured();
         let learned = if needs_facts {
-            learn(&configured, facts)
+            learn(&configured, facts)?
         } else {
             vec![Vec::new(); configured.len()]
         };
@@ -651,19 +662,22 @@ impl Config {
             return Ok(matching);
         }
         if needs_facts {
-            return Err(ConfigError::NoLabel(term.to_owned()));
+            return Err(E::from(ConfigError::NoLabel(term.to_owned())));
         }
         match term.parse::<MachineName>() {
             Ok(name) => Ok(vec![self.machine(&name)]),
-            Err(_invalid) => Err(ConfigError::BadTerm(term.to_owned())),
+            Err(_invalid) => Err(E::from(ConfigError::BadTerm(term.to_owned()))),
         }
     }
 }
 
-fn learn(
+fn learn<E>(
     machines: &[Machine],
-    facts: &(dyn Fn(&Machine) -> Vec<String> + Sync),
-) -> Vec<Vec<String>> {
+    facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
+) -> Result<Vec<Vec<String>>, E>
+where
+    E: From<ConfigError> + Send,
+{
     std::thread::scope(|scope| {
         #[expect(
             clippy::needless_collect,
@@ -675,9 +689,12 @@ fn learn(
             .collect();
         handles
             .into_iter()
-            .map(|handle| match handle.join() {
+            .zip(machines)
+            .map(|(handle, machine)| match handle.join() {
                 Ok(learned) => learned,
-                Err(_panicked) => Vec::new(),
+                Err(_panicked) => Err(E::from(ConfigError::FactWorkerPanicked(
+                    machine.name.clone(),
+                ))),
             })
             .collect()
     })
@@ -798,11 +815,15 @@ heavy = ["box", "win"]
 everything = ["@heavy", "pod"]
 "#;
 
-    fn facts(machine: &Machine) -> Vec<String> {
-        match machine.name.as_str() {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the test callback shares the fallible selector signature"
+    )]
+    fn facts(machine: &Machine) -> Result<Vec<String>, ConfigError> {
+        Ok(match machine.name.as_str() {
             "win" => vec!["os=windows".into()],
             _ => vec!["os=linux".into()],
-        }
+        })
     }
 
     fn names(machines: Vec<Machine>) -> Vec<String> {
@@ -837,6 +858,25 @@ everything = ["@heavy", "pod"]
             names(config.select("os=linux", &together).unwrap()),
             ["box", "pod"]
         );
+    }
+
+    #[test]
+    fn a_failed_fact_query_cannot_silently_drop_a_machine_from_selection() {
+        let config = Config::layered(SAMPLE, "sample").unwrap();
+        let fallible = |machine: &Machine| {
+            if machine.name.as_str() == "win" {
+                Err(ConfigError::Read {
+                    path: PathBuf::from("facts"),
+                    source: std::io::Error::other("unreachable"),
+                })
+            } else {
+                facts(machine)
+            }
+        };
+        assert!(matches!(
+            config.select("os=linux", &fallible),
+            Err(ConfigError::Read { .. })
+        ));
     }
 
     #[test]

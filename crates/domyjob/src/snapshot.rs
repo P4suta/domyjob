@@ -487,19 +487,25 @@ fn parse_listing(
     Ok(out)
 }
 
-#[must_use]
-pub fn identity(detected: &Detected<'_>) -> Option<PathBuf> {
-    let argv = detected
-        .source
-        .identity
-        .as_ref()?
-        .render(&Bindings::new().with("root", Arg::path(&detected.root)));
-    let printed = match argv.map(|argv| run_template((detected.name, detected.source), &argv)) {
-        Ok(Ok(printed)) => printed,
-        Ok(Err(_)) | Err(_) => return None,
+pub fn identity(detected: &Detected<'_>) -> Result<Option<PathBuf>, SnapshotError> {
+    let Some(identity) = &detected.source.identity else {
+        return Ok(None);
     };
+    let argv = identity
+        .render(&Bindings::new().with("root", Arg::path(&detected.root)))
+        .map_err(|source| SnapshotError::Template {
+            source_name: detected.name.to_owned(),
+            source,
+        })?;
+    let printed = run_template((detected.name, detected.source), &argv)?;
     let printed = String::from_utf8_lossy(&printed).trim().to_owned();
-    (!printed.is_empty()).then(|| PathBuf::from(printed))
+    if printed.is_empty() {
+        return Err(SnapshotError::Output {
+            source_name: detected.name.to_owned(),
+            detail: "the identity command printed no path".to_owned(),
+        });
+    }
+    Ok(Some(PathBuf::from(printed)))
 }
 
 pub fn from_revision(
@@ -751,8 +757,12 @@ mod tests {
             ],
         );
         let config = Config::builtin().unwrap();
-        let main_id = identity(&detect(&config, &root).unwrap().unwrap()).unwrap();
-        let side_id = identity(&detect(&config, &side).unwrap().unwrap()).unwrap();
+        let main_id = identity(&detect(&config, &root).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        let side_id = identity(&detect(&config, &side).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             std::fs::canonicalize(&main_id).unwrap(),
             std::fs::canonicalize(&side_id).unwrap()
@@ -760,11 +770,33 @@ mod tests {
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
         run(&other, "git", &["init", "-q"]);
-        let other_id = identity(&detect(&config, &other).unwrap().unwrap()).unwrap();
+        let other_id = identity(&detect(&config, &other).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
         assert_ne!(
             std::fs::canonicalize(other_id).unwrap(),
             std::fs::canonicalize(main_id).unwrap()
         );
+    }
+
+    #[test]
+    fn a_configured_identity_command_that_fails_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::builtin().unwrap();
+        let source = config.sources.get_mut("git").unwrap();
+        source.identity = Some(
+            crate::template::Argv::try_from(vec!["domyjob-no-such-identity-command".to_owned()])
+                .unwrap(),
+        );
+        let detected = Detected {
+            name: "git",
+            source,
+            root: tmp.path().to_path_buf(),
+        };
+        assert!(matches!(
+            identity(&detected),
+            Err(SnapshotError::Start { .. })
+        ));
     }
 
     #[test]
