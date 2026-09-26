@@ -164,7 +164,7 @@ pub const fn nature(request: &Request) -> Nature {
         Request::Tail { .. } => nature_of("tail", Needs(Observe), Query, Unaudited),
         Request::Kill { .. } => nature_of("kill", Needs(Kill), Command, Audited),
         Request::Clean { .. } => nature_of("clean", Needs(Maintain), Command, Audited),
-        Request::Pause { .. } => nature_of("pause", Needs(Maintain), Command, Audited),
+        Request::Configure { .. } => nature_of("configure", Needs(Maintain), Command, Audited),
         Request::Get { .. } => nature_of("get", Needs(Fetch), Query, Audited),
         Request::Changes { .. } => nature_of("changes", Needs(Fetch), Query, Audited),
     }
@@ -231,7 +231,12 @@ mod tests {
             Denied(Capability::Kill)
         );
         authorize(peer(&[Capability::Kill]), kill()).unwrap();
-        let pause = || Request::Pause { paused: true };
+        let pause = || Request::Configure {
+            change: crate::protocol::Change {
+                paused: Some(true),
+                max_jobs: None,
+            },
+        };
         assert_eq!(
             authorize(peer(&[Capability::Kill]), pause()).unwrap_err(),
             Denied(Capability::Maintain)

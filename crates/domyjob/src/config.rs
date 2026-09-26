@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::domain::{Concurrency, Host, MachineName};
+use crate::domain::{Host, MachineName};
 use crate::template::{Argv, TemplateError, Text};
 
 const BUILTIN: &str = include_str!("builtin.toml");
@@ -222,7 +222,6 @@ pub enum StdinFormat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
-    pub max_jobs: Option<Concurrency>,
     pub transport: Option<String>,
     pub notify: Option<Vec<ConfigText>>,
 }
@@ -230,7 +229,6 @@ pub struct Defaults {
 impl Defaults {
     const fn empty() -> Self {
         Self {
-            max_jobs: None,
             transport: None,
             notify: None,
         }
@@ -260,7 +258,6 @@ pub struct MachineConf {
     pub host: Option<Host>,
     pub transport: Option<String>,
     pub labels: Option<Vec<String>>,
-    pub max_jobs: Option<Concurrency>,
     pub shell: Option<String>,
 }
 
@@ -391,7 +388,6 @@ pub struct Machine {
     pub host: Host,
     pub transport: String,
     pub labels: Vec<String>,
-    pub max_jobs: Concurrency,
     pub shell: Option<String>,
 }
 
@@ -569,10 +565,6 @@ impl Config {
                 .unwrap_or_else(|| name.to_host()),
             transport,
             labels: conf.and_then(|c| c.labels.clone()).unwrap_or_default(),
-            max_jobs: conf
-                .and_then(|c| c.max_jobs)
-                .or(self.defaults.max_jobs)
-                .unwrap_or(Concurrency::DEFAULT),
             shell: conf.and_then(|c| c.shell.clone()),
         }
     }
@@ -813,16 +805,12 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"
-[defaults]
-max_jobs = 2
-
 [machines.box]
 host = "me@build-box"
 labels = ["gpu"]
 
 [machines.win]
 labels = ["fast"]
-max_jobs = 8
 
 [machines.pod]
 transport = "kube"
@@ -916,8 +904,6 @@ everything = ["@heavy", "pod"]
         ));
         let named = |name: &str| config.machine(&name.parse().unwrap()).unwrap();
         assert_eq!(named("local").transport, "local");
-        assert_eq!(named("win").max_jobs.slots(), 8);
-        assert_eq!(named("box").max_jobs.slots(), 2);
     }
 
     #[test]
@@ -953,7 +939,7 @@ everything = ["@heavy", "pod"]
     fn machines_are_added_without_disturbing_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
-        std::fs::write(&path, "[defaults]\nmax_jobs = 2 # keep this note\n").unwrap();
+        std::fs::write(&path, "[defaults]\ntransport = \"ssh\" # keep this note\n").unwrap();
         let machine = NewMachine {
             name: "box".parse().unwrap(),
             host: Some("me@box".parse().unwrap()),

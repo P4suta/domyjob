@@ -466,6 +466,18 @@ enum MachinesAction {
     Pause(PauseArgs),
     #[command(about = "Let paused machines take jobs again")]
     Resume(PauseArgs),
+    #[command(
+        about = "Set how many jobs sent from now on machines run at once; `on` does not count"
+    )]
+    Limit(LimitArgs),
+}
+
+#[derive(Debug, Args)]
+struct LimitArgs {
+    #[arg(value_name = "MACHINES", help = "Which machines, as for `domyjob run`")]
+    targets: String,
+    #[arg(value_name = "JOBS", help = "How many jobs run at once, from 1 to 64")]
+    jobs: crate::domain::Concurrency,
 }
 
 #[derive(Debug, Args)]
@@ -907,8 +919,30 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
             Some(MachinesAction::Add(add)) => machines_add(add),
             Some(MachinesAction::Remove(remove)) => machines_remove(remove),
             Some(MachinesAction::Rewitness(rewitness)) => machines_rewitness(rewitness),
-            Some(MachinesAction::Pause(pause)) => machines_pause(pause, true),
-            Some(MachinesAction::Resume(resume)) => machines_pause(resume, false),
+            Some(MachinesAction::Pause(pause)) => machines_configure(
+                &pause.targets,
+                crate::protocol::Change {
+                    paused: Some(true),
+                    max_jobs: None,
+                },
+                "paused; running jobs carry on, new ones are refused until `domyjob machines resume`",
+            ),
+            Some(MachinesAction::Resume(resume)) => machines_configure(
+                &resume.targets,
+                crate::protocol::Change {
+                    paused: Some(false),
+                    max_jobs: None,
+                },
+                "takes jobs again",
+            ),
+            Some(MachinesAction::Limit(limit)) => machines_configure(
+                &limit.targets,
+                crate::protocol::Change {
+                    paused: None,
+                    max_jobs: Some(limit.jobs),
+                },
+                &format!("runs at most {} jobs at once", limit.jobs),
+            ),
         },
         Top::Setup(args) => setup(&args),
         Top::Doctor(args) => doctor(&args),
@@ -1890,21 +1924,17 @@ fn job_command(
     Ok((job, machine))
 }
 
-fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> {
+fn machines_configure(
+    targets: &str,
+    change: crate::protocol::Change,
+    done: &str,
+) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let machines = ctx.select(&args.targets)?;
+    let machines = ctx.select(targets)?;
     let mut all_ok = true;
     for machine in &machines {
-        match client::pause(&ctx, machine, paused) {
-            Ok(_) => eprintln!(
-                "domyjob: {}: {}",
-                machine.name,
-                if paused {
-                    "paused; running jobs carry on, new ones are refused until `domyjob machines resume`"
-                } else {
-                    "takes jobs again"
-                }
-            ),
+        match client::configure(&ctx, machine, change) {
+            Ok(_) => eprintln!("domyjob: {}: {done}", machine.name),
             Err(error) => {
                 all_ok = false;
                 crate::ui::report_error(

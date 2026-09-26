@@ -96,8 +96,8 @@ pub enum Request {
         logs: bool,
         idle: bool,
     },
-    Pause {
-        paused: bool,
+    Configure {
+        change: Change,
     },
     AuditAt {
         seq: u64,
@@ -268,6 +268,42 @@ pub struct Report {
     pub disk_short: bool,
     pub uptime_seconds: u64,
     pub paused: bool,
+    pub max_jobs: Concurrency,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    pub paused: bool,
+    pub max_jobs: Concurrency,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            max_jobs: Concurrency::DEFAULT,
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct Change {
+    pub paused: Option<bool>,
+    pub max_jobs: Option<Concurrency>,
+}
+
+impl Settings {
+    #[must_use]
+    pub fn with(self, change: Change) -> Self {
+        Self {
+            paused: change.paused.unwrap_or(self.paused),
+            max_jobs: change.max_jobs.unwrap_or(self.max_jobs),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -423,7 +459,6 @@ pub struct Submission {
     pub location: Location,
     pub env: BTreeMap<EnvName, String>,
     pub shell: Option<String>,
-    pub concurrency: Concurrency,
     pub queue: Queue,
 }
 
@@ -622,6 +657,7 @@ impl crate::ingress::Ingress for Reply {}
 impl crate::ingress::Ingress for Frame {}
 impl crate::ingress::Ingress for Phase {}
 impl crate::ingress::Ingress for Spec {}
+impl crate::ingress::Ingress for Settings {}
 impl crate::ingress::Ingress for Job {}
 impl crate::ingress::Ingress for Hello {}
 impl crate::ingress::Ingress for Digest {}

@@ -171,7 +171,7 @@ pub fn machine_card(
         ui::machine(machine),
         resources(report)?.join(&ui::paint(Tone::Dim, " · "))
     )?;
-    writeln!(out, "  {}", activity(jobs)?.join("   "))?;
+    writeln!(out, "  {}", activity(jobs, report.max_jobs)?.join("   "))?;
     attention(&mut out, machine, report, (jobs, now))?;
     Ok(out)
 }
@@ -210,7 +210,10 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
     Ok(facts)
 }
 
-fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
+fn activity(
+    jobs: &[Job],
+    at_once: crate::domain::Concurrency,
+) -> Result<Vec<String>, std::fmt::Error> {
     let running: Vec<&Job> = jobs
         .iter()
         .filter(|job| matches!(job.state(), State::Running | State::Preparing))
@@ -249,8 +252,9 @@ fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
     }
     if queued > 0 {
         activity.push(format!(
-            "{} {queued} queued",
-            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued))
+            "{} {queued} queued {}",
+            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued)),
+            ui::paint(Tone::Dim, &format!("({at_once} at once)"))
         ));
     }
     if activity.is_empty() {
@@ -683,6 +687,7 @@ pub mod tests {
             disk_short: true,
             uptime_seconds: 60,
             paused: true,
+            max_jobs: crate::domain::Concurrency::DEFAULT,
         };
         let running = {
             let mut job = sample();
@@ -718,7 +723,7 @@ pub mod tests {
         for wanted in [
             "16 cores load 3.20",
             "1 running: tests",
-            "1 queued",
+            "1 queued (4 at once)",
             "failed",
             "domyjob digest linux:0AAAAAAA",
             "domyjob machines resume linux",
