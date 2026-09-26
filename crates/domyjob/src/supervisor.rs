@@ -474,9 +474,21 @@ struct Supervisor {
     shared: Arc<Shared>,
 }
 
-pub fn supervise(dirs: Dirs, id: &JobId, readiness: Readiness) -> Result<(), NodeError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stops {
+    Heard,
+    Unheard,
+}
+
+pub fn supervise(
+    dirs: Dirs,
+    id: &JobId,
+    readiness: Readiness,
+    stops: Stops,
+) -> Result<(), NodeError> {
     let store = Store::open(&dirs)?;
-    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, readiness) {
+    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, (readiness, stops))
+    {
         Ok(taken) => taken,
         Err(error) => {
             store.record_start_failure(id, &error.to_string())?;
@@ -493,7 +505,7 @@ fn take_charge(
     dirs: Dirs,
     store: Store,
     id: &JobId,
-    readiness: Readiness,
+    (readiness, stops): (Readiness, Stops),
 ) -> Result<(Supervisor, OsLock, Receiver<Event>), NodeError> {
     let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
         return Err(NodeError::AlreadySupervised(id.clone()));
@@ -539,11 +551,13 @@ fn take_charge(
     });
     serve_control(listener, Arc::clone(&shared));
     let told = Arc::clone(&shared);
-    if let Err(error) = ctrlc::set_handler(move || {
-        if let Err(error) = told.kill(Stop::Ended) {
-            told.say(&format!("stopping the job failed: {error}"));
-        }
-    }) {
+    if stops == Stops::Heard
+        && let Err(error) = ctrlc::set_handler(move || {
+            if let Err(error) = told.kill(Stop::Ended) {
+                told.say(&format!("stopping the job failed: {error}"));
+            }
+        })
+    {
         shared.say(&format!(
             "a shutdown will read as a vanished supervisor, because the machine's requests to stop cannot be heard: {error}"
         ));

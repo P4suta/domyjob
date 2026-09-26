@@ -2464,6 +2464,14 @@ mod tests {
             "{}",
             at("staging was left behind")
         );
+        for id in node.store.ids().unwrap() {
+            let phase = node.store.phase(&id);
+            assert!(
+                !matches!(phase, Ok(Phase::Running { .. })),
+                "{}",
+                at(&format!("{id} still reads as running: {phase:?}"))
+            );
+        }
         node.configure(Change::default())
             .unwrap_or_else(|e| panic!("{}", at(&format!("configuring: {e}"))));
         for nonce in [
@@ -2578,6 +2586,58 @@ mod tests {
                 "{reply:?}"
             );
         });
+    }
+
+    const SUPERVISED: &str = "0BBBBBBBBBBBBBBB";
+
+    fn one_queued_job(root: &Path) {
+        let store = Store::open(&dirs(root)).unwrap();
+        let spec = Spec {
+            id: SUPERVISED.parse().unwrap(),
+            name: None,
+            command: Command::Script("exit 0".into()),
+            location: Location::Home,
+            env_names: std::collections::BTreeSet::new(),
+            shell: None,
+            concurrency: Concurrency::DEFAULT,
+            sequence: 1,
+            submitted_by: authz::Submitter::Owner,
+            submitted_at: Timestamp::observe(),
+        };
+        store
+            .stage(
+                &spec,
+                (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
+            )
+            .unwrap();
+    }
+
+    fn supervise_the_queued_job(node: &Node) {
+        let supervised = crate::supervisor::supervise(
+            node.dirs.clone(),
+            &SUPERVISED.parse().unwrap(),
+            proc::Readiness::unwatched(),
+            crate::supervisor::Stops::Unheard,
+        );
+        match supervised {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn a_crash_at_any_step_of_supervising_a_job_leaves_it_closed_or_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        one_queued_job(tmp.path());
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        supervise_the_queued_job(&node);
+        assert_eq!(
+            node.store
+                .job(&SUPERVISED.parse().unwrap())
+                .unwrap()
+                .state(),
+            crate::protocol::State::Succeeded
+        );
+        crash_everywhere(one_queued_job, supervise_the_queued_job);
     }
 
     #[test]

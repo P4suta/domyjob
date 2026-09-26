@@ -989,7 +989,7 @@ fn node(args: &NodeArgs) -> Result<ExitCode, CliError> {
         if let Some(home) = &args.home_dir {
             dirs.home.clone_from(home);
         }
-        crate::supervisor::supervise(dirs, id, readiness(args)?)?;
+        crate::supervisor::supervise(dirs, id, readiness(args)?, crate::supervisor::Stops::Heard)?;
         return Ok(ExitCode::SUCCESS);
     }
     let node = crate::node::Node::open(dirs)?;
