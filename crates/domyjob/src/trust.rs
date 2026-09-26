@@ -212,8 +212,8 @@ impl Grant {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
-    pub servers: BTreeMap<MachineName, Server>,
-    pub grants: Vec<Grant>,
+    servers: BTreeMap<MachineName, Server>,
+    grants: Vec<Grant>,
 }
 
 impl Trust {
@@ -225,12 +225,58 @@ impl Trust {
         Ok(state_file::read_json(&Self::path(dirs))?.unwrap_or_default())
     }
 
-    pub fn update<R>(dirs: &Dirs, change: impl FnOnce(&mut Self) -> R) -> Result<R, TrustError> {
+    fn update<R>(dirs: &Dirs, change: impl FnOnce(&mut Self) -> R) -> Result<R, TrustError> {
         Ok(state_file::update_json(
             &Self::path(dirs),
             Self::default,
             change,
         )?)
+    }
+
+    pub(crate) fn record_grant(
+        dirs: &Dirs,
+        proof: crate::serve::Confirmed,
+        details: GrantDetails,
+    ) -> Result<(), TrustError> {
+        Self::update(dirs, |trust| {
+            trust
+                .grants
+                .retain(|grant| grant.public_key != details.public_key);
+            trust.grants.push(Grant::confirmed(proof, details));
+        })
+    }
+
+    pub(crate) fn record_server(
+        dirs: &Dirs,
+        name: MachineName,
+        server: Server,
+    ) -> Result<(), TrustError> {
+        Self::update(dirs, |trust| {
+            trust.servers.insert(name, server);
+        })
+    }
+
+    pub(crate) fn remove(dirs: &Dirs, who: &str) -> Result<usize, TrustError> {
+        Self::update(dirs, |trust| {
+            let before = trust.grants.len().saturating_add(trust.servers.len());
+            trust.grants.retain(|grant| {
+                grant.label.as_str() != who && grant.public_key.fingerprint() != who
+            });
+            trust.servers.retain(|name, server| {
+                name.as_str() != who && server.public_key.fingerprint() != who
+            });
+            before.saturating_sub(trust.grants.len().saturating_add(trust.servers.len()))
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn server_for(&self, name: &MachineName) -> Option<&Server> {
+        self.servers.get(name)
+    }
+
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (BTreeMap<MachineName, Server>, Vec<Grant>) {
+        (self.servers, self.grants)
     }
 
     #[must_use]

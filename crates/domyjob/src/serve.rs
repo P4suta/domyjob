@@ -666,18 +666,16 @@ fn pair_with(
     let (verdict, answer, outcome) = match confirmation {
         Confirmation::Confirmed(proof) => {
             let here = Greeting::here()?;
-            Trust::update(&shared.dirs, |trust| {
-                trust.grants.retain(|grant| grant.public_key() != &key);
-                trust.grants.push(Grant::confirmed(
-                    proof,
-                    GrantDetails {
-                        label: peer.name.clone(),
-                        public_key: key,
-                        capabilities: capabilities.clone(),
-                        granted_at,
-                    },
-                ));
-            })?;
+            Trust::record_grant(
+                &shared.dirs,
+                proof,
+                GrantDetails {
+                    label: peer.name.clone(),
+                    public_key: key,
+                    capabilities: capabilities.clone(),
+                    granted_at,
+                },
+            )?;
             settle(shared, true)?;
             (
                 Verdict::Allowed,
@@ -829,16 +827,15 @@ pub fn pair(
     let machine = name.cloned().unwrap_or(server_name);
     let key = *pending.channel.remote();
     let paired_at = Timestamp::observe();
-    Trust::update(dirs, |trust| {
-        trust.servers.insert(
-            machine.clone(),
-            Server {
-                public_key: key,
-                address: address.clone(),
-                paired_at,
-            },
-        );
-    })?;
+    Trust::record_server(
+        dirs,
+        machine.clone(),
+        Server {
+            public_key: key,
+            address: address.clone(),
+            paired_at,
+        },
+    )?;
     Ok(Paired {
         name: machine,
         address,
@@ -874,8 +871,7 @@ fn verified_channel(
 pub fn tunnel(dirs: &Dirs, machine: &MachineName) -> Result<(), ServeError> {
     let trust = Trust::load(dirs)?;
     let server = trust
-        .servers
-        .get(machine)
+        .server_for(machine)
         .ok_or_else(|| ServeError::NotPaired {
             machine: machine.clone(),
         })?;
@@ -907,24 +903,12 @@ pub struct Listing {
 }
 
 pub fn listing(dirs: &Dirs) -> Result<Listing, ServeError> {
-    let trust = Trust::load(dirs)?;
-    Ok(Listing {
-        servers: trust.servers,
-        grants: trust.grants,
-    })
+    let (servers, grants) = Trust::load(dirs)?.into_parts();
+    Ok(Listing { servers, grants })
 }
 
 pub fn revoke(dirs: &Dirs, who: &str) -> Result<usize, ServeError> {
-    let removed = Trust::update(dirs, |trust| {
-        let before = trust.grants.len().saturating_add(trust.servers.len());
-        trust.grants.retain(|grant| {
-            grant.label().as_str() != who && grant.public_key().fingerprint() != who
-        });
-        trust
-            .servers
-            .retain(|name, server| name.as_str() != who && server.public_key.fingerprint() != who);
-        before.saturating_sub(trust.grants.len().saturating_add(trust.servers.len()))
-    })?;
+    let removed = Trust::remove(dirs, who)?;
     if removed == 0 {
         return Err(ServeError::Trust(TrustError::Unknown(who.to_owned())));
     }
@@ -944,6 +928,47 @@ impl crate::ingress::Ingress for Answer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_records_confirmed_grants_and_revokes_both_kinds_of_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Dirs::for_test(tmp.path());
+        let name: MachineName = "peer".parse().unwrap();
+        let key = PublicKey::from_slice(&[7; 32]).unwrap();
+        Trust::record_server(
+            &dirs,
+            name.clone(),
+            Server {
+                public_key: key,
+                address: "127.0.0.1:4747".to_owned(),
+                paired_at: Timestamp::at_millis(1),
+            },
+        )
+        .unwrap();
+        for capability in [Capability::Observe, Capability::Submit] {
+            Trust::record_grant(
+                &dirs,
+                Confirmed(()),
+                GrantDetails {
+                    label: name.clone(),
+                    public_key: key,
+                    capabilities: BTreeSet::from([capability]),
+                    granted_at: Timestamp::at_millis(2),
+                },
+            )
+            .unwrap();
+        }
+        let trust = Trust::load(&dirs).unwrap();
+        assert!(trust.server_for(&name).is_some());
+        assert_eq!(
+            trust.grant_for(&key).unwrap().capabilities(),
+            &BTreeSet::from([Capability::Submit])
+        );
+        assert_eq!(Trust::remove(&dirs, name.as_str()).unwrap(), 2);
+        let (servers, grants) = Trust::load(&dirs).unwrap().into_parts();
+        assert!(servers.is_empty());
+        assert!(grants.is_empty());
+    }
 
     #[test]
     fn exposures_are_explicit_and_tailnet_is_recognized() {
