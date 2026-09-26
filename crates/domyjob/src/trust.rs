@@ -170,10 +170,43 @@ pub struct Server {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
+    label: MachineName,
+    public_key: PublicKey,
+    capabilities: BTreeSet<Capability>,
+    granted_at: Timestamp,
+}
+
+pub(crate) struct GrantDetails {
     pub label: MachineName,
     pub public_key: PublicKey,
     pub capabilities: BTreeSet<Capability>,
     pub granted_at: Timestamp,
+}
+
+impl Grant {
+    pub(crate) fn confirmed(_proof: crate::serve::Confirmed, details: GrantDetails) -> Self {
+        Self {
+            label: details.label,
+            public_key: details.public_key,
+            capabilities: details.capabilities,
+            granted_at: details.granted_at,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(&self) -> &MachineName {
+        &self.label
+    }
+
+    #[must_use]
+    pub const fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+
+    #[must_use]
+    pub const fn capabilities(&self) -> &BTreeSet<Capability> {
+        &self.capabilities
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

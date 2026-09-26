@@ -2771,11 +2771,11 @@ fn trust(args: &TrustArgs) -> Result<ExitCode, CliError> {
             }
             println!("machines that may reach this one:");
             for grant in &listing.grants {
-                let caps: Vec<&str> = grant.capabilities.iter().map(|c| c.as_str()).collect();
+                let caps: Vec<&str> = grant.capabilities().iter().map(|c| c.as_str()).collect();
                 println!(
                     "  {}\t{}\t{}",
-                    grant.label,
-                    grant.public_key.fingerprint(),
+                    grant.label(),
+                    grant.public_key().fingerprint(),
                     caps.join(",")
                 );
             }

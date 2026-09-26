@@ -12,7 +12,7 @@ use crate::domain::{Invalid, MachineName};
 use crate::paths::Dirs;
 use crate::secure::{self, PairingCode, Purpose, SecureError, Side};
 use crate::terminal::Display;
-use crate::trust::{Grant, Identity, PublicKey, Server, Trust, TrustError};
+use crate::trust::{Grant, GrantDetails, Identity, PublicKey, Server, Trust, TrustError};
 
 pub const DEFAULT_PORT: u16 = 4747;
 pub const SERVICE: &str = "_domyjob._tcp.local.";
@@ -510,9 +510,9 @@ fn serve_connection(stream: TcpStream, shared: &Shared) -> Result<(), ServeError
     let trust = Trust::load(&shared.dirs)?;
     let (channel, principal) = secure::accept(stream, &shared.identity, |key| {
         trust.grant_for(key).map(|grant| Principal::Peer {
-            key: grant.public_key,
-            label: grant.label.clone(),
-            capabilities: grant.capabilities.clone(),
+            key: *grant.public_key(),
+            label: grant.label().clone(),
+            capabilities: grant.capabilities().clone(),
         })
     })?;
     let secure::Halves { reader, mut writer } = channel.into_halves();
@@ -582,11 +582,24 @@ fn settle(shared: &Shared, consumed: bool) -> Result<(), ServeError> {
     Ok(())
 }
 
+pub(crate) struct Confirmed(());
+
+enum Confirmation {
+    Confirmed(Confirmed),
+    Declined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingOutcome {
+    Paired,
+    Declined,
+}
+
 fn confirm_on_terminal(
     peer: &Greeting,
     sas: &str,
     capabilities: &BTreeSet<Capability>,
-) -> Result<bool, ServeError> {
+) -> Result<Confirmation, ServeError> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Err(ServeError::Refused(
@@ -607,14 +620,17 @@ fn confirm_on_terminal(
     std::io::stdout().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim() == "yes")
+    Ok(match answer.trim() {
+        "yes" => Confirmation::Confirmed(Confirmed(())),
+        _ => Confirmation::Declined,
+    })
 }
 
 fn accept_pairing(stream: TcpStream, shared: &Shared) -> Result<(), ServeError> {
     let (code, capabilities) = claim(shared)?;
     match pair_with(stream, shared, &code, &capabilities) {
-        Ok(true) => Ok(()),
-        Ok(false) => settle(shared, false),
+        Ok(PairingOutcome::Paired) => Ok(()),
+        Ok(PairingOutcome::Declined) => settle(shared, false),
         Err(error) => {
             settle(shared, false)?;
             Err(error)
@@ -627,7 +643,7 @@ fn pair_with(
     shared: &Shared,
     code: &PairingCode,
     capabilities: &BTreeSet<Capability>,
-) -> Result<bool, ServeError> {
+) -> Result<PairingOutcome, ServeError> {
     let mut pending = secure::pair(
         stream,
         &shared.identity,
@@ -641,35 +657,40 @@ fn pair_with(
         .confirming
         .lock()
         .map_err(|_poisoned| ServeError::Refused("the confirmation prompt is poisoned"))?;
-    let accepted = match standing(shared)? {
+    let confirmation = match standing(shared)? {
         Standing::Open => confirm_on_terminal(&peer, pending.sas.as_str(), capabilities)?,
-        Standing::Closed => false,
+        Standing::Closed => Confirmation::Declined,
     };
     let key = *pending.channel.remote();
     let granted_at = Timestamp::observe();
-    let (verdict, answer) = if accepted {
-        let here = Greeting::here()?;
-        Trust::update(&shared.dirs, |trust| {
-            trust.grants.retain(|grant| grant.public_key != key);
-            trust.grants.push(Grant {
-                label: peer.name.clone(),
-                public_key: key,
-                capabilities: capabilities.clone(),
-                granted_at,
-            });
-        })?;
-        settle(shared, true)?;
-        (
-            Verdict::Allowed,
-            Answer::Accepted {
-                name: here.name,
-                os: here.os,
-                arch: here.arch,
-                capabilities: capabilities.clone(),
-            },
-        )
-    } else {
-        (Verdict::Denied, Answer::Declined)
+    let (verdict, answer, outcome) = match confirmation {
+        Confirmation::Confirmed(proof) => {
+            let here = Greeting::here()?;
+            Trust::update(&shared.dirs, |trust| {
+                trust.grants.retain(|grant| grant.public_key() != &key);
+                trust.grants.push(Grant::confirmed(
+                    proof,
+                    GrantDetails {
+                        label: peer.name.clone(),
+                        public_key: key,
+                        capabilities: capabilities.clone(),
+                        granted_at,
+                    },
+                ));
+            })?;
+            settle(shared, true)?;
+            (
+                Verdict::Allowed,
+                Answer::Accepted {
+                    name: here.name,
+                    os: here.os,
+                    arch: here.arch,
+                    capabilities: capabilities.clone(),
+                },
+                PairingOutcome::Paired,
+            )
+        }
+        Confirmation::Declined => (Verdict::Denied, Answer::Declined, PairingOutcome::Declined),
     };
     let subject = Some(format!("{} {}", peer.name, key.fingerprint()));
     shared.audit.record(crate::audit::Event {
@@ -681,8 +702,14 @@ fn pair_with(
     drop(turn);
     send_line(&mut pending.channel.writer, &answer)?;
     pending.channel.writer.close()?;
-    println!("{}", if accepted { "paired" } else { "declined" });
-    Ok(accepted)
+    println!(
+        "{}",
+        match outcome {
+            PairingOutcome::Paired => "paired",
+            PairingOutcome::Declined => "declined",
+        }
+    );
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -890,9 +917,9 @@ pub fn listing(dirs: &Dirs) -> Result<Listing, ServeError> {
 pub fn revoke(dirs: &Dirs, who: &str) -> Result<usize, ServeError> {
     let removed = Trust::update(dirs, |trust| {
         let before = trust.grants.len().saturating_add(trust.servers.len());
-        trust
-            .grants
-            .retain(|grant| grant.label.as_str() != who && grant.public_key.fingerprint() != who);
+        trust.grants.retain(|grant| {
+            grant.label().as_str() != who && grant.public_key().fingerprint() != who
+        });
         trust
             .servers
             .retain(|name, server| name.as_str() != who && server.public_key.fingerprint() != who);
