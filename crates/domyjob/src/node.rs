@@ -424,6 +424,40 @@ const fn audited(request: &Request) -> bool {
     }
 }
 
+#[derive(Debug)]
+struct Commanded(());
+
+enum Routed {
+    Query(Request),
+    Command(Request, Commanded),
+}
+
+const fn route(request: Request) -> Routed {
+    match request {
+        Request::Submit { .. }
+        | Request::Upload { .. }
+        | Request::Kill { .. }
+        | Request::Clean { .. }
+        | Request::Pause { .. } => Routed::Command(request, Commanded(())),
+        Request::Hello
+        | Request::Hold
+        | Request::Report
+        | Request::AuditAt { .. }
+        | Request::AuditHead
+        | Request::Digest { .. }
+        | Request::Search { .. }
+        | Request::Missing { .. }
+        | Request::List { .. }
+        | Request::Status { .. }
+        | Request::Wait { .. }
+        | Request::Logs { .. }
+        | Request::Tail { .. }
+        | Request::Get { .. }
+        | Request::Changes { .. }
+        | Request::Watch => Routed::Query(request),
+    }
+}
+
 impl Node {
     pub fn open(dirs: Dirs) -> Result<Self, NodeError> {
         crate::state_file::private_dir(&dirs.state)?;
@@ -445,7 +479,6 @@ impl Node {
         input: impl Input,
         output: &mut (dyn Write + Send),
     ) -> Result<(), NodeError> {
-        self.sweep();
         crate::liveness::with_pulse(output, |pulsed| self.answer(principal, input, pulsed))
     }
 
@@ -488,6 +521,17 @@ impl Node {
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
         let (principal, request) = authorized.into_parts();
+        let request = match route(request) {
+            Routed::Query(request) => request,
+            Routed::Command(request, commanded) => {
+                self.upkeep(&commanded);
+                if let Request::Submit { submission } = request {
+                    let job = self.accept(&principal, *submission, &commanded)?;
+                    return send(output, &Reply::Job(Box::new(job)));
+                }
+                request
+            }
+        };
         match request {
             Request::Hold => self.hold(input, output),
             Request::Logs {
@@ -568,9 +612,6 @@ impl Node {
             Request::Upload { count } => Reply::Stored {
                 count: self.upload(count, &mut input)?,
             },
-            Request::Submit { submission } => {
-                Reply::Job(Box::new(self.accept(principal, *submission)?))
-            }
             Request::List { limit } => {
                 let (jobs, unreadable) = self.list(principal, limit)?;
                 Reply::Jobs { jobs, unreadable }
@@ -589,6 +630,7 @@ impl Node {
                 input,
             )?)),
             Request::Hold
+            | Request::Submit { .. }
             | Request::Logs { .. }
             | Request::Tail { .. }
             | Request::Get { .. }
@@ -618,10 +660,16 @@ impl Node {
         Ok(count)
     }
 
-    fn accept(&self, principal: &Principal, submission: Submission) -> Result<Job, NodeError> {
+    fn accept(
+        &self,
+        principal: &Principal,
+        submission: Submission,
+        commanded: &Commanded,
+    ) -> Result<Job, NodeError> {
         if submission.queue == crate::protocol::Queue::Slot && self.paused() {
             return Err(NodeError::Paused);
         }
+        self.make_room(&|| self.short_of_room(), commanded)?;
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
         let nonce_path = self.store.nonce_path(
             &crate::supervisor::scope_name(&principal.submitter()),
@@ -718,7 +766,7 @@ impl Node {
         self.settle(id, Order::Kill, std::io::empty())
     }
 
-    pub fn sweep(&self) {
+    fn upkeep(&self, _commanded: &Commanded) {
         if let Ok(ids) = self.store.ids() {
             for id in ids {
                 match self.recover(&id) {
@@ -738,10 +786,6 @@ impl Node {
         }
         self.empty_trash();
         retire_old_binaries();
-        let short = || self.short_of_room();
-        match self.make_room(&short) {
-            Ok(()) | Err(_) => {}
-        }
     }
 
     fn report(&self) -> crate::protocol::Report {
@@ -793,7 +837,11 @@ impl Node {
         (self.short)(&self.store.area("jobs"))
     }
 
-    fn make_room(&self, short: &impl Fn() -> bool) -> Result<(), NodeError> {
+    fn make_room(
+        &self,
+        short: &impl Fn() -> bool,
+        _commanded: &Commanded,
+    ) -> Result<(), NodeError> {
         if !short() {
             return Ok(());
         }
@@ -1674,6 +1722,154 @@ mod tests {
         }
     }
 
+    fn state_of(root: &std::path::Path) -> std::collections::BTreeMap<String, Option<BlobId>> {
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for item in std::fs::read_dir(&dir).unwrap() {
+                let path = item.unwrap().path();
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                    found.insert(name, None);
+                    pending.push(path);
+                } else {
+                    found.insert(name, Some(BlobId::of(&std::fs::read(&path).unwrap())));
+                }
+            }
+        }
+        found
+    }
+
+    fn one_of_every_request(job: &JobRef) -> Vec<Request> {
+        vec![
+            Request::Hello,
+            Request::Hold,
+            Request::Missing {
+                blobs: vec![BlobId::of(b"absent")],
+            },
+            Request::Upload { count: 0 },
+            submission(crate::domain::Nonce::generate().unwrap(), Location::Home),
+            Request::List { limit: 10 },
+            Request::Status { job: job.clone() },
+            Request::Wait { job: job.clone() },
+            Request::Kill { job: job.clone() },
+            logs_of(job),
+            Request::Tail {
+                job: job.clone(),
+                lines: 2,
+            },
+            Request::Get {
+                job: job.clone(),
+                path: "a.txt".parse().unwrap(),
+            },
+            Request::Changes { job: job.clone() },
+            Request::Report,
+            Request::Watch,
+            Request::Clean {
+                apply: false,
+                logs: false,
+                idle: false,
+            },
+            Request::Pause { paused: false },
+            Request::AuditAt { seq: 0 },
+            Request::AuditHead,
+            Request::Digest {
+                job: job.clone(),
+                tail: 2,
+            },
+            Request::Search {
+                job: job.clone(),
+                pattern: "line".to_owned(),
+                context: 1,
+                limit: 5,
+            },
+        ]
+    }
+
+    #[test]
+    fn no_question_changes_anything_on_the_machine_even_when_its_disk_is_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, finished) = published(tmp.path(), b"a log\nwith lines\n");
+        let node = Node {
+            short: |_| true,
+            ..node
+        };
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let first = store.resolve(&finished).unwrap();
+        let mut vanished = store.spec(&first).unwrap();
+        vanished.id = "0BBBBBBBBBBBBBBB".parse().unwrap();
+        vanished.sequence = 2;
+        store
+            .stage(
+                &vanished,
+                (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
+            )
+            .unwrap();
+        store.publish(&vanished.id).unwrap();
+        let running = Phase::Running {
+            started_at: Timestamp::at_millis(1),
+            pid: 1,
+            workspace: String::new(),
+        };
+        store.set_phase(&vanished.id, &running).unwrap();
+        let mut abandoned = vanished.clone();
+        abandoned.id = "0CCCCCCCCCCCCCCC".parse().unwrap();
+        abandoned.sequence = 3;
+        store
+            .stage(
+                &abandoned,
+                (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
+            )
+            .unwrap();
+        crate::state_file::write_bytes(&store.area("trash").join("old"), b"junk").unwrap();
+
+        let every = one_of_every_request(&finished);
+        let schema = schemars::schema_for!(Request);
+        let variants = schema.as_value()["oneOf"].as_array().unwrap().len();
+        assert_eq!(every.len(), variants, "a request is missing from this law");
+        let state = tmp.path().join("state");
+        let audit = state.join("audit.jsonl");
+        let not_audit = |mut all: std::collections::BTreeMap<String, Option<BlobId>>| {
+            all.retain(|path, _| !path.starts_with("audit."));
+            all
+        };
+        let before = not_audit(state_of(&state));
+        for request in &every {
+            if let Routed::Query(question) = route(request.clone()) {
+                let audited = crate::state_file::read_bytes(&audit)
+                    .unwrap()
+                    .unwrap_or_default();
+                ask(&node, &question);
+                let after = not_audit(state_of(&state));
+                let changed: Vec<&String> = before
+                    .keys()
+                    .chain(after.keys())
+                    .filter(|path| before.get(*path) != after.get(*path))
+                    .collect();
+                assert!(changed.is_empty(), "{question:?} changed {changed:?}");
+                let now = crate::state_file::read_bytes(&audit)
+                    .unwrap()
+                    .unwrap_or_default();
+                assert!(
+                    now.starts_with(&audited),
+                    "{question:?} rewrote the audit log"
+                );
+            }
+        }
+        ask(
+            &node,
+            &Request::Clean {
+                apply: false,
+                logs: false,
+                idle: false,
+            },
+        );
+        assert_eq!(
+            store.job(&vanished.id).unwrap().state(),
+            crate::protocol::State::Errored
+        );
+    }
+
     fn logs_of(job: &JobRef) -> Request {
         Request::Logs {
             job: job.clone(),
@@ -1749,12 +1945,12 @@ mod tests {
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| false, &Commanded(())).unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), [b'x'; 10_000]);
         let same_size = vec![b'z'; DISCARDED.len()];
         for log in [b"tiny".to_vec(), same_size] {
             crate::state_file::write_bytes(&store.log_path(&id), &log).unwrap();
-            node.make_room(&|| true).unwrap();
+            node.make_room(&|| true, &Commanded(())).unwrap();
             assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), log);
         }
     }
@@ -1793,7 +1989,7 @@ mod tests {
         let id = store.resolve(&job).unwrap();
         crate::state_file::write_bytes(&store.job_dir(&id).join("failure"), b"once").unwrap();
         let finished = store.phase(&id).unwrap();
-        node.sweep();
+        node.upkeep(&Commanded(()));
         assert_eq!(store.phase(&id).unwrap(), finished);
         let open: JobId = "0FFFFFFFFFFFFFFF".parse().unwrap();
         finished_like(&store, &id, &[open.as_str()]);
@@ -1833,7 +2029,7 @@ mod tests {
                     .unwrap();
             }
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.sweep();
+            node.upkeep(&Commanded(()));
         }
         Node::open(node.dirs.clone()).unwrap();
         for area in [
@@ -2165,7 +2361,7 @@ mod tests {
                 },
             )
             .unwrap();
-        node.sweep();
+        node.upkeep(&Commanded(()));
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             started_at,
@@ -2193,10 +2389,10 @@ mod tests {
         let phase_file = store.job_dir(&id).join("phase.json").display().to_string();
         {
             let _faults = crate::faults::inject(&[("state_file::write", &phase_file)]);
-            node.sweep();
+            node.upkeep(&Commanded(()));
         }
         assert_eq!(store.phase(&id).unwrap(), running);
-        node.sweep();
+        node.upkeep(&Commanded(()));
         assert!(matches!(store.phase(&id).unwrap(), Phase::Finished { .. }));
     }
 
@@ -2208,7 +2404,7 @@ mod tests {
         let id = store.resolve(&job).unwrap();
         store.set_phase(&id, &Phase::Queued).unwrap();
         store.record_start_failure(&id, "no shell").unwrap();
-        node.sweep();
+        node.upkeep(&Commanded(()));
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             ..
@@ -2239,7 +2435,7 @@ mod tests {
         spec_of(&orphan);
         spec_of(&busy);
         let held = crate::lock::OsLock::exclusive(&store.staging_lock_path(&busy)).unwrap();
-        node.sweep();
+        node.upkeep(&Commanded(()));
         assert_eq!(store.staged_ids().unwrap(), vec![busy]);
         held.release().unwrap();
     }
@@ -2338,7 +2534,7 @@ mod tests {
             ("state_file::overwrite", text(&log)),
         ] {
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.make_room(&|| true).unwrap_err();
+            node.make_room(&|| true, &Commanded(())).unwrap_err();
         }
     }
 
@@ -2449,10 +2645,11 @@ mod tests {
         let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
         let running = crate::lock::OsLock::exclusive(&store.alive_path(&oldest)).unwrap();
 
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| false, &Commanded(())).unwrap();
         assert!(there("0") && there("2"));
         let until_one_workspace_is_gone = || there("0") && there("2");
-        node.make_room(&until_one_workspace_is_gone).unwrap();
+        node.make_room(&until_one_workspace_is_gone, &Commanded(()))
+            .unwrap();
         assert_ne!(there("0"), there("2"));
         assert!(project.join("1").join("file").try_exists().unwrap());
         assert_eq!(store.ids().unwrap().len(), 3);
@@ -2463,7 +2660,8 @@ mod tests {
         crate::state_file::write_bytes(&store.log_path(small), &[b'y'; 9_000]).unwrap();
         let until_the_biggest_log_is_gone =
             || std::fs::read(store.log_path(big)).unwrap() != DISCARDED;
-        node.make_room(&until_the_biggest_log_is_gone).unwrap();
+        node.make_room(&until_the_biggest_log_is_gone, &Commanded(()))
+            .unwrap();
         assert_eq!(std::fs::read(store.log_path(big)).unwrap(), DISCARDED);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), [b'y'; 9_000]);
         assert_eq!(store.ids().unwrap().len(), 3);
@@ -2486,7 +2684,7 @@ mod tests {
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
             .unwrap();
-        node.make_room(&|| true).unwrap();
+        node.make_room(&|| true, &Commanded(())).unwrap();
         assert!(!there("0") && !there("2"));
         assert_eq!(store.ids().unwrap().len(), 3);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), DISCARDED);
@@ -2495,7 +2693,7 @@ mod tests {
         assert!(kept.contains(&needed) && kept.contains(&spent));
         assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
-        node.make_room(&|| false).unwrap();
+        node.make_room(&|| false, &Commanded(())).unwrap();
         busy.release().unwrap();
         running.release().unwrap();
     }

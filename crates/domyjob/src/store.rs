@@ -343,12 +343,9 @@ impl Store {
     }
 
     fn supervisor(&self, id: &JobId) -> Result<Supervisor, StoreError> {
-        match OsLock::try_exclusive(&self.alive_path(id))? {
-            Some(free) => {
-                free.release()?;
-                Ok(Supervisor::Gone)
-            }
-            None => Ok(Supervisor::Alive),
+        match OsLock::probe(&self.alive_path(id))? {
+            crate::lock::Probe::Held => Ok(Supervisor::Alive),
+            crate::lock::Probe::Absent | crate::lock::Probe::Free => Ok(Supervisor::Gone),
         }
     }
 

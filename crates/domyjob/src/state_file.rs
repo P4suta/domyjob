@@ -317,6 +317,15 @@ pub fn open_lock(path: &Path) -> Result<std::fs::File, StateError> {
         .map_err(io("opening", path))
 }
 
+pub fn open_existing_lock(path: &Path) -> Result<Option<std::fs::File>, StateError> {
+    crate::faults::at("state_file::lock", path).map_err(io("opening", path))?;
+    match private_options().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io("opening", path)(error)),
+    }
+}
+
 pub fn create_empty(path: &Path) -> Result<(), StateError> {
     crate::faults::at("state_file::create", path).map_err(io("creating", path))?;
     prepared_parent(path)?;
