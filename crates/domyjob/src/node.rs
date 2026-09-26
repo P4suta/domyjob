@@ -340,32 +340,6 @@ fn read_line<T: crate::ingress::Ingress>(input: &mut dyn BufRead) -> Result<T, N
     crate::ingress::json(&line).map_err(NodeError::Request)
 }
 
-const fn action(request: &Request) -> &'static str {
-    match request {
-        Request::Hello => "hello",
-        Request::Report => "report",
-        Request::Watch => "watch",
-        Request::Clean { .. } => "clean",
-        Request::Pause { .. } => "pause",
-        Request::Hold => "hold",
-        Request::Missing { .. } => "missing",
-        Request::Upload { .. } => "upload",
-        Request::Submit { .. } => "submit",
-        Request::List { .. } => "list",
-        Request::Status { .. } => "status",
-        Request::Wait { .. } => "wait",
-        Request::Kill { .. } => "kill",
-        Request::Logs { .. } => "logs",
-        Request::Tail { .. } => "tail",
-        Request::AuditAt { .. } => "audit-at",
-        Request::AuditHead => "audit-head",
-        Request::Digest { .. } => "digest",
-        Request::Search { .. } => "search",
-        Request::Get { .. } => "get",
-        Request::Changes { .. } => "changes",
-    }
-}
-
 fn subject(request: &Request) -> Option<String> {
     match request {
         Request::Kill { job }
@@ -392,32 +366,6 @@ fn subject(request: &Request) -> Option<String> {
     }
 }
 
-const fn audited(request: &Request) -> bool {
-    match request {
-        Request::Submit { .. }
-        | Request::Kill { .. }
-        | Request::Clean { .. }
-        | Request::Pause { .. }
-        | Request::Get { .. }
-        | Request::Changes { .. } => true,
-        Request::Hello
-        | Request::Report
-        | Request::Watch
-        | Request::Hold
-        | Request::AuditAt { .. }
-        | Request::AuditHead
-        | Request::Missing { .. }
-        | Request::Upload { .. }
-        | Request::List { .. }
-        | Request::Status { .. }
-        | Request::Wait { .. }
-        | Request::Logs { .. }
-        | Request::Tail { .. }
-        | Request::Digest { .. }
-        | Request::Search { .. } => false,
-    }
-}
-
 #[derive(Debug)]
 struct Commanded(());
 
@@ -427,28 +375,9 @@ enum Routed {
 }
 
 const fn route(request: Request) -> Routed {
-    match request {
-        Request::Submit { .. }
-        | Request::Upload { .. }
-        | Request::Kill { .. }
-        | Request::Clean { .. }
-        | Request::Pause { .. } => Routed::Command(request, Commanded(())),
-        Request::Hello
-        | Request::Hold
-        | Request::Report
-        | Request::AuditAt { .. }
-        | Request::AuditHead
-        | Request::Digest { .. }
-        | Request::Search { .. }
-        | Request::Missing { .. }
-        | Request::List { .. }
-        | Request::Status { .. }
-        | Request::Wait { .. }
-        | Request::Logs { .. }
-        | Request::Tail { .. }
-        | Request::Get { .. }
-        | Request::Changes { .. }
-        | Request::Watch => Routed::Query(request),
+    match authz::nature(&request).effect {
+        authz::Effect::Command => Routed::Command(request, Commanded(())),
+        authz::Effect::Query => Routed::Query(request),
     }
 }
 
@@ -483,9 +412,10 @@ impl Node {
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
         let outcome = read_line::<Request>(&mut input).and_then(|request| {
-            let verb = action(&request);
+            let verb = authz::nature(&request).name;
             let about = subject(&request);
-            let must_audit = audited(&request) || matches!(principal, Principal::Peer { .. });
+            let must_audit = authz::nature(&request).audit == authz::Audit::Always
+                || matches!(principal, Principal::Peer { .. });
             let decision = authz::authorize(principal.clone(), request);
             let verdict = match &decision {
                 Ok(_) => Verdict::Allowed,
@@ -630,7 +560,7 @@ impl Node {
             | Request::Get { .. }
             | Request::Watch
             | Request::Changes { .. } => {
-                return Err(NodeError::Misrouted(action(&request)));
+                return Err(NodeError::Misrouted(authz::nature(&request).name));
             }
         })
     }

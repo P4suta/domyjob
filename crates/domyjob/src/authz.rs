@@ -98,28 +98,63 @@ pub enum Access {
     Needs(Capability),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    Query,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audit {
+    Always,
+    WhenAPeerAsks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nature {
+    pub name: &'static str,
+    pub access: Access,
+    pub effect: Effect,
+    pub audit: Audit,
+}
+
+const fn nature_of(name: &'static str, access: Access, effect: Effect, audit: Audit) -> Nature {
+    Nature {
+        name,
+        access,
+        effect,
+        audit,
+    }
+}
+
 #[must_use]
-pub const fn access(request: &Request) -> Access {
+pub const fn nature(request: &Request) -> Nature {
+    use Access::{Always, Needs};
+    use Audit::{Always as Audited, WhenAPeerAsks as Unaudited};
+    use Capability::{Fetch, Kill, Observe, Submit};
+    use Effect::{Command, Query};
     match request {
-        Request::Hello | Request::Hold => Access::Always,
-        Request::Missing { .. } | Request::Upload { .. } | Request::Submit { .. } => {
-            Access::Needs(Capability::Submit)
-        }
-        Request::List { .. }
-        | Request::Report
-        | Request::Watch
-        | Request::AuditAt { .. }
-        | Request::AuditHead
-        | Request::Digest { .. }
-        | Request::Search { .. }
-        | Request::Status { .. }
-        | Request::Wait { .. }
-        | Request::Logs { .. }
-        | Request::Tail { .. } => Access::Needs(Capability::Observe),
-        Request::Kill { .. } | Request::Clean { .. } | Request::Pause { .. } => {
-            Access::Needs(Capability::Kill)
-        }
-        Request::Get { .. } | Request::Changes { .. } => Access::Needs(Capability::Fetch),
+        Request::Hello => nature_of("hello", Always, Query, Unaudited),
+        Request::Hold => nature_of("hold", Always, Query, Unaudited),
+        Request::Missing { .. } => nature_of("missing", Needs(Submit), Query, Unaudited),
+        Request::Upload { .. } => nature_of("upload", Needs(Submit), Command, Unaudited),
+        Request::Submit { .. } => nature_of("submit", Needs(Submit), Command, Audited),
+        Request::List { .. } => nature_of("list", Needs(Observe), Query, Unaudited),
+        Request::Report => nature_of("report", Needs(Observe), Query, Unaudited),
+        Request::Watch => nature_of("watch", Needs(Observe), Query, Unaudited),
+        Request::AuditAt { .. } => nature_of("audit-at", Needs(Observe), Query, Unaudited),
+        Request::AuditHead => nature_of("audit-head", Needs(Observe), Query, Unaudited),
+        Request::Digest { .. } => nature_of("digest", Needs(Observe), Query, Unaudited),
+        Request::Search { .. } => nature_of("search", Needs(Observe), Query, Unaudited),
+        Request::Status { .. } => nature_of("status", Needs(Observe), Query, Unaudited),
+        Request::Wait { .. } => nature_of("wait", Needs(Observe), Query, Unaudited),
+        Request::Logs { .. } => nature_of("logs", Needs(Observe), Query, Unaudited),
+        Request::Tail { .. } => nature_of("tail", Needs(Observe), Query, Unaudited),
+        Request::Kill { .. } => nature_of("kill", Needs(Kill), Command, Audited),
+        Request::Clean { .. } => nature_of("clean", Needs(Kill), Command, Audited),
+        Request::Pause { .. } => nature_of("pause", Needs(Kill), Command, Audited),
+        Request::Get { .. } => nature_of("get", Needs(Fetch), Query, Audited),
+        Request::Changes { .. } => nature_of("changes", Needs(Fetch), Query, Audited),
     }
 }
 
@@ -146,7 +181,7 @@ impl Authorized {
 }
 
 pub fn authorize(principal: Principal, request: Request) -> Result<Authorized, Denied> {
-    let allowed = match (&principal, access(&request)) {
+    let allowed = match (&principal, nature(&request).access) {
         (_, Access::Always) | (Principal::Owner, Access::Needs(_)) => Ok(()),
         (Principal::Peer { capabilities, .. }, Access::Needs(capability)) => {
             if capabilities.contains(&capability) {
