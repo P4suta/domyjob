@@ -71,8 +71,30 @@ impl Stop {
 const LOG_HEAD: u64 = 256 << 20;
 const LOG_TAIL: usize = 8 << 20;
 
-fn slot_is_available(settings: Settings, held: usize, has_earlier_waiter: bool) -> bool {
-    !settings.paused && !has_earlier_waiter && held < settings.max_jobs.slots()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Open,
+    Paused,
+    EarlierWaiter,
+    Full,
+}
+
+fn decide_admission(settings: Settings, held: usize, earlier: usize) -> Admission {
+    if settings.paused {
+        Admission::Paused
+    } else if earlier > 0 {
+        Admission::EarlierWaiter
+    } else if held >= settings.max_jobs.slots() {
+        Admission::Full
+    } else {
+        Admission::Open
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillState {
+    Open,
+    Asked,
 }
 
 #[derive(Debug)]
@@ -226,8 +248,12 @@ impl Shared {
         }
     }
 
-    fn killed(&self) -> bool {
-        self.killed.load(Ordering::SeqCst)
+    fn kill_state(&self) -> KillState {
+        if self.killed.load(Ordering::SeqCst) {
+            KillState::Asked
+        } else {
+            KillState::Open
+        }
     }
 
     fn stopped(&self) -> Stop {
@@ -681,14 +707,13 @@ impl Supervisor {
                 }
             }
             let earlier = self.store.earlier_waiters(&self.spec)?;
-            let slot = if slot_is_available(settings, held.len(), !earlier.is_empty()) {
-                OsLock::first_free(
+            let slot = match decide_admission(settings, held.len(), earlier.len()) {
+                Admission::Open => OsLock::first_free(
                     &slots,
                     crate::domain::to_usize(crate::domain::Concurrency::MOST),
                 )?
-                .map(|(_, lock)| lock)
-            } else {
-                None
+                .map(|(_, lock)| lock),
+                Admission::Paused | Admission::EarlierWaiter | Admission::Full => None,
             };
             admission.release()?;
             if slot.is_some() {
@@ -757,7 +782,7 @@ impl Supervisor {
             Err(other) => return Err(other),
         };
         held.workspace = workspace_lock;
-        if self.shared.killed() {
+        if matches!(self.shared.kill_state(), KillState::Asked) {
             return Ok(self.shared.before_start("preparing"));
         }
         self.store.set_phase(
@@ -775,7 +800,7 @@ impl Supervisor {
             }
             return Err(NodeError::AlreadySupervised(self.spec.id.clone()));
         }
-        if self.shared.killed()
+        if matches!(self.shared.kill_state(), KillState::Asked)
             && let Err(error) = group.kill()
         {
             self.shared
@@ -831,13 +856,13 @@ impl Supervisor {
         if let Err(error) = collecting.finish() {
             self.shared.say(&format!("collecting output: {error}"));
         }
-        match (status, self.shared.killed()) {
-            (Ok(_) | Err(_), true) => self.shared.stopped().while_running(),
-            (Ok(status), false) => match proc::exit_code(status) {
+        match (status, self.shared.kill_state()) {
+            (Ok(_) | Err(_), KillState::Asked) => self.shared.stopped().while_running(),
+            (Ok(status), KillState::Open) => match proc::exit_code(status) {
                 0 => Outcome::Succeeded,
                 code => Outcome::Failed { exit_code: code },
             },
-            (Err(error), false) => Outcome::Errored {
+            (Err(error), KillState::Open) => Outcome::Errored {
                 reason: RemoteText::new(error.to_string()),
             },
         }
@@ -993,23 +1018,26 @@ mod tests {
             paused: false,
             max_jobs: crate::domain::Concurrency::try_from(2).unwrap(),
         };
-        assert!(slot_is_available(two, 1, false));
-        assert!(!slot_is_available(two, 2, false));
-        assert!(!slot_is_available(
-            Settings {
-                paused: true,
-                ..two
-            },
-            0,
-            false
-        ));
-        assert!(!slot_is_available(two, 0, true));
+        assert_eq!(decide_admission(two, 1, 0), Admission::Open);
+        assert_eq!(decide_admission(two, 2, 0), Admission::Full);
+        assert_eq!(
+            decide_admission(
+                Settings {
+                    paused: true,
+                    ..two
+                },
+                0,
+                0
+            ),
+            Admission::Paused
+        );
+        assert_eq!(decide_admission(two, 0, 1), Admission::EarlierWaiter);
 
         let three = Settings {
             max_jobs: crate::domain::Concurrency::try_from(3).unwrap(),
             ..two
         };
-        assert!(slot_is_available(three, 2, false));
+        assert_eq!(decide_admission(three, 2, 0), Admission::Open);
     }
 
     #[test]

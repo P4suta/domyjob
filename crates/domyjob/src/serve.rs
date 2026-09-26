@@ -122,21 +122,38 @@ impl Exposure {
     }
 
     #[must_use]
-    pub const fn announces(self) -> bool {
+    const fn announcement(self) -> Announcement {
         match self {
-            Self::Lan | Self::Explicit(_) => true,
-            Self::Loopback | Self::Tailnet => false,
+            Self::Lan | Self::Explicit(_) => Announcement::Public,
+            Self::Loopback | Self::Tailnet => Announcement::Private,
         }
     }
 }
 
-fn is_tailnet(ip: IpAddr) -> bool {
-    match ip {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Announcement {
+    Public,
+    Private,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressScope {
+    Tailnet,
+    Elsewhere,
+}
+
+fn address_scope(ip: IpAddr) -> AddressScope {
+    let tailnet = match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
             a == 100 && (64..128).contains(&b)
         }
         IpAddr::V6(v6) => v6.segments().starts_with(&[0xfd7a, 0x115c, 0xa1e0]),
+    };
+    if tailnet {
+        AddressScope::Tailnet
+    } else {
+        AddressScope::Elsewhere
     }
 }
 
@@ -157,12 +174,12 @@ fn addresses() -> Result<Vec<IpAddr>, ServeError> {
 fn tailnet_address() -> Result<Option<IpAddr>, ServeError> {
     Ok(addresses()?
         .into_iter()
-        .find(|ip| is_tailnet(*ip) && ip.is_ipv4()))
+        .find(|ip| matches!(address_scope(*ip), AddressScope::Tailnet) && ip.is_ipv4()))
 }
 
 fn lan_address() -> Result<Option<IpAddr>, ServeError> {
     Ok(addresses()?.into_iter().find(|ip| match ip {
-        IpAddr::V4(v4) => v4.is_private() && !is_tailnet(*ip),
+        IpAddr::V4(v4) => v4.is_private() && matches!(address_scope(*ip), AddressScope::Elsewhere),
         IpAddr::V6(_) => false,
     }))
 }
@@ -416,9 +433,12 @@ pub fn serve(dirs: Dirs, options: &Options) -> Result<(), ServeError> {
         Some(capabilities) => open_pairing(capabilities.clone())?,
         None => PairingState::Closed,
     };
-    let advertiser = match (&pairing, options.exposure.announces()) {
-        (PairingState::Open(_), true) => Advertiser::start(bound.port(), identity.public()),
-        (PairingState::Open(_) | PairingState::Closed, _) => None,
+    let advertiser = match (&pairing, options.exposure.announcement()) {
+        (PairingState::Open(_), Announcement::Public) => {
+            Advertiser::start(bound.port(), identity.public())
+        }
+        (PairingState::Open(_), Announcement::Private)
+        | (PairingState::Closed, Announcement::Public | Announcement::Private) => None,
     };
     let shared = Arc::new(Shared {
         dirs,
@@ -906,14 +926,33 @@ mod tests {
             Exposure::Explicit("10.0.0.2:4747".parse().unwrap())
         );
         Exposure::parse("0.0.0.0").unwrap_err();
-        assert!(is_tailnet("100.101.102.103".parse().unwrap()));
-        assert!(!is_tailnet("100.128.0.1".parse().unwrap()));
-        assert!(is_tailnet("fd7a:115c:a1e0::1".parse().unwrap()));
+        assert_eq!(
+            address_scope("100.101.102.103".parse().unwrap()),
+            AddressScope::Tailnet
+        );
+        assert_eq!(
+            address_scope("100.128.0.1".parse().unwrap()),
+            AddressScope::Elsewhere
+        );
+        assert_eq!(
+            address_scope("fd7a:115c:a1e0::1".parse().unwrap()),
+            AddressScope::Tailnet
+        );
+        assert_eq!(
+            address_scope("fd7a:115c:a1e1::1".parse().unwrap()),
+            AddressScope::Elsewhere
+        );
         assert_eq!(
             Exposure::Loopback.resolve(1).unwrap(),
             "127.0.0.1:1".parse().unwrap()
         );
-        assert!(!Exposure::Tailnet.announces());
+        assert_eq!(Exposure::Tailnet.announcement(), Announcement::Private);
+        assert_eq!(Exposure::Loopback.announcement(), Announcement::Private);
+        assert_eq!(Exposure::Lan.announcement(), Announcement::Public);
+        assert_eq!(
+            Exposure::Explicit("10.0.0.2:4747".parse().unwrap()).announcement(),
+            Announcement::Public
+        );
         assert_eq!(with_port("box"), format!("box:{DEFAULT_PORT}"));
         host_name().parse::<MachineName>().unwrap();
     }

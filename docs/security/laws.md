@@ -6,7 +6,7 @@ These laws are the kinds.
 Each one names the property it guarantees, the mechanism that guarantees it, and the check that fails the build when the mechanism is bypassed.
 
 These are design targets, not a claim that every mechanism and check below is implemented.
-The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, and `audit.rs`, and CI does not run `cargo vet`.
+The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, and `store.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
 
 ## 1. No ambient authority
@@ -44,7 +44,7 @@ Changing a label requires a named function that states why, such as `Peer -> Loc
 
 **Mechanism.** Decisions are enums (`Decision`, `Access`, `Verdict`), never `bool`; state machines (job lifecycle, pairing, connections) are typestates or enums whose transitions are functions from one state to the next.
 
-**Check.** `wildcard_enum_match_arm` is denied crate-wide; the gate refuses `-> bool` in the authorization, trust, and pairing modules.
+**Check.** `wildcard_enum_match_arm` is denied crate-wide; the gate refuses `-> bool` in the authorization, trust, audit, supervisor, pairing, and state-store modules.
 
 ## 5. Time decides nothing
 

@@ -71,23 +71,32 @@ impl LaunchEnv {
     fn from_vars(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Self {
         let mut launch = Self::default();
         for (key, value) in vars {
-            match (key.into_string(), value.into_string()) {
-                (Ok(key), Ok(value)) if allowed_launch_variable(&key) => {
-                    launch.vars.insert(key, value);
+            let name = match key.into_string() {
+                Ok(name) => classify_launch_name(name),
+                Err(_) => LaunchName::Omitted,
+            };
+            match (name, value.into_string()) {
+                (LaunchName::Allowed(name), Ok(value)) => {
+                    launch.vars.insert(name, value);
                 }
-                (Ok(key), Err(_)) if allowed_launch_variable(&key) => {
-                    launch.not_unicode.push(key);
+                (LaunchName::Allowed(name), Err(_)) => {
+                    launch.not_unicode.push(name);
                 }
-                (Ok(_) | Err(_), Ok(_) | Err(_)) => {}
+                (LaunchName::Omitted, Ok(_) | Err(_)) => {}
             }
         }
         launch
     }
 }
 
-fn allowed_launch_variable(name: &str) -> bool {
+enum LaunchName {
+    Allowed(String),
+    Omitted,
+}
+
+fn classify_launch_name(name: String) -> LaunchName {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with("LC_")
+    if upper.starts_with("LC_")
         || matches!(
             upper.as_str(),
             "PATH"
@@ -122,6 +131,11 @@ fn allowed_launch_variable(name: &str) -> bool {
                 | "COLORTERM"
                 | "NO_COLOR"
         )
+    {
+        LaunchName::Allowed(name)
+    } else {
+        LaunchName::Omitted
+    }
 }
 
 const ENV: &str = "env.json";

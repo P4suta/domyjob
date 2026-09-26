@@ -123,7 +123,14 @@ fn is_time_method(name: &str) -> bool {
     TIME_METHODS.contains(&name) || TIME_METHOD_PARTS.iter().any(|part| name.contains(part))
 }
 
-const DECISION_FILES: &[&str] = &["authz.rs", "trust.rs", "audit.rs"];
+const DECISION_FILES: &[&str] = &[
+    "authz.rs",
+    "trust.rs",
+    "audit.rs",
+    "supervisor.rs",
+    "serve.rs",
+    "store.rs",
+];
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &["failure.rs", "xtask/src/lib.rs", "xtask/src/release.rs"];
 
@@ -570,12 +577,20 @@ mod tests {
         let declare = "fn f() { let _t = crate::input::UserText::from_cli(String::new()); }";
         assert_eq!(check_file(declare, "src/serve.rs").unwrap().len(), 1);
         assert!(check_file(declare, "src/cli.rs").unwrap().is_empty());
-        assert_eq!(
-            check_file("pub fn allowed() -> bool { true }", "src/authz.rs")
-                .unwrap()
-                .len(),
-            1
-        );
+        for file in [
+            "src/authz.rs",
+            "src/supervisor.rs",
+            "src/serve.rs",
+            "src/store.rs",
+        ] {
+            assert_eq!(
+                check_file("pub fn allowed() -> bool { true }", file)
+                    .unwrap()
+                    .len(),
+                1,
+                "{file}"
+            );
+        }
         assert!(
             check_file("pub fn allowed() -> bool { true }", "src/shell.rs")
                 .unwrap()
