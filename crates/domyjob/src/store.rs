@@ -618,6 +618,13 @@ impl Store {
     }
 
     pub fn resolve(&self, reference: &JobRef) -> Result<JobId, StoreError> {
+        if let Ok(id) = reference.as_str().parse::<JobId>() {
+            let spec = self.job_dir(&id).join("spec.json");
+            return match crate::state_file::read_bytes(&spec)? {
+                Some(_) => Ok(id),
+                None => Err(StoreError::NoSuchJob(reference.clone())),
+            };
+        }
         let mut matching: Vec<JobId> = self
             .ids()?
             .into_iter()
@@ -1152,12 +1159,25 @@ mod tests {
             Err(StoreError::Exists(_))
         ));
         assert_eq!(store.resolve(&a.clone().into()).unwrap(), a);
+        {
+            let tag = store.area("jobs").display().to_string();
+            let _faults = crate::faults::inject(&[("store::list", &tag)]);
+            assert_eq!(store.resolve(&a.clone().into()).unwrap(), a);
+            assert!(matches!(
+                store.resolve(&JobRef::parse_loose("0").unwrap()),
+                Err(StoreError::Io(_))
+            ));
+        }
         assert!(matches!(
             store.resolve(&JobRef::parse_loose("0").unwrap()),
             Err(StoreError::Ambiguous { count: 2, .. })
         ));
         assert!(matches!(
             store.resolve(&JobRef::parse_loose("Z").unwrap()),
+            Err(StoreError::NoSuchJob(_))
+        ));
+        assert!(matches!(
+            store.resolve(&JobRef::parse_loose("0CCCCCCCCCCCCCCC").unwrap()),
             Err(StoreError::NoSuchJob(_))
         ));
         assert_eq!(store.job(&b).unwrap().supervisor, Supervisor::Gone);

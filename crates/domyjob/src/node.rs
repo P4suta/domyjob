@@ -513,14 +513,17 @@ impl Node {
     ) -> Result<(), NodeError> {
         let (principal, request) = authorized.into_parts();
         let request = match route(request) {
-            Routed::Query(request) => request,
             Routed::Command(Request::Configure { change }, commanded) => {
+                self.upkeep(&commanded)?;
                 self.configure(change)?;
-                self.upkeep(&commanded);
                 return send(output, &Reply::Report(Box::new(self.report()?)));
             }
+            Routed::Query(request)
+            | Routed::Command(request @ (Request::Upload { .. } | Request::Kill { .. }), _) => {
+                request
+            }
             Routed::Command(request, commanded) => {
-                self.upkeep(&commanded);
+                self.upkeep(&commanded)?;
                 if let Request::Submit { submission } = request {
                     let job = self.accept(&principal, *submission, &commanded)?;
                     return send(output, &Reply::Job(Box::new(job)));
@@ -626,11 +629,11 @@ impl Node {
                 self.retry(&id)?;
                 Reply::Job(Box::new(self.settle(&id, Order::Wait, input)?))
             }
-            Request::Kill { job } => Reply::Job(Box::new(self.settle(
-                &self.own(principal, &job)?,
-                Order::Kill,
-                input,
-            )?)),
+            Request::Kill { job } => {
+                let id = self.own(principal, &job)?;
+                self.recover(&id)?;
+                Reply::Job(Box::new(self.settle(&id, Order::Kill, input)?))
+            }
             Request::Hold
             | Request::Submit { .. }
             | Request::Logs { .. }
@@ -787,23 +790,16 @@ impl Node {
     }
 
     pub fn stop(&self, id: &JobId) -> Result<Job, NodeError> {
+        self.recover(id)?;
         self.settle(id, Order::Kill, std::io::empty())
     }
 
-    fn upkeep(&self, _commanded: &Commanded) {
-        if let Ok(ids) = self.store.ids() {
-            for id in ids {
-                match self.recover(&id) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
+    fn upkeep(&self, _commanded: &Commanded) -> Result<(), NodeError> {
+        for id in self.store.ids()? {
+            self.recover(&id)?;
         }
-        if let Ok(staged) = self.store.staged_ids() {
-            for id in staged {
-                match self.abandon_staging(&id) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
+        for id in self.store.staged_ids()? {
+            self.abandon_staging(&id)?;
         }
         match self.retire(KEEP_FINISHED) {
             Ok(()) | Err(_) => {}
@@ -812,6 +808,7 @@ impl Node {
             Ok(()) | Err(_) => {}
         }
         retire_old_binaries(&self.dirs);
+        Ok(())
     }
 
     fn report(&self) -> Result<crate::protocol::Report, NodeError> {
@@ -2016,7 +2013,7 @@ mod tests {
         store.set_phase(&vanished, &running).unwrap();
         let unstarted = staged("0EEEEEEEEEEEEEEE", 5);
         store.record_start_failure(&unstarted, "no shell").unwrap();
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         assert_eq!(
             holds_anywhere(&state, CANARY.as_bytes()),
             Vec::<String>::new()
@@ -2173,7 +2170,7 @@ mod tests {
         let id = store.resolve(&job).unwrap();
         crate::state_file::write_bytes(&store.job_dir(&id).join("failure"), b"once").unwrap();
         let finished = store.phase(&id).unwrap();
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         assert_eq!(store.phase(&id).unwrap(), finished);
         let open: JobId = "0FFFFFFFFFFFFFFF".parse().unwrap();
         finished_like(&store, &id, &[open.as_str()]);
@@ -2213,7 +2210,7 @@ mod tests {
                     .unwrap();
             }
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.upkeep(&Commanded(()));
+            node.upkeep(&Commanded(())).unwrap_err();
         }
         Node::open(node.dirs.clone()).unwrap();
         for area in [
@@ -2481,6 +2478,67 @@ mod tests {
     }
 
     #[test]
+    fn failed_recovery_refuses_new_work_before_it_changes_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, job) = published(tmp.path(), b"");
+        let tag = node.store.area("jobs").display().to_string();
+        {
+            let _faults = crate::faults::inject(&[("store::list", &tag)]);
+            for request in [
+                submission(crate::domain::Nonce::generate().unwrap(), Location::Home),
+                Request::Configure {
+                    change: Change {
+                        paused: Some(true),
+                        max_jobs: None,
+                    },
+                },
+            ] {
+                assert!(matches!(
+                    reply_to(&node, line_of(&request)),
+                    Reply::Refused(Refusal {
+                        code: RefusalCode::Storage,
+                        ..
+                    })
+                ));
+            }
+            assert!(matches!(
+                reply_to(&node, line_of(&Request::Upload { count: 0 })),
+                Reply::Stored { count: 0 }
+            ));
+            let killed = reply_to(&node, line_of(&Request::Kill { job }));
+            assert!(matches!(killed, Reply::Job(_)), "{killed:?}");
+        }
+        assert_eq!(node.store.ids().unwrap().len(), 1);
+        assert!(!node.store.settings().unwrap().paused);
+    }
+
+    #[test]
+    fn kill_recovers_its_target_without_listing_other_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id: JobId = "0BBBBBBBBBBBBBBB".parse().unwrap();
+        let store = staged(tmp.path(), &id, "true");
+        store.publish(&id).unwrap();
+        store
+            .set_phase(
+                &id,
+                &Phase::Running {
+                    started_at: Timestamp::at_millis(1),
+                    pid: 1,
+                    workspace: String::new(),
+                },
+            )
+            .unwrap();
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        let tag = node.store.area("jobs").display().to_string();
+        let _faults = crate::faults::inject(&[("store::list", &tag)]);
+        let reply = reply_to(&node, line_of(&Request::Kill { job: id.into() }));
+        let Reply::Job(job) = reply else {
+            panic!("expected the target job, got {reply:?}");
+        };
+        assert_eq!(job.state(), crate::protocol::State::Errored);
+    }
+
+    #[test]
     fn uninstall_cannot_treat_unreadable_job_state_as_no_running_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let (node, _) = published(tmp.path(), b"");
@@ -2639,7 +2697,9 @@ mod tests {
     fn sound_after_a_crash(root: &Path, step: usize, retried: &RetryNonce) {
         let at = |what: &str| format!("after a crash before step {step}: {what}");
         let node = Node::open(dirs(root)).unwrap_or_else(|e| panic!("{}", at(&e.to_string())));
-        node.upkeep(&Commanded(()));
+        match node.upkeep(&Commanded(())) {
+            Ok(()) | Err(_) => {}
+        }
         node.audit
             .verify()
             .unwrap_or_else(|e| panic!("{}", at(&format!("the audit log: {e}"))));
@@ -2758,7 +2818,9 @@ mod tests {
     #[test]
     fn a_crash_at_any_step_of_recovering_a_lost_job_is_recovered_from_next_time() {
         crash_everywhere(one_running_job, |node, _retried| {
-            node.upkeep(&Commanded(()));
+            match node.upkeep(&Commanded(())) {
+                Ok(()) | Err(_) => {}
+            }
         });
     }
 
@@ -2823,7 +2885,7 @@ mod tests {
         let node = Node::open(dirs(tmp.path())).unwrap();
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             started_at,
@@ -2851,10 +2913,10 @@ mod tests {
         let phase_file = store.job_dir(&id).join("phase.json").display().to_string();
         {
             let _faults = crate::faults::inject(&[("state_file::write", &phase_file)]);
-            node.upkeep(&Commanded(()));
+            node.upkeep(&Commanded(())).unwrap_err();
         }
         assert_eq!(store.phase(&id).unwrap(), running);
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         assert!(matches!(store.phase(&id).unwrap(), Phase::Finished { .. }));
     }
 
@@ -2888,7 +2950,7 @@ mod tests {
         let id = store.resolve(&job).unwrap();
         store.set_phase(&id, &Phase::Queued).unwrap();
         store.record_start_failure(&id, "no shell").unwrap();
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             ..
@@ -2919,7 +2981,7 @@ mod tests {
         spec_of(&orphan);
         spec_of(&busy);
         let held = crate::lock::OsLock::exclusive(&store.staging_lock_path(&busy)).unwrap();
-        node.upkeep(&Commanded(()));
+        node.upkeep(&Commanded(())).unwrap();
         assert_eq!(store.staged_ids().unwrap(), vec![busy]);
         held.release().unwrap();
     }
