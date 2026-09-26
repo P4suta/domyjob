@@ -86,7 +86,11 @@ fn create_with_bits(options: &mut cap_std::fs::OpenOptions, bits: u32) {
 }
 
 #[cfg(not(unix))]
-const fn create_with_bits(_options: &mut cap_std::fs::OpenOptions, _bits: u32) {}
+#[expect(
+    clippy::missing_const_for_fn,
+    reason = "kept a plain function so create_as has one signature on every system"
+)]
+fn create_with_bits(_options: &mut cap_std::fs::OpenOptions, _bits: u32) {}
 
 pub fn link(dir: &cap_std::fs::Dir, target: &str, at: &Path) -> std::io::Result<()> {
     link_in(dir, target, at)
@@ -308,10 +312,6 @@ pub fn let_owner_change(perms: &mut std::fs::Permissions) {
 }
 
 #[cfg(not(unix))]
-#[expect(
-    clippy::permissions_set_readonly_false,
-    reason = "clearing the read-only attribute a job left is exactly what removing its files needs"
-)]
 pub fn let_owner_change(perms: &mut std::fs::Permissions) {
     perms.set_readonly(false);
 }
