@@ -1870,6 +1870,97 @@ mod tests {
         );
     }
 
+    fn holds_anywhere(root: &std::path::Path, needle: &[u8]) -> Vec<String> {
+        state_of(root)
+            .keys()
+            .map(|name| root.join(name))
+            .filter(|path| std::fs::symlink_metadata(path).unwrap().is_file())
+            .filter(|path| {
+                std::fs::read(path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            })
+            .map(|path| path.display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn no_secret_outlives_the_queue_whichever_way_a_job_ends() {
+        const CANARY: &str = "canary-3f9a1c";
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, finished) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let template = store.spec(&store.resolve(&finished).unwrap()).unwrap();
+        let env = std::collections::BTreeMap::from([(
+            "API_TOKEN".parse().unwrap(),
+            format!("{CANARY}-env"),
+        )]);
+        let mut launch = LaunchEnv::default();
+        launch
+            .vars
+            .insert("SESSION_TOKEN".to_owned(), format!("{CANARY}-launch"));
+        let state = tmp.path().join("state");
+        let staged = |id: &str, sequence: u64| {
+            let mut spec = template.clone();
+            spec.id = id.parse().unwrap();
+            spec.sequence = sequence;
+            store.stage(&spec, (&env, &launch)).unwrap();
+            store.publish(&spec.id).unwrap();
+            assert!(!holds_anywhere(&state, CANARY.as_bytes()).is_empty());
+            spec.id
+        };
+        let finished_as = |outcome| Phase::Finished {
+            started_at: None,
+            finished_at: Timestamp::at_millis(3),
+            outcome,
+        };
+        let running = Phase::Running {
+            started_at: Timestamp::at_millis(1),
+            pid: 1,
+            workspace: String::new(),
+        };
+
+        let killed = staged("0BBBBBBBBBBBBBBB", 2);
+        store
+            .set_phase(&killed, &finished_as(crate::protocol::Outcome::Killed))
+            .unwrap();
+        assert_eq!(
+            holds_anywhere(&state, CANARY.as_bytes()),
+            Vec::<String>::new()
+        );
+
+        let started = staged("0CCCCCCCCCCCCCCC", 3);
+        let taken = store.take_launch(&started).unwrap();
+        assert!(!format!("{taken:?}").contains(CANARY));
+        assert_eq!(
+            holds_anywhere(&state, CANARY.as_bytes()),
+            Vec::<String>::new()
+        );
+
+        let vanished = staged("0DDDDDDDDDDDDDDD", 4);
+        store.set_phase(&vanished, &running).unwrap();
+        let unstarted = staged("0EEEEEEEEEEEEEEE", 5);
+        store.record_start_failure(&unstarted, "no shell").unwrap();
+        node.upkeep(&Commanded(()));
+        assert_eq!(
+            holds_anywhere(&state, CANARY.as_bytes()),
+            Vec::<String>::new()
+        );
+
+        let full_disk = staged("0FFFFFFFFFFFFFFF", 6);
+        store
+            .record_outcome_in_place(
+                &full_disk,
+                &finished_as(crate::protocol::Outcome::Succeeded),
+            )
+            .unwrap();
+        assert_eq!(
+            holds_anywhere(&state, CANARY.as_bytes()),
+            Vec::<String>::new()
+        );
+    }
+
     fn logs_of(job: &JobRef) -> Request {
         Request::Logs {
             job: job.clone(),
