@@ -243,10 +243,12 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
         None => (None, text),
     };
     let entries = index(ctx)?;
-    let found = |entry: Option<&IndexEntry>| {
-        entry
-            .map(|e| (ctx.config.machine(&e.machine), e.job.clone().into()))
-            .ok_or_else(|| ClientError::Unknown(text.to_owned()))
+    let found = |entry: Option<&IndexEntry>| -> Result<(Machine, JobRef), ClientError> {
+        let entry = entry.ok_or_else(|| ClientError::Unknown(text.to_owned()))?;
+        Ok((
+            ctx.config.machine(&entry.machine)?,
+            entry.job.clone().into(),
+        ))
     };
     if let Ok(name) = rest.parse::<JobName>()
         && let Some(entry) = newest(&entries, machine.as_ref(), |e| {
@@ -260,7 +262,7 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
         (Wanted::Named(name), machine) => found(newest(&entries, machine.as_ref(), |e| {
             e.name.as_ref() == Some(&name)
         })),
-        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine), reference)),
+        (Wanted::Id(reference), Some(machine)) => Ok((ctx.config.machine(&machine)?, reference)),
         (Wanted::Id(reference), None) => {
             let mut matches: Vec<&IndexEntry> = entries
                 .iter()
@@ -268,7 +270,7 @@ pub fn locate(ctx: &Context, text: &str) -> Result<(Machine, JobRef), ClientErro
                 .collect();
             matches.dedup_by(|a, b| a.machine == b.machine);
             match matches.as_slice() {
-                [only] => Ok((ctx.config.machine(&only.machine), reference)),
+                [only] => Ok((ctx.config.machine(&only.machine)?, reference)),
                 [] => match rest.parse::<JobName>() {
                     Ok(name) => found(newest(&entries, None, |e| e.name.as_ref() == Some(&name))),
                     Err(_not_a_name) => Err(ClientError::Unknown(text.to_owned())),
@@ -812,7 +814,9 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
     names.dedup();
     let mut machines = Vec::new();
     for name in names {
-        let machine = ctx.config.machine(&name);
+        let Ok(machine) = ctx.config.machine(&name) else {
+            continue;
+        };
         if cached_facts(&ctx.dirs, &machine)?.is_some() || machine.transport == "local" {
             machines.push(machine);
         }

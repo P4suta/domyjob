@@ -720,6 +720,7 @@ dependencies = [
  "snow",
  "socket2",
  "spake2",
+ "strsim",
  "supports-unicode",
  "sysinfo",
  "tempfile",

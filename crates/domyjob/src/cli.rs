@@ -19,7 +19,7 @@ use crate::template::Arg;
     name = "domyjob",
     version,
     about = "Send your work to any machine you can reach, run it there, and walk away",
-    long_about = "Send your work to any machine you can reach, run it there, and walk away.\n\nThe directory is sent as it is, uncommitted edits included, and the command keeps running on the machine whether or not you stay. Any host your ssh config knows works as it is; domyjob installs itself there the first time.",
+    long_about = "Send your work to any machine you can reach, run it there, and walk away.\n\nThe directory is sent as it is, uncommitted edits included, and the command keeps running on the machine whether or not you stay. Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as ssh:HOST; domyjob installs itself there the first time.",
     after_long_help = AFTER_LONG_HELP
 )]
 struct Cli {
@@ -517,6 +517,12 @@ struct RemoveArgs {
         help = "With --wipe, stop jobs still running there instead of refusing"
     )]
     kill_running: bool,
+    #[arg(
+        long,
+        requires = "wipe",
+        help = "With --wipe, remove without showing what would go first"
+    )]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2324,7 +2330,7 @@ fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
     };
     crate::config::add_machine(&path, &machine).map_err(ClientError::from)?;
     let ctx = Context::load()?;
-    let configured = ctx.config.machine(&args.name);
+    let configured = ctx.config.machine(&args.name).map_err(ClientError::from)?;
     match crate::remote::Link::open(&ctx.config, &ctx.dirs, &configured) {
         Ok(_) => {
             let facts =
@@ -2352,21 +2358,32 @@ fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
 fn machines_remove(args: &RemoveArgs) -> Result<ExitCode, CliError> {
     let dirs = Dirs::from_env();
     if args.wipe {
-        wipe(&args.name, args.kill_running)?;
+        let ctx = Context::load()?;
+        let remote = ctx.config.remote(&args.name).map_err(ClientError::from)?;
+        if !args.yes {
+            println!(
+                "would remove from {} ({}): domyjob's jobs, workspaces, logs, key, service, and copy of domyjob",
+                args.name,
+                remote.machine().host
+            );
+            println!(
+                "run `domyjob machines remove {} --wipe --yes` to remove them",
+                args.name
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        wipe(&ctx, &remote, args.kill_running)?;
     }
     crate::remote::forget_witness(&dirs, &args.name).map_err(ClientError::from)?;
-    match crate::config::remove_machine(&crate::config::path(&dirs), &args.name) {
-        Ok(()) => {}
-        Err(crate::config::ConfigError::NotConfigured(_)) if args.wipe => {}
-        Err(other) => return Err(ClientError::from(other).into()),
-    }
+    crate::config::remove_machine(&crate::config::path(&dirs), &args.name)
+        .map_err(ClientError::from)?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn wipe(name: &MachineName, kill_running: bool) -> Result<(), CliError> {
-    let ctx = Context::load()?;
-    let machine = ctx.config.machine(name);
-    let (jobs, rejected) = client::list(&ctx, std::slice::from_ref(&machine), u32::MAX);
+fn wipe(ctx: &Context, remote: &crate::config::Remote, kill_running: bool) -> Result<(), CliError> {
+    let machine = remote.machine();
+    let name = &machine.name;
+    let (jobs, rejected) = client::list(ctx, std::slice::from_ref(machine), u32::MAX);
     if let Some(item) = rejected.into_iter().next() {
         return Err(ClientError::from(item.error).into());
     }
@@ -2387,10 +2404,10 @@ fn wipe(name: &MachineName, kill_running: bool) -> Result<(), CliError> {
     }
     for still in running {
         let reference = format!("{name}:{}", still.spec.id);
-        client::job_request(&ctx, &reference, |job| Request::Kill { job })?;
+        client::job_request(ctx, &reference, |job| Request::Kill { job })?;
     }
     let link =
-        crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
+        crate::remote::Link::open(&ctx.config, &ctx.dirs, machine).map_err(ClientError::from)?;
     let report = link.wipe().map_err(ClientError::from)?;
     if !report.is_empty() {
         eprintln!("{report}");
@@ -2434,13 +2451,13 @@ fn self_uninstall(
         node.stop(&id)?;
     }
     drop(node);
-    match crate::service::uninstall(&dirs) {
-        Ok(()) | Err(_) => {}
+    let mut kept = Vec::new();
+    if let Err(error) = crate::service::uninstall(&dirs) {
+        kept.push(format!("the service ({error})"));
     }
     dirs.keys
         .forget(&dirs.state, "identity")
         .map_err(|e| CliError::Declined(e.to_string()))?;
-    let mut kept = Vec::new();
     for dir in [&dirs.state, &dirs.cache] {
         if let Err(error) = crate::state_file::remove_tree_forcibly(dir) {
             kept.push(format!("{} ({error})", dir.display()));
@@ -2448,13 +2465,14 @@ fn self_uninstall(
     }
     if kept.is_empty() {
         println!("removed domyjob's service, key, state, and cache from this machine");
+        Ok(ExitCode::SUCCESS)
     } else {
         println!(
-            "removed domyjob's service, key, and what could go; still here: {}",
+            "removed domyjob's key and what else could go; still here: {}",
             kept.join(", ")
         );
+        Ok(ExitCode::from(DOMYJOB_ERROR))
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
@@ -2478,7 +2496,7 @@ fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     crate::remote::forget_witness(&ctx.dirs, &args.name).map_err(ClientError::from)?;
-    let machine = ctx.config.machine(&args.name);
+    let machine = ctx.config.machine(&args.name).map_err(ClientError::from)?;
     crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
     match crate::remote::witnessed(&ctx.dirs, &args.name) {
         Some(head) => eprintln!(
@@ -2507,8 +2525,14 @@ fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     if matches!(args.service, Some(ServiceAction::Uninstall)) {
-        crate::service::uninstall(&dirs)?;
-        println!("domyjob serve no longer starts with your session");
+        match crate::service::uninstall(&dirs)? {
+            crate::service::Uninstalled::Service => {
+                println!("domyjob serve no longer starts with your session");
+            }
+            crate::service::Uninstalled::Nothing => {
+                println!("domyjob serve was not set to start with your session");
+            }
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let exposure = match &args.expose {
@@ -2622,7 +2646,10 @@ fn pair(args: &PairArgs) -> Result<ExitCode, CliError> {
         Err(error) => return Err(ClientError::from(error).into()),
     }
     let ctx = Context::load()?;
-    let machine = ctx.config.machine(&paired.name);
+    let machine = ctx
+        .config
+        .machine(&paired.name)
+        .map_err(ClientError::from)?;
     crate::remote::Link::open(&ctx.config, &ctx.dirs, &machine).map_err(ClientError::from)?;
     println!("try it:  domyjob run {} -- echo hello", paired.name);
     Ok(ExitCode::SUCCESS)

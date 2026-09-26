@@ -142,6 +142,14 @@ pub const fn of_remote(error: &RemoteError) -> Diagnosis {
 pub const fn of_client(error: &ClientError) -> Diagnosis {
     match error {
         ClientError::Remote(remote) => of_remote(remote),
+        ClientError::Config(crate::config::ConfigError::Unknown { .. }) => hinted(
+            Kind::Usage,
+            "add it with `domyjob machines add NAME`, or reach an ssh host directly as ssh:HOST",
+        ),
+        ClientError::Config(crate::config::ConfigError::ThisMachine(_)) => hinted(
+            Kind::Usage,
+            "`domyjob self uninstall` removes domyjob from this machine",
+        ),
         ClientError::Config(_) | ClientError::Project(_) | ClientError::Runner { .. } => {
             plain(Kind::Config)
         }

@@ -58,7 +58,9 @@ pub enum ConfigError {
     TooDeep(String),
     #[error("no machine has label {0}")]
     NoLabel(String),
-    #[error("{0:?} is neither a machine, a label, nor a host name")]
+    #[error(
+        "{0:?} is neither a machine, a group, nor a label; an ssh host not yet added is written ssh:HOST"
+    )]
     BadTerm(String),
     #[error("no {kind} named {name}")]
     Missing { kind: &'static str, name: String },
@@ -73,7 +75,27 @@ pub enum ConfigError {
     Exists(MachineName),
     #[error("machine {0} is not configured")]
     NotConfigured(MachineName),
+    #[error("{name} is not a configured machine{}", nearest.as_ref().map_or_else(String::new, |nearest| format!("; did you mean {nearest}?")))]
+    Unknown {
+        name: MachineName,
+        nearest: Option<MachineName>,
+    },
+    #[error("{0} is this machine")]
+    ThisMachine(MachineName),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote(Machine);
+
+impl Remote {
+    #[must_use]
+    pub const fn machine(&self) -> &Machine {
+        &self.0
+    }
+}
+
+pub const LOCAL: &str = "local";
+pub const AD_HOC: &str = "ssh:";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -488,7 +510,7 @@ impl Config {
                 .map_err(template("distribution", "unpack"))?;
         }
         for name in self.machines.keys() {
-            let machine = self.machine(name);
+            let machine = self.build(name);
             if !self.transports.contains_key(&machine.transport) {
                 return Err(ConfigError::UnknownTransport {
                     machine: machine.name,
@@ -506,13 +528,43 @@ impl Config {
             .unwrap_or_else(|| "ssh".to_owned())
     }
 
-    #[must_use]
-    pub fn machine(&self, name: &MachineName) -> Machine {
+    pub fn machine(&self, name: &MachineName) -> Result<Machine, ConfigError> {
+        if self.machines.contains_key(name) || name.as_str() == LOCAL {
+            Ok(self.build(name))
+        } else {
+            Err(ConfigError::Unknown {
+                name: name.clone(),
+                nearest: self.nearest(name),
+            })
+        }
+    }
+
+    pub fn remote(&self, name: &MachineName) -> Result<Remote, ConfigError> {
+        if !self.machines.contains_key(name) {
+            return Err(ConfigError::NotConfigured(name.clone()));
+        }
+        let machine = self.build(name);
+        if machine.transport == LOCAL {
+            return Err(ConfigError::ThisMachine(name.clone()));
+        }
+        Ok(Remote(machine))
+    }
+
+    fn nearest(&self, name: &MachineName) -> Option<MachineName> {
+        self.machines
+            .keys()
+            .map(|known| (strsim::jaro_winkler(known.as_str(), name.as_str()), known))
+            .filter(|(likeness, _)| *likeness >= 0.8)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, known)| known.clone())
+    }
+
+    fn build(&self, name: &MachineName) -> Machine {
         let conf = self.machines.get(name);
-        let local = name.as_str() == "local";
+        let local = name.as_str() == LOCAL;
         let transport = conf.and_then(|c| c.transport.clone()).unwrap_or_else(|| {
             if local {
-                "local".to_owned()
+                LOCAL.to_owned()
             } else {
                 self.default_transport()
             }
@@ -534,10 +586,7 @@ impl Config {
 
     #[must_use]
     pub fn configured(&self) -> Vec<Machine> {
-        self.machines
-            .keys()
-            .map(|name| self.machine(name))
-            .collect()
+        self.machines.keys().map(|name| self.build(name)).collect()
     }
 
     pub fn transport(&self, name: &str) -> Result<&TransportConf, ConfigError> {
@@ -624,10 +673,16 @@ impl Config {
                 .ok_or_else(|| ConfigError::TooDeep(group.to_owned()))?;
             return self.select_at(&members.join(","), facts, deeper);
         }
+        if let Some(host) = term.strip_prefix(AD_HOC) {
+            return match host.parse::<MachineName>() {
+                Ok(name) if !self.machines.contains_key(&name) => Ok(vec![self.build(&name)]),
+                Ok(_) | Err(_) => Err(ConfigError::BadTerm(term.to_owned())),
+            };
+        }
         if let Ok(name) = term.parse::<MachineName>()
             && self.machines.contains_key(&name)
         {
-            return Ok(vec![self.machine(&name)]);
+            return Ok(vec![self.build(&name)]);
         }
         let wanted: Vec<&str> = term.split('+').collect();
         let needs_facts = wanted.iter().any(|w| w.contains('='));
@@ -654,7 +709,7 @@ impl Config {
             return Err(ConfigError::NoLabel(term.to_owned()));
         }
         match term.parse::<MachineName>() {
-            Ok(name) => Ok(vec![self.machine(&name)]),
+            Ok(name) => Ok(vec![self.machine(&name)?]),
             Err(_invalid) => Err(ConfigError::BadTerm(term.to_owned())),
         }
     }
@@ -859,9 +914,6 @@ everything = ["@heavy", "pod"]
             names(config.select("@all", &facts).unwrap()),
             ["box", "pod", "win"]
         );
-        let adhoc = config.select("user@elsewhere", &facts).unwrap();
-        assert_eq!(adhoc.first().unwrap().host.as_str(), "user@elsewhere");
-        assert_eq!(adhoc.first().unwrap().transport, "ssh");
         assert!(matches!(
             config.select("os=plan9", &facts),
             Err(ConfigError::NoLabel(_))
@@ -874,9 +926,39 @@ everything = ["@heavy", "pod"]
             config.select("-oProxy", &facts),
             Err(ConfigError::BadTerm(_))
         ));
-        assert_eq!(config.machine(&"local".parse().unwrap()).transport, "local");
-        assert_eq!(config.machine(&"win".parse().unwrap()).max_jobs.slots(), 8);
-        assert_eq!(config.machine(&"box".parse().unwrap()).max_jobs.slots(), 2);
+        let named = |name: &str| config.machine(&name.parse().unwrap()).unwrap();
+        assert_eq!(named("local").transport, "local");
+        assert_eq!(named("win").max_jobs.slots(), 8);
+        assert_eq!(named("box").max_jobs.slots(), 2);
+    }
+
+    #[test]
+    fn a_name_nobody_configured_is_never_taken_for_a_host() {
+        let config = Config::layered(SAMPLE, "sample").unwrap();
+        assert!(matches!(
+            config.select("wim", &facts),
+            Err(ConfigError::Unknown { nearest: Some(near), .. }) if near.as_str() == "win"
+        ));
+        assert!(matches!(
+            config.select("elsewhere", &facts),
+            Err(ConfigError::Unknown { nearest: None, .. })
+        ));
+        assert!(matches!(
+            config.select("user@elsewhere", &facts),
+            Err(ConfigError::Unknown { .. })
+        ));
+        let direct = config.select("ssh:user@elsewhere", &facts).unwrap();
+        assert_eq!(direct.first().unwrap().host.as_str(), "user@elsewhere");
+        assert_eq!(direct.first().unwrap().transport, "ssh");
+        assert!(matches!(
+            config.select("ssh:win", &facts),
+            Err(ConfigError::BadTerm(_))
+        ));
+        assert!(matches!(
+            config.remote(&"local".parse().unwrap()),
+            Err(ConfigError::NotConfigured(_))
+        ));
+        config.remote(&"win".parse().unwrap()).unwrap();
     }
 
     #[test]
@@ -900,7 +982,11 @@ everything = ["@heavy", "pod"]
         ));
         let config = Config::load(&path).unwrap();
         assert_eq!(
-            config.machine(&"box".parse().unwrap()).host.as_str(),
+            config
+                .machine(&"box".parse().unwrap())
+                .unwrap()
+                .host
+                .as_str(),
             "me@box"
         );
         let broken = NewMachine {

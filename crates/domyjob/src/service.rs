@@ -204,9 +204,23 @@ pub fn install(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Result<String, ServiceE
     }
 }
 
-pub fn uninstall(dirs: &Dirs) -> Result<(), ServiceError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uninstalled {
+    Nothing,
+    Service,
+}
+
+fn defined(path: &Path) -> Result<bool, ServiceError> {
+    crate::user_files::present(path).map_err(ServiceError::Files)
+}
+
+pub fn uninstall(dirs: &Dirs) -> Result<Uninstalled, ServiceError> {
     match std::env::consts::OS {
         "linux" => {
+            let path = systemd_path(dirs);
+            if !defined(&path)? {
+                return Ok(Uninstalled::Nothing);
+            }
             run(
                 "systemctl",
                 &[
@@ -216,38 +230,32 @@ pub fn uninstall(dirs: &Dirs) -> Result<(), ServiceError> {
                     Arg::literal(UNIT),
                 ],
             )?;
-            remove(&systemd_path(dirs))
+            remove(&path).map(|()| Uninstalled::Service)
         }
         "macos" => {
             let path = agent_path(dirs);
+            if !defined(&path)? {
+                return Ok(Uninstalled::Nothing);
+            }
             run(
                 "launchctl",
                 &[Arg::literal("bootout"), gui_domain(), Arg::path(&path)],
             )?;
-            remove(&path)
+            remove(&path).map(|()| Uninstalled::Service)
         }
         "windows" => {
-            if run(
-                "schtasks",
-                &[
-                    Arg::literal("/End"),
-                    Arg::literal("/TN"),
-                    Arg::literal(TASK),
-                ],
-            )
-            .is_err()
-            {
+            let task = [Arg::literal("/TN"), Arg::literal(TASK)];
+            if run("schtasks", &[&[Arg::literal("/Query")][..], &task].concat()).is_err() {
+                return Ok(Uninstalled::Nothing);
+            }
+            if run("schtasks", &[&[Arg::literal("/End")][..], &task].concat()).is_err() {
                 eprintln!("domyjob: the task was not running");
             }
             run(
                 "schtasks",
-                &[
-                    Arg::literal("/Delete"),
-                    Arg::literal("/F"),
-                    Arg::literal("/TN"),
-                    Arg::literal(TASK),
-                ],
+                &[&[Arg::literal("/Delete"), Arg::literal("/F")][..], &task].concat(),
             )
+            .map(|()| Uninstalled::Service)
         }
         _ => Err(ServiceError::Unsupported(std::env::consts::OS)),
     }

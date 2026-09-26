@@ -20,6 +20,14 @@ fn failed(
     }
 }
 
+pub fn present(path: &Path) -> Result<bool, UserFileError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(failed("checking", path)(error)),
+    }
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "files the user named on the command line or owns in their configuration"
