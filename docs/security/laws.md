@@ -5,6 +5,10 @@ Fixing the mistakes a review happens to find is not enough for a tool like that;
 These laws are the kinds.
 Each one names the property it guarantees, the mechanism that guarantees it, and the check that fails the build when the mechanism is bypassed.
 
+These are design targets, not a claim that every mechanism and check below is implemented.
+The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, and `audit.rs`, and CI does not run `cargo vet`.
+Passing `mise run check` therefore does not establish all seven laws.
+
 ## 1. No ambient authority
 
 **Property.** A function can touch the filesystem, start a process, open a socket, or read the environment only if it was handed the capability to do so.
