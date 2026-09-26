@@ -1519,7 +1519,7 @@ fn abandon_when_the_client_leaves(mut input: impl Input, session: Session) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Concurrency;
+    use crate::domain::{Concurrency, Nonce as RetryNonce};
     use crate::protocol::{Command, Location, Spec};
     use crate::store::LaunchEnv;
 
@@ -2511,8 +2511,6 @@ mod tests {
         assert!(visible.is_empty() && hidden.is_empty());
     }
 
-    const RETRIED: &str = "0123456789abcdef0123456789abcdef";
-
     fn reply_to(node: &Node, bytes: Vec<u8>) -> Reply {
         let mut out = Vec::new();
         node.serve(&Principal::Owner, std::io::Cursor::new(bytes), &mut out)
@@ -2536,7 +2534,7 @@ mod tests {
         reply_to(node, bytes)
     }
 
-    fn sound_after_a_crash(root: &Path, step: usize) {
+    fn sound_after_a_crash(root: &Path, step: usize, retried: &RetryNonce) {
         let at = |what: &str| format!("after a crash before step {step}: {what}");
         let node = Node::open(dirs(root)).unwrap_or_else(|e| panic!("{}", at(&e.to_string())));
         node.upkeep(&Commanded(()));
@@ -2569,10 +2567,7 @@ mod tests {
         }
         node.configure(Change::default())
             .unwrap_or_else(|e| panic!("{}", at(&format!("configuring: {e}"))));
-        for nonce in [
-            RETRIED.parse().unwrap(),
-            crate::domain::Nonce::generate().unwrap(),
-        ] {
+        for nonce in [retried.clone(), RetryNonce::generate().unwrap()] {
             let reply = reply_to(&node, line_of(&submission(nonce, Location::Home)));
             assert!(
                 matches!(&reply, Reply::Job(_))
@@ -2583,13 +2578,14 @@ mod tests {
         }
     }
 
-    fn crash_everywhere(setup: fn(&Path), act: fn(&Node)) {
+    fn crash_everywhere(setup: fn(&Path), act: impl Fn(&Node, &RetryNonce)) {
+        let retried = RetryNonce::generate().unwrap();
         let steps = {
             let tmp = tempfile::tempdir().unwrap();
             setup(tmp.path());
             let node = Node::open(dirs(tmp.path())).unwrap();
             let counting = crate::faults::crash_after(tmp.path(), None);
-            act(&node);
+            act(&node, &retried);
             counting.steps()
         };
         assert!(steps > 0);
@@ -2599,9 +2595,9 @@ mod tests {
             {
                 let node = Node::open(dirs(tmp.path())).unwrap();
                 let _crashing = crate::faults::crash_after(tmp.path(), Some(step));
-                act(&node);
+                act(&node, &retried);
             }
-            sound_after_a_crash(tmp.path(), step);
+            sound_after_a_crash(tmp.path(), step, &retried);
         }
     }
 
@@ -2625,11 +2621,8 @@ mod tests {
 
     #[test]
     fn a_crash_at_any_step_of_a_submission_leaves_a_machine_that_takes_it_again() {
-        crash_everywhere(nothing_yet, |node| {
-            let reply = reply_to(
-                node,
-                line_of(&submission(RETRIED.parse().unwrap(), Location::Home)),
-            );
+        crash_everywhere(nothing_yet, |node, retried| {
+            let reply = reply_to(node, line_of(&submission(retried.clone(), Location::Home)));
             assert!(
                 matches!(reply, Reply::Job(_) | Reply::Refused(_)),
                 "{reply:?}"
@@ -2639,7 +2632,7 @@ mod tests {
 
     #[test]
     fn a_crash_at_any_step_of_an_upload_leaves_only_whole_blobs() {
-        crash_everywhere(nothing_yet, |node| {
+        crash_everywhere(nothing_yet, |node, _retried| {
             let reply = uploaded(node, b"contents");
             assert!(
                 matches!(reply, Reply::Stored { .. } | Reply::Refused(_)),
@@ -2650,7 +2643,7 @@ mod tests {
 
     #[test]
     fn a_crash_at_any_step_of_settling_the_machine_leaves_it_answering() {
-        crash_everywhere(nothing_yet, |node| {
+        crash_everywhere(nothing_yet, |node, _retried| {
             match node.configure(Change {
                 paused: Some(true),
                 max_jobs: Some(Concurrency::try_from(2).unwrap()),
@@ -2662,12 +2655,14 @@ mod tests {
 
     #[test]
     fn a_crash_at_any_step_of_recovering_a_lost_job_is_recovered_from_next_time() {
-        crash_everywhere(one_running_job, |node| node.upkeep(&Commanded(())));
+        crash_everywhere(one_running_job, |node, _retried| {
+            node.upkeep(&Commanded(()));
+        });
     }
 
     #[test]
     fn a_crash_at_any_step_of_cleaning_leaves_a_machine_that_answers() {
-        crash_everywhere(one_running_job, |node| {
+        crash_everywhere(one_running_job, |node, _retried| {
             let reply = reply_to(
                 node,
                 line_of(&Request::Clean {
@@ -2714,7 +2709,9 @@ mod tests {
                 .state(),
             crate::protocol::State::Succeeded
         );
-        crash_everywhere(one_queued_job, supervise_the_queued_job);
+        crash_everywhere(one_queued_job, |supervising, _retried| {
+            supervise_the_queued_job(supervising);
+        });
     }
 
     #[test]
