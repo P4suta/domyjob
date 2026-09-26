@@ -10,14 +10,10 @@ const KEEP_THE_TASK_RUNNING: &str = "$s = New-ScheduledTaskSettingsSet -Executio
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
     #[error(transparent)]
-    Files(crate::user_files::UserFileError),
+    Io(#[from] crate::failure::IoFailure),
+    #[error(transparent)]
+    Files(crate::failure::IoFailure),
     #[error("{program} could not start: {source}")]
     Start {
         program: String,

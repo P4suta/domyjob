@@ -164,10 +164,12 @@ fn fire(ctx: &Context, firing: &Firing<'_>) -> Result<(), ClientError> {
 
 pub fn trigger(fired: &Event) -> Result<ExitCode, ClientError> {
     let ctx = Context::load()?;
-    let root = std::fs::canonicalize(&fired.root).map_err(|e| ClientError::Io {
-        action: "resolving",
-        path: fired.root.clone(),
-        source: e,
+    let root = std::fs::canonicalize(&fired.root).map_err(|e| {
+        ClientError::Io(crate::failure::IoFailure {
+            action: "resolving",
+            path: fired.root.clone(),
+            source: e,
+        })
     })?;
     let matching: Vec<(&String, &crate::config::TriggerConf)> = ctx
         .config

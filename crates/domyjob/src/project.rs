@@ -10,11 +10,8 @@ pub const FILE: &str = "domyjob.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectError {
-    #[error("reading {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{origin}: {source}")]
     Parse {
         origin: String,
@@ -72,7 +69,7 @@ impl Project {
         match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse(&text, &path.display().to_string()).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(ProjectError::Read { path, source }),
+            Err(source) => Err(crate::failure::io("reading", &path)(source).into()),
         }
     }
 

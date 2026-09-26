@@ -3,12 +3,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
 }
 
 #[derive(Debug)]
@@ -18,10 +14,12 @@ pub struct OsLock {
 }
 
 fn open(path: &Path) -> Result<File, LockError> {
-    crate::state_file::open_lock(path).map_err(|error| LockError::Io {
-        action: "opening",
-        path: path.to_path_buf(),
-        source: std::io::Error::other(error.to_string()),
+    crate::state_file::open_lock(path).map_err(|error| {
+        LockError::Io(crate::failure::IoFailure {
+            action: "opening",
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error.to_string()),
+        })
     })
 }
 
@@ -34,23 +32,24 @@ pub enum Probe {
 
 impl OsLock {
     pub fn probe(path: &Path) -> Result<Probe, LockError> {
-        let opened =
-            crate::state_file::open_existing_lock(path).map_err(|error| LockError::Io {
+        let opened = crate::state_file::open_existing_lock(path).map_err(|error| {
+            LockError::Io(crate::failure::IoFailure {
                 action: "opening",
                 path: path.to_path_buf(),
                 source: std::io::Error::other(error.to_string()),
-            })?;
+            })
+        })?;
         let Some(file) = opened else {
             return Ok(Probe::Absent);
         };
         match file.try_lock() {
             Ok(()) => Ok(Probe::Free),
             Err(TryLockError::WouldBlock) => Ok(Probe::Held),
-            Err(TryLockError::Error(source)) => Err(LockError::Io {
+            Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
                 action: "locking",
                 path: path.to_path_buf(),
                 source,
-            }),
+            })),
         }
     }
 
@@ -62,20 +61,22 @@ impl OsLock {
                 path: path.to_path_buf(),
             })),
             Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(source)) => Err(LockError::Io {
+            Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
                 action: "locking",
                 path: path.to_path_buf(),
                 source,
-            }),
+            })),
         }
     }
 
     pub fn exclusive(path: &Path) -> Result<Self, LockError> {
         let file = open(path)?;
-        file.lock().map_err(|source| LockError::Io {
-            action: "locking",
-            path: path.to_path_buf(),
-            source,
+        file.lock().map_err(|source| {
+            LockError::Io(crate::failure::IoFailure {
+                action: "locking",
+                path: path.to_path_buf(),
+                source,
+            })
         })?;
         Ok(Self {
             file,
@@ -98,10 +99,12 @@ impl OsLock {
     }
 
     pub fn release(self) -> Result<(), LockError> {
-        self.file.unlock().map_err(|source| LockError::Io {
-            action: "unlocking",
-            path: self.path.clone(),
-            source,
+        self.file.unlock().map_err(|source| {
+            LockError::Io(crate::failure::IoFailure {
+                action: "unlocking",
+                path: self.path.clone(),
+                source,
+            })
         })
     }
 }

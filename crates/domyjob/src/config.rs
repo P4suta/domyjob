@@ -29,11 +29,8 @@ pub const NOTIFIER_VARS: &[&str] = &["target"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("reading {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("{origin}: {source}")]
     Parse {
         origin: String,
@@ -70,7 +67,7 @@ pub enum ConfigError {
         source: Box<toml_edit::TomlError>,
     },
     #[error(transparent)]
-    Write(crate::user_files::UserFileError),
+    Write(crate::failure::IoFailure),
     #[error("machine {0} is already configured")]
     Exists(MachineName),
     #[error("machine {0} is not configured")]
@@ -423,10 +420,7 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::layered(&text, &path.display().to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::builtin(),
-            Err(source) => Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-            }),
+            Err(source) => Err(crate::failure::io("reading", path)(source).into()),
         }
     }
 
@@ -752,12 +746,7 @@ fn edit(
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+        Err(source) => return Err(crate::failure::io("reading", path)(source).into()),
     };
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()

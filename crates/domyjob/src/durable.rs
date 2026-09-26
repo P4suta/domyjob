@@ -12,30 +12,12 @@ pub enum Access {
     Shared,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{action} {path}: {source}")]
-pub struct DurableError {
-    pub action: &'static str,
-    pub path: PathBuf,
-    pub source: std::io::Error,
-}
-
-fn failed(
-    action: &'static str,
-    path: &Path,
-) -> impl FnOnce(std::io::Error) -> DurableError + use<> {
-    let path = path.to_path_buf();
-    move |source| DurableError {
-        action,
-        path,
-        source,
-    }
-}
-
-pub fn beside(destination: &Path, tag: &str) -> Result<PathBuf, DurableError> {
+pub fn beside(destination: &Path, tag: &str) -> Result<PathBuf, crate::failure::IoFailure> {
     let mut random = [0u8; 8];
     getrandom::fill(&mut random).map_err(|error| {
-        failed("naming a file beside", destination)(std::io::Error::other(error.to_string()))
+        crate::failure::io("naming a file beside", destination)(std::io::Error::other(
+            error.to_string(),
+        ))
     })?;
     let name = destination
         .file_name()
@@ -53,7 +35,7 @@ pub struct Staged {
 }
 
 impl Staged {
-    pub fn beside(destination: &Path, access: Access) -> Result<Self, DurableError> {
+    pub fn beside(destination: &Path, access: Access) -> Result<Self, crate::failure::IoFailure> {
         let temporary = beside(destination, "staged")?;
         let mut options = match access {
             Access::Private => crate::platform::private_options(),
@@ -63,7 +45,7 @@ impl Staged {
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(failed("creating", &temporary))?;
+            .map_err(crate::failure::io("creating", &temporary))?;
         Ok(Self {
             file,
             temporary,
@@ -76,20 +58,20 @@ impl Staged {
         &mut self.file
     }
 
-    pub fn commit(mut self) -> Result<u64, DurableError> {
+    pub fn commit(mut self) -> Result<u64, crate::failure::IoFailure> {
         self.file
             .sync_all()
-            .map_err(failed("syncing", &self.temporary))?;
+            .map_err(crate::failure::io("syncing", &self.temporary))?;
         let bytes = self
             .file
             .metadata()
-            .map_err(failed("measuring", &self.temporary))?
+            .map_err(crate::failure::io("measuring", &self.temporary))?
             .len();
         std::fs::rename(&self.temporary, &self.destination)
-            .map_err(failed("replacing", &self.destination))?;
+            .map_err(crate::failure::io("replacing", &self.destination))?;
         self.committed = true;
         let dir = self.destination.parent().unwrap_or_else(|| Path::new("."));
-        crate::platform::sync_dir(dir).map_err(failed("syncing", dir))?;
+        crate::platform::sync_dir(dir).map_err(crate::failure::io("syncing", dir))?;
         Ok(bytes)
     }
 }
@@ -104,12 +86,16 @@ impl Drop for Staged {
     }
 }
 
-pub fn write(destination: &Path, bytes: &[u8], access: Access) -> Result<(), DurableError> {
+pub fn write(
+    destination: &Path,
+    bytes: &[u8],
+    access: Access,
+) -> Result<(), crate::failure::IoFailure> {
     let mut staged = Staged::beside(destination, access)?;
     staged
         .file()
         .write_all(bytes)
-        .map_err(failed("writing", destination))?;
+        .map_err(crate::failure::io("writing", destination))?;
     staged.commit().map(drop)
 }
 

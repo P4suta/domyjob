@@ -124,6 +124,21 @@ fn is_time_method(name: &str) -> bool {
 }
 
 const DECISION_FILES: &[&str] = &["authz.rs", "trust.rs", "audit.rs"];
+const FAILURE_FILES: &[&str] = &["failure.rs", "xtask/src/lib.rs", "xtask/src/release.rs"];
+
+fn carries_io_source(fields: &syn::Fields) -> bool {
+    let has_path = fields
+        .iter()
+        .any(|field| field.ident.as_ref().is_some_and(|name| name == "path"));
+    has_path
+        && fields.iter().any(|field| {
+            field.ident.as_ref().is_some_and(|name| name == "source")
+                && matches!(&field.ty, syn::Type::Path(path)
+                if path.path.segments.len() >= 2
+                    && path.path.segments.last().is_some_and(|last| last.ident == "Error")
+                    && path.path.segments.iter().rev().nth(1).is_some_and(|io| io.ident == "io"))
+        })
+}
 const WIRE_FILES: &[&str] = &["protocol.rs"];
 const LOCAL_ONLY_TYPES: &[&str] = &["ConfigText", "UserText", "Arg", "Rendered", "Secret"];
 
@@ -312,7 +327,23 @@ impl<'ast> Visit<'ast> for Gate {
         syn::visit::visit_attribute(self, attr);
     }
 
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if carries_io_source(&variant.fields) && !self.file_is(FAILURE_FILES) {
+            self.flag(
+                variant.ident.span(),
+                "an I/O failure is failure::IoFailure, with the action and path it happened at",
+            );
+        }
+        syn::visit::visit_variant(self, variant);
+    }
+
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if carries_io_source(&item.fields) && !self.file_is(FAILURE_FILES) {
+            self.flag(
+                item.ident.span(),
+                "an I/O failure is failure::IoFailure, with the action and path it happened at",
+            );
+        }
         self.check_input(
             &item.attrs,
             item.ident.span(),
@@ -450,6 +481,29 @@ mod tests {
         assert_eq!(
             os_branches("#[cfg(feature = \"x\")]\nfn a() {}").unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn an_io_error_travels_only_inside_io_failure() {
+        let variant =
+            "enum E { Io { action: &'static str, path: PathBuf, source: std::io::Error } }";
+        assert_eq!(rules(variant).len(), 1);
+        assert_eq!(
+            rules("struct S { path: PathBuf, source: std::io::Error }").len(),
+            1
+        );
+        assert!(
+            rules("enum E { Listen { address: SocketAddr, source: std::io::Error } }").is_empty()
+        );
+        assert!(rules("enum E { Output(std::io::Error) }").is_empty());
+        assert!(
+            check_file(
+                "struct IoFailure { source: std::io::Error }",
+                "x/failure.rs"
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

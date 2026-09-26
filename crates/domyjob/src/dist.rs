@@ -1,3 +1,4 @@
+use crate::failure::io;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -79,22 +80,9 @@ pub enum DistError {
     #[error(transparent)]
     State(#[from] crate::state_file::StateError),
     #[error(transparent)]
-    Replace(crate::user_files::UserFileError),
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
-}
-
-fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> DistError + use<> {
-    let path = path.to_path_buf();
-    move |source| DistError::Io {
-        action,
-        path,
-        source,
-    }
+    Replace(crate::failure::IoFailure),
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -379,7 +367,9 @@ fn fetch(
 }
 
 fn read_text(path: &Path) -> Result<Vec<u8>, DistError> {
-    std::fs::read(path).map_err(io("reading", path))
+    std::fs::read(path)
+        .map_err(io("reading", path))
+        .map_err(Into::into)
 }
 
 pub fn fetch_manifest(
@@ -436,16 +426,20 @@ fn download(
 ) -> Result<Verified<Binary>, DistError> {
     let bindings = names(target, exe);
     let dir = dirs.cache.join("dist").join(VERSION).join(target.as_str());
-    crate::state_file::private_dir(&dir).map_err(|e| DistError::Io {
-        action: "preparing",
-        path: dir.clone(),
-        source: std::io::Error::other(e.to_string()),
-    })?;
-    let _one_download_at_a_time =
-        crate::lock::OsLock::exclusive(&dir.join("fetch.lock")).map_err(|e| DistError::Io {
-            action: "locking",
+    crate::state_file::private_dir(&dir).map_err(|e| {
+        DistError::Io(crate::failure::IoFailure {
+            action: "preparing",
             path: dir.clone(),
             source: std::io::Error::other(e.to_string()),
+        })
+    })?;
+    let _one_download_at_a_time =
+        crate::lock::OsLock::exclusive(&dir.join("fetch.lock")).map_err(|e| {
+            DistError::Io(crate::failure::IoFailure {
+                action: "locking",
+                path: dir.clone(),
+                source: std::io::Error::other(e.to_string()),
+            })
         })?;
     let manifest = fetch_manifest(distribution, &dir, &distribution.manifest, &bindings)?;
     if manifest.get().version != VERSION {

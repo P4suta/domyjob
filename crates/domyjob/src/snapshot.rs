@@ -16,12 +16,8 @@ const SHOW_THREADS: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
-    #[error("{action} {path}: {source}")]
-    Io {
-        action: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
     #[error("walking {root}: {source}")]
     Walk {
         root: PathBuf,
@@ -145,10 +141,12 @@ pub enum Origin {
 impl Origin {
     pub fn read(&self) -> Result<Vec<u8>, SnapshotError> {
         match self {
-            Self::Disk(path) => std::fs::read(path).map_err(|source| SnapshotError::Io {
-                action: "reading",
-                path: path.clone(),
-                source,
+            Self::Disk(path) => std::fs::read(path).map_err(|source| {
+                SnapshotError::Io(crate::failure::IoFailure {
+                    action: "reading",
+                    path: path.clone(),
+                    source,
+                })
             }),
             Self::Memory(bytes) => Ok(bytes.clone()),
         }
@@ -238,10 +236,12 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     let rel = relative(root, path)?;
     let io = |action| {
         let path = path.to_path_buf();
-        move |source| SnapshotError::Io {
-            action,
-            path,
-            source,
+        move |source| {
+            SnapshotError::Io(crate::failure::IoFailure {
+                action,
+                path,
+                source,
+            })
         }
     };
     if symlink {
@@ -315,13 +315,13 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
 
 fn hash_file(path: &Path) -> Result<(BlobId, u64), SnapshotError> {
     let mut hasher = blake3::Hasher::new();
-    hasher
-        .update_mmap(path)
-        .map_err(|source| SnapshotError::Io {
+    hasher.update_mmap(path).map_err(|source| {
+        SnapshotError::Io(crate::failure::IoFailure {
             action: "hashing",
             path: path.to_path_buf(),
             source,
-        })?;
+        })
+    })?;
     Ok((BlobId::from_hash(&hasher.finalize()), hasher.count()))
 }
 
@@ -383,11 +383,11 @@ pub fn detect<'a>(config: &'a Config, start: &Path) -> Result<Option<Detected<'a
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(failure) => {
-                    return Err(SnapshotError::Io {
+                    return Err(SnapshotError::Io(crate::failure::IoFailure {
                         action: "checking",
                         path: marker,
                         source: failure,
-                    });
+                    }));
                 }
             }
         }
