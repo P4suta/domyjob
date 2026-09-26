@@ -47,8 +47,8 @@ pub enum Invalid {
     Exposure(String),
     #[error("{0:?} is not a 32-byte hex key")]
     Key(String),
-    #[error("{0} is not a concurrency: expected 1 to 64")]
-    Concurrency(u32),
+    #[error("{0:?} is not a number of jobs at once: expected 1 to 64")]
+    Concurrency(String),
     #[error("the system random source failed: {0}")]
     Random(getrandom::Error),
 }
@@ -355,8 +355,25 @@ impl TryFrom<u32> for Concurrency {
     fn try_from(value: u32) -> Result<Self, Invalid> {
         match NonZeroU32::new(value) {
             Some(n) if value <= Self::MOST => Ok(Self(n)),
-            Some(_) | None => Err(Invalid::Concurrency(value)),
+            Some(_) | None => Err(Invalid::Concurrency(value.to_string())),
         }
+    }
+}
+
+impl std::str::FromStr for Concurrency {
+    type Err = Invalid;
+
+    fn from_str(text: &str) -> Result<Self, Invalid> {
+        match text.parse::<u32>() {
+            Ok(value) => Self::try_from(value),
+            Err(_not_a_number) => Err(Invalid::Concurrency(text.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for Concurrency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

@@ -318,7 +318,7 @@ struct DigestArgs {
     job: String,
     #[arg(
         long,
-        default_value_t = 40,
+        default_value_t = crate::output::DIGEST_TAIL,
         help = "How many of the last lines to include"
     )]
     tail: u32,
@@ -466,6 +466,18 @@ enum MachinesAction {
     Pause(PauseArgs),
     #[command(about = "Let paused machines take jobs again")]
     Resume(PauseArgs),
+    #[command(
+        about = "Set how many jobs sent from now on machines run at once; `on` does not count"
+    )]
+    Limit(LimitArgs),
+}
+
+#[derive(Debug, Args)]
+struct LimitArgs {
+    #[arg(value_name = "MACHINES", help = "Which machines, as for `domyjob run`")]
+    targets: String,
+    #[arg(value_name = "JOBS", help = "How many jobs run at once, from 1 to 64")]
+    jobs: crate::domain::Concurrency,
 }
 
 #[derive(Debug, Args)]
@@ -869,12 +881,12 @@ pub fn main() -> ExitCode {
         Err(error) => {
             let diagnosis = diagnose(&error);
             if json {
-                let value = serde_json::json!({"schema": crate::view::JSON_SCHEMA, "error": {
-                    "kind": diagnosis.kind,
-                    "message": error.to_string(),
-                    "hint": diagnosis.hint,
-                }});
-                println!("{value}");
+                let failed = crate::output::Failed {
+                    error: crate::output::ErrorView::new(error.to_string(), diagnosis),
+                };
+                match crate::output::print(&mut std::io::stdout(), &failed) {
+                    Ok(()) | Err(_) => {}
+                }
             } else {
                 crate::ui::report_error(&error.to_string(), None, diagnosis.hint.as_deref());
             }
@@ -894,9 +906,7 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
         Top::Status(args) => job_command(&args, |job| Request::Status { job })
             .map(|(job, _)| exit(&[verdict_of(&job)])),
         Top::Digest(args) => digest(&args),
-        Top::Kill(args) => {
-            job_command(&args, |job| Request::Kill { job }).map(|_| ExitCode::SUCCESS)
-        }
+        Top::Kill(args) => kill(&args),
         Top::Wait(args) => wait(&args),
         Top::Get(args) => get(&args),
         Top::Pull(args) => pull(&args),
@@ -907,8 +917,30 @@ fn dispatch(command: Top) -> Result<ExitCode, CliError> {
             Some(MachinesAction::Add(add)) => machines_add(add),
             Some(MachinesAction::Remove(remove)) => machines_remove(remove),
             Some(MachinesAction::Rewitness(rewitness)) => machines_rewitness(rewitness),
-            Some(MachinesAction::Pause(pause)) => machines_pause(pause, true),
-            Some(MachinesAction::Resume(resume)) => machines_pause(resume, false),
+            Some(MachinesAction::Pause(pause)) => machines_configure(
+                &pause.targets,
+                crate::protocol::Change {
+                    paused: Some(true),
+                    max_jobs: None,
+                },
+                "paused; running jobs carry on, new ones are refused until `domyjob machines resume`",
+            ),
+            Some(MachinesAction::Resume(resume)) => machines_configure(
+                &resume.targets,
+                crate::protocol::Change {
+                    paused: Some(false),
+                    max_jobs: None,
+                },
+                "takes jobs again",
+            ),
+            Some(MachinesAction::Limit(limit)) => machines_configure(
+                &limit.targets,
+                crate::protocol::Change {
+                    paused: None,
+                    max_jobs: Some(limit.jobs),
+                },
+                &format!("runs at most {} jobs at once", limit.jobs),
+            ),
         },
         Top::Setup(args) => setup(&args),
         Top::Doctor(args) => doctor(&args),
@@ -967,20 +999,8 @@ fn node(args: &NodeArgs) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(unix)]
 fn readiness(args: &NodeArgs) -> Result<crate::proc::Readiness, CliError> {
-    match &args.ready_event {
-        None => Ok(crate::proc::Readiness::from_parent()),
-        Some(_) => Err(CliError::Readiness),
-    }
-}
-
-#[cfg(windows)]
-fn readiness(args: &NodeArgs) -> Result<crate::proc::Readiness, CliError> {
-    match &args.ready_event {
-        Some(token) => Ok(crate::proc::Readiness::from_parent(token.clone())),
-        None => Err(CliError::Readiness),
-    }
+    crate::proc::Readiness::from_parent(args.ready_event.as_ref()).ok_or(CliError::Readiness)
 }
 
 fn parse_env(pairs: &[String]) -> Result<BTreeMap<EnvName, String>, CliError> {
@@ -1225,8 +1245,11 @@ fn announce(submitted: &[Submitted], json: bool) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
     for item in submitted {
         if json {
-            let value = crate::view::job_json(&item.machine.name, &item.job);
-            writeln!(out, "{value}").map_err(CliError::Output)?;
+            crate::output::print(
+                &mut out,
+                &crate::output::JobView::full(&item.machine.name, &item.job),
+            )
+            .map_err(CliError::Output)?;
         } else {
             let revision = item
                 .job
@@ -1447,7 +1470,7 @@ fn settle(
         }
     };
     if common.digest {
-        match client::digest(ctx, &reference(item), DIGEST_TAIL) {
+        match client::digest(ctx, &reference(item), crate::output::DIGEST_TAIL) {
             Ok((_, digest)) => show_digest(&item.machine.name, &digest, json)?,
             Err(error) => {
                 eprintln!("domyjob: {}: {error}", item.machine.name);
@@ -1530,24 +1553,22 @@ fn finish(
     Ok(ExitCode::from(exit_for(&verdicts)))
 }
 
-const DIGEST_TAIL: u32 = 40;
-
 fn show_preview(preview: &client::Preview, json: bool) -> Result<ExitCode, CliError> {
     let mut out = std::io::stdout().lock();
     let sent = preview.sending.as_ref();
     if json {
-        let value = serde_json::json!({
-            "machines": preview.machines,
-            "command": preview.command.display(),
-            "sending": sent.map(|s| serde_json::json!({
-                "root": s.root,
-                "runs_in": s.subdir,
-                "revision": s.revision,
-                "files": s.files,
-                "bytes": s.bytes,
-            })),
-        });
-        writeln!(out, "{value}").map_err(CliError::Output)?;
+        let shown = crate::output::Preview {
+            machines: &preview.machines,
+            command: preview.command.display(),
+            sending: sent.map(|s| crate::output::Sending {
+                root: &s.root,
+                runs_in: s.subdir.as_ref(),
+                revision: &s.revision,
+                files: s.files,
+                bytes: s.bytes,
+            }),
+        };
+        crate::output::print(&mut out, &shown).map_err(CliError::Output)?;
         return Ok(ExitCode::SUCCESS);
     }
     let names: Vec<String> = preview.machines.iter().map(ToString::to_string).collect();
@@ -1587,21 +1608,8 @@ fn show_digest(
     }
     let mut out = std::io::stdout().lock();
     if json {
-        let mut value = crate::view::job_json(machine, job);
-        if let Some(fields) = value.as_object_mut() {
-            fields.insert("lines".to_owned(), digest.lines.into());
-            fields.insert("bytes".to_owned(), digest.bytes.into());
-            fields.insert(
-                "tail".to_owned(),
-                digest
-                    .tail
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
-        }
-        return writeln!(out, "{value}").map_err(CliError::Output);
+        return crate::output::print(&mut out, &crate::output::DigestView::of(machine, digest))
+            .map_err(CliError::Output);
     }
     writeln!(
         out,
@@ -1646,13 +1654,11 @@ fn search(args: &LogsArgs, pattern: &str) -> Result<ExitCode, CliError> {
     let (machine, found) = client::search(&ctx, &args.job, query)?;
     let mut out = std::io::stdout().lock();
     if args.json {
-        let hits: Vec<serde_json::Value> = found
-            .hits
-            .iter()
-            .map(|hit| serde_json::json!({"line": hit.line, "text": hit.text.to_string(), "matched": hit.matched}))
-            .collect();
-        let value = serde_json::json!({"schema": crate::view::JSON_SCHEMA, "machine": machine.name, "matched": found.matched, "truncated": found.truncated, "hits": hits});
-        writeln!(out, "{value}").map_err(CliError::Output)?;
+        crate::output::print(
+            &mut out,
+            &crate::output::FoundView::of(&machine.name, &found),
+        )
+        .map_err(CliError::Output)?;
     } else {
         let mut previous = None;
         for hit in &found.hits {
@@ -1683,8 +1689,11 @@ fn report_final(
     (json, board): (bool, &crate::board::Board),
 ) -> Result<(), CliError> {
     if json {
-        let value = crate::view::job_json(&machine.name, job);
-        writeln!(std::io::stdout(), "{value}").map_err(CliError::Output)
+        crate::output::print(
+            &mut std::io::stdout(),
+            &crate::output::JobView::full(&machine.name, job),
+        )
+        .map_err(CliError::Output)
     } else {
         if board.is_quiet() && job.succeeded() {
             return Ok(());
@@ -1735,6 +1744,8 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
     let mut unknown = false;
     let mut listed_any = false;
     let mut failure: Option<CliError> = None;
+    let mut gathered: Vec<(MachineName, Vec<Job>)> = Vec::new();
+    let mut unreachable = Vec::new();
     client::list_each(&ctx, &machines, args.limit, |machine, result| {
         let shown = match result {
             Ok((jobs, unreadable)) => {
@@ -1746,11 +1757,19 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
                     );
                 }
                 listed_any |= !jobs.is_empty();
-                list_rows(&machine.name, &jobs, (person, args.json), now)
+                if args.json {
+                    gathered.push((machine.name.clone(), jobs));
+                    Ok(())
+                } else {
+                    list_rows(&machine.name, &jobs, person, now)
+                }
             }
             Err(error) => {
                 unknown = true;
-                if person {
+                if args.json {
+                    unreachable.push(crate::output::MachineError::of(&machine.name, &error));
+                    Ok(())
+                } else if person {
                     crate::view::unreachable_line(&machine.name, &error.to_string())
                         .map_err(|e| CliError::Output(std::io::Error::other(e)))
                         .and_then(|line| {
@@ -1769,6 +1788,9 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
     if let Some(error) = failure {
         return Err(error);
     }
+    if args.json {
+        print_listed(&mut out, gathered, unreachable).map_err(CliError::Output)?;
+    }
     if person && !listed_any && !unknown {
         writeln!(out, "{}", crate::view::no_jobs()).map_err(CliError::Output)?;
     }
@@ -1779,10 +1801,30 @@ fn ls(args: &LsArgs) -> Result<ExitCode, CliError> {
     })
 }
 
+fn print_listed(
+    out: &mut dyn Write,
+    mut gathered: Vec<(MachineName, Vec<Job>)>,
+    mut unreachable: Vec<crate::output::MachineError>,
+) -> std::io::Result<()> {
+    gathered.sort_by(|a, b| a.0.cmp(&b.0));
+    unreachable.sort_by(|a, b| a.machine.cmp(&b.machine));
+    let listed = crate::output::Jobs {
+        jobs: gathered
+            .iter()
+            .flat_map(|(machine, jobs)| {
+                jobs.iter()
+                    .map(move |job| crate::output::JobView::full(machine, job))
+            })
+            .collect(),
+        unreachable,
+    };
+    crate::output::print(out, &listed)
+}
+
 fn list_rows(
     machine: &MachineName,
     jobs: &[Job],
-    (person, json): (bool, bool),
+    person: bool,
     now: Timestamp,
 ) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
@@ -1795,10 +1837,6 @@ fn list_rows(
         return writeln!(out, "{block}").map_err(CliError::Output);
     }
     for job in jobs {
-        if json {
-            writeln!(out, "{}", crate::view::job_json(machine, job)).map_err(CliError::Output)?;
-            continue;
-        }
         let (age, took) = age(job, now);
         let exit = job
             .exit_code()
@@ -1868,7 +1906,7 @@ fn print_job(machine: &MachineName, job: &Job, json: bool) -> Result<(), CliErro
     }
     let mut out = std::io::stdout().lock();
     if json {
-        writeln!(out, "{}", crate::view::job_json(machine, job))
+        crate::output::print(&mut out, &crate::output::JobView::full(machine, job))
     } else {
         writeln!(
             out,
@@ -1878,6 +1916,20 @@ fn print_job(machine: &MachineName, job: &Job, json: bool) -> Result<(), CliErro
         )
     }
     .map_err(CliError::Output)
+}
+
+fn kill(args: &JobArgs) -> Result<ExitCode, CliError> {
+    let (job, machine) = job_command(args, |job| Request::Kill { job })?;
+    if job.state() == crate::protocol::State::Killed {
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!(
+        "domyjob: {}:{} had already {}; nothing was stopped",
+        machine.name,
+        job.spec.id,
+        job.state().as_str()
+    );
+    Ok(ExitCode::from(FAILED_JOB))
 }
 
 fn job_command(
@@ -1890,21 +1942,17 @@ fn job_command(
     Ok((job, machine))
 }
 
-fn machines_pause(args: &PauseArgs, paused: bool) -> Result<ExitCode, CliError> {
+fn machines_configure(
+    targets: &str,
+    change: crate::protocol::Change,
+    done: &str,
+) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let machines = ctx.select(&args.targets)?;
+    let machines = ctx.select(targets)?;
     let mut all_ok = true;
     for machine in &machines {
-        match client::pause(&ctx, machine, paused) {
-            Ok(_) => eprintln!(
-                "domyjob: {}: {}",
-                machine.name,
-                if paused {
-                    "paused; running jobs carry on, new ones are refused until `domyjob machines resume`"
-                } else {
-                    "takes jobs again"
-                }
-            ),
+        match client::configure(&ctx, machine, change) {
+            Ok(_) => eprintln!("domyjob: {}: {done}", machine.name),
             Err(error) => {
                 all_ok = false;
                 crate::ui::report_error(
@@ -1938,23 +1986,11 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
     }
     let series = crate::history::series(&jobs);
     if args.json {
-        let values: Vec<serde_json::Value> = series
-            .iter()
-            .map(|one| {
-                serde_json::json!({
-                    "machine": one.machine,
-                    "name": one.label,
-                    "runs": one.runs,
-                    "succeeded": one.succeeded,
-                    "recent": one.recent.iter().map(|state| state.as_str()).collect::<Vec<_>>(),
-                    "typical_millis": one.typical.map(crate::clock::Elapsed::millis),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "history": values})
-        );
+        crate::output::print(
+            &mut std::io::stdout(),
+            &crate::output::HistoryView::of(&series),
+        )
+        .map_err(CliError::Output)?;
     } else {
         show(crate::view::history(
             &series,
@@ -1972,7 +2008,7 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let machines = ctx.select(&args.targets)?;
     let mut all_ok = true;
-    let mut values = Vec::new();
+    let mut answers = Vec::new();
     std::thread::scope(|scope| -> Result<(), CliError> {
         let handles: Vec<_> = machines
             .iter()
@@ -1995,29 +2031,35 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
                 Ok(result) => result,
                 Err(_panicked) => return Err(ClientError::Panicked.into()),
             };
+            all_ok &= result.is_ok();
             match result {
-                Ok(cleaned) if args.json => values.push(serde_json::json!({
-                    "machine": machine.name,
-                    "cleaned": cleaned,
-                })),
-                Ok(cleaned) => show(crate::view::cleaned(&machine.name, &cleaned))?,
-                Err(error) => {
-                    all_ok = false;
-                    crate::ui::report_error(
-                        &error.to_string(),
-                        None,
-                        crate::diagnosis::of_remote(&error).hint.as_deref(),
-                    );
-                }
+                Ok(cleaned) if !args.json => show(crate::view::cleaned(&machine.name, &cleaned))?,
+                Err(error) if !args.json => crate::ui::report_error(
+                    &error.to_string(),
+                    None,
+                    crate::diagnosis::of_remote(&error).hint.as_deref(),
+                ),
+                answer @ (Ok(_) | Err(_)) => answers.push((&machine.name, answer)),
             }
         }
         Ok(())
     })?;
     if args.json {
-        println!(
-            "{}",
-            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "machines": values})
-        );
+        let cleaned = crate::output::Machines {
+            machines: answers
+                .iter()
+                .map(|(machine, answer)| match answer {
+                    Ok(cleaned) => crate::output::Answered::Answer(crate::output::CleanedOn {
+                        machine,
+                        cleaned,
+                    }),
+                    Err(error) => crate::output::Answered::Unreachable(
+                        crate::output::MachineError::of(machine, error),
+                    ),
+                })
+                .collect(),
+        };
+        crate::output::print(&mut std::io::stdout(), &cleaned).map_err(CliError::Output)?;
     }
     Ok(if all_ok {
         ExitCode::SUCCESS
@@ -2036,7 +2078,7 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
     let now = Timestamp::observe();
     let (answers, answered) = std::sync::mpsc::channel();
     let mut reachable = true;
-    let mut values = Vec::new();
+    let mut gathered = Vec::new();
     std::thread::scope(|scope| -> Result<(), CliError> {
         for machine in &machines {
             let answers = answers.clone();
@@ -2050,52 +2092,40 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
         }
         drop(answers);
         for (name, survey) in answered {
+            reachable &= survey.is_ok();
+            if json {
+                gathered.push((name, survey));
+                continue;
+            }
             match survey {
                 Ok((report, jobs)) => {
-                    if json {
-                        values.push(overview_json(&name, &report, &jobs));
-                    } else {
-                        show(crate::view::machine_card(&name, &report, &jobs, now))?;
-                    }
+                    show(crate::view::machine_card(&name, &report, &jobs, now))?;
                 }
-                Err(error) => {
-                    reachable = false;
-                    if json {
-                        values.push(serde_json::json!({
-                            "machine": name,
-                            "reachable": false,
-                            "error": {
-                                "message": error.to_string(),
-                                "hint": crate::diagnosis::of_remote(&error).hint,
-                            },
-                        }));
-                    } else {
-                        let why = error.to_string();
-                        let why = why
-                            .strip_prefix(&format!("{name}: "))
-                            .unwrap_or(&why)
-                            .to_owned();
-                        show(crate::view::unreachable_card(
-                            &name,
-                            &why,
-                            crate::diagnosis::of_remote(&error).hint.as_deref(),
-                        ))?;
-                    }
-                }
+                Err(error) => show(crate::view::unreachable_card(
+                    &name,
+                    &crate::output::unprefixed(&name, &error),
+                    crate::diagnosis::of_remote(&error).hint.as_deref(),
+                ))?,
             }
         }
         Ok(())
     })?;
     if json {
-        values.sort_by(|a, b| {
-            a.get("machine")
-                .map(ToString::to_string)
-                .cmp(&b.get("machine").map(ToString::to_string))
-        });
-        println!(
-            "{}",
-            serde_json::json!({"schema": crate::view::JSON_SCHEMA, "machines": values})
-        );
+        gathered.sort_by(|a, b| a.0.cmp(&b.0));
+        let surveyed = crate::output::Machines {
+            machines: gathered
+                .iter()
+                .map(|(name, survey)| match survey {
+                    Ok((report, jobs)) => crate::output::Answered::Answer(
+                        crate::output::Overview::of(name, report, jobs),
+                    ),
+                    Err(error) => crate::output::Answered::Unreachable(
+                        crate::output::MachineError::of(name, error),
+                    ),
+                })
+                .collect(),
+        };
+        crate::output::print(&mut std::io::stdout(), &surveyed).map_err(CliError::Output)?;
     }
     Ok(if reachable {
         ExitCode::SUCCESS
@@ -2124,12 +2154,18 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
                 {
                     Ok(()) | Err(_) => {}
                 };
-                let ended = client::watch(ctx, machine, &mut each);
-                let why = match ended {
-                    Ok(()) => "stopped reporting".to_owned(),
-                    Err(error) => error.to_string(),
+                let ended = match client::watch(ctx, machine, &mut each) {
+                    Ok(()) => crate::output::MachineError::told(
+                        &name,
+                        "stopped reporting".to_owned(),
+                        crate::diagnosis::Diagnosis {
+                            kind: crate::diagnosis::Kind::Unreachable,
+                            hint: None,
+                        },
+                    ),
+                    Err(error) => crate::output::MachineError::of(&name, &error),
                 };
-                match updates.send((name, Err(why))) {
+                match updates.send((name, Err(ended))) {
                     Ok(()) | Err(_) => {}
                 }
             });
@@ -2139,15 +2175,7 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
         let mut drawn = 0usize;
         for (name, update) in arrivals {
             if json {
-                let value = match &update {
-                    Ok(survey) => overview_json(&name, &survey.report, &survey.jobs),
-                    Err(why) => serde_json::json!({
-                        "machine": name,
-                        "reachable": false,
-                        "error": {"message": why},
-                    }),
-                };
-                println!("{value}");
+                print_update(&name, &update).map_err(CliError::Output)?;
                 continue;
             }
             let card = match update {
@@ -2157,7 +2185,9 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
                     &survey.jobs,
                     Timestamp::observe(),
                 ),
-                Err(why) => crate::view::unreachable_card(&name, &why, None),
+                Err(lost) => {
+                    crate::view::unreachable_card(&name, lost.error.message(), lost.error.hint())
+                }
             }
             .map_err(|e| CliError::Output(std::io::Error::other(e)))?;
             cards.insert(name, card);
@@ -2179,30 +2209,18 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
     Ok(ExitCode::from(UNKNOWN))
 }
 
-fn overview_json(
+fn print_update(
     name: &MachineName,
-    report: &crate::protocol::Report,
-    jobs: &[Job],
-) -> serde_json::Value {
-    let summaries = |wanted: &dyn Fn(&Job) -> bool| -> Vec<serde_json::Value> {
-        jobs.iter()
-            .filter(|job| wanted(job))
-            .map(|job| crate::view::job_summary_json(name, job))
-            .collect()
-    };
-    serde_json::json!({
-        "machine": name,
-        "reachable": true,
-        "report": report,
-        "running": summaries(&|job| matches!(job.state(), crate::protocol::State::Running | crate::protocol::State::Preparing)),
-        "queued": summaries(&|job| job.state() == crate::protocol::State::Queued),
-        "recent": jobs
-            .iter()
-            .filter(|job| job.is_settled())
-            .take(5)
-            .map(|job| crate::view::job_summary_json(name, job))
-            .collect::<Vec<_>>(),
-    })
+    update: &Result<crate::protocol::Survey, crate::output::MachineError>,
+) -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    match update {
+        Ok(survey) => crate::output::print(
+            &mut out,
+            &crate::output::Overview::of(name, &survey.report, &survey.jobs),
+        ),
+        Err(lost) => crate::output::print(&mut out, lost),
+    }
 }
 
 fn show(text: Result<String, std::fmt::Error>) -> Result<(), CliError> {
@@ -2343,22 +2361,19 @@ fn show_pulled(
 ) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
     if json {
-        let listed: Vec<serde_json::Value> = steps
-            .iter()
-            .map(|step| serde_json::json!({"path": step.path, "change": step.kind().word()}))
-            .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::json!({
-                "schema": crate::view::JSON_SCHEMA,
-                "job": reference,
-                "root": root,
-                "applied": applied.is_some(),
-                "changes": listed,
-            })
-        )
-        .map_err(CliError::Output)?;
+        let pulled = crate::output::Pulled {
+            job: reference,
+            root,
+            applied: applied.is_some(),
+            changes: steps
+                .iter()
+                .map(|step| crate::output::Change {
+                    path: &step.path,
+                    change: step.kind().word(),
+                })
+                .collect(),
+        };
+        crate::output::print(&mut out, &pulled).map_err(CliError::Output)?;
     } else {
         for step in steps {
             writeln!(out, "{} {}", step.kind().letter(), step.path).map_err(CliError::Output)?;
@@ -2751,12 +2766,30 @@ fn self_update(allow_downgrade: bool) -> Result<ExitCode, CliError> {
 
 fn machines(json: bool) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    if !json && crate::view::stdout_is_a_person() {
-        let configured = ctx.config.configured();
-        let mut facts = Vec::with_capacity(configured.len());
-        for machine in &configured {
-            facts.push(crate::remote::cached_facts(&ctx.dirs, machine).map_err(ClientError::from)?);
-        }
+    let configured = ctx.config.configured();
+    let mut facts = Vec::with_capacity(configured.len());
+    for machine in &configured {
+        facts.push(crate::remote::cached_facts(&ctx.dirs, machine).map_err(ClientError::from)?);
+    }
+    let mut out = std::io::stdout().lock();
+    if json {
+        let listed = crate::output::Machines {
+            machines: configured
+                .iter()
+                .zip(facts)
+                .map(|(machine, facts)| crate::output::Configured {
+                    machine: &machine.name,
+                    host: &machine.host,
+                    transport: &machine.transport,
+                    labels: &machine.labels,
+                    facts,
+                })
+                .collect(),
+        };
+        crate::output::print(&mut out, &listed).map_err(CliError::Output)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if crate::view::stdout_is_a_person() {
         let rows: Vec<crate::view::Seen<'_>> = configured
             .iter()
             .zip(&facts)
@@ -2768,6 +2801,7 @@ fn machines(json: bool) -> Result<ExitCode, CliError> {
                 facts: facts.as_ref(),
             })
             .collect();
+        drop(out);
         show(crate::view::machines(&rows))?;
         return Ok(if configured.is_empty() {
             ExitCode::from(FAILED_JOB)
@@ -2775,30 +2809,20 @@ fn machines(json: bool) -> Result<ExitCode, CliError> {
             ExitCode::SUCCESS
         });
     }
-    let mut out = std::io::stdout().lock();
-    for machine in ctx.config.configured() {
-        let facts = crate::remote::cached_facts(&ctx.dirs, &machine).map_err(ClientError::from)?;
-        if json {
-            let value = serde_json::json!({
-                "name": machine.name, "host": machine.host, "transport": machine.transport,
-                "labels": machine.labels, "facts": facts,
-            });
-            writeln!(out, "{value}").map_err(CliError::Output)?;
-        } else {
-            let seen = facts.map_or_else(
-                || "not contacted yet".to_owned(),
-                |f| format!("{}/{} {}", f.hello.os, f.hello.arch, f.hello.version),
-            );
-            writeln!(
-                out,
-                "{}\t{}\t{}\t{}\t{seen}",
-                machine.name,
-                machine.transport,
-                machine.host,
-                machine.labels.join(",")
-            )
-            .map_err(CliError::Output)?;
-        }
+    for (machine, seen) in configured.iter().zip(&facts) {
+        let seen = seen.as_ref().map_or_else(
+            || "not contacted yet".to_owned(),
+            |f| format!("{}/{} {}", f.hello.os, f.hello.arch, f.hello.version),
+        );
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{seen}",
+            machine.name,
+            machine.transport,
+            machine.host,
+            machine.labels.join(",")
+        )
+        .map_err(CliError::Output)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2874,70 +2898,50 @@ const SKILL: &str = include_str!("skill.md");
 const JOB_ENVIRONMENT: &str = "jobs keep the environment of the session that started them, but not what lived only in it: a forwarded ssh agent is gone once the session closes, so clone private repositories with credentials the machine holds";
 
 #[derive(Debug, serde::Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum Checked {
-    Reached {
-        machine: MachineName,
-        os: String,
-        arch: String,
-        version: String,
-        shell: String,
-        placement: crate::remote::Placement,
-    },
-    Failed {
-        machine: MachineName,
-        kind: crate::diagnosis::Kind,
-        error: String,
-        hint: Option<String>,
-    },
+struct Reached {
+    machine: MachineName,
+    os: String,
+    arch: String,
+    version: String,
+    shell: String,
+    placement: crate::remote::Placement,
 }
+
+type Checked = crate::output::Answered<Reached>;
 
 fn checked(
     name: &MachineName,
     result: &Result<crate::remote::Facts, crate::remote::RemoteError>,
 ) -> Checked {
     match result {
-        Ok(facts) => Checked::Reached {
+        Ok(facts) => Checked::Answer(Reached {
             machine: name.clone(),
             os: facts.hello.os.to_string(),
             arch: facts.hello.arch.to_string(),
             version: facts.hello.version.to_string(),
             shell: facts.hello.shell.to_string(),
             placement: facts.placement,
-        },
-        Err(error) => {
-            let diagnosis = crate::diagnosis::of_remote(error);
-            Checked::Failed {
-                machine: name.clone(),
-                kind: diagnosis.kind,
-                error: error.to_string(),
-                hint: diagnosis.hint,
-            }
-        }
+        }),
+        Err(error) => Checked::Unreachable(crate::output::MachineError::of(name, error)),
     }
 }
 
 fn print_checked(out: &mut dyn Write, row: &Checked) -> std::io::Result<()> {
     match row {
-        Checked::Reached {
+        Checked::Answer(Reached {
             machine,
             os,
             arch,
             version,
             shell,
             ..
-        } => writeln!(
+        }) => writeln!(
             out,
             "ok     {machine}: {os}/{arch} domyjob {version} shell {shell}"
         ),
-        Checked::Failed {
-            machine,
-            error,
-            hint,
-            ..
-        } => {
-            writeln!(out, "FAIL   {machine}: {error}")?;
-            match hint {
+        Checked::Unreachable(failed) => {
+            writeln!(out, "FAIL   {}: {}", failed.machine, failed.error.message())?;
+            match failed.error.hint() {
                 Some(hint) => writeln!(out, "       hint: {hint}"),
                 None => Ok(()),
             }
@@ -3028,18 +3032,18 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
         .iter()
         .map(|(name, result)| checked(name, result))
         .collect();
-    let all_ok = socket_fits
-        && rows
-            .iter()
-            .all(|row| matches!(row, Checked::Reached { .. }));
+    let all_ok = socket_fits && rows.iter().all(|row| matches!(row, Checked::Answer(_)));
     let mut out = std::io::stdout().lock();
     if args.json {
-        let value = serde_json::json!({
-            "local": {"key_storage": protection, "state_fits_local_sockets": socket_fits},
-            "machines": rows,
-            "notes": [JOB_ENVIRONMENT],
-        });
-        writeln!(out, "{value}").map_err(CliError::Output)?;
+        let checkup = crate::output::Checkup {
+            local: crate::output::Local {
+                key_storage: protection,
+                state_fits_local_sockets: socket_fits,
+            },
+            machines: &rows,
+            notes: &[JOB_ENVIRONMENT],
+        };
+        crate::output::print(&mut out, &checkup).map_err(CliError::Output)?;
     } else {
         writeln!(out, "this machine: its key is kept in {protection}").map_err(CliError::Output)?;
         if !socket_fits {

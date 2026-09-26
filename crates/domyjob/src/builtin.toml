@@ -136,7 +136,7 @@ run = [
   "--data-binary",
   "@-",
   "--url",
-  "{target}",
+  "https://ntfy.sh/{target}",
 ]
 
 [notifiers.desktop]

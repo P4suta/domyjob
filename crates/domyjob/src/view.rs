@@ -171,7 +171,7 @@ pub fn machine_card(
         ui::machine(machine),
         resources(report)?.join(&ui::paint(Tone::Dim, " · "))
     )?;
-    writeln!(out, "  {}", activity(jobs)?.join("   "))?;
+    writeln!(out, "  {}", activity(jobs, report.max_jobs)?.join("   "))?;
     attention(&mut out, machine, report, (jobs, now))?;
     Ok(out)
 }
@@ -210,7 +210,10 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
     Ok(facts)
 }
 
-fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
+fn activity(
+    jobs: &[Job],
+    at_once: crate::domain::Concurrency,
+) -> Result<Vec<String>, std::fmt::Error> {
     let running: Vec<&Job> = jobs
         .iter()
         .filter(|job| matches!(job.state(), State::Running | State::Preparing))
@@ -249,8 +252,9 @@ fn activity(jobs: &[Job]) -> Result<Vec<String>, std::fmt::Error> {
     }
     if queued > 0 {
         activity.push(format!(
-            "{} {queued} queued",
-            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued))
+            "{} {queued} queued {}",
+            ui::paint(Tone::Waiting, ui::symbol(Symbol::Queued)),
+            ui::paint(Tone::Dim, &format!("({at_once} at once)"))
         ));
     }
     if activity.is_empty() {
@@ -612,39 +616,6 @@ pub fn doctor_failed(
     Ok(out)
 }
 
-pub const JSON_SCHEMA: u32 = 2;
-
-#[must_use]
-pub fn job_summary_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    serde_json::json!({
-        "schema": JSON_SCHEMA,
-        "job": format!("{machine}:{}", job.spec.id),
-        "machine": machine,
-        "state": job.state().as_str(),
-        "exit_code": job.exit_code(),
-        "name": job.spec.name,
-        "command": job.spec.command.display(),
-        "reason": job.reason(),
-        "notes": job.notes,
-        "behind": job.behind.iter().map(|holder| format!("{machine}:{holder}")).collect::<Vec<_>>(),
-    })
-}
-
-#[must_use]
-pub fn job_json(machine: &MachineName, job: &Job) -> serde_json::Value {
-    let mut value = job_summary_json(machine, job);
-    if let Some(fields) = value.as_object_mut() {
-        fields.insert(
-            "detail".to_owned(),
-            match serde_json::to_value(job) {
-                Ok(detail) => detail,
-                Err(_unencodable) => serde_json::Value::Null,
-            },
-        );
-    }
-    value
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -683,6 +654,7 @@ pub mod tests {
             disk_short: true,
             uptime_seconds: 60,
             paused: true,
+            max_jobs: crate::domain::Concurrency::DEFAULT,
         };
         let running = {
             let mut job = sample();
@@ -718,7 +690,7 @@ pub mod tests {
         for wanted in [
             "16 cores load 3.20",
             "1 running: tests",
-            "1 queued",
+            "1 queued (4 at once)",
             "failed",
             "domyjob digest linux:0AAAAAAA",
             "domyjob machines resume linux",
@@ -798,38 +770,5 @@ pub mod tests {
             behind: Vec::new(),
             notes: Vec::new(),
         }
-    }
-
-    #[test]
-    fn the_job_json_keeps_its_shape_for_scripts_and_agents() {
-        let job = sample();
-        let machine: MachineName = "linux".parse().unwrap();
-        let mut keys: Vec<String> = job_json(&machine, &job)
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "behind",
-                "command",
-                "detail",
-                "exit_code",
-                "job",
-                "machine",
-                "name",
-                "notes",
-                "reason",
-                "schema",
-                "state"
-            ]
-        );
-        assert_eq!(
-            job_summary_json(&machine, &job).get("job").unwrap(),
-            "linux:0AAAAAAAAAAAAAAA"
-        );
     }
 }

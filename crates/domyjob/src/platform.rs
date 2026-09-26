@@ -20,6 +20,11 @@ pub const FAMILY: Family = if cfg!(windows) {
     Family::Unix
 };
 pub const LINKS: bool = FAMILY.links();
+pub const RUNNING_EXECUTABLE: Option<&str> = if cfg!(target_os = "linux") {
+    Some("/proc/self/exe")
+} else {
+    None
+};
 pub const MODES: bool = FAMILY.modes();
 
 const fn bits(mode: Mode) -> u32 {

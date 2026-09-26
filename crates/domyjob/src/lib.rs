@@ -28,6 +28,7 @@ pub mod logscan;
 pub mod mcp;
 pub mod node;
 pub mod notify;
+pub mod output;
 pub mod paths;
 pub mod platform;
 pub mod pq;

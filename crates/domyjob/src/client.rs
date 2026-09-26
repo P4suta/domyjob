@@ -651,7 +651,6 @@ impl Plan<'_> {
             location,
             env: self.order.env.clone(),
             shell: self.order.shell.clone().or_else(|| machine.shell.clone()),
-            concurrency: machine.max_jobs,
             queue: self.order.queue,
         }
     }
@@ -870,13 +869,13 @@ pub fn clean(
         .map_err(|other| link.unexpected("what was cleaned", *other))
 }
 
-pub fn pause(
+pub fn configure(
     ctx: &Context,
     machine: &Machine,
-    paused: bool,
+    change: crate::protocol::Change,
 ) -> Result<crate::protocol::Report, RemoteError> {
     let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
-    link.call(&Request::Pause { paused }, &[])?
+    link.call(&Request::Configure { change }, &[])?
         .into_report()
         .map_err(|other| link.unexpected("a report", *other))
 }

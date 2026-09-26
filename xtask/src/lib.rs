@@ -45,9 +45,8 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GateError> {
 const PLATFORM: &str = "crates/domyjob/src/platform.rs";
 
 const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
-    ("crates/domyjob/src/cli.rs", 2),
     ("crates/domyjob/src/keystore.rs", 5),
-    ("crates/domyjob/src/proc.rs", 6),
+    ("crates/domyjob/src/proc.rs", 5),
     ("crates/domyjob/src/service.rs", 6),
     ("crates/domyjob/src/spawn.rs", 1),
     ("xtask/src/release.rs", 1),

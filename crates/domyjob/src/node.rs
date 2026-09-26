@@ -13,8 +13,8 @@ use crate::lock::LockError;
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
-    Submission, VERSION,
+    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request,
+    Settings, Spec, Submission, VERSION,
 };
 use crate::store::{Store, StoreError};
 use crate::terminal::RemoteText;
@@ -356,7 +356,7 @@ fn subject(request: &Request) -> Option<String> {
         | Request::Report
         | Request::Watch
         | Request::Clean { .. }
-        | Request::Pause { .. }
+        | Request::Configure { .. }
         | Request::Hold
         | Request::AuditAt { .. }
         | Request::AuditHead
@@ -473,7 +473,7 @@ impl Node {
             single @ (Request::Hello
             | Request::Report
             | Request::Clean { .. }
-            | Request::Pause { .. }
+            | Request::Configure { .. }
             | Request::AuditAt { .. }
             | Request::AuditHead
             | Request::Digest { .. }
@@ -506,8 +506,8 @@ impl Node {
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
             Request::Report => Reply::Report(Box::new(self.report())),
-            Request::Pause { paused } => {
-                self.pause(paused)?;
+            Request::Configure { change } => {
+                self.configure(change)?;
                 Reply::Report(Box::new(self.report()))
             }
             Request::Clean { apply, logs, idle } => {
@@ -590,7 +590,8 @@ impl Node {
         submission: Submission,
         commanded: &Commanded,
     ) -> Result<Job, NodeError> {
-        if submission.queue == crate::protocol::Queue::Slot && self.paused() {
+        let settings = self.settings();
+        if submission.queue == crate::protocol::Queue::Slot && settings.paused {
             return Err(NodeError::Paused);
         }
         self.make_room(&|| self.short_of_room(), commanded)?;
@@ -617,7 +618,7 @@ impl Node {
             location: submission.location,
             env_names: submission.env.keys().cloned().collect(),
             shell: submission.shell,
-            concurrency: submission.concurrency,
+            concurrency: settings.max_jobs,
             sequence: self.store.next_sequence()?,
             submitted_by: principal.submitter(),
             submitted_at: Timestamp::observe(),
@@ -715,6 +716,7 @@ impl Node {
     }
 
     fn report(&self) -> crate::protocol::Report {
+        let settings = self.settings();
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         let load = sysinfo::System::load_average();
@@ -736,28 +738,26 @@ impl Node {
             disk_available,
             disk_short: short(disk_available, disk_total),
             uptime_seconds: sysinfo::System::uptime(),
-            paused: self.paused(),
+            paused: settings.paused,
+            max_jobs: settings.max_jobs,
         }
     }
 
-    fn pause_path(&self) -> PathBuf {
-        self.store.area("paused")
+    fn settings_path(&self) -> PathBuf {
+        self.store.area("settings.json")
     }
 
-    fn paused(&self) -> bool {
-        matches!(
-            crate::state_file::read_bytes(&self.pause_path()),
-            Ok(Some(_))
-        )
-    }
-
-    fn pause(&self, paused: bool) -> Result<(), NodeError> {
-        if paused {
-            crate::state_file::write_bytes(&self.pause_path(), b"paused")?;
-        } else {
-            crate::state_file::remove_file(&self.pause_path())?;
+    fn settings(&self) -> Settings {
+        match crate::state_file::read_json(&self.settings_path()) {
+            Ok(Some(settings)) => settings,
+            Ok(None) | Err(_) => Settings::default(),
         }
-        Ok(())
+    }
+
+    fn configure(&self, change: Change) -> Result<(), NodeError> {
+        let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
+        crate::state_file::write_json(&self.settings_path(), &self.settings().with(change))?;
+        Ok(collecting.release()?)
     }
 
     fn short_of_room(&self) -> bool {
@@ -1592,7 +1592,6 @@ mod tests {
                 location,
                 env: std::collections::BTreeMap::new(),
                 shell: None,
-                concurrency: Concurrency::DEFAULT,
             }),
         }
     }
@@ -1719,7 +1718,9 @@ mod tests {
                 logs: false,
                 idle: false,
             },
-            Request::Pause { paused: false },
+            Request::Configure {
+                change: Change::default(),
+            },
             Request::AuditAt { seq: 0 },
             Request::AuditHead,
             Request::Digest {
@@ -2209,7 +2210,13 @@ mod tests {
         let report = node.report();
         assert!(report.cores > 0 && report.memory_total > 0 && report.disk_total > 0);
         assert!(!report.paused);
-        let wire = ask(&node, &Request::Pause { paused: true });
+        let pause = |paused| Request::Configure {
+            change: Change {
+                paused: Some(paused),
+                max_jobs: None,
+            },
+        };
+        let wire = ask(&node, &pause(true));
         let paused = crate::remote::receive("m", &mut wire.as_slice(), &mut Vec::new()).unwrap();
         assert!(paused.into_report().unwrap().paused);
         let nonce = crate::domain::Nonce::generate().unwrap();
@@ -2221,8 +2228,14 @@ mod tests {
             matches!(&reply, Reply::Refused(refusal) if refusal.code == RefusalCode::Paused),
             "{reply:?}"
         );
-        node.pause(false).unwrap();
-        assert!(!node.report().paused);
+        let five = Concurrency::try_from(5).unwrap();
+        node.configure(Change {
+            paused: Some(false),
+            max_jobs: Some(five),
+        })
+        .unwrap();
+        let resumed = node.report();
+        assert!(!resumed.paused && resumed.max_jobs == five);
     }
 
     #[test]
@@ -2763,7 +2776,6 @@ mod tests {
             location: Location::Home,
             env: std::collections::BTreeMap::new(),
             shell: None,
-            concurrency: spec.concurrency,
         };
         let wire = ask(
             &node,
