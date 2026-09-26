@@ -1302,24 +1302,27 @@ impl Node {
         if !job.is_settled() {
             return Err(NodeError::Unfinished(job.spec.id));
         }
+        let raw = self.cas.get(&source.manifest)?;
         let sent = self.cas.manifest(&source.manifest)?;
-        let (root, workspace) = self.workspace_of(id)?;
-        let now = crate::snapshot::from_directory(&root)?.manifest;
-        let changes = crate::snapshot::changes(&sent, &now);
+        let (_, workspace) = self.workspace_of(id)?;
+        let header = crate::snapshot::Changed {
+            sent: crate::domain::len_u64(raw.len()),
+            left: workspace.left(&sent)?,
+        };
         streamed(output, |framed| {
-            let mut listed =
-                serde_json::to_vec(&changes).map_err(|e| NodeError::Output(e.into()))?;
-            listed.push(b'\n');
-            framed.write_all(&listed).map_err(NodeError::Output)?;
-            for change in &changes {
-                if let Some(crate::snapshot::Entry::File { size, .. }) = &change.after {
-                    let file = workspace.open_file(&change.path)?;
+            let mut line = serde_json::to_vec(&header).map_err(|e| NodeError::Output(e.into()))?;
+            line.push(b'\n');
+            framed.write_all(&line).map_err(NodeError::Output)?;
+            framed.write_all(&raw).map_err(NodeError::Output)?;
+            for left in &header.left {
+                if let Some(crate::snapshot::Entry::File { size, .. }) = &left.now {
+                    let file = workspace.open_file(&left.path)?;
                     let copied =
                         std::io::copy(&mut file.take(*size), framed).map_err(NodeError::Output)?;
                     if copied != *size {
                         return Err(NodeError::Output(std::io::Error::other(format!(
                             "{} changed while it was being sent",
-                            change.path
+                            left.path
                         ))));
                     }
                 }
@@ -1885,7 +1888,7 @@ mod tests {
         let (node, job) = published(tmp.path(), b"");
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        let workspace = tmp.path().join("ws");
+        let workspace = tmp.path().join("home").join("ws");
         for (name, text) in [
             ("keep.txt", "same"),
             ("edit.txt", "old"),
@@ -1907,17 +1910,22 @@ mod tests {
         crate::state_file::remove_file(&workspace.join("drop.txt")).unwrap();
         crate::state_file::write_bytes(&workspace.join("born.txt"), b"hi").unwrap();
         crate::state_file::write_bytes(&workspace.join("target/out.bin"), b"built").unwrap();
+        crate::state_file::write_bytes(&workspace.join(".git/config"), b"[core]").unwrap();
+        crate::state_file::write_bytes(&tmp.path().join("home/.gitignore"), b"*\n").unwrap();
 
         let mut payload = Vec::new();
         let wire = ask(&node, &Request::Changes { job: job.clone() });
         let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut payload).unwrap();
         assert!(matches!(reply, Reply::Stream), "{reply:?}");
         let end = payload.iter().position(|b| *b == b'\n').unwrap();
-        let listed: Vec<crate::snapshot::Change> =
+        let changed: crate::snapshot::Changed =
             crate::ingress::json(payload.get(..end).unwrap()).unwrap();
-        let paths: Vec<String> = listed.iter().map(|c| c.path.to_string()).collect();
+        let paths: Vec<String> = changed.left.iter().map(|c| c.path.to_string()).collect();
         assert_eq!(paths, ["born.txt", "drop.txt", "edit.txt"]);
-        assert_eq!(payload.get(end + 1..).unwrap(), b"hinew");
+        let rest = payload.get(end + 1..).unwrap();
+        let (raw, files) = rest.split_at(usize::try_from(changed.sent).unwrap());
+        assert_eq!(BlobId::of(raw), manifest);
+        assert_eq!(files, b"hinew");
 
         store.set_phase(&id, &Phase::Queued).unwrap();
         let _alive = crate::lock::OsLock::exclusive(&store.alive_path(&id)).unwrap();

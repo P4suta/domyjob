@@ -21,7 +21,8 @@ You then ask for a digest or search the log instead of reading all of it.
 5. Fetch a result if you need one:
    `domyjob get tests target/report.json -o report.json`
 6. Bring back what it changed:
-   `domyjob pull tests` writes the files the job added, altered, or removed into this directory, and refuses if you edited any of them since sending.
+   `domyjob pull tests` writes the files the job added, altered, or removed into the directory it was sent from, and refuses if you edited any of them since sending.
+   `domyjob pull --undo tests` puts them back.
    Commit, sign, and push here: the other machines never need your keys.
 
 When a result is needed right away and the job is short, `domyjob run win --wait --digest -- cargo test` waits and prints only the digest.

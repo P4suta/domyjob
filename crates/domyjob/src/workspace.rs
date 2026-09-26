@@ -6,7 +6,7 @@ use cap_std::fs::{Dir, OpenOptions};
 
 use crate::cas::{Applied, Cas, CasError};
 use crate::domain::RelPath;
-use crate::snapshot::{Entry, Manifest, Mode};
+use crate::snapshot::{Entry, Left, Manifest, Mode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -24,6 +24,8 @@ pub enum WorkspaceError {
     Stopped,
     #[error("{0} is a directory; get copies one file, so name a file inside it")]
     NotAFile(PathBuf),
+    #[error(transparent)]
+    Snapshot(#[from] crate::snapshot::SnapshotError),
 }
 
 fn io(action: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> WorkspaceError + use<> {
@@ -90,6 +92,10 @@ impl Workspace {
         path: &Path,
         blob: &crate::domain::BlobId,
     ) -> Result<bool, WorkspaceError> {
+        Ok(&self.digest(path)? == blob)
+    }
+
+    fn digest(&self, path: &Path) -> Result<crate::domain::BlobId, WorkspaceError> {
         let mut file = self.dir.open(path).map_err(io("opening", path))?;
         let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0u8; 64 * 1024];
@@ -102,10 +108,13 @@ impl Workspace {
                 }
             }
         }
-        Ok(&crate::domain::BlobId::from_hash(&hasher.finalize()) == blob)
+        Ok(crate::domain::BlobId::from_hash(&hasher.finalize()))
     }
 
     fn holds(&self, path: &Path, entry: &Entry) -> Result<bool, WorkspaceError> {
+        if !self.under_directories(path)? {
+            return Ok(false);
+        }
         let meta = match self.dir.symlink_metadata(path) {
             Ok(meta) => meta,
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
@@ -134,7 +143,10 @@ impl Workspace {
         if !meta.is_symlink() {
             return Ok(false);
         }
-        let found = self.dir.read_link(path).map_err(io("reading", path))?;
+        let found = self
+            .dir
+            .read_link_contents(path)
+            .map_err(io("reading", path))?;
         Ok(found.as_os_str() == target)
     }
 
@@ -212,7 +224,9 @@ impl Workspace {
 
     #[cfg(unix)]
     fn place_symlink(&self, target: &str, path: &Path) -> Result<(), WorkspaceError> {
-        self.dir.symlink(target, path).map_err(io("linking", path))
+        self.dir
+            .symlink_contents(target, path)
+            .map_err(io("linking", path))
     }
 
     #[cfg(not(unix))]
@@ -265,6 +279,76 @@ impl Workspace {
             next.insert(rel.clone());
         }
         Ok((next, changes))
+    }
+
+    pub fn left(&self, sent: &Manifest) -> Result<Vec<Left>, WorkspaceError> {
+        let mut left = Vec::new();
+        for (rel, entry) in &sent.entries {
+            let path = relative(rel);
+            if !self.holds(&path, entry)? {
+                left.push(Left {
+                    path: rel.clone(),
+                    now: self.entry(&path)?,
+                });
+            }
+        }
+        for rel in crate::snapshot::inside_paths(&self.root)? {
+            if !sent.entries.contains_key(&rel)
+                && let Some(now) = self.entry(&relative(&rel))?
+            {
+                left.push(Left {
+                    path: rel,
+                    now: Some(now),
+                });
+            }
+        }
+        left.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(left)
+    }
+
+    fn under_directories(&self, path: &Path) -> Result<bool, WorkspaceError> {
+        let mut walked = PathBuf::new();
+        for component in path.parent().into_iter().flat_map(Path::components) {
+            walked.push(component);
+            match self.dir.symlink_metadata(&walked) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(io("checking", &walked)(e)),
+            }
+        }
+        Ok(true)
+    }
+
+    fn entry(&self, path: &Path) -> Result<Option<Entry>, WorkspaceError> {
+        if !self.under_directories(path)? {
+            return Ok(None);
+        }
+        let meta = match self.dir.symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io("checking", path)(e)),
+        };
+        if meta.is_symlink() {
+            let target = self
+                .dir
+                .read_link_contents(path)
+                .map_err(io("reading", path))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| crate::snapshot::SnapshotError::Unportable(self.root.join(path)))?;
+            return Ok(Some(Entry::Symlink {
+                target: target.to_owned(),
+            }));
+        }
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Entry::File {
+            blob: self.digest(path)?,
+            size: meta.len(),
+            mode: mode_of(&meta),
+        }))
     }
 
     pub fn open_file(&self, rel: &RelPath) -> Result<std::fs::File, WorkspaceError> {
@@ -422,6 +506,38 @@ mod tests {
             std::fs::read_to_string(ws.root().join("target/cache")).unwrap(),
             "warm"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_absolute_target_is_placed_and_then_recognised() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("cas")).unwrap();
+        let manifest = Manifest {
+            entries: std::collections::BTreeMap::from([(
+                "hosts".parse().unwrap(),
+                Entry::Symlink {
+                    target: "/etc/hosts".to_owned(),
+                },
+            )]),
+        };
+        let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
+        let fill = |previous: &Applied| {
+            ws.materialize(
+                &cas,
+                Plan {
+                    manifest: &manifest,
+                    previous,
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+        };
+        let (applied, first) = fill(&Applied::default());
+        assert_eq!(first.written, 1);
+        let (_, second) = fill(&applied);
+        assert_eq!((second.written, second.kept), (0, 1));
+        assert!(ws.left(&manifest).unwrap().is_empty());
     }
 
     #[cfg(unix)]

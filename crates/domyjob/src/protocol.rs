@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-const FRAMING: &str = "json lines; a stream is u32 big-endian lengths, 0 to end, u32::MAX to beat, then an ending line";
+const FRAMING: &str = "json lines; a stream is u32 big-endian lengths, 0 to end, u32::MAX to beat, then an ending line; changes stream a changed line, the sent manifest, then each file left";
 
 #[must_use]
 pub fn wire() -> &'static str {
@@ -21,6 +21,7 @@ pub fn wire() -> &'static str {
             "frame": schemars::schema_for!(Frame),
             "ending": schemars::schema_for!(crate::framed::Ending),
             "survey": schemars::schema_for!(Survey),
+            "changed": schemars::schema_for!(crate::snapshot::Changed),
             "framing": FRAMING,
         });
         let digest = blake3::hash(described.to_string().as_bytes()).to_hex();

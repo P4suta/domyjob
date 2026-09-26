@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -431,11 +431,8 @@ struct CleanArgs {
 struct PullArgs {
     #[arg(help = "A job id, a unique prefix of one, a name, or MACHINE:ID")]
     job: String,
-    #[arg(
-        long,
-        help = "The project directory the job was sent from [default: the one containing this directory]"
-    )]
-    root: Option<PathBuf>,
+    #[arg(long, help = "Put back what an earlier pull of this job changed")]
+    undo: bool,
     #[arg(long, help = "List the changes without writing anything")]
     dry_run: bool,
     #[arg(long, help = "Print machine-readable JSON")]
@@ -810,12 +807,8 @@ const fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
             kind: Kind::Unreachable,
             hint: Some("each machine's own error is printed above it"),
         },
-        CliError::Pull(crate::pull::PullError::Diverged(_)) => Diagnosis {
-            kind: Kind::Usage,
-            hint: Some("commit or set aside your own edits to those files, then pull again"),
-        },
-        CliError::Pull(_)
-        | CliError::Node(_)
+        CliError::Pull(error) => crate::diagnosis::of_pull(error),
+        CliError::Node(_)
         | CliError::Output(_)
         | CliError::Mcp(_)
         | CliError::Serve(_)
@@ -2211,74 +2204,113 @@ fn get(args: &GetArgs) -> Result<ExitCode, CliError> {
 
 fn pull(args: &PullArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
-    let pulled = client::changes(&ctx, &args.job)?;
-    let (root, here) = client::project_here(&ctx, &current_dir()?, args.root.as_deref())?;
-    let sent_from = match &pulled.job.spec.location {
-        crate::protocol::Location::Snapshot { source, .. } => Some(&source.project),
-        crate::protocol::Location::Home => None,
-    };
-    if sent_from != Some(&here) {
-        return Err(ClientError::OtherProject {
-            job: pulled.job.spec.id,
-        }
-        .into());
+    if args.undo {
+        return pull_undo(&ctx, args);
     }
+    let pulled = client::changes(&ctx, &args.job)?;
+    let reference = format!("{}:{}", pulled.machine.name, pulled.job.spec.id);
+    let tree = crate::pull::Tree::open(&pulled.from.root)?;
+    let steps = pulled.plan.steps().to_vec();
+    let checked = pulled.plan.check(&tree)?;
+    let applied = if args.dry_run {
+        None
+    } else {
+        let journal = crate::pull::Journal::open(
+            &client::pulls(&ctx),
+            &format!("{}-{}", pulled.machine.name, pulled.job.spec.id),
+        )?;
+        Some(checked.keep(&tree, &journal)?.apply(&tree, &journal)?)
+    };
+    show_pulled(
+        &steps,
+        (&reference, tree.root()),
+        (applied, Pulling::Forward),
+        args.json,
+    )?;
+    if applied.is_some_and(|applied| applied.changed > 0) {
+        eprintln!("domyjob: `domyjob pull --undo {reference}` puts them back");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn pull_undo(ctx: &Context, args: &PullArgs) -> Result<ExitCode, CliError> {
+    let (machine, job) = client::recorded(ctx, &args.job)?;
+    let reference = format!("{machine}:{job}");
+    let journal =
+        crate::pull::Journal::find(&client::pulls(ctx), &format!("{machine}-{job}"), &reference)?;
+    let (tree, plan) = journal.undo()?;
+    let steps = plan.steps().to_vec();
+    let checked = plan.check(&tree)?;
+    let applied = if args.dry_run {
+        None
+    } else {
+        Some(checked.apply(&tree, &journal)?)
+    };
+    show_pulled(
+        &steps,
+        (&reference, tree.root()),
+        (applied, Pulling::Back),
+        args.json,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pulling {
+    Forward,
+    Back,
+}
+
+fn show_pulled(
+    steps: &[crate::pull::Step],
+    (reference, root): (&str, &Path),
+    (applied, pulling): (Option<crate::pull::Applied>, Pulling),
+    json: bool,
+) -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
-    if args.json {
-        let listed: Vec<serde_json::Value> = pulled
-            .changes
+    if json {
+        let listed: Vec<serde_json::Value> = steps
             .iter()
-            .map(|change| {
-                serde_json::json!({
-                    "path": change.path,
-                    "change": match crate::pull::kind(change) {
-                        crate::pull::Kind::Added => "added",
-                        crate::pull::Kind::Modified => "modified",
-                        crate::pull::Kind::Removed => "removed",
-                    },
-                })
-            })
+            .map(|step| serde_json::json!({"path": step.path, "change": step.kind().word()}))
             .collect();
         writeln!(
             out,
             "{}",
             serde_json::json!({
                 "schema": crate::view::JSON_SCHEMA,
-                "job": format!("{}:{}", pulled.machine.name, pulled.job.spec.id),
-                "applied": !args.dry_run,
+                "job": reference,
+                "root": root,
+                "applied": applied.is_some(),
                 "changes": listed,
             })
         )
         .map_err(CliError::Output)?;
     } else {
-        for change in &pulled.changes {
-            writeln!(
-                out,
-                "{} {}",
-                crate::pull::kind(change).letter(),
-                change.path
-            )
-            .map_err(CliError::Output)?;
+        for step in steps {
+            writeln!(out, "{} {}", step.kind().letter(), step.path).map_err(CliError::Output)?;
         }
     }
     drop(out);
-    let reference = format!("{}:{}", pulled.machine.name, pulled.job.spec.id);
-    if pulled.changes.is_empty() {
-        eprintln!("domyjob: {reference} changed no files");
-    } else if args.dry_run {
-        let diverged = crate::pull::diverged(&root, &pulled.changes)?;
-        if !diverged.is_empty() {
-            return Err(crate::pull::PullError::Diverged(diverged).into());
+    let root = root.display();
+    match (applied, pulling) {
+        _ if steps.is_empty() => eprintln!("domyjob: {reference} changed no files"),
+        (None, _) => {}
+        (Some(applied), Pulling::Forward) if applied.changed == 0 => {
+            eprintln!("domyjob: {root} already matches {reference}");
         }
-    } else {
-        crate::pull::apply(&root, &pulled.changes, &pulled.contents)?;
-        eprintln!(
-            "domyjob: brought {} changed files back from {reference} into {}",
-            pulled.changes.len(),
-            root.display()
-        );
+        (Some(applied), Pulling::Back) if applied.changed == 0 => {
+            eprintln!("domyjob: {root} is already as it was before pulling {reference}");
+        }
+        (Some(applied), Pulling::Forward) => eprintln!(
+            "domyjob: changed {} files in {root} to match {reference}",
+            applied.changed
+        ),
+        (Some(applied), Pulling::Back) => eprintln!(
+            "domyjob: put back {} files in {root} as they were before pulling {reference}",
+            applied.changed
+        ),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 fn machines_add(args: &AddArgs) -> Result<ExitCode, CliError> {
