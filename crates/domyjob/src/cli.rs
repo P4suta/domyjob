@@ -374,7 +374,11 @@ struct DoArgs {
 struct LsArgs {
     #[arg(help = "Which machines to ask [default: every machine domyjob knows]")]
     machines: Option<String>,
-    #[arg(long, default_value_t = 20, help = "How many jobs to show per machine")]
+    #[arg(
+        long,
+        default_value_t = 20,
+        help = "How many jobs to show per machine (up to 1000)"
+    )]
     limit: u32,
     #[arg(long, help = "Print machine-readable JSON")]
     json: bool,

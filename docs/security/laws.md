@@ -42,6 +42,9 @@ Child command output is captured through `bounded::command_output` or `bounded::
 The local supervisor control socket accepts at most 32 active sessions, and only a private `ControlPermit` can spawn an answer thread; dropping it releases the slot.
 The MCP server accepts at most 1 MiB per input line and at most 32 active request workers; a private permit holds each slot through response writing and tracks cancellation only for active request IDs.
 The syntax gate confines MCP worker spawning to a dispatch function that requires the permit and rejects unbounded line iteration in that module.
+`Store::JobIds` streams published and staged job IDs, and a queued supervisor retains only the earliest live predecessor plus at most 64 slot watchers and one predecessor watcher.
+Job listing retains at most the requested 1000 most recent jobs and refuses a list with more than 1000 unreadable records instead of returning an incomplete result.
+The syntax gate confines `Store::ids` and `Store::staged_ids` collection helpers to tests and rejects direct thread spawning inside the queue loop.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
 Source snapshots admit at most 100,000 entries and 16 MiB of path bytes; each disk blob can be up to 8 GiB and remains streamed, while materialized revision content has a 64 MiB total budget.
 Directory hashing reads no further than each inspected file size and uses at most four workers.

@@ -57,6 +57,10 @@ pub enum NodeError {
     Incomplete(String),
     #[error("an upload of {0} items is more than one request may carry")]
     TooMany(u64),
+    #[error("a list request may return at most {0} jobs")]
+    ListLimit(u32),
+    #[error("more than {0} unreadable jobs prevent a complete list")]
+    TooManyUnreadable(usize),
     #[error("job {0} has no workspace to fetch from")]
     NoWorkspace(JobId),
     #[error(
@@ -115,6 +119,7 @@ impl NodeError {
             | Self::Invalid(_)
             | Self::Input(_)
             | Self::TooMany(_)
+            | Self::ListLimit(_)
             | Self::Scan(
                 crate::logscan::ScanError::Pattern(..) | crate::logscan::ScanError::PatternTooLong,
             )
@@ -133,6 +138,7 @@ impl NodeError {
             | Self::Audit(_)
             | Self::State(_)
             | Self::Scan(crate::logscan::ScanError::Io(_))
+            | Self::TooManyUnreadable(_)
             | Self::Lock(_) => RefusalCode::Storage,
         }
     }
@@ -824,7 +830,8 @@ impl Node {
 
     pub fn running(&self) -> Result<Vec<JobId>, NodeError> {
         let mut running = Vec::new();
-        for id in self.store.ids()? {
+        for id in self.store.ids_iter()? {
+            let id = id?;
             match self.store.phase(&id)? {
                 Phase::Finished { .. } => continue,
                 Phase::Queued
@@ -846,10 +853,12 @@ impl Node {
     }
 
     fn upkeep(&self, _commanded: &Commanded) -> Result<(), NodeError> {
-        for id in self.store.ids()? {
+        for id in self.store.ids_iter()? {
+            let id = id?;
             self.recover(&id)?;
         }
-        for id in self.store.staged_ids()? {
+        for id in self.store.staged_ids_iter()? {
+            let id = id?;
             self.abandon_staging(&id)?;
         }
         match self.retire(KEEP_FINISHED) {
@@ -1118,7 +1127,8 @@ impl Node {
 
     fn finished_oldest_first(&self) -> Result<Vec<JobId>, NodeError> {
         let mut finished = Vec::new();
-        for id in self.store.ids()? {
+        for id in self.store.ids_iter()? {
+            let id = id?;
             match self.store.phase(&id)? {
                 Phase::Finished { .. } => finished.push((self.store.spec(&id)?.sequence, id)),
                 Phase::Queued
@@ -1174,7 +1184,8 @@ impl Node {
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
         let mut needed = Vec::new();
         let mut spent = Vec::new();
-        for id in self.store.ids()? {
+        for id in self.store.ids_iter()? {
+            let id = id?;
             let spec = self.store.spec(&id)?;
             if keep == Keep::Unfinished && matches!(self.store.phase(&id)?, Phase::Finished { .. })
             {
@@ -1183,7 +1194,8 @@ impl Node {
                 needed.push(spec);
             }
         }
-        for id in self.store.staged_ids()? {
+        for id in self.store.staged_ids_iter()? {
+            let id = id?;
             needed.push(self.store.staged_spec(&id)?);
         }
         let mut reachable = self.reachable(&needed)?;
@@ -1308,16 +1320,33 @@ impl Node {
         principal: &Principal,
         limit: u32,
     ) -> Result<(Vec<Job>, Vec<crate::protocol::Unreadable>), NodeError> {
-        let mut jobs = Vec::new();
+        const MAX_LIST_JOBS: u32 = 1000;
+        const MAX_UNREADABLE: usize = 1000;
+        if limit > MAX_LIST_JOBS {
+            return Err(NodeError::ListLimit(MAX_LIST_JOBS));
+        }
+        let keep = crate::domain::to_usize(limit);
+        let mut jobs = std::collections::BTreeMap::new();
         let mut unreadable = Vec::new();
-        for id in self.store.ids()? {
+        for id in self.store.ids_iter()? {
+            let id = id?;
             match self.store.job(&id) {
                 Ok(job) => match principal.relation_to(&job.spec.submitted_by) {
-                    Relation::Oversees | Relation::Submitted => jobs.push(job),
+                    Relation::Oversees | Relation::Submitted => {
+                        if keep > 0 {
+                            jobs.insert((job.spec.sequence, id), job);
+                            if jobs.len() > keep {
+                                jobs.pop_first();
+                            }
+                        }
+                    }
                     Relation::Stranger => {}
                 },
                 Err(error) => {
                     if matches!(principal, Principal::Owner) {
+                        if unreadable.len() >= MAX_UNREADABLE {
+                            return Err(NodeError::TooManyUnreadable(MAX_UNREADABLE));
+                        }
                         unreadable.push(crate::protocol::Unreadable {
                             id,
                             why: RemoteText::new(error.to_string()),
@@ -1326,8 +1355,7 @@ impl Node {
                 }
             }
         }
-        jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.sequence));
-        jobs.truncate(crate::domain::to_usize(limit));
+        let jobs = jobs.into_iter().rev().map(|(_, job)| job).collect();
         Ok((jobs, unreadable))
     }
 
@@ -1636,8 +1664,7 @@ mod tests {
         Dirs::for_test(root)
     }
 
-    fn staged(root: &Path, id: &JobId, script: &str) -> Store {
-        let store = Store::open(&dirs(root)).unwrap();
+    fn stage_with_sequence(store: &Store, id: &JobId, script: &str, sequence: u64) {
         let spec = Spec {
             id: id.clone(),
             name: None,
@@ -1646,7 +1673,7 @@ mod tests {
             env_names: std::collections::BTreeSet::new(),
             shell: None,
             concurrency: Concurrency::DEFAULT,
-            sequence: 1,
+            sequence,
             submitted_by: authz::Submitter::Owner,
             submitted_at: Timestamp::observe(),
         };
@@ -1656,6 +1683,11 @@ mod tests {
                 (&std::collections::BTreeMap::new(), &LaunchEnv::default()),
             )
             .unwrap();
+    }
+
+    fn staged(root: &Path, id: &JobId, script: &str) -> Store {
+        let store = Store::open(&dirs(root)).unwrap();
+        stage_with_sequence(&store, id, script, 1);
         store
     }
 
@@ -1681,6 +1713,41 @@ mod tests {
             },
             id.as_str().parse().unwrap(),
         )
+    }
+
+    #[test]
+    fn listing_keeps_only_requested_recent_jobs_and_rejects_an_excess_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        for (sequence, text) in [
+            "0AAAAAAAAAAAAAAA",
+            "0BBBBBBBBBBBBBBB",
+            "0CCCCCCCCCCCCCCC",
+            "0DDDDDDDDDDDDDDD",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id: JobId = text.parse().unwrap();
+            stage_with_sequence(
+                &store,
+                &id,
+                "true",
+                crate::domain::len_u64(sequence.saturating_add(1)),
+            );
+            store.publish(&id).unwrap();
+        }
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        let (jobs, unreadable) = node.list(&Principal::Owner, 2).unwrap();
+        assert!(unreadable.is_empty());
+        assert_eq!(
+            jobs.iter().map(|job| job.spec.sequence).collect::<Vec<_>>(),
+            [4, 3]
+        );
+        assert!(matches!(
+            node.list(&Principal::Owner, 1001),
+            Err(NodeError::ListLimit(1000))
+        ));
     }
 
     fn ask(node: &Node, request: &Request) -> Vec<u8> {

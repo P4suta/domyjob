@@ -27,6 +27,82 @@ enum Event {
     Kill,
 }
 
+fn watch_lock_release(path: PathBuf, sender: Sender<Event>) {
+    std::thread::spawn(move || match OsLock::exclusive(&path) {
+        Ok(lock) => {
+            match lock.release() {
+                Ok(()) | Err(_) => {}
+            }
+            match sender.send(Event::Released(path)) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Err(error) => match sender.send(Event::LockFailed(error)) {
+            Ok(()) | Err(_) => {}
+        },
+    });
+}
+
+struct QueueWatchers {
+    slots: std::collections::BTreeSet<PathBuf>,
+    earlier: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchRegistration {
+    Start,
+    Ignore,
+}
+
+impl QueueWatchers {
+    const fn new() -> Self {
+        Self {
+            slots: std::collections::BTreeSet::new(),
+            earlier: None,
+        }
+    }
+
+    fn register_slot(&mut self, path: &Path) -> WatchRegistration {
+        let limit = crate::domain::to_usize(crate::domain::Concurrency::MOST);
+        if self.slots.contains(path) || self.slots.len() >= limit {
+            return WatchRegistration::Ignore;
+        }
+        self.slots.insert(path.to_path_buf());
+        WatchRegistration::Start
+    }
+
+    fn observe_slots(&mut self, held: &[PathBuf], sender: &Sender<Event>) {
+        for path in held {
+            if self.register_slot(path) == WatchRegistration::Start {
+                watch_lock_release(path.clone(), sender.clone());
+            }
+        }
+    }
+
+    fn register_earlier(&mut self, path: &Path) -> WatchRegistration {
+        if self.earlier.is_some() {
+            return WatchRegistration::Ignore;
+        }
+        self.earlier = Some(path.to_path_buf());
+        WatchRegistration::Start
+    }
+
+    fn observe_earlier(&mut self, path: Option<PathBuf>, sender: &Sender<Event>) {
+        if let Some(path) = path
+            && self.register_earlier(&path) == WatchRegistration::Start
+        {
+            watch_lock_release(path, sender.clone());
+        }
+    }
+
+    fn released(&mut self, path: &Path) {
+        self.slots.remove(path);
+        if self.earlier.as_deref() == Some(path) {
+            self.earlier = None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
     Asked,
@@ -704,7 +780,7 @@ impl Supervisor {
             .map_err(|error| crate::node::watching(&watched, &error))?;
         notify::Watcher::watch(&mut notifier, &watched, notify::RecursiveMode::NonRecursive)
             .map_err(|error| crate::node::watching(&watched, &error))?;
-        let mut watched_locks = std::collections::BTreeSet::new();
+        let mut watchers = QueueWatchers::new();
         loop {
             let admission = OsLock::exclusive(&self.store.admission_lock_path())?;
             let settings = self.store.settings()?;
@@ -715,8 +791,9 @@ impl Supervisor {
                     held.push(path);
                 }
             }
-            let earlier = self.store.earlier_waiters(&self.spec)?;
-            let slot = match decide_admission(settings, held.len(), earlier.len()) {
+            let earlier = self.store.earliest_waiter(&self.spec)?;
+            let slot = match decide_admission(settings, held.len(), usize::from(earlier.is_some()))
+            {
                 Admission::Open => OsLock::first_free(
                     &slots,
                     crate::domain::to_usize(crate::domain::Concurrency::MOST),
@@ -728,32 +805,15 @@ impl Supervisor {
             if slot.is_some() {
                 return Ok(slot);
             }
-            let blockers = held
-                .into_iter()
-                .chain(earlier.into_iter().map(|id| self.store.alive_path(&id)));
-            for path in blockers {
-                if !watched_locks.insert(path.clone()) {
-                    continue;
-                }
-                let sender = self.shared.events.clone();
-                std::thread::spawn(move || match OsLock::exclusive(&path) {
-                    Ok(lock) => {
-                        match lock.release() {
-                            Ok(()) | Err(_) => {}
-                        }
-                        match sender.send(Event::Released(path)) {
-                            Ok(()) | Err(_) => {}
-                        }
-                    }
-                    Err(error) => match sender.send(Event::LockFailed(error)) {
-                        Ok(()) | Err(_) => {}
-                    },
-                });
-            }
+            watchers.observe_slots(&held, &self.shared.events);
+            watchers.observe_earlier(
+                earlier.map(|id| self.store.alive_path(&id)),
+                &self.shared.events,
+            );
             match events.recv() {
                 Ok(Event::Changed) => {}
                 Ok(Event::Released(path)) => {
-                    watched_locks.remove(&path);
+                    watchers.released(&path);
                 }
                 Ok(Event::LockFailed(error)) => return Err(NodeError::Lock(error)),
                 Ok(Event::Kill) => return Ok(None),
@@ -1091,6 +1151,43 @@ mod tests {
             ..two
         };
         assert_eq!(decide_admission(three, 2, 0), Admission::Open);
+    }
+
+    #[test]
+    fn queue_watcher_registration_has_a_fixed_slot_and_predecessor_budget() {
+        let mut watchers = QueueWatchers::new();
+        for index in 0..crate::domain::Concurrency::MOST {
+            assert_eq!(
+                watchers.register_slot(Path::new(&format!("{index}.lock"))),
+                WatchRegistration::Start
+            );
+        }
+        assert_eq!(
+            watchers.register_slot(Path::new("extra.lock")),
+            WatchRegistration::Ignore
+        );
+        assert_eq!(
+            watchers.register_slot(Path::new("0.lock")),
+            WatchRegistration::Ignore
+        );
+        assert_eq!(
+            watchers.register_earlier(Path::new("first.alive")),
+            WatchRegistration::Start
+        );
+        assert_eq!(
+            watchers.register_earlier(Path::new("second.alive")),
+            WatchRegistration::Ignore
+        );
+        watchers.released(Path::new("first.alive"));
+        watchers.released(Path::new("0.lock"));
+        assert_eq!(
+            watchers.register_earlier(Path::new("second.alive")),
+            WatchRegistration::Start
+        );
+        assert_eq!(
+            watchers.register_slot(Path::new("extra.lock")),
+            WatchRegistration::Start
+        );
     }
 
     #[test]

@@ -15,6 +15,36 @@ const SCHEMA: &str = "v3";
 const OUTCOME_RESERVED: usize = 4096;
 const NOTES_LINE: u64 = 64 << 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdArea {
+    Published,
+    Staged,
+}
+
+pub(crate) struct JobIds {
+    directory: PathBuf,
+    entries: Option<std::fs::ReadDir>,
+}
+
+impl Iterator for JobIds {
+    type Item = Result<JobId, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let entry = self.entries.as_mut()?.next()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => return Some(Err(io("listing", &self.directory)(error).into())),
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Ok(id) = name.parse::<JobId>() {
+                return Some(Ok(id));
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -198,6 +228,24 @@ pub struct Store {
 }
 
 impl Store {
+    fn iter_ids(&self, area: IdArea) -> Result<JobIds, StoreError> {
+        let name = match area {
+            IdArea::Published => "jobs",
+            IdArea::Staged => "staging",
+        };
+        let dir = self.root.join(name);
+        crate::faults::at("store::list", &dir).map_err(io("listing", &dir))?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == ErrorKind::NotFound && area == IdArea::Staged => None,
+            Err(error) => return Err(io("listing", &dir)(error).into()),
+        };
+        Ok(JobIds {
+            directory: dir,
+            entries,
+        })
+    }
+
     pub fn open(dirs: &Dirs) -> Result<Self, StoreError> {
         let root = dirs.state.join(SCHEMA);
         for dir in [
@@ -391,25 +439,13 @@ impl Store {
         self.root.join("staging").join(format!("{id}.lock"))
     }
 
+    pub(crate) fn staged_ids_iter(&self) -> Result<JobIds, StoreError> {
+        self.iter_ids(IdArea::Staged)
+    }
+
+    #[cfg(test)]
     pub fn staged_ids(&self) -> Result<Vec<JobId>, StoreError> {
-        let dir = self.root.join("staging");
-        crate::faults::at("store::list", &dir).map_err(io("listing", &dir))?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io("listing", &dir)(e).into()),
-        };
-        let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(io("listing", &dir))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            match name.parse::<JobId>() {
-                Ok(id) => ids.push(id),
-                Err(_lock_or_foreign) => {}
-            }
-        }
-        Ok(ids)
+        self.staged_ids_iter()?.collect()
     }
 
     #[must_use]
@@ -535,9 +571,10 @@ impl Store {
         }
     }
 
-    pub fn earlier_waiters(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
-        let mut earlier = Vec::new();
-        for id in self.ids()? {
+    pub fn earliest_waiter(&self, waiting: &Spec) -> Result<Option<JobId>, StoreError> {
+        let mut earliest: Option<(u64, JobId)> = None;
+        for id in self.ids_iter()? {
+            let id = id?;
             if id == waiting.id || matches!(self.queue_mode(&id)?, QueueMode::Immediate) {
                 continue;
             }
@@ -548,10 +585,14 @@ impl Store {
             {
                 continue;
             }
-            earlier.push((spec.sequence, id));
+            if earliest
+                .as_ref()
+                .is_none_or(|(sequence, _)| spec.sequence < *sequence)
+            {
+                earliest = Some((spec.sequence, id));
+            }
         }
-        earlier.sort_by_key(|(sequence, _)| *sequence);
-        Ok(earlier.into_iter().map(|(_, id)| id).collect())
+        Ok(earliest.map(|(_, id)| id))
     }
 
     pub fn job(&self, id: &JobId) -> Result<Job, StoreError> {
@@ -663,20 +704,13 @@ impl Store {
         })
     }
 
+    pub(crate) fn ids_iter(&self) -> Result<JobIds, StoreError> {
+        self.iter_ids(IdArea::Published)
+    }
+
+    #[cfg(test)]
     pub fn ids(&self) -> Result<Vec<JobId>, StoreError> {
-        let dir = self.root.join("jobs");
-        crate::faults::at("store::list", &dir).map_err(io("listing", &dir))?;
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&dir).map_err(io("listing", &dir))? {
-            let entry = entry.map_err(io("listing", &dir))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            match name.parse::<JobId>() {
-                Ok(id) => ids.push(id),
-                Err(_not_a_job) => {}
-            }
-        }
-        Ok(ids)
+        self.ids_iter()?.collect()
     }
 
     pub fn resolve(&self, reference: &JobRef) -> Result<JobId, StoreError> {
@@ -687,16 +721,22 @@ impl Store {
                 None => Err(StoreError::NoSuchJob(reference.clone())),
             };
         }
-        let mut matching: Vec<JobId> = self
-            .ids()?
-            .into_iter()
-            .filter(|id| id.matches(reference))
-            .collect();
-        match (matching.pop(), matching.len()) {
-            (Some(only), 0) => Ok(only),
+        let mut first = None;
+        let mut count = 0usize;
+        for id in self.ids_iter()? {
+            let id = id?;
+            if id.matches(reference) {
+                count = count.saturating_add(1);
+                if first.is_none() {
+                    first = Some(id);
+                }
+            }
+        }
+        match (first, count) {
+            (Some(only), 1) => Ok(only),
             (Some(_), others) => Err(StoreError::Ambiguous {
                 reference: reference.clone(),
-                count: others.saturating_add(1),
+                count: others,
             }),
             (None, _) => Err(StoreError::NoSuchJob(reference.clone())),
         }
@@ -1112,6 +1152,50 @@ mod tests {
         }
         assert_eq!(store.queue_mode(&now).unwrap(), QueueMode::Immediate);
         assert_eq!(store.queue_mode(&queued).unwrap(), QueueMode::Ordinary);
+    }
+
+    #[test]
+    fn queue_order_keeps_only_the_earliest_live_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let [waiting, second, first, later]: [JobId; 4] = [
+            "0AAAAAAAAAAAAAAA",
+            "0BBBBBBBBBBBBBBB",
+            "0CCCCCCCCCCCCCCC",
+            "0DDDDDDDDDDDDDDD",
+        ]
+        .map(|id| id.parse().unwrap());
+        let mut alive = Vec::new();
+        for (id, sequence) in [(&waiting, 4), (&second, 2), (&first, 1), (&later, 5)] {
+            store
+                .stage(
+                    &spec(id, sequence),
+                    (&BTreeMap::new(), &LaunchEnv::default()),
+                )
+                .unwrap();
+            store.publish(id).unwrap();
+            alive.push(OsLock::exclusive(&store.alive_path(id)).unwrap());
+        }
+        let requested = spec(&waiting, 4);
+        assert_eq!(
+            store.earliest_waiter(&requested).unwrap(),
+            Some(first.clone())
+        );
+        let finished = |millis| Phase::Finished {
+            started_at: None,
+            finished_at: crate::clock::Timestamp::at_millis(millis),
+            outcome: crate::protocol::Outcome::Succeeded,
+        };
+        store.set_phase(&first, &finished(1)).unwrap();
+        assert_eq!(
+            store.earliest_waiter(&requested).unwrap(),
+            Some(second.clone())
+        );
+        store.set_phase(&second, &finished(2)).unwrap();
+        assert_eq!(store.earliest_waiter(&requested).unwrap(), None);
+        for lock in alive {
+            lock.release().unwrap();
+        }
     }
 
     #[test]

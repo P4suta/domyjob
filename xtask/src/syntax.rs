@@ -150,6 +150,9 @@ const MCP_WORKER_RULE: &str =
     "MCP workers must be spawned only through dispatch with an McpDispatch permit";
 const SNAPSHOT_BUDGET_RULE: &str =
     "snapshot file reads and worker counts must use fixed source budgets";
+const QUEUE_WATCH_RULE: &str =
+    "queue lock watchers must be registered through bounded QueueWatchers";
+const JOB_IDS_RULE: &str = "production job ID traversal must stream through JobIds";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -373,6 +376,7 @@ impl Gate {
         }
         self.check_mcp_path(path);
         self.check_snapshot_path(path);
+        self.check_queue_path(path);
         self.check_locked_state_path(path);
         if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
@@ -467,6 +471,16 @@ impl Gate {
             && let Some(segment) = path.segments.last()
         {
             self.flag(segment.ident.span(), SNAPSHOT_BUDGET_RULE);
+        }
+    }
+
+    fn check_queue_path(&mut self, path: &syn::Path) {
+        if self.file_is(&["supervisor.rs"])
+            && self.function.as_deref() == Some("queue")
+            && path_ends_with(path, &["thread", "spawn"])
+            && let Some(segment) = path.segments.last()
+        {
+            self.flag(segment.ident.span(), QUEUE_WATCH_RULE);
         }
     }
 
@@ -624,6 +638,13 @@ impl<'ast> Visit<'ast> for Gate {
         if self.test_depth == 0 && self.file_is(&["snapshot.rs"]) && method == "update_mmap" {
             self.flag(call.method.span(), SNAPSHOT_BUDGET_RULE);
         }
+        if self.test_depth == 0
+            && self.file_is(&["supervisor.rs"])
+            && self.function.as_deref() == Some("queue")
+            && method == "spawn"
+        {
+            self.flag(call.method.span(), QUEUE_WATCH_RULE);
+        }
         if self.test_depth == 0 && self.file_is(&["mcp.rs"]) {
             if method == "lines" {
                 self.flag(call.method.span(), MCP_LINE_RULE);
@@ -690,6 +711,12 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         self.check_signature(&item.sig);
+        if self.file_is(&["store.rs"])
+            && (item.sig.ident == "ids" || item.sig.ident == "staged_ids")
+            && !is_test_module(&item.attrs)
+        {
+            self.flag(item.sig.ident.span(), JOB_IDS_RULE);
+        }
         if self.file_is(&["client.rs"]) && item.sig.ident == "from_project" {
             let inputs: Vec<_> = item
                 .sig
@@ -758,6 +785,21 @@ impl<'ast> Visit<'ast> for Gate {
             has_named_fields(&item.fields),
         );
         self.check_project_structure(item);
+        if self.file_is(&["supervisor.rs"]) && item.ident == "QueueWatchers" {
+            let slots = item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == "slots")
+                    && is_generic_of(&field.ty, "BTreeSet", &["PathBuf"])
+                    && matches!(field.vis, syn::Visibility::Inherited)
+            });
+            let earlier = item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == "earlier")
+                    && is_generic_of(&field.ty, "Option", &["PathBuf"])
+                    && matches!(field.vis, syn::Visibility::Inherited)
+            });
+            if !slots || !earlier {
+                self.flag(item.ident.span(), QUEUE_WATCH_RULE);
+            }
+        }
         if self.file_is(&["mcp.rs"])
             && item.ident == "McpDispatch"
             && !item.fields.iter().any(|field| {
@@ -1301,6 +1343,44 @@ mod tests {
                 Some(SNAPSHOT_BUDGET_RULE)
             );
         }
+    }
+
+    #[test]
+    fn queue_and_store_resource_paths_stay_typed_and_bounded() {
+        for (source, file, rule) in [
+            (
+                "fn queue() { std::thread::spawn(|| {}); }",
+                "crates/domyjob/src/supervisor.rs",
+                QUEUE_WATCH_RULE,
+            ),
+            (
+                "struct QueueWatchers { slots: Vec<PathBuf>, earlier: Vec<PathBuf> }",
+                "crates/domyjob/src/supervisor.rs",
+                QUEUE_WATCH_RULE,
+            ),
+            (
+                "impl Store { pub fn ids(&self) -> Vec<JobId> { vec![] } }",
+                "crates/domyjob/src/store.rs",
+                JOB_IDS_RULE,
+            ),
+        ] {
+            assert_eq!(
+                check_file(source, file)
+                    .unwrap()
+                    .first()
+                    .map(|finding| finding.rule),
+                Some(rule),
+                "{source}"
+            );
+        }
+        assert!(
+            check_file(
+                "impl Store { #[cfg(test)] pub fn ids(&self) -> Vec<JobId> { vec![] } }",
+                "crates/domyjob/src/store.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
