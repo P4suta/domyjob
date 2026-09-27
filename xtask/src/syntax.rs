@@ -148,6 +148,8 @@ const PROJECT_PROOF_PRIVACY_RULE: &str = "project approval proof and request fie
 const MCP_LINE_RULE: &str = "MCP input lines must use bounded::line with an explicit byte budget";
 const MCP_WORKER_RULE: &str =
     "MCP workers must be spawned only through dispatch with an McpDispatch permit";
+const SNAPSHOT_BUDGET_RULE: &str =
+    "snapshot file reads and worker counts must use fixed source budgets";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -370,6 +372,7 @@ impl Gate {
             return;
         }
         self.check_mcp_path(path);
+        self.check_snapshot_path(path);
         self.check_locked_state_path(path);
         if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
@@ -455,6 +458,15 @@ impl Gate {
                 MCP_WORKER_RULE
             };
             self.flag(segment.ident.span(), rule);
+        }
+    }
+
+    fn check_snapshot_path(&mut self, path: &syn::Path) {
+        if self.file_is(&["snapshot.rs"])
+            && path_ends_with(path, &["thread", "available_parallelism"])
+            && let Some(segment) = path.segments.last()
+        {
+            self.flag(segment.ident.span(), SNAPSHOT_BUDGET_RULE);
         }
     }
 
@@ -609,6 +621,9 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if self.test_depth == 0 && self.file_is(&["snapshot.rs"]) && method == "update_mmap" {
+            self.flag(call.method.span(), SNAPSHOT_BUDGET_RULE);
+        }
         if self.test_depth == 0 && self.file_is(&["mcp.rs"]) {
             if method == "lines" {
                 self.flag(call.method.span(), MCP_LINE_RULE);
@@ -1270,6 +1285,22 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn snapshot_hashing_cannot_bypass_fixed_resource_budgets() {
+        for source in [
+            "fn f() { std::thread::available_parallelism(); }",
+            "fn f(hash: &mut H, path: &Path) { hash.update_mmap(path); }",
+        ] {
+            assert_eq!(
+                check_file(source, "crates/domyjob/src/snapshot.rs")
+                    .unwrap()
+                    .first()
+                    .map(|finding| finding.rule),
+                Some(SNAPSHOT_BUDGET_RULE)
+            );
+        }
     }
 
     #[test]

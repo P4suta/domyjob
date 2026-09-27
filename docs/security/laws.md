@@ -43,6 +43,9 @@ The local supervisor control socket accepts at most 32 active sessions, and only
 The MCP server accepts at most 1 MiB per input line and at most 32 active request workers; a private permit holds each slot through response writing and tracks cancellation only for active request IDs.
 The syntax gate confines MCP worker spawning to a dispatch function that requires the permit and rejects unbounded line iteration in that module.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
+Source snapshots admit at most 100,000 entries and 16 MiB of path bytes; each disk blob can be up to 8 GiB and remains streamed, while materialized revision content has a 64 MiB total budget.
+Directory hashing reads no further than each inspected file size and uses at most four workers.
+The syntax gate rejects memory-mapped snapshot hashing and host CPU count as a snapshot worker limit.
 Source archives stream each origin into a 64 MiB capped archive and verify its digest; job uploads also stream origins and verify their digest before accepting success.
 Directory snapshots retain a confined directory handle and validated relative paths for their disk origins, so a later path replacement cannot move a read outside the selected root.
 Setup output, tree reads, and log tails use explicit byte limits.

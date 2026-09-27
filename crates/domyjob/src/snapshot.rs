@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,10 @@ use crate::template::{Arg, Bindings, TemplateError};
 
 use crate::domain::METADATA_DIRS;
 pub const IGNORE_FILE: &str = ".domyjobignore";
-const SHOW_THREADS: usize = 8;
+const SNAPSHOT_WORKERS: usize = 4;
+const SOURCE_ENTRIES: usize = 100_000;
+const SOURCE_PATH_BYTES: u64 = 16 << 20;
+const SOURCE_CONTENT_BYTES: u64 = crate::bounded::SOURCE_ARCHIVE;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -64,6 +68,12 @@ pub enum SnapshotError {
     SizeChanged { expected: u64, actual: u64 },
     #[error("a source file has {size} bytes, exceeding the {limit}-byte blob budget")]
     TooLarge { size: u64, limit: u64 },
+    #[error("source contains more than {limit} entries")]
+    TooManyEntries { limit: usize },
+    #[error("source paths exceed {limit} bytes")]
+    TooManyPathBytes { limit: u64 },
+    #[error("source content exceeds {limit} bytes")]
+    TooMuchContent { limit: u64 },
     #[error("{0} changed from a regular source file")]
     NotFile(PathBuf),
 }
@@ -190,10 +200,46 @@ pub struct Manifest {
     pub entries: BTreeMap<RelPath, Entry>,
 }
 
+#[derive(Default)]
+struct SourceBudget {
+    entries: usize,
+    paths: u64,
+}
+
+impl SourceBudget {
+    fn path(&mut self, path: &RelPath) -> Result<(), SnapshotError> {
+        self.entries = self.entries.saturating_add(1);
+        if self.entries > SOURCE_ENTRIES {
+            return Err(SnapshotError::TooManyEntries {
+                limit: SOURCE_ENTRIES,
+            });
+        }
+        self.paths = self
+            .paths
+            .saturating_add(crate::domain::len_u64(path.as_str().len()));
+        if self.paths > SOURCE_PATH_BYTES {
+            return Err(SnapshotError::TooManyPathBytes {
+                limit: SOURCE_PATH_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Manifest {
     pub fn check_portable(&self) -> Result<(), SnapshotError> {
         let mut seen = BTreeMap::new();
-        for path in self.entries.keys() {
+        let mut budget = SourceBudget::default();
+        for (path, entry) in &self.entries {
+            budget.path(path)?;
+            if let Entry::File { size, .. } = entry
+                && *size > crate::bounded::BLOB
+            {
+                return Err(SnapshotError::TooLarge {
+                    size: *size,
+                    limit: crate::bounded::BLOB,
+                });
+            }
             let folded = path.as_str().to_lowercase();
             if let Some(first) = seen.insert(folded, path) {
                 return Err(SnapshotError::Collision {
@@ -369,6 +415,7 @@ struct Pending {
     rel: RelPath,
     path: PathBuf,
     mode: Mode,
+    size: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,13 +448,16 @@ fn walker(root: &Path, rules: Rules) -> ignore::Walk {
 
 pub fn inside_paths(root: &Path) -> Result<Vec<RelPath>, SnapshotError> {
     let mut paths = Vec::new();
+    let mut budget = SourceBudget::default();
     for item in walker(root, Rules::InsideOnly) {
         let item = item.map_err(|source| SnapshotError::Walk {
             root: root.to_path_buf(),
             source,
         })?;
         if item.file_type().is_some_and(|kind| !kind.is_dir()) {
-            paths.push(relative(root, item.path())?);
+            let path = relative(root, item.path())?;
+            budget.path(&path)?;
+            paths.push(path);
         }
     }
     Ok(paths)
@@ -439,10 +489,17 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
         return Ok(Found::Ready(rel, Entry::Symlink { target }));
     }
     let meta = std::fs::symlink_metadata(path).map_err(io("reading"))?;
+    if meta.len() > crate::bounded::BLOB {
+        return Err(SnapshotError::TooLarge {
+            size: meta.len(),
+            limit: crate::bounded::BLOB,
+        });
+    }
     Ok(Found::Hash(Pending {
         rel,
         path: path.to_path_buf(),
         mode: crate::platform::Moded::mode(&meta),
+        size: meta.len(),
     }))
 }
 
@@ -475,6 +532,7 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
     );
     let mut entries = BTreeMap::new();
     let mut pending = Vec::new();
+    let mut budget = SourceBudget::default();
     for item in walker(root, Rules::Everywhere) {
         let item = item.map_err(|source| SnapshotError::Walk {
             root: root.to_path_buf(),
@@ -488,9 +546,13 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
         }
         match classify(root, item.path(), kind.is_symlink())? {
             Found::Ready(rel, entry) => {
+                budget.path(&rel)?;
                 entries.insert(rel, entry);
             }
-            Found::Hash(work) => pending.push(work),
+            Found::Hash(work) => {
+                budget.path(&work.rel)?;
+                pending.push(work);
+            }
         }
     }
     for (item, (blob, size)) in hash_all(&pending)? {
@@ -513,26 +575,39 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
     })
 }
 
-fn hash_file(path: &Path) -> Result<(BlobId, u64), SnapshotError> {
+fn hash_file(item: &Pending) -> Result<(BlobId, u64), SnapshotError> {
+    let io = |action| crate::failure::io(action, &item.path);
+    let mut file = std::fs::File::open(&item.path).map_err(io("opening"))?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update_mmap(path).map_err(|source| {
-        SnapshotError::Io(crate::failure::IoFailure {
-            action: "hashing",
-            path: path.to_path_buf(),
-            source,
-        })
-    })?;
-    Ok((BlobId::from_hash(&hasher.finalize()), hasher.count()))
+    let mut size = 0u64;
+    let mut buffer = [0u8; 16 << 10];
+    loop {
+        let read = file.read(&mut buffer).map_err(io("hashing"))?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(crate::domain::len_u64(read));
+        if size > item.size {
+            return Err(SnapshotError::SizeChanged {
+                expected: item.size,
+                actual: size,
+            });
+        }
+        hasher.update(buffer.get(..read).unwrap_or(&[]));
+    }
+    if size != item.size {
+        return Err(SnapshotError::SizeChanged {
+            expected: item.size,
+            actual: size,
+        });
+    }
+    Ok((BlobId::from_hash(&hasher.finalize()), size))
 }
 
 type Hashed<'a> = (&'a Pending, (BlobId, u64));
 
 fn hash_all(pending: &[Pending]) -> Result<Vec<Hashed<'_>>, SnapshotError> {
-    let threads = match std::thread::available_parallelism() {
-        Ok(count) => count.get(),
-        Err(_unknown) => 4,
-    };
-    let chunk = pending.len().div_ceil(threads).max(1);
+    let chunk = pending.len().div_ceil(SNAPSHOT_WORKERS).max(1);
     std::thread::scope(|scope| {
         let workers: Vec<_> = pending
             .chunks(chunk)
@@ -540,7 +615,7 @@ fn hash_all(pending: &[Pending]) -> Result<Vec<Hashed<'_>>, SnapshotError> {
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|item| hash_file(&item.path).map(|blob| (item, blob)))
+                        .map(|item| hash_file(item).map(|blob| (item, blob)))
                         .collect::<Result<Vec<_>, _>>()
                 })
             })
@@ -646,6 +721,7 @@ fn parse_listing(
         detail,
     };
     let mut out = Vec::new();
+    let mut budget = SourceBudget::default();
     for record in bytes.split(|byte| *byte == split) {
         let record = match separator {
             Separator::Nul => record,
@@ -679,6 +755,7 @@ fn parse_listing(
         let rel = path
             .parse::<RelPath>()
             .map_err(|_invalid| SnapshotError::Unportable(PathBuf::from(path)))?;
+        budget.path(&rel)?;
         out.push(Listed {
             rel,
             symlink: kind == "symlink" || mode == "120000",
@@ -788,17 +865,31 @@ pub fn from_revision(
     })
 }
 
+fn reserve_revision_content(used: &AtomicU64, size: u64) -> Result<(), SnapshotError> {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current
+            .checked_add(size)
+            .filter(|total| *total <= SOURCE_CONTENT_BYTES)
+    })
+    .map_err(|_over| SnapshotError::TooMuchContent {
+        limit: SOURCE_CONTENT_BYTES,
+    })?;
+    Ok(())
+}
+
 fn show_all(
     name: &str,
     source: &SourceConf,
     base: &Bindings,
     listed: &[Listed],
 ) -> Result<Vec<Vec<u8>>, SnapshotError> {
-    let chunk = listed.len().div_ceil(SHOW_THREADS).max(1);
+    let chunk = listed.len().div_ceil(SNAPSHOT_WORKERS).max(1);
+    let content = AtomicU64::new(0);
     std::thread::scope(|scope| {
         let workers: Vec<_> = listed
             .chunks(chunk)
             .map(|slice| {
+                let content = &content;
                 scope.spawn(move || {
                     slice
                         .iter()
@@ -810,7 +901,10 @@ fn show_all(
                                     source_name: name.to_owned(),
                                     source: e,
                                 })?;
-                            run_template((name, source), &argv)
+                            let bytes = run_template((name, source), &argv)?;
+                            let size = crate::domain::len_u64(bytes.len());
+                            reserve_revision_content(content, size)?;
+                            Ok::<Vec<u8>, SnapshotError>(bytes)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -1170,5 +1264,90 @@ mod tests {
         ));
         let lines = parse_listing("hg", Separator::Newline, b"a.txt\r\nb.txt\n").unwrap();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn source_metadata_budgets_fail_at_the_first_excess_entry_and_byte() {
+        let path: RelPath = "a".parse().unwrap();
+        let mut budget = SourceBudget::default();
+        for _ in 0..SOURCE_ENTRIES {
+            budget.path(&path).unwrap();
+        }
+        assert!(matches!(
+            budget.path(&path),
+            Err(SnapshotError::TooManyEntries {
+                limit: SOURCE_ENTRIES
+            })
+        ));
+
+        let mut paths = SourceBudget {
+            paths: SOURCE_PATH_BYTES,
+            ..SourceBudget::default()
+        };
+        assert!(matches!(
+            paths.path(&path),
+            Err(SnapshotError::TooManyPathBytes {
+                limit: SOURCE_PATH_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn materialized_revision_content_has_a_total_budget() {
+        let content = AtomicU64::new(0);
+        reserve_revision_content(&content, SOURCE_CONTENT_BYTES).unwrap();
+        assert!(matches!(
+            reserve_revision_content(&content, 1),
+            Err(SnapshotError::TooMuchContent {
+                limit: SOURCE_CONTENT_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn imported_manifests_allow_streamed_large_files_but_reject_overlarge_blobs() {
+        let entry = |size| Entry::File {
+            blob: BlobId::of(b"a"),
+            size,
+            mode: Mode::Regular,
+        };
+        let manifest = Manifest {
+            entries: BTreeMap::from([("a".parse().unwrap(), entry(SOURCE_CONTENT_BYTES + 1))]),
+        };
+        manifest.check_portable().unwrap();
+        let too_large = Manifest {
+            entries: BTreeMap::from([("a".parse().unwrap(), entry(crate::bounded::BLOB + 1))]),
+        };
+        assert!(matches!(
+            too_large.check_portable(),
+            Err(SnapshotError::TooLarge {
+                limit: crate::bounded::BLOB,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test changes an inspected source file"
+    )]
+    fn hashing_stops_when_a_file_grows_past_its_inspected_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file");
+        std::fs::write(&path, vec![b'x'; 32 << 10]).unwrap();
+        let pending = Pending {
+            rel: "file".parse().unwrap(),
+            path,
+            mode: Mode::Regular,
+            size: 1,
+        };
+        assert!(matches!(
+            hash_file(&pending),
+            Err(SnapshotError::SizeChanged {
+                expected: 1,
+                actual: 16_384
+            })
+        ));
     }
 }
