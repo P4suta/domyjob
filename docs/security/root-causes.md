@@ -40,4 +40,3 @@ RC-E remains open because the state layer exposes functions rather than the requ
 RC-F and RC-L remain open because source-specific argument types cover only some flows; wire and repository values do not yet carry a general provenance label, and `Arg::path` still accepts an ordinary `Path`.
 RC-K remains open because the code does not yet have distinct `LocalPolicy` and `RepositoryRequest` types.
 RC-M remains open because the claimed `create_new` gate is absent from `clippy.toml`.
-RC-O remains open until a test exercises workspace isolation between owner and peer submitters; production paths already include the submitter scope, and client-origin IDs no longer use the job ID type.

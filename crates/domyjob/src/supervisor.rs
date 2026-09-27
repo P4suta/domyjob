@@ -995,6 +995,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn warm_workspaces_are_separate_for_owner_and_each_peer_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&Dirs::for_test(tmp.path())).unwrap();
+        let owner = Spec {
+            id: "0123456789ABCDEF".parse().unwrap(),
+            name: None,
+            command: crate::protocol::Command::Script("true".into()),
+            location: Location::Snapshot {
+                source: crate::protocol::Source {
+                    project: "project".parse().unwrap(),
+                    manifest: crate::domain::BlobId::of(b"manifest"),
+                    revision: crate::protocol::Revision::WorkingDirectory,
+                },
+                subdir: None,
+                workspace: Workspace::Warm,
+            },
+            env_names: std::collections::BTreeSet::new(),
+            shell: None,
+            concurrency: crate::domain::Concurrency::DEFAULT,
+            sequence: 1,
+            submitted_by: Submitter::Owner,
+            submitted_at: Timestamp::at_millis(0),
+        };
+        let peer = |byte, label: &str| Spec {
+            submitted_by: Submitter::Peer {
+                key: crate::trust::PublicKey::from_slice(&[byte; 32]).unwrap(),
+                label: label.parse().unwrap(),
+            },
+            ..owner.clone()
+        };
+        let owner_root = workspace_root(&store, &owner, 0).unwrap();
+        let peer_one_root = workspace_root(&store, &peer(1, "first"), 0).unwrap();
+        assert_ne!(owner_root, peer_one_root);
+        assert_ne!(
+            peer_one_root,
+            workspace_root(&store, &peer(2, "second"), 0).unwrap()
+        );
+        assert_eq!(
+            peer_one_root,
+            workspace_root(&store, &peer(1, "renamed"), 0).unwrap()
+        );
+    }
+
+    #[test]
     fn a_job_the_machine_stops_before_it_starts_is_returned_and_one_it_stops_while_running_is_closed()
      {
         assert_eq!(
