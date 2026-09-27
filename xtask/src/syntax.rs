@@ -134,6 +134,7 @@ const DECISION_FILES: &[&str] = &[
     "pull.rs",
     "workspace.rs",
     "mcp.rs",
+    "node.rs",
 ];
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &[
@@ -612,6 +613,7 @@ mod tests {
             "src/supervisor.rs",
             "src/serve.rs",
             "src/store.rs",
+            "src/node.rs",
         ] {
             for signature in [
                 "fn answer() -> bool { true }",

@@ -89,7 +89,7 @@ pub enum NodeError {
 
 impl NodeError {
     fn code(&self) -> RefusalCode {
-        if out_of_space(self) {
+        if out_of_space(self) == ErrorCause::DiskFull {
             return RefusalCode::DiskFull;
         }
         match self {
@@ -131,12 +131,29 @@ impl NodeError {
     }
 }
 
-fn telling(jobs: &Path, path: &Path) -> bool {
-    path.parent() == Some(jobs)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchedPath {
+    JobChange,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchWake {
+    Changed,
+    ClientGone,
+}
+
+fn telling(jobs: &Path, path: &Path) -> WatchedPath {
+    if path.parent() == Some(jobs)
         || path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == "phase.json" || name == "outcome")
+    {
+        WatchedPath::JobChange
+    } else {
+        WatchedPath::Other
+    }
 }
 
 pub(crate) fn watching(jobs: &Path, error: &notify::Error) -> NodeError {
@@ -190,10 +207,10 @@ fn size_of(path: &Path) -> Result<u64, NodeError> {
     Ok(total)
 }
 
-fn disk_is_short(area: &Path) -> Result<bool, NodeError> {
+fn disk_pressure(area: &Path) -> Result<DiskPressure, NodeError> {
     crate::faults::at("node::disk", area).map_err(io("measuring disk space in", area))?;
     let stats = fs4::statvfs(area).map_err(io("measuring disk space in", area))?;
-    Ok(short(stats.available_space(), stats.total_space()))
+    Ok(pressure(stats.available_space(), stats.total_space()))
 }
 
 fn cores() -> u32 {
@@ -223,8 +240,30 @@ fn hundredths(value: f64) -> u32 {
     }
 }
 
-fn short(available: u64, total: u64) -> bool {
-    available < (total / ROOM_SHARE).min(ROOM_AT_LEAST)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskPressure {
+    Enough,
+    Short,
+}
+
+fn pressure(available: u64, total: u64) -> DiskPressure {
+    if available < (total / ROOM_SHARE).min(ROOM_AT_LEAST) {
+        DiskPressure::Short
+    } else {
+        DiskPressure::Enough
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reclamation {
+    Busy,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceFreshness {
+    Current,
+    Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +313,13 @@ fn identity_agent(printed: &str, home: &Path) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn out_of_space(error: &(dyn std::error::Error + 'static)) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorCause {
+    DiskFull,
+    Other,
+}
+
+fn out_of_space(error: &(dyn std::error::Error + 'static)) -> ErrorCause {
     let mut current = Some(error);
     while let Some(link) = current {
         if let Some(io) = link.downcast_ref::<std::io::Error>()
@@ -283,11 +328,11 @@ fn out_of_space(error: &(dyn std::error::Error + 'static)) -> bool {
                 std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
             )
         {
-            return true;
+            return ErrorCause::DiskFull;
         }
         current = link.source();
     }
-    false
+    ErrorCause::Other
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,7 +347,7 @@ pub struct Node {
     store: Store,
     cas: Cas,
     audit: AuditLog,
-    short: fn(&Path) -> Result<bool, NodeError>,
+    pressure: fn(&Path) -> Result<DiskPressure, NodeError>,
 }
 
 #[must_use]
@@ -459,7 +504,7 @@ impl Node {
             store,
             cas,
             audit,
-            short: disk_is_short,
+            pressure: disk_pressure,
         })
     }
 
@@ -675,7 +720,7 @@ impl Node {
         if submission.queue == crate::protocol::Queue::Slot && settings.paused {
             return Err(NodeError::Paused);
         }
-        self.make_room(&|| self.short_of_room(), commanded)?;
+        self.make_room(&|| self.disk_pressure(), commanded)?;
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
         let nonce_path = self.store.nonce_path(
             &crate::supervisor::scope_name(&principal.submitter()),
@@ -825,7 +870,10 @@ impl Node {
             Ok(stats) => crate::protocol::DiskSpace::Measured {
                 total: stats.total_space(),
                 available: stats.available_space(),
-                short: short(stats.available_space(), stats.total_space()),
+                short: matches!(
+                    pressure(stats.available_space(), stats.total_space()),
+                    DiskPressure::Short
+                ),
             },
             Err(error) => crate::protocol::DiskSpace::Unavailable {
                 reason: RemoteText::new(error.to_string()),
@@ -855,49 +903,51 @@ impl Node {
         Ok(admission.release()?)
     }
 
-    fn short_of_room(&self) -> Result<bool, NodeError> {
-        (self.short)(&self.store.area("jobs"))
+    fn disk_pressure(&self) -> Result<DiskPressure, NodeError> {
+        (self.pressure)(&self.store.area("jobs"))
     }
 
     fn make_room(
         &self,
-        short: &impl Fn() -> Result<bool, NodeError>,
+        pressure: &impl Fn() -> Result<DiskPressure, NodeError>,
         _commanded: &Commanded,
     ) -> Result<(), NodeError> {
-        if !short()? {
+        if pressure()? == DiskPressure::Enough {
             return Ok(());
         }
         for (workspace, lock) in self.idle_workspaces()? {
-            if self.evict(&workspace, &lock)? && !short()? {
+            if self.evict(&workspace, &lock)? == Reclamation::Done
+                && pressure()? == DiskPressure::Enough
+            {
                 return Ok(());
             }
         }
         for id in self.finished_largest_log_first()? {
-            if self.discard_log(&id)? && !short()? {
+            if self.discard_log(&id)? == Reclamation::Done && pressure()? == DiskPressure::Enough {
                 return Ok(());
             }
         }
         self.collect(Keep::Unfinished)
     }
 
-    fn stale(&self, workspace: &Path) -> Result<bool, NodeError> {
+    fn freshness(&self, workspace: &Path) -> Result<WorkspaceFreshness, NodeError> {
         let filled_by = crate::supervisor::filled_by_path(workspace);
         let last = match crate::state_file::read_bytes(&filled_by)? {
             Some(bytes) => bytes,
-            None => return Ok(true),
+            None => return Ok(WorkspaceFreshness::Stale),
         };
         match String::from_utf8_lossy(&last).trim().parse::<JobId>() {
-            Ok(id) => Ok(matches!(
-                self.store.publication(&id)?,
-                Publication::Unpublished
-            )),
-            Err(_foreign) => Ok(true),
+            Ok(id) => match self.store.publication(&id)? {
+                Publication::Published => Ok(WorkspaceFreshness::Current),
+                Publication::Unpublished => Ok(WorkspaceFreshness::Stale),
+            },
+            Err(_foreign) => Ok(WorkspaceFreshness::Stale),
         }
     }
 
-    fn evict(&self, workspace: &Path, lock: &Path) -> Result<bool, NodeError> {
+    fn evict(&self, workspace: &Path, lock: &Path) -> Result<Reclamation, NodeError> {
         let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
-            return Ok(false);
+            return Ok(Reclamation::Busy);
         };
         let aside = self
             .store
@@ -906,18 +956,18 @@ impl Node {
         crate::state_file::move_aside(workspace, &aside)?;
         crate::state_file::remove_tree_forcibly(&aside)?;
         idle.release()?;
-        Ok(true)
+        Ok(Reclamation::Done)
     }
 
-    fn discard_log(&self, id: &JobId) -> Result<bool, NodeError> {
+    fn discard_log(&self, id: &JobId) -> Result<Reclamation, NodeError> {
         let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
-            return Ok(false);
+            return Ok(Reclamation::Busy);
         };
         let log = self.store.log_path(id);
         crate::state_file::cut_to(&log, 0)?;
         crate::state_file::overwrite_in_place(&log, DISCARDED)?;
         alive.release()?;
-        Ok(true)
+        Ok(Reclamation::Done)
     }
 
     fn clean(
@@ -927,12 +977,12 @@ impl Node {
         let work = self.store.area("work");
         let mut items = Vec::new();
         for (workspace, lock) in self.idle_workspaces()? {
-            let stale = self.stale(&workspace)?;
-            if !stale && !idle {
+            let freshness = self.freshness(&workspace)?;
+            if freshness == WorkspaceFreshness::Current && !idle {
                 continue;
             }
             let bytes = size_of(&workspace)?;
-            if apply && !self.evict(&workspace, &lock)? {
+            if apply && self.evict(&workspace, &lock)? == Reclamation::Busy {
                 continue;
             }
             let shown = match workspace.strip_prefix(&work) {
@@ -942,7 +992,10 @@ impl Node {
             items.push(crate::protocol::Freeable {
                 what: RemoteText::new(format!(
                     "{} workspace {}",
-                    if stale { "stale" } else { "idle" },
+                    match freshness {
+                        WorkspaceFreshness::Current => "idle",
+                        WorkspaceFreshness::Stale => "stale",
+                    },
                     shown.display()
                 )),
                 bytes,
@@ -954,7 +1007,7 @@ impl Node {
             let mut count = 0u64;
             for id in &finished {
                 let size = size_of(&self.store.log_path(id))?;
-                if apply && !self.discard_log(id)? {
+                if apply && self.discard_log(id)? == Reclamation::Busy {
                     continue;
                 }
                 bytes = bytes
@@ -1460,15 +1513,18 @@ impl Node {
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
         let jobs = self.store.area("jobs");
-        let (wake, woken) = std::sync::mpsc::channel::<bool>();
+        let (wake, woken) = std::sync::mpsc::channel::<WatchWake>();
         let changed = wake.clone();
         let area = jobs.clone();
         let mut notifier =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if let Ok(event) = event
-                    && event.paths.iter().any(|path| telling(&area, path))
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| telling(&area, path) == WatchedPath::JobChange)
                 {
-                    match changed.send(true) {
+                    match changed.send(WatchWake::Changed) {
                         Ok(()) | Err(_) => {}
                     }
                 }
@@ -1483,7 +1539,7 @@ impl Node {
                     break;
                 }
             }
-            match wake.send(false) {
+            match wake.send(WatchWake::ClientGone) {
                 Ok(()) | Err(_) => {}
             }
         });
@@ -1500,12 +1556,15 @@ impl Node {
                 framed.write_all(&line).map_err(NodeError::Output)?;
                 framed.flush().map_err(NodeError::Output)?;
                 match woken.recv() {
-                    Ok(true) => {
-                        if woken.try_iter().any(|job_changed| !job_changed) {
+                    Ok(WatchWake::Changed) => {
+                        if woken
+                            .try_iter()
+                            .any(|signal| signal == WatchWake::ClientGone)
+                        {
                             return Ok(());
                         }
                     }
-                    Ok(false) | Err(_) => return Ok(()),
+                    Ok(WatchWake::ClientGone) | Err(_) => return Ok(()),
                 }
             }
         })
@@ -1601,7 +1660,7 @@ mod tests {
         crate::state_file::write_bytes(&store.log_path(&id), log).unwrap();
         (
             Node {
-                short: |_| Ok(false),
+                pressure: |_| Ok(DiskPressure::Enough),
                 ..Node::open(dirs(root)).unwrap()
             },
             id.as_str().parse().unwrap(),
@@ -1866,7 +1925,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (node, finished) = published(tmp.path(), b"a log\nwith lines\n");
         let node = Node {
-            short: |_| Ok(true),
+            pressure: |_| Ok(DiskPressure::Short),
             ..node
         };
         let store = Store::open(&dirs(tmp.path())).unwrap();
@@ -2100,11 +2159,11 @@ mod tests {
     #[test]
     fn a_disk_is_short_below_a_tenth_of_its_size_or_ten_gigabytes() {
         let gib: u64 = 1 << 30;
-        assert!(short(ROOM_AT_LEAST - 1, 500 * gib));
-        assert!(!short(ROOM_AT_LEAST, 500 * gib));
-        assert!(short(50 * gib / 10 - 1, 50 * gib));
-        assert!(!short(50 * gib / 10, 50 * gib));
-        assert!(!short(1, 0));
+        assert_eq!(pressure(ROOM_AT_LEAST - 1, 500 * gib), DiskPressure::Short);
+        assert_eq!(pressure(ROOM_AT_LEAST, 500 * gib), DiskPressure::Enough);
+        assert_eq!(pressure(50 * gib / 10 - 1, 50 * gib), DiskPressure::Short);
+        assert_eq!(pressure(50 * gib / 10, 50 * gib), DiskPressure::Enough);
+        assert_eq!(pressure(1, 0), DiskPressure::Enough);
     }
 
     #[test]
@@ -2130,12 +2189,14 @@ mod tests {
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        node.make_room(&|| Ok(false), &Commanded(())).unwrap();
+        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+            .unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), [b'x'; 10_000]);
         let same_size = vec![b'z'; DISCARDED.len()];
         for log in [b"tiny".to_vec(), same_size] {
             crate::state_file::write_bytes(&store.log_path(&id), &log).unwrap();
-            node.make_room(&|| Ok(true), &Commanded(())).unwrap();
+            node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+                .unwrap();
             assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), log);
         }
     }
@@ -2452,7 +2513,7 @@ mod tests {
         let (node, _) = published(tmp.path(), b"");
         let tag = node.store.area("jobs").display().to_string();
         let _faults = crate::faults::inject(&[("node::disk", &tag)]);
-        disk_is_short(&node.store.area("jobs")).unwrap_err();
+        disk_pressure(&node.store.area("jobs")).unwrap_err();
         assert!(matches!(
             node.report().unwrap().disk,
             crate::protocol::DiskSpace::Unavailable { .. }
@@ -3086,7 +3147,8 @@ mod tests {
             ("state_file::overwrite", text(&log)),
         ] {
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.make_room(&|| Ok(true), &Commanded(())).unwrap_err();
+            node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+                .unwrap_err();
         }
     }
 
@@ -3197,9 +3259,16 @@ mod tests {
         let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
         let running = crate::lock::OsLock::exclusive(&store.alive_path(&oldest)).unwrap();
 
-        node.make_room(&|| Ok(false), &Commanded(())).unwrap();
+        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+            .unwrap();
         assert!(there("0") && there("2"));
-        let until_one_workspace_is_gone = || Ok(there("0") && there("2"));
+        let until_one_workspace_is_gone = || {
+            Ok(if there("0") && there("2") {
+                DiskPressure::Short
+            } else {
+                DiskPressure::Enough
+            })
+        };
         node.make_room(&until_one_workspace_is_gone, &Commanded(()))
             .unwrap();
         assert_ne!(there("0"), there("2"));
@@ -3210,8 +3279,15 @@ mod tests {
         let small = ids.last().unwrap();
         crate::state_file::write_bytes(&store.log_path(big), &[b'x'; 10_000]).unwrap();
         crate::state_file::write_bytes(&store.log_path(small), &[b'y'; 9_000]).unwrap();
-        let until_the_biggest_log_is_gone =
-            || Ok(std::fs::read(store.log_path(big)).unwrap() != DISCARDED);
+        let until_the_biggest_log_is_gone = || {
+            Ok(
+                if std::fs::read(store.log_path(big)).unwrap() == DISCARDED {
+                    DiskPressure::Enough
+                } else {
+                    DiskPressure::Short
+                },
+            )
+        };
         node.make_room(&until_the_biggest_log_is_gone, &Commanded(()))
             .unwrap();
         assert_eq!(std::fs::read(store.log_path(big)).unwrap(), DISCARDED);
@@ -3236,7 +3312,8 @@ mod tests {
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
             .unwrap();
-        node.make_room(&|| Ok(true), &Commanded(())).unwrap();
+        node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+            .unwrap();
         assert!(!there("0") && !there("2"));
         assert_eq!(store.ids().unwrap().len(), 3);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), DISCARDED);
@@ -3245,7 +3322,8 @@ mod tests {
         assert!(kept.contains(&needed) && kept.contains(&spent));
         assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
-        node.make_room(&|| Ok(false), &Commanded(())).unwrap();
+        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+            .unwrap();
         busy.release().unwrap();
         running.release().unwrap();
     }
