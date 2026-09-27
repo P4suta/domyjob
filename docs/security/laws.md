@@ -8,6 +8,23 @@ Each one names the property it guarantees, the mechanism that guarantees it, and
 These are design targets, not a claim that every mechanism and check below is implemented.
 The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, `workspace.rs`, `mcp.rs`, and `node.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
+
+## Closure ledger
+
+Each law closes only when its production API prevents the forbidden flow, a build gate rejects a bypass, a boundary test exercises the guarantee, and the supported operating-system matrix passes.
+New findings must map to a law and a root-cause class, or add a new class with the same closure criteria.
+The remaining conditions below keep a green test run from being mistaken for completion.
+
+| Law | Current evidence | Remaining condition |
+| --- | --- | --- |
+| 1. No ambient authority | Some workspace and snapshot paths use confined directory handles; process arguments use typed `Invocation` | Route all filesystem, process, network, and environment effects through explicit capabilities and reject ambient calls at the build gate |
+| 2. Every value carries its origin | Source-specific text types and a sealed argument-word trait protect some sinks | Label all peer and repository values and require a named validation or neutralization step at each sink |
+| 3. Parse once, at the border | `ingress` owns several JSON and TOML decoders and domain newtypes validate selected fields | Audit every external input and make the gate reject decoding or parsing it outside its border |
+| 4. Decisions are total | Enum-match lints apply crate-wide and the decision-signature gate covers the modules named above | Extend decision types and the signature gate to every security decision and state transition |
+| 5. Time decides nothing | Clock and timeout gates exist, with one documented silent-peer exception | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
+| 6. Proof obligations | Test, fuzz, Kani, ProVerif, and mutation tasks are defined | Make required proof runs and their reviewed results reproducible in CI for the security-critical modules |
+| 7. Dependencies are audited | `cargo deny` and `cargo audit` run as checks | Add a maintained `cargo vet` audit set and make an unvetted dependency fail CI |
+
 The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types and the internally generated `TransferId`.
 CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
 Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
