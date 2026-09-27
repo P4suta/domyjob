@@ -50,6 +50,8 @@ impl RemoteError {
             | Self::Outdated { machine, .. }
             | Self::Unbuilt { machine, .. } => Some(machine),
             Self::TransferId(_)
+            | Self::SshSession(_)
+            | Self::ControlPath { .. }
             | Self::Config(_)
             | Self::Template { .. }
             | Self::Dist(_)
@@ -209,7 +211,17 @@ fn shared_lock(
     })
 }
 
-static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SSH_SESSION: std::sync::OnceLock<Result<SshSessionId, getrandom::Error>> =
+    std::sync::OnceLock::new();
+
+#[derive(Debug)]
+struct SshSessionId(String);
+
+impl SshSessionId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransferId(Nonce);
@@ -224,18 +236,23 @@ impl TransferId {
     }
 }
 
-fn session() -> &'static str {
-    SESSION.get_or_init(|| {
-        let mut random = [0u8; 16];
-        match getrandom::fill(&mut random) {
-            Ok(()) => crate::trust::hex(&random),
-            Err(_no_entropy) => format!("{:08x}", std::process::id()),
-        }
-    })
+fn ssh_session() -> Result<&'static SshSessionId, RemoteError> {
+    match SSH_SESSION.get_or_init(|| {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random)?;
+        Ok(SshSessionId(crate::trust::hex(&random)))
+    }) {
+        Ok(id) => Ok(id),
+        Err(error) => Err(RemoteError::SshSession(error.to_string())),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
+    #[error("could not generate an SSH connection ID: {0}")]
+    SshSession(String),
+    #[error("the SSH control socket path needs {bytes} bytes, but at most {limit} fit")]
+    ControlPath { bytes: usize, limit: usize },
     #[error("could not generate a unique setup ID: {0}")]
     TransferId(crate::domain::Invalid),
     #[error(transparent)]
@@ -727,6 +744,23 @@ fn powershell(script: &Arg) -> Vec<Arg> {
 
 fn cmd(script: Arg) -> Vec<Arg> {
     vec![Arg::literal("cmd"), Arg::literal("/c"), script]
+}
+
+fn check_control_paths(argv: &[Arg]) -> Result<(), RemoteError> {
+    for word in argv {
+        let Some(path) = word.as_arg_str().strip_prefix("ControlPath=") else {
+            continue;
+        };
+        let expanded = path.replace("%C", &"0".repeat(40));
+        let bytes = expanded.len();
+        if bytes > crate::platform::SOCKET_PATH_LIMIT {
+            return Err(RemoteError::ControlPath {
+                bytes,
+                limit: crate::platform::SOCKET_PATH_LIMIT,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Remote {
@@ -1242,6 +1276,7 @@ impl<'a> Link<'a> {
 
     fn command_from(&self, template: &Argv, remote: &Remote) -> Result<Command, RemoteError> {
         let transport = self.config.transport(&self.machine.transport)?;
+        let session = ssh_session()?;
         let exe = std::env::current_exe().map_err(|source| {
             RemoteError::Io(crate::failure::IoFailure {
                 action: "locating",
@@ -1264,7 +1299,7 @@ impl<'a> Link<'a> {
             .with("name", Arg::word(&self.machine.name))
             .with("self", Arg::path(&exe))
             .with("cache", Arg::path(&self.dirs.cache))
-            .with("session", Arg::literal(session()))
+            .with("session", Arg::literal(session.as_str()))
             .with("home", Arg::path(&self.dirs.home))
             .with("remote", remote.text())
             .with_list("remote_argv", remote_argv);
@@ -1274,6 +1309,7 @@ impl<'a> Link<'a> {
                 transport: self.machine.transport.clone(),
                 source,
             })?;
+        check_control_paths(&argv)?;
         let invocation =
             crate::spawn::Invocation::from_words(argv).ok_or_else(|| RemoteError::Empty {
                 machine: self.name(),
@@ -1801,6 +1837,22 @@ mod tests {
 
     fn dirs(root: &std::path::Path) -> Dirs {
         Dirs::isolated_for_test(root)
+    }
+
+    #[test]
+    fn ssh_control_path_has_its_own_short_identity_and_a_checked_length() {
+        let id = ssh_session().unwrap();
+        assert_eq!(id.as_str().len(), 16);
+        let normal = Arg::for_test(format!("ControlPath=/tmp/domyjob/s{}-%C", id.as_str()));
+        check_control_paths(&[normal]).unwrap();
+        let overlong = Arg::for_test(format!(
+            "ControlPath={}",
+            "x".repeat(crate::platform::SOCKET_PATH_LIMIT.saturating_add(1))
+        ));
+        assert!(matches!(
+            check_control_paths(&[overlong]),
+            Err(RemoteError::ControlPath { .. })
+        ));
     }
 
     #[test]

@@ -103,6 +103,10 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         RemoteError::Config(_) | RemoteError::Template { .. } | RemoteError::Empty { .. } => {
             plain(Kind::Config)
         }
+        RemoteError::ControlPath { .. } => hinted(
+            Kind::Config,
+            "use a shorter cache directory or a shorter SSH ControlPath in the transport configuration",
+        ),
         RemoteError::Start { .. } | RemoteError::Pipe { .. } | RemoteError::Exited { .. } => {
             hinted(
                 Kind::Unreachable,
@@ -151,6 +155,7 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         | RemoteError::AuditRolledBack { .. }
         | RemoteError::AuditRewritten { .. } => plain(Kind::Security),
         RemoteError::TransferId(_)
+        | RemoteError::SshSession(_)
         | RemoteError::State(_)
         | RemoteError::Snapshot(_)
         | RemoteError::Io { .. } => plain(Kind::Local),

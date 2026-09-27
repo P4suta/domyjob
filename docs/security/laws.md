@@ -17,6 +17,7 @@ The append-only job notes file is read through a checked handle one bounded line
 The syntax gate rejects direct `read_to_end` and `read_line` calls outside `bounded.rs`; setup output, tree reads, and log tails use explicit byte limits.
 Builds and installs now receive a fresh random `TransferId`; setup fails if entropy fails.
 The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.
+SSH multiplexing has its own shorter `SshSessionId`, and the rendered control socket path is checked before SSH starts.
 Source builds use the archive's `BlobId` under the client build stamp for their Cargo target directory, so different sources cannot share an executable cache entry.
 The syntax gate rejects a fixed incoming filename, and a Windows test builds two sources in one cache at once, then runs and promotes each staged executable.
 Source build scripts remove their extraction directory on ordinary failure, and setup discards only its own staged files when it receives an error.
