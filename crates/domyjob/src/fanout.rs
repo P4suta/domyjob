@@ -1,23 +1,43 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Panicked;
 
+const MAX_WORKERS: usize = 16;
+
 pub fn arrivals<T: Sync, R: Send>(
     items: &[T],
     work: impl Fn(&T) -> R + Sync,
     mut each: impl FnMut(&T, Result<R, Panicked>),
 ) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (done, arrived) = std::sync::mpsc::channel();
-        for (index, item) in items.iter().enumerate() {
+        for _ in 0..items.len().min(MAX_WORKERS) {
             let (work, done) = (&work, done.clone());
+            let next = &next;
             scope.spawn(move || {
-                let result =
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(item))) {
-                        Ok(result) => Ok(result),
-                        Err(_payload) => Err(Panicked),
+                while let Ok(index) = next.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |index| {
+                        if index < items.len() {
+                            index.checked_add(1)
+                        } else {
+                            None
+                        }
+                    },
+                ) {
+                    let Some(item) = items.get(index) else {
+                        break;
                     };
-                match done.send((index, result)) {
-                    Ok(()) | Err(_) => {}
+                    let result =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(item)))
+                        {
+                            Ok(result) => Ok(result),
+                            Err(_payload) => Err(Panicked),
+                        };
+                    match done.send((index, result)) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             });
         }
@@ -70,5 +90,15 @@ mod tests {
         arrivals(&items, |n| *n, |item, result| seen.push((*item, result)));
         seen.sort_unstable_by_key(|(item, _)| *item);
         assert_eq!(seen, [(0, Ok(0)), (1, Ok(1)), (2, Ok(2)), (3, Ok(3))]);
+    }
+
+    #[test]
+    fn worker_count_is_bounded_independently_of_item_count() {
+        let items: Vec<usize> = (0..MAX_WORKERS * 3).collect();
+        let answers = gathered(&items, |_| std::thread::current().id());
+        assert_eq!(answers.len(), items.len());
+        let workers: std::collections::HashSet<_> =
+            answers.into_iter().map(Result::unwrap).collect();
+        assert!(workers.len() <= MAX_WORKERS);
     }
 }

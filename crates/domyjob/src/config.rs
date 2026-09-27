@@ -38,6 +38,8 @@ pub const SERVICE_VARS: &[&str] = &[
     "uid",
     "action",
 ];
+pub const MAX_MACHINES: usize = 64;
+pub const MAX_SELECTOR_TERMS: usize = 256;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -99,6 +101,12 @@ pub enum ConfigError {
     ProjectRoot(PathBuf),
     #[error("project job policy for {0} has no permitted machines")]
     EmptyProjectMachines(PathBuf),
+    #[error("project job policy for {root} permits {count} machines, above the limit of {limit}")]
+    TooManyProjectMachines {
+        root: PathBuf,
+        count: usize,
+        limit: usize,
+    },
     #[error("project job policy for {root} names unconfigured machine {machine}")]
     ProjectMachineUnknown { root: PathBuf, machine: MachineName },
     #[error("project job policy repeats root {0}")]
@@ -109,6 +117,39 @@ pub enum ConfigError {
     ProjectMachineDenied { root: PathBuf, machine: MachineName },
     #[error("project job target {0:?} must be a configured machine name or @all")]
     ProjectSelector(String),
+    #[error("{count} machines are configured, above the limit of {limit}")]
+    TooManyMachines { count: usize, limit: usize },
+    #[error("machine selection exceeds the limit of {limit} targets")]
+    TooManyTargets { limit: usize },
+    #[error("machine selection expands more than {limit} terms")]
+    SelectorTooComplex { limit: usize },
+}
+
+struct SelectorBudget {
+    remaining: usize,
+}
+
+struct SelectorContext<'a> {
+    depth: u8,
+    budget: &'a mut SelectorBudget,
+}
+
+impl SelectorBudget {
+    const fn new() -> Self {
+        Self {
+            remaining: MAX_SELECTOR_TERMS,
+        }
+    }
+
+    fn consume(&mut self) -> Result<(), ConfigError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or(ConfigError::SelectorTooComplex {
+                limit: MAX_SELECTOR_TERMS,
+            })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -547,6 +588,12 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.machines.len() > MAX_MACHINES {
+            return Err(ConfigError::TooManyMachines {
+                count: self.machines.len(),
+                limit: MAX_MACHINES,
+            });
+        }
         let template = |kind: &'static str, name: &str| {
             let name = name.to_owned();
             move |source| ConfigError::Template { kind, name, source }
@@ -630,6 +677,13 @@ impl Config {
             }
             if policy.machines.is_empty() {
                 return Err(ConfigError::EmptyProjectMachines(policy.root.clone()));
+            }
+            if policy.machines.len() > MAX_MACHINES {
+                return Err(ConfigError::TooManyProjectMachines {
+                    root: policy.root.clone(),
+                    count: policy.machines.len(),
+                    limit: MAX_MACHINES,
+                });
             }
             for machine in &policy.machines {
                 if machine.as_str() != LOCAL && !self.machines.contains_key(machine) {
@@ -768,7 +822,12 @@ impl Config {
     where
         E: From<ConfigError> + Send,
     {
-        let out = self.select_at(selector, facts, 0)?;
+        let mut budget = SelectorBudget::new();
+        let mut context = SelectorContext {
+            depth: 0,
+            budget: &mut budget,
+        };
+        let out = self.select_at(selector, facts, &mut context)?;
         if out.is_empty() {
             return Err(E::from(ConfigError::NoMatch {
                 selector: selector.to_owned(),
@@ -781,15 +840,21 @@ impl Config {
         &self,
         selector: &str,
         facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
-        depth: u8,
+        context: &mut SelectorContext<'_>,
     ) -> Result<Vec<Machine>, E>
     where
         E: From<ConfigError> + Send,
     {
         let mut out: Vec<Machine> = Vec::new();
         for term in selector.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-            for machine in self.term(term, facts, depth)? {
+            context.budget.consume().map_err(E::from)?;
+            for machine in self.term(term, facts, context)? {
                 if !out.iter().any(|known| known.name == machine.name) {
+                    if out.len() == MAX_MACHINES {
+                        return Err(E::from(ConfigError::TooManyTargets {
+                            limit: MAX_MACHINES,
+                        }));
+                    }
                     out.push(machine);
                 }
             }
@@ -801,7 +866,7 @@ impl Config {
         &self,
         term: &str,
         facts: &(dyn Fn(&Machine) -> Result<Vec<String>, E> + Sync),
-        depth: u8,
+        context: &mut SelectorContext<'_>,
     ) -> Result<Vec<Machine>, E>
     where
         E: From<ConfigError> + Send,
@@ -814,11 +879,19 @@ impl Config {
                 .groups
                 .get(group)
                 .ok_or_else(|| E::from(ConfigError::UnknownGroup(group.to_owned())))?;
-            let deeper = depth
+            let deeper = context
+                .depth
                 .checked_add(1)
                 .filter(|d| *d <= 8)
                 .ok_or_else(|| E::from(ConfigError::TooDeep(group.to_owned())))?;
-            return self.select_at(&members.join(","), facts, deeper);
+            return self.select_at(
+                &members.join(","),
+                facts,
+                &mut SelectorContext {
+                    depth: deeper,
+                    budget: &mut *context.budget,
+                },
+            );
         }
         if let Some(host) = term.strip_prefix(AD_HOC) {
             return match host.parse::<MachineName>() {
@@ -1062,6 +1135,61 @@ everything = ["@heavy", "pod"]
         assert!(matches!(
             config.project_policy(root.path()),
             Err(ConfigError::DuplicateProjectRoot(_))
+        ));
+    }
+
+    #[test]
+    fn machine_and_target_counts_have_a_fixed_budget() {
+        use std::fmt::Write as _;
+
+        let mut configured = String::new();
+        for number in 0..MAX_MACHINES {
+            writeln!(&mut configured, "[machines.m{number}]").unwrap();
+        }
+        let config = Config::layered(&configured, "machine limit").unwrap();
+        assert_eq!(config.configured().len(), MAX_MACHINES);
+        let too_many = format!("{configured}[machines.extra]\n");
+        assert!(matches!(
+            Config::layered(&too_many, "too many machines"),
+            Err(ConfigError::TooManyMachines { .. })
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let policy_names = std::iter::once("'local'".to_owned())
+            .chain((0..MAX_MACHINES).map(|number| format!("'m{number}'")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized_policy = format!(
+            "{configured}[[project_jobs]]\nroot = '{}'\nmachines = [{policy_names}]\n",
+            root.path().display()
+        );
+        assert!(matches!(
+            Config::layered(&oversized_policy, "too many project targets"),
+            Err(ConfigError::TooManyProjectMachines { .. })
+        ));
+
+        let selector = (0..=MAX_MACHINES)
+            .map(|number| format!("ssh:host{number}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            config.select(&selector, &facts),
+            Err(ConfigError::TooManyTargets { .. })
+        ));
+        let repeated = std::iter::repeat_n("ssh:one", MAX_MACHINES + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(names(config.select(&repeated, &facts).unwrap()), ["one"]);
+
+        let group_members = std::iter::repeat_n("'m0'", MAX_SELECTOR_TERMS / 2 + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let grouped = format!(
+            "{configured}[groups]\nfirst = [{group_members}]\nsecond = [{group_members}]\n"
+        );
+        let grouped = Config::layered(&grouped, "wide groups").unwrap();
+        assert!(matches!(
+            grouped.select("@first,@second", &facts),
+            Err(ConfigError::SelectorTooComplex { .. })
         ));
     }
 

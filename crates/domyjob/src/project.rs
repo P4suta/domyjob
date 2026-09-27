@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::config::{Config, ConfigError, Machine};
+use crate::config::{Config, ConfigError, MAX_SELECTOR_TERMS, Machine};
 use crate::domain::{EnvName, JobName, MachineName, RelPath};
 use crate::protocol::Workspace;
 
@@ -66,8 +66,14 @@ impl TryFrom<String> for ProjectSelector {
             .split(',')
             .map(str::trim)
             .map(str::parse::<MachineName>)
+            .take(MAX_SELECTOR_TERMS.saturating_add(1))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_invalid| ConfigError::ProjectSelector(text.clone()))?;
+        if names.len() > MAX_SELECTOR_TERMS {
+            return Err(ConfigError::SelectorTooComplex {
+                limit: MAX_SELECTOR_TERMS,
+            });
+        }
         if names.is_empty()
             || names.iter().any(|name| name.as_str().starts_with("ssh:"))
             || names.iter().any(|name| name.as_str().starts_with('@'))
@@ -347,6 +353,13 @@ workspace = "fresh"
         "ssh:unlisted".parse::<ProjectSelector>().unwrap_err();
         "@unknown".parse::<ProjectSelector>().unwrap_err();
         "win,,local".parse::<ProjectSelector>().unwrap_err();
+        let too_many = std::iter::repeat_n("win", MAX_SELECTOR_TERMS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(matches!(
+            too_many.parse::<ProjectSelector>(),
+            Err(ConfigError::SelectorTooComplex { .. })
+        ));
     }
 
     #[test]

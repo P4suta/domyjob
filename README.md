@@ -37,6 +37,7 @@ Add a host your ssh config knows with `domyjob machines add NAME`, or reach it d
 | `clean`, `machines pause` | Free the disk space domyjob holds; stop a machine taking jobs for maintenance |
 
 `MACHINES` is a name, `@all`, a label such as `gpu`, or a fact such as `os=windows`.
+A configuration may name at most 64 machines, and each selector may expand to at most 64 distinct targets through 256 terms.
 
 ## For agents
 

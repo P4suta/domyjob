@@ -76,6 +76,7 @@ Nothing is sent and it runs in the machine's home directory, so use it wherever 
 ## Choosing machines
 
 `MACHINES` is a name, labels joined with `+` such as `windows+gpu`, a fact such as `os=linux`, `@group`, or `@all`, separated by commas.
+Local configuration accepts at most 64 machines, each selection resolves to at most 64 distinct targets, and group expansion processes at most 256 terms.
 `domyjob run @all --wait --digest -- cargo test` checks every operating system at once and prints one digest per machine.
 
 ## What differs on the other side
