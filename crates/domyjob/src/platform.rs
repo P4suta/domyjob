@@ -174,24 +174,41 @@ fn link_in(_dir: &cap_std::fs::Dir, target: &str, _at: &Path) -> std::io::Result
 
 #[cfg(test)]
 pub fn make_link(target: &str, at: &Path) -> std::io::Result<()> {
-    make_link_in(target, at)
+    make_link_in(Path::new(target), at, LinkKind::File)
+}
+
+#[cfg(test)]
+pub fn make_dir_link(target: &Path, at: &Path) -> std::io::Result<()> {
+    make_link_in(target, at, LinkKind::Directory)
+}
+
+#[cfg(test)]
+enum LinkKind {
+    File,
+    Directory,
 }
 
 #[cfg(all(test, unix))]
-fn make_link_in(target: &str, at: &Path) -> std::io::Result<()> {
+fn make_link_in(target: &Path, at: &Path, _kind: LinkKind) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, at)
 }
 
 #[cfg(all(test, windows))]
-fn make_link_in(target: &str, at: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(target, at)
+fn make_link_in(target: &Path, at: &Path, kind: LinkKind) -> std::io::Result<()> {
+    match kind {
+        LinkKind::File => std::os::windows::fs::symlink_file(target, at),
+        LinkKind::Directory => std::os::windows::fs::symlink_dir(target, at),
+    }
 }
 
 #[cfg(all(test, not(any(unix, windows))))]
-fn make_link_in(target: &str, _at: &Path) -> std::io::Result<()> {
+fn make_link_in(target: &Path, _at: &Path, _kind: LinkKind) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        format!("a symbolic link to {target} cannot be made on this system"),
+        format!(
+            "a symbolic link to {} cannot be made on this system",
+            target.display()
+        ),
     ))
 }
 

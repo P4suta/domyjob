@@ -1800,15 +1800,17 @@ fn send_request<W: Write>(
     stdin.write_all(line).map_err(pipe)?;
     stdin.write_all(b"\n").map_err(pipe)?;
     for (blob, origin) in blobs {
-        let bytes = origin.read()?;
+        let mut input = origin.open()?;
+        let size = input.size();
         let frame = Frame {
             blob: (*blob).clone(),
-            size: crate::domain::len_u64(bytes.len()),
+            size,
         };
         let mut header = serde_json::to_vec(&frame).map_err(|e| pipe(e.into()))?;
         header.push(b'\n');
         stdin.write_all(&header).map_err(pipe)?;
-        stdin.write_all(&bytes).map_err(pipe)?;
+        std::io::copy(&mut std::io::Read::take(&mut input, size), &mut stdin).map_err(pipe)?;
+        input.verify(blob)?;
     }
     stdin.flush().map_err(pipe)?;
     Ok(stdin)
@@ -1834,6 +1836,19 @@ impl crate::ingress::Ingress for Facts {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_origin_must_still_match_its_snapshot_digest() {
+        let blob = BlobId::of(b"first");
+        let original = Origin::Memory(b"first".to_vec());
+        let sent = send_request(Vec::new(), b"{}", &[(&blob, &original)]).unwrap();
+        assert!(sent.ends_with(b"first"));
+        let changed = Origin::Memory(b"other".to_vec());
+        assert!(matches!(
+            send_request(Vec::new(), b"{}", &[(&blob, &changed)]),
+            Err(RemoteError::Snapshot(SnapshotError::Changed { .. }))
+        ));
+    }
 
     fn dirs(root: &std::path::Path) -> Dirs {
         Dirs::isolated_for_test(root)

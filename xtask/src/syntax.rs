@@ -335,7 +335,7 @@ impl Gate {
             self.flag(segment.ident.span(), UNBOUNDED_TEXT_RULE);
         }
         if self.file.starts_with("crates/domyjob/src/")
-            && !self.file_is(&["bounded.rs", "snapshot.rs"])
+            && !self.file_is(&["bounded.rs"])
             && path_ends_with(path, &["fs", "read"])
             && let Some(segment) = path.segments.last()
         {
@@ -812,10 +812,12 @@ mod tests {
                 .map(|finding| finding.rule),
             Some(UNBOUNDED_FILE_RULE)
         );
-        assert!(
+        assert_eq!(
             check_file(raw, "crates/domyjob/src/snapshot.rs")
                 .unwrap()
-                .is_empty()
+                .first()
+                .map(|finding| finding.rule),
+            Some(UNBOUNDED_FILE_RULE)
         );
     }
 

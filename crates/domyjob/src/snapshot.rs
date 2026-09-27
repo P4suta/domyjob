@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,16 @@ pub enum SnapshotError {
     Encode(serde_json::Error),
     #[error("packing the source: {0}")]
     Archive(String),
+    #[error("source content changed after it was inspected: expected {expected}, found {actual}")]
+    Changed { expected: BlobId, actual: BlobId },
+    #[error(
+        "source size changed after it was inspected: expected {expected} bytes, found {actual}"
+    )]
+    SizeChanged { expected: u64, actual: u64 },
+    #[error("a source file has {size} bytes, exceeding the {limit}-byte blob budget")]
+    TooLarge { size: u64, limit: u64 },
+    #[error("{0} changed from a regular source file")]
+    NotFile(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -77,22 +88,31 @@ impl Mode {
 
 pub fn archive(snapshot: &Snapshot) -> Result<Vec<u8>, SnapshotError> {
     let failed = |source: std::io::Error| SnapshotError::Archive(source.to_string());
-    let mut builder = tar::Builder::new(Vec::new());
+    let mut builder = tar::Builder::new(crate::bounded::CappedVec::new(
+        crate::bounded::SOURCE_ARCHIVE,
+    ));
     for (rel, entry) in &snapshot.manifest.entries {
         let mut header = tar::Header::new_gnu();
         match entry {
-            Entry::File { blob, mode, .. } => {
-                let bytes = snapshot
+            Entry::File { blob, mode, size } => {
+                let mut input = snapshot
                     .origins
                     .get(blob)
                     .ok_or_else(|| SnapshotError::Archive(format!("{rel} has no content")))?
-                    .read()?;
+                    .open()?;
+                if input.size() != *size {
+                    return Err(SnapshotError::SizeChanged {
+                        expected: *size,
+                        actual: input.size(),
+                    });
+                }
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_mode(mode.unix_bits());
-                header.set_size(crate::domain::len_u64(bytes.len()));
+                header.set_size(*size);
                 builder
-                    .append_data(&mut header, rel.as_str(), bytes.as_slice())
+                    .append_data(&mut header, rel.as_str(), (&mut input).take(*size))
                     .map_err(failed)?;
+                input.verify(blob)?;
             }
             Entry::Symlink { target } => {
                 header.set_entry_type(tar::EntryType::Symlink);
@@ -104,7 +124,10 @@ pub fn archive(snapshot: &Snapshot) -> Result<Vec<u8>, SnapshotError> {
             }
         }
     }
-    builder.into_inner().map_err(failed)
+    builder
+        .into_inner()
+        .map(crate::bounded::CappedVec::into_vec)
+        .map_err(failed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -204,24 +227,102 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Origin {
-    Disk(PathBuf),
+    Disk(DiskOrigin),
     Memory(Vec<u8>),
 }
 
+#[derive(Debug, Clone)]
+pub struct DiskOrigin {
+    root: Arc<cap_std::fs::Dir>,
+    relative: RelPath,
+    shown: PathBuf,
+}
+
 impl Origin {
-    pub fn read(&self) -> Result<Vec<u8>, SnapshotError> {
-        match self {
-            Self::Disk(path) => std::fs::read(path).map_err(|source| {
-                SnapshotError::Io(crate::failure::IoFailure {
-                    action: "reading",
-                    path: path.clone(),
-                    source,
-                })
-            }),
-            Self::Memory(bytes) => Ok(bytes.clone()),
+    pub fn open(&self) -> Result<OriginInput<'_>, SnapshotError> {
+        let (reader, size) = match self {
+            Self::Disk(disk) => {
+                let file = disk
+                    .root
+                    .open(disk.relative.to_local())
+                    .map_err(crate::failure::io("opening", &disk.shown))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(crate::failure::io("checking", &disk.shown))?;
+                if !metadata.is_file() {
+                    return Err(SnapshotError::NotFile(disk.shown.clone()));
+                }
+                (OriginReader::Disk(file), metadata.len())
+            }
+            Self::Memory(bytes) => (
+                OriginReader::Memory(bytes.as_slice()),
+                crate::domain::len_u64(bytes.len()),
+            ),
+        };
+        if size > crate::bounded::BLOB {
+            return Err(SnapshotError::TooLarge {
+                size,
+                limit: crate::bounded::BLOB,
+            });
         }
+        Ok(OriginInput {
+            reader,
+            size,
+            read: 0,
+            hasher: blake3::Hasher::new(),
+        })
+    }
+}
+
+#[derive(Debug)]
+enum OriginReader<'a> {
+    Disk(cap_std::fs::File),
+    Memory(&'a [u8]),
+}
+
+#[derive(Debug)]
+pub struct OriginInput<'a> {
+    reader: OriginReader<'a>,
+    size: u64,
+    read: u64,
+    hasher: blake3::Hasher,
+}
+
+impl OriginInput<'_> {
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn verify(self, expected: &BlobId) -> Result<(), SnapshotError> {
+        if self.read != self.size {
+            return Err(SnapshotError::SizeChanged {
+                expected: self.size,
+                actual: self.read,
+            });
+        }
+        let actual = BlobId::from_hash(&self.hasher.finalize());
+        if &actual != expected {
+            return Err(SnapshotError::Changed {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Read for OriginInput<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = match &mut self.reader {
+            OriginReader::Disk(file) => file.read(buffer)?,
+            OriginReader::Memory(bytes) => bytes.read(buffer)?,
+        };
+        self.read = self.read.saturating_add(crate::domain::len_u64(count));
+        self.hasher.update(buffer.get(..count).unwrap_or(&[]));
+        Ok(count)
     }
 }
 
@@ -332,12 +433,22 @@ fn classify(root: &Path, path: &Path, symlink: bool) -> Result<Found, SnapshotEr
     }))
 }
 
-fn disk_origins(root: &Path, manifest: &Manifest) -> BTreeMap<BlobId, Origin> {
+fn disk_origins(
+    root: &Arc<cap_std::fs::Dir>,
+    shown: &Path,
+    manifest: &Manifest,
+) -> BTreeMap<BlobId, Origin> {
     let mut origins = BTreeMap::new();
     for (rel, entry) in &manifest.entries {
         if let Entry::File { blob, .. } = entry {
             origins.entry(blob.clone()).or_insert_with(|| {
-                Origin::Disk(rel.parts().fold(root.to_path_buf(), |p, part| p.join(part)))
+                Origin::Disk(DiskOrigin {
+                    root: Arc::clone(root),
+                    relative: rel.clone(),
+                    shown: rel
+                        .parts()
+                        .fold(shown.to_path_buf(), |p, part| p.join(part)),
+                })
             });
         }
     }
@@ -345,6 +456,10 @@ fn disk_origins(root: &Path, manifest: &Manifest) -> BTreeMap<BlobId, Origin> {
 }
 
 pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
+    let rooted = Arc::new(
+        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            .map_err(crate::failure::io("opening", root))?,
+    );
     let mut entries = BTreeMap::new();
     let mut pending = Vec::new();
     for item in walker(root, Rules::Everywhere) {
@@ -377,7 +492,7 @@ pub fn from_directory(root: &Path) -> Result<Snapshot, SnapshotError> {
     }
     let manifest = Manifest { entries };
     manifest.check_portable()?;
-    let origins = disk_origins(root, &manifest);
+    let origins = disk_origins(&rooted, root, &manifest);
     Ok(Snapshot {
         manifest,
         origins,
@@ -716,6 +831,58 @@ impl crate::ingress::Ingress for Manifest {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn source_archive_refuses_content_or_size_changed_after_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let file = source.join("file.txt");
+        std::fs::write(&file, b"first").unwrap();
+        let snapshot = from_directory(&source).unwrap();
+        let packed = archive(&snapshot).unwrap();
+        assert!(!packed.is_empty());
+        std::fs::write(&file, b"other").unwrap();
+        assert!(matches!(
+            archive(&snapshot),
+            Err(SnapshotError::Changed { .. })
+        ));
+        std::fs::write(&file, b"different size").unwrap();
+        assert!(matches!(
+            archive(&snapshot),
+            Err(SnapshotError::SizeChanged { .. })
+        ));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        assert!(matches!(archive(&snapshot), Err(SnapshotError::NotFile(_))));
+    }
+
+    #[test]
+    fn a_replaced_parent_directory_cannot_redirect_an_origin_outside_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let parent = source.join("nested");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("file.txt"), b"safe").unwrap();
+        let snapshot = from_directory(&source).unwrap();
+        std::fs::rename(&parent, dir.path().join("moved")).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("file.txt"), b"secret").unwrap();
+        match crate::platform::make_dir_link(&outside, &parent) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::Unsupported
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        }
+        assert!(matches!(archive(&snapshot), Err(SnapshotError::Io(_))));
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "the test builds a fixture repository with the real git"
@@ -830,10 +997,10 @@ mod tests {
             panic!("run.sh missing");
         };
         assert_eq!(*mode, Mode::Executable);
-        assert_eq!(
+        assert!(matches!(
             snapshot.origins.get(blob),
-            Some(&Origin::Memory(b"echo one".to_vec()))
-        );
+            Some(Origin::Memory(bytes)) if bytes == b"echo one"
+        ));
         assert!(matches!(
             from_revision(&detected, &"no-such-rev".parse().unwrap()),
             Err(SnapshotError::Failed { .. })

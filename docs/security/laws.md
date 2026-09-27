@@ -15,8 +15,10 @@ Warm workspace paths include the submitter's owner or peer-key scope, with a tes
 State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.
 Local configuration and project definitions have a 4 MiB parsing and file-read budget; signed release metadata also has a 4 MiB file budget, and setup reads executables only within a 64 MiB budget.
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
-The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`, with the remaining raw snapshot read identified as an exception.
+The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
+Source archives stream each origin into a 64 MiB capped archive and verify its digest; job uploads also stream origins and verify their digest before accepting success.
+Directory snapshots retain a confined directory handle and validated relative paths for their disk origins, so a later path replacement cannot move a read outside the selected root.
 Setup output, tree reads, and log tails use explicit byte limits.
 Builds and installs now receive a fresh random `TransferId`; setup fails if entropy fails.
 The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.

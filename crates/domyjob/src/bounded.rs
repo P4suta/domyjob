@@ -1,4 +1,4 @@
-use std::io::{BufRead, ErrorKind, Read};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::path::Path;
 
 pub const REQUEST_LINE: u64 = 1 << 20;
@@ -12,6 +12,7 @@ pub const CONTROL_LINE: u64 = 1024;
 pub const CONFIG_TEXT: u64 = 4 << 20;
 pub const BOOT_ID: u64 = 128;
 pub const SIGNED_METADATA: u64 = 4 << 20;
+pub const SOURCE_ARCHIVE: u64 = 64 << 20;
 
 fn too_long(limit: u64) -> std::io::Error {
     std::io::Error::new(
@@ -37,6 +38,44 @@ pub fn file_bytes(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 pub fn text_file(path: &Path, limit: u64) -> std::io::Result<String> {
     let bytes = file_bytes(path, limit)?;
     String::from_utf8(bytes).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
+}
+
+#[derive(Debug)]
+pub struct CappedVec {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+
+impl CappedVec {
+    #[must_use]
+    pub const fn new(limit: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for CappedVec {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if crate::domain::len_u64(self.bytes.len().saturating_add(bytes.len())) > self.limit {
+            return Err(too_long(self.limit));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(std::io::Error::other)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -189,5 +228,16 @@ mod tests {
             text_file(&dir.path().join("absent"), 2).unwrap_err().kind(),
             ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn capped_writes_refuse_an_archive_before_growing_past_its_budget() {
+        let mut buffer = CappedVec::new(3);
+        buffer.write_all(b"abc").unwrap();
+        assert_eq!(
+            buffer.write_all(b"d").unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(buffer.into_vec(), b"abc");
     }
 }

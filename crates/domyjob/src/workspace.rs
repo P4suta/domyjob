@@ -190,9 +190,25 @@ mod tests {
             .materialize(cas, Plan { manifest, previous }, &AtomicBool::new(false))
             .unwrap()
     }
+
+    fn upload(cas: &Cas, snapshot: &crate::snapshot::Snapshot) {
+        for blob in cas.missing(&snapshot.manifest.blobs()).unwrap() {
+            let mut input = snapshot.origins.get(&blob).unwrap().open().unwrap();
+            let bytes = crate::bounded::to_end(&mut input, crate::bounded::IN_MEMORY_FILE).unwrap();
+            input.verify(&blob).unwrap();
+            cas.put(&blob, &bytes).unwrap();
+        }
+    }
     use crate::snapshot::Mode;
     use crate::snapshot::from_directory;
     use std::io::ErrorKind;
+
+    fn assert_missing(path: &Path) {
+        assert_eq!(
+            std::fs::metadata(path).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn a_manifest_size_mismatch_leaves_no_partial_workspace_file() {
@@ -211,12 +227,7 @@ mod tests {
             workspace.place(&cas, &path, &entry),
             Err(WorkspaceError::SizeMismatch { .. })
         ));
-        assert_eq!(
-            std::fs::metadata(workspace.root().join("file.txt"))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::NotFound
-        );
+        assert_missing(&workspace.root().join("file.txt"));
         let (fan, leaf) = blob.split();
         crate::state_file::write_bytes(&tmp.path().join("cas").join(fan).join(leaf), b"broken")
             .unwrap();
@@ -229,12 +240,7 @@ mod tests {
             workspace.place(&cas, &path, &valid_size),
             Err(WorkspaceError::Cas(CasError::Damaged(_)))
         ));
-        assert_eq!(
-            std::fs::metadata(workspace.root().join("file.txt"))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::NotFound
-        );
+        assert_missing(&workspace.root().join("file.txt"));
     }
 
     #[test]
@@ -245,10 +251,7 @@ mod tests {
         std::fs::write(src.join("kept.rs"), "kept").unwrap();
         let cas = Cas::open(tmp.path().join("cas")).unwrap();
         let next = from_directory(&src).unwrap();
-        for blob in cas.missing(&next.manifest.blobs()).unwrap() {
-            cas.put(&blob, &next.origins.get(&blob).unwrap().read().unwrap())
-                .unwrap();
-        }
+        upload(&cas, &next);
         let root = tmp.path().join("ws");
         let ws = Workspace::open(&root).unwrap();
         std::fs::create_dir_all(root.join("half")).unwrap();
@@ -285,14 +288,8 @@ mod tests {
         std::fs::write(src.join("gone.txt"), "bye").unwrap();
         std::fs::write(src.join(".gitignore"), "target/\n").unwrap();
         let cas = Cas::open(tmp.path().join("cas")).unwrap();
-        let upload = |snapshot: &crate::snapshot::Snapshot| {
-            for blob in cas.missing(&snapshot.manifest.blobs()).unwrap() {
-                cas.put(&blob, &snapshot.origins.get(&blob).unwrap().read().unwrap())
-                    .unwrap();
-            }
-        };
         let first = from_directory(&src).unwrap();
-        upload(&first);
+        upload(&cas, &first);
         let ws = Workspace::open(&tmp.path().join("ws")).unwrap();
         let (applied, changes) = ws
             .materialize(
@@ -320,7 +317,7 @@ mod tests {
         std::fs::write(src.join("lib/a.rs"), "changed").unwrap();
         std::fs::write(src.join("new.txt"), "new").unwrap();
         let second = from_directory(&src).unwrap();
-        upload(&second);
+        upload(&cas, &second);
         let (_, second_changes) = ws
             .materialize(
                 &cas,
