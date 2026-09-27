@@ -244,10 +244,24 @@ impl Origin {
     pub fn open(&self) -> Result<OriginInput<'_>, SnapshotError> {
         let (reader, size) = match self {
             Self::Disk(disk) => {
-                let file = disk
-                    .root
-                    .open(disk.relative.to_local())
-                    .map_err(crate::failure::io("opening", &disk.shown))?;
+                let relative = disk.relative.to_local();
+                let file = match disk.root.open(&relative) {
+                    Ok(file) => file,
+                    Err(_opening)
+                        if disk
+                            .root
+                            .symlink_metadata(&relative)
+                            .is_ok_and(|metadata| !metadata.is_file()) =>
+                    {
+                        return Err(SnapshotError::NotFile(disk.shown.clone()));
+                    }
+                    Err(source) => {
+                        return Err(SnapshotError::Io(crate::failure::io(
+                            "opening",
+                            &disk.shown,
+                        )(source)));
+                    }
+                };
                 let metadata = file
                     .metadata()
                     .map_err(crate::failure::io("checking", &disk.shown))?;

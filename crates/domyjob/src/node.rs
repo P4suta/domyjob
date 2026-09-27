@@ -2411,6 +2411,7 @@ mod tests {
             }
         }
         crate::state_file::write_json(&store.left_path(&id), &recorded).unwrap();
+        drop(sent);
         crate::state_file::remove_dir_all(&workspace).unwrap();
         let mut kept = Vec::new();
         let again = ask(&node, &Request::Changes { job: job.clone() });
