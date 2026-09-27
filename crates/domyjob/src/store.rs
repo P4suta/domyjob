@@ -722,6 +722,7 @@ mod tests {
     }
     use crate::domain::Concurrency;
     use crate::protocol::{Command, Location};
+    use crate::state_file::StateError;
 
     #[test]
     fn a_job_inherits_only_the_explicit_base_environment_allowlist() {
@@ -1141,7 +1142,7 @@ mod tests {
         let damaged_slot = OsLock::exclusive(&slots.join("1.lock")).unwrap();
         assert!(matches!(
             store.job(&waiting),
-            Err(StoreError::State(crate::state_file::StateError::Io { .. }))
+            Err(StoreError::State(StateError::NotFile { .. }))
         ));
         crate::state_file::remove_tree_forcibly(&slots.join("01.holder")).unwrap();
         assert!(matches!(

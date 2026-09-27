@@ -179,7 +179,12 @@ fn make_link_in(target: &str, at: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, at)
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, windows))]
+fn make_link_in(target: &str, at: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, at)
+}
+
+#[cfg(all(test, not(any(unix, windows))))]
 fn make_link_in(target: &str, _at: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -342,6 +347,19 @@ pub fn private_options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     owner_only(&mut options);
     options
+}
+
+#[cfg(unix)]
+pub fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+    options.custom_flags(flags.bits().cast_signed());
+}
+
+#[cfg(windows)]
+pub fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 #[cfg(unix)]

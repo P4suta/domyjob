@@ -4,7 +4,7 @@
 )]
 
 use crate::failure::io;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -24,6 +24,8 @@ pub enum StateError {
     Exposed { path: PathBuf, mode: u32 },
     #[error("{path} belongs to another user; refusing to trust it")]
     Foreign { path: PathBuf },
+    #[error("{path} is not a regular state file")]
+    NotFile { path: PathBuf },
 }
 
 fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateError> {
@@ -37,6 +39,16 @@ fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateEr
             mode,
         }),
     }
+}
+
+fn check_private_file(path: &Path, file: &std::fs::File) -> Result<(), StateError> {
+    let meta = file.metadata().map_err(io("checking", path))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(StateError::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    check_owner_only(path, &meta)
 }
 
 fn create_private_dir(path: &Path) -> Result<(), StateError> {
@@ -59,18 +71,21 @@ pub fn private_dir(path: &Path) -> Result<(), StateError> {
     }
 }
 
+#[expect(
+    clippy::verbose_file_reads,
+    reason = "read from the checked handle; fs::read would reopen the untrusted path"
+)]
 pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
     crate::faults::at("state_file::read", path).map_err(io("reading", path))?;
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
+    let mut file = match private_options().read(true).open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io("checking", path)(e).into()),
+        Err(e) => return Err(io("opening", path)(e).into()),
     };
-    check_owner_only(path, &meta)?;
-    std::fs::read(path)
-        .map(Some)
-        .map_err(io("reading", path))
-        .map_err(Into::into)
+    check_private_file(path, &file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io("reading", path))?;
+    Ok(Some(bytes))
 }
 
 pub fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, StateError> {
@@ -102,7 +117,9 @@ fn sync_dir(dir: &Path) -> Result<(), StateError> {
 }
 
 fn private_options() -> std::fs::OpenOptions {
-    crate::platform::private_options()
+    let mut options = crate::platform::private_options();
+    crate::platform::no_follow(&mut options);
+    options
 }
 
 fn prepared_parent(path: &Path) -> Result<(), StateError> {
@@ -115,12 +132,13 @@ fn prepared_parent(path: &Path) -> Result<(), StateError> {
 pub fn open_append(path: &Path) -> Result<std::fs::File, StateError> {
     crate::faults::at("state_file::append", path).map_err(io("opening", path))?;
     prepared_parent(path)?;
-    private_options()
+    let file = private_options()
         .append(true)
         .create(true)
         .open(path)
-        .map_err(io("opening", path))
-        .map_err(Into::into)
+        .map_err(io("opening", path))?;
+    check_private_file(path, &file)?;
+    Ok(file)
 }
 
 pub fn overwrite_in_place(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
@@ -130,6 +148,7 @@ pub fn overwrite_in_place(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
         .write(true)
         .open(path)
         .map_err(io("opening", path))?;
+    check_private_file(path, &file)?;
     file.write_all(bytes).map_err(io("writing", path))?;
     file.sync_all()
         .map_err(io("syncing", path))
@@ -142,6 +161,7 @@ pub fn cut_to(path: &Path, len: u64) -> Result<(), StateError> {
         .write(true)
         .open(path)
         .map_err(io("opening", path))?;
+    check_private_file(path, &file)?;
     file.set_len(len).map_err(io("cutting", path))?;
     file.sync_all()
         .map_err(io("syncing", path))
@@ -151,20 +171,24 @@ pub fn cut_to(path: &Path, len: u64) -> Result<(), StateError> {
 pub fn open_lock(path: &Path) -> Result<std::fs::File, StateError> {
     crate::faults::at("state_file::lock", path).map_err(io("opening", path))?;
     prepared_parent(path)?;
-    private_options()
+    let file = private_options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
-        .map_err(io("opening", path))
-        .map_err(Into::into)
+        .map_err(io("opening", path))?;
+    check_private_file(path, &file)?;
+    Ok(file)
 }
 
 pub fn open_existing_lock(path: &Path) -> Result<Option<std::fs::File>, StateError> {
     crate::faults::at("state_file::lock", path).map_err(io("opening", path))?;
     match private_options().read(true).write(true).open(path) {
-        Ok(file) => Ok(Some(file)),
+        Ok(file) => {
+            check_private_file(path, &file)?;
+            Ok(Some(file))
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io("opening", path)(error).into()),
     }
@@ -374,5 +398,25 @@ mod tests {
                 Err(StateError::Exposed { .. })
             ));
         }
+    }
+
+    #[test]
+    fn a_state_file_name_cannot_redirect_reads_writes_or_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        let target = dir.join("target");
+        write_bytes(&target, b"safe").unwrap();
+        let alias = dir.join("alias");
+        if crate::platform::make_link("target", &alias).is_err() {
+            return;
+        }
+
+        read_bytes(&alias).unwrap_err();
+        open_append(&alias).unwrap_err();
+        open_lock(&alias).unwrap_err();
+        open_existing_lock(&alias).unwrap_err();
+        overwrite_in_place(&alias, b"changed").unwrap_err();
+        cut_to(&alias, 0).unwrap_err();
+        assert_eq!(read_bytes(&target).unwrap(), Some(b"safe".to_vec()));
     }
 }
