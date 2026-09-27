@@ -49,6 +49,7 @@ The syntax gate rejects a fixed incoming filename, and a Windows test builds two
 Source build scripts remove their extraction directory on ordinary failure, and setup discards only its own staged files when it receives an error.
 Recovery after an abrupt client or remote crash remains part of the open RC-R work.
 Test fault guards now own distinct rules with path scopes; concurrent tests cannot overwrite another guard's plan, and a delayed fault counts only operations inside its declared `Path`.
+The repository Nextest profile fixes four concurrent test processes on every host instead of inheriting CPU count; leaked output handles still fail the run.
 Clippy and the syntax gate now confine exclusive file creation to four ordinary-file constructors, leaving liveness and serialization to operating-system locks.
 
 ## 1. No ambient authority
