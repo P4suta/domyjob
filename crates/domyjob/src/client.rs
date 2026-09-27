@@ -11,7 +11,7 @@ use crate::domain::{
     RelPath,
 };
 use crate::paths::Dirs;
-use crate::project::{self, ProjectError};
+use crate::project::{self, ApprovedProjectJob, ApprovedProjectTargets, ProjectError};
 use crate::protocol::{
     Command, Follow, Job, Location, Reply, Request, Source, Submission, Workspace,
 };
@@ -69,6 +69,8 @@ pub enum ClientError {
     Elsewhere { reference: String, root: PathBuf },
     #[error("machine {0} answered but left no facts for label selection")]
     NoFacts(MachineName),
+    #[error("working directory {start} is outside source root {root}")]
+    OutsideRoot { start: PathBuf, root: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +326,7 @@ pub enum Sending {
 
 #[derive(Debug, Clone)]
 pub struct Order {
-    pub targets: String,
+    pub targets: Targets,
     pub words: Vec<Arg>,
     pub runner: Option<String>,
     pub rev: Option<crate::domain::Revision>,
@@ -336,6 +338,68 @@ pub struct Order {
     pub shell: Option<String>,
     pub name: Option<JobName>,
     pub queue: crate::protocol::Queue,
+}
+
+#[derive(Debug, Clone)]
+pub struct Targets {
+    source: TargetSource,
+}
+
+#[derive(Debug, Clone)]
+enum TargetSource {
+    Selector(String),
+    Project(Vec<Machine>),
+}
+
+impl Targets {
+    #[must_use]
+    pub(crate) const fn selector(selector: String) -> Self {
+        Self {
+            source: TargetSource::Selector(selector),
+        }
+    }
+
+    fn project(approved: ApprovedProjectTargets) -> Self {
+        Self {
+            source: TargetSource::Project(approved.into_machines()),
+        }
+    }
+
+    fn resolve(&self, ctx: &Context) -> Result<Vec<Machine>, ClientError> {
+        match &self.source {
+            TargetSource::Selector(selector) => ctx.select(selector),
+            TargetSource::Project(machines) => Ok(machines.clone()),
+        }
+    }
+}
+
+impl Order {
+    #[must_use]
+    pub fn from_project(
+        approved: ApprovedProjectJob,
+        name: JobName,
+        rev: Option<crate::domain::Revision>,
+    ) -> Self {
+        let parts = approved.into_parts();
+        let start = parts
+            .dir
+            .as_ref()
+            .map_or_else(|| parts.root.clone(), |dir| parts.root.join(dir.to_local()));
+        Self {
+            queue: crate::protocol::Queue::Slot,
+            targets: Targets::project(parts.targets),
+            words: parts.words.iter().map(Arg::project_word).collect(),
+            runner: parts.runner,
+            rev,
+            sending: Sending::Directory,
+            workspace: parts.workspace,
+            start,
+            root: Some(parts.root),
+            env: parts.env,
+            shell: None,
+            name: Some(name),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -548,12 +612,17 @@ pub fn prepare(ctx: &Context, order: &Order) -> Result<Option<Prepared>, ClientE
     };
     let root = std::fs::canonicalize(project_root(&order, &ctx.config)?)
         .map_err(io("resolving", &order.start))?;
-    let snapshot = snapshot_at(&ctx.config, &root, order.rev.as_ref())?;
     let subdir = match order.start.strip_prefix(&root) {
         Ok(inner) if inner.as_os_str().is_empty() => None,
         Ok(_) => Some(snapshot::relative(&root, &order.start)?),
-        Err(_outside) => None,
+        Err(_outside) => {
+            return Err(ClientError::OutsideRoot {
+                start: order.start,
+                root,
+            });
+        }
     };
+    let snapshot = snapshot_at(&ctx.config, &root, order.rev.as_ref())?;
     prepared(ctx, &root, snapshot, subdir).map(Some)
 }
 
@@ -758,7 +827,7 @@ pub fn submit_prepared(
     prepared: Option<Prepared>,
     report: Report<'_>,
 ) -> Result<(Vec<Submitted>, Vec<Rejected>), ClientError> {
-    let machines = ctx.select(&order.targets)?;
+    let machines = order.targets.resolve(ctx)?;
     let plan = Plan {
         ctx,
         order,
@@ -795,8 +864,9 @@ pub struct Sent {
 }
 
 pub fn preview(ctx: &Context, order: &Order) -> Result<Preview, ClientError> {
-    let machines = ctx
-        .select(&order.targets)?
+    let machines = order
+        .targets
+        .resolve(ctx)?
         .into_iter()
         .map(|m| m.name)
         .collect();
@@ -1597,7 +1667,7 @@ mod tests {
         .unwrap();
         let order = |words: &[&str], runner: Option<&str>| Order {
             queue: crate::protocol::Queue::Slot,
-            targets: "local".into(),
+            targets: Targets::selector("local".into()),
             words: words
                 .iter()
                 .map(|w| Arg::user(&crate::input::UserText::for_test((*w).to_owned())))
@@ -1628,5 +1698,42 @@ mod tests {
             command(&config, &order(&[], None)),
             Err(ClientError::NoInput)
         ));
+    }
+
+    #[test]
+    fn source_preparation_rejects_a_working_directory_outside_its_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        crate::state_file::private_dir(&root).unwrap();
+        crate::state_file::private_dir(&outside).unwrap();
+        let ctx = Context {
+            config: Config::builtin().unwrap(),
+            dirs: Dirs::for_test(temp.path()),
+        };
+        let order = Order {
+            queue: crate::protocol::Queue::Slot,
+            targets: Targets::selector("local".into()),
+            words: vec![Arg::literal("pwd")],
+            runner: None,
+            rev: None,
+            sending: Sending::Directory,
+            workspace: Workspace::Warm,
+            start: outside.clone(),
+            root: Some(root.clone()),
+            env: BTreeMap::new(),
+            shell: None,
+            name: None,
+        };
+        match prepare(&ctx, &order) {
+            Err(ClientError::OutsideRoot {
+                start,
+                root: source,
+            }) => {
+                assert_eq!(start, std::fs::canonicalize(outside).unwrap());
+                assert_eq!(source, std::fs::canonicalize(root).unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

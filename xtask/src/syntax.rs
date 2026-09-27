@@ -142,6 +142,9 @@ const FAULT_SCENARIO_RULE: &str =
     "test fault scenarios belong only in faults.rs; use a path-scoped guard elsewhere";
 const REFERENCE_TYPE_RULE: &str =
     "trigger references and patterns must use their bounded domain types";
+const PROJECT_APPROVAL_RULE: &str =
+    "project jobs must pass from RepositoryRequest through local approval before becoming an Order";
+const PROJECT_PROOF_PRIVACY_RULE: &str = "project approval proof and request fields must stay private so callers cannot forge or reclassify them";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -280,21 +283,54 @@ fn is_named_type(ty: &syn::Type, name: &str) -> bool {
 }
 
 fn is_vec_of(ty: &syn::Type, name: &str) -> bool {
+    is_generic_of(ty, "Vec", &[name])
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "syn::GenericArgument is non-exhaustive, so a foreign crate forces the default arm"
+)]
+fn generic_types<'a>(ty: &'a syn::Type, outer: &str) -> Option<Vec<&'a syn::Type>> {
     let syn::Type::Path(path) = ty else {
-        return false;
+        return None;
     };
-    let Some(segment) = path
+    let segment = path
         .path
         .segments
         .last()
-        .filter(|segment| segment.ident == "Vec")
-    else {
-        return false;
-    };
+        .filter(|part| part.ident == outer)?;
     let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return false;
+        return None;
     };
-    matches!(arguments.args.first(), Some(syn::GenericArgument::Type(inner)) if is_named_type(inner, name))
+    arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            syn::GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_generic_of(ty: &syn::Type, outer: &str, inner: &[&str]) -> bool {
+    generic_types(ty, outer).is_some_and(|types| {
+        types.len() == inner.len()
+            && types
+                .iter()
+                .zip(inner)
+                .all(|(argument, expected)| is_named_type(argument, expected))
+    })
+}
+
+fn is_option_map_of(ty: &syn::Type, key: &str, value: &str) -> bool {
+    generic_types(ty, "Option")
+        .is_some_and(|types| matches!(types.as_slice(), [inner] if is_generic_of(inner, "BTreeMap", &[key, value])))
+}
+
+fn field_is(fields: &syn::Fields, name: &str, valid: impl Fn(&syn::Type) -> bool) -> bool {
+    fields
+        .iter()
+        .any(|field| field.ident.as_ref().is_some_and(|id| id == name) && valid(&field.ty))
 }
 
 fn returns_bool(output: &syn::ReturnType) -> bool {
@@ -431,6 +467,61 @@ impl Gate {
         }
     }
 
+    fn check_project_structure(&mut self, item: &syn::ItemStruct) {
+        let project_shape = if self.file_is(&["project.rs"]) && item.ident == "Project" {
+            Some(field_is(&item.fields, "jobs", |ty| {
+                is_generic_of(ty, "BTreeMap", &["JobName", "RepositoryRequest"])
+            }))
+        } else if self.file_is(&["project.rs"]) && item.ident == "RepositoryRequest" {
+            Some(
+                field_is(&item.fields, "on", |ty| {
+                    is_named_type(ty, "ProjectSelector")
+                }) && field_is(&item.fields, "dir", |ty| {
+                    is_generic_of(ty, "Option", &["RelPath"])
+                }) && field_is(&item.fields, "env", |ty| {
+                    is_option_map_of(ty, "EnvName", "String")
+                }),
+            )
+        } else if self.file_is(&["client.rs"]) && item.ident == "Order" {
+            Some(field_is(&item.fields, "targets", |ty| {
+                is_named_type(ty, "Targets")
+            }))
+        } else if self.file_is(&["project.rs"]) && item.ident == "ProjectOrderParts" {
+            Some(field_is(&item.fields, "root", |ty| {
+                is_named_type(ty, "PathBuf")
+            }))
+        } else if self.file_is(&["config.rs"]) && item.ident == "Config" {
+            Some(field_is(&item.fields, "project_jobs", |ty| {
+                is_vec_of(ty, "LocalPolicy")
+            }))
+        } else {
+            None
+        };
+        if project_shape == Some(false) {
+            self.flag(item.ident.span(), PROJECT_APPROVAL_RULE);
+        }
+        let proof_fields = (self.file_is(&["project.rs"])
+            && [
+                "RepositoryRequest",
+                "ProjectSelector",
+                "ApprovedProjectTargets",
+                "ApprovedProjectWord",
+                "ApprovedProjectJob",
+            ]
+            .iter()
+            .any(|name| item.ident == name))
+            || (self.file_is(&["config.rs"]) && item.ident == "LocalPolicy")
+            || (self.file_is(&["client.rs"]) && item.ident == "Targets");
+        if proof_fields
+            && item
+                .fields
+                .iter()
+                .any(|field| !matches!(field.vis, syn::Visibility::Inherited))
+        {
+            self.flag(item.ident.span(), PROJECT_PROOF_PRIVACY_RULE);
+        }
+    }
+
     fn exclusive_create_allowed(&self) -> bool {
         EXCLUSIVE_CREATE.iter().any(|(file, function)| {
             self.file == *file && self.function.as_deref() == Some(*function)
@@ -544,6 +635,30 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         self.check_signature(&item.sig);
+        if self.file_is(&["client.rs"]) && item.sig.ident == "from_project" {
+            let inputs: Vec<_> = item
+                .sig
+                .inputs
+                .iter()
+                .filter_map(|argument| match argument {
+                    syn::FnArg::Typed(typed) => Some(typed.ty.as_ref()),
+                    syn::FnArg::Receiver(_) => None,
+                })
+                .collect();
+            let approved = matches!(inputs.as_slice(), [job, name, revision]
+                if is_named_type(job, "ApprovedProjectJob")
+                    && is_named_type(name, "JobName")
+                    && is_generic_of(revision, "Option", &["Revision"]));
+            if !approved {
+                self.flag(item.sig.ident.span(), PROJECT_APPROVAL_RULE);
+            }
+        }
+        if self.file_is(&["client.rs"])
+            && item.sig.ident == "project"
+            && !matches!(item.vis, syn::Visibility::Inherited)
+        {
+            self.flag(item.sig.ident.span(), PROJECT_PROOF_PRIVACY_RULE);
+        }
         let before = self.function.replace(item.sig.ident.to_string());
         syn::visit::visit_impl_item_fn(self, item);
         self.function = before;
@@ -587,6 +702,7 @@ impl<'ast> Visit<'ast> for Gate {
             item.ident.span(),
             has_named_fields(&item.fields),
         );
+        self.check_project_structure(item);
         let required = if self.file_is(&["config.rs"]) && item.ident == "TriggerConf" {
             Some(("refs", "RefPattern", true))
         } else if self.file_is(&["hook.rs"]) && item.ident == "Event" {
@@ -619,6 +735,22 @@ impl<'ast> Visit<'ast> for Gate {
             }
         }
         syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
+        if self.file_is(&["cli.rs"])
+            && self.function.as_deref() == Some("run_named")
+            && path_ends_with(&expr.path, &["Order"])
+        {
+            self.flag(
+                expr.path
+                    .segments
+                    .first()
+                    .map_or_else(Span::call_site, |part| part.ident.span()),
+                PROJECT_APPROVAL_RULE,
+            );
+        }
+        syn::visit::visit_expr_struct(self, expr);
     }
 
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
@@ -807,6 +939,61 @@ mod tests {
             check_file(
                 "struct Event { reference: EventRef }",
                 "crates/domyjob/src/hook.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn repository_jobs_cannot_regress_to_plain_order_inputs() {
+        for (source, file) in [
+            (
+                "struct Project { jobs: BTreeMap<JobName, JobDef> }",
+                "crates/domyjob/src/project.rs",
+            ),
+            (
+                "struct RepositoryRequest { on: String, dir: Option<String>, env: Option<BTreeMap<String, String>> }",
+                "crates/domyjob/src/project.rs",
+            ),
+            (
+                "struct Order { targets: String }",
+                "crates/domyjob/src/client.rs",
+            ),
+            (
+                "struct Config { project_jobs: Vec<String> }",
+                "crates/domyjob/src/config.rs",
+            ),
+            (
+                "fn run_named() { let order = Order { targets: \"@all\".into() }; }",
+                "crates/domyjob/src/cli.rs",
+            ),
+            (
+                "struct ApprovedProjectJob { pub parts: ProjectOrderParts }",
+                "crates/domyjob/src/project.rs",
+            ),
+            (
+                "struct Targets { pub source: TargetSource }",
+                "crates/domyjob/src/client.rs",
+            ),
+            (
+                "impl Targets { pub fn project(x: ApprovedProjectTargets) -> Self { todo!() } }",
+                "crates/domyjob/src/client.rs",
+            ),
+            (
+                "impl Order { fn from_project(approved: ApprovedProjectJob, root: PathBuf, name: JobName, rev: Option<Revision>) -> Self { todo!() } }",
+                "crates/domyjob/src/client.rs",
+            ),
+        ] {
+            assert!(
+                !check_file(source, file).unwrap().is_empty(),
+                "{file}: {source}"
+            );
+        }
+        assert!(
+            check_file(
+                "struct RepositoryRequest { on: ProjectSelector, dir: Option<RelPath>, env: Option<BTreeMap<EnvName, String>> }",
+                "crates/domyjob/src/project.rs"
             )
             .unwrap()
             .is_empty()

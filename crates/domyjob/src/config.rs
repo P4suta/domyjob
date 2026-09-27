@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -95,6 +95,20 @@ pub enum ConfigError {
     },
     #[error("{0} is this machine")]
     ThisMachine(MachineName),
+    #[error("project job policy root {0} must be an absolute path")]
+    ProjectRoot(PathBuf),
+    #[error("project job policy for {0} has no permitted machines")]
+    EmptyProjectMachines(PathBuf),
+    #[error("project job policy for {root} names unconfigured machine {machine}")]
+    ProjectMachineUnknown { root: PathBuf, machine: MachineName },
+    #[error("project job policy repeats root {0}")]
+    DuplicateProjectRoot(PathBuf),
+    #[error("no local project job policy permits {0}; add a [[project_jobs]] entry to config.toml")]
+    ProjectNotApproved(PathBuf),
+    #[error("project job target {machine} is not permitted for {root}")]
+    ProjectMachineDenied { root: PathBuf, machine: MachineName },
+    #[error("project job target {0:?} must be a configured machine name or @all")]
+    ProjectSelector(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +138,26 @@ struct File {
     triggers: Option<BTreeMap<String, TriggerConf>>,
     mcp: Option<McpPolicy>,
     services: Option<BTreeMap<String, ServiceConf>>,
+    project_jobs: Option<Vec<LocalPolicy>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPolicy {
+    root: PathBuf,
+    machines: BTreeSet<MachineName>,
+}
+
+impl LocalPolicy {
+    #[must_use]
+    pub(crate) const fn machines(&self) -> &BTreeSet<MachineName> {
+        &self.machines
+    }
+
+    #[must_use]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -144,7 +178,7 @@ pub enum McpTool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpPolicy {
-    pub tools: std::collections::BTreeSet<McpTool>,
+    pub tools: BTreeSet<McpTool>,
     pub machines: String,
     pub runners: Vec<String>,
     pub directories: Vec<PathBuf>,
@@ -209,6 +243,7 @@ pub struct Config {
     pub triggers: BTreeMap<String, TriggerConf>,
     pub mcp: McpPolicy,
     pub services: BTreeMap<String, ServiceConf>,
+    project_jobs: Vec<LocalPolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -286,6 +321,7 @@ impl File {
             triggers: self.triggers.unwrap_or_default(),
             mcp: self.mcp.unwrap_or_else(McpPolicy::read_only),
             services: self.services.unwrap_or_default(),
+            project_jobs: self.project_jobs.unwrap_or_default(),
         }
     }
 }
@@ -479,6 +515,7 @@ impl Config {
         }
         merged.triggers = user.triggers;
         merged.mcp = user.mcp;
+        merged.project_jobs = user.project_jobs;
 
         merged.validate()?;
         Ok(merged)
@@ -579,7 +616,51 @@ impl Config {
                 });
             }
         }
+        self.validate_project_policies()
+    }
+
+    fn validate_project_policies(&self) -> Result<(), ConfigError> {
+        let mut roots = BTreeSet::new();
+        for policy in &self.project_jobs {
+            if !policy.root.is_absolute() {
+                return Err(ConfigError::ProjectRoot(policy.root.clone()));
+            }
+            if !roots.insert(&policy.root) {
+                return Err(ConfigError::DuplicateProjectRoot(policy.root.clone()));
+            }
+            if policy.machines.is_empty() {
+                return Err(ConfigError::EmptyProjectMachines(policy.root.clone()));
+            }
+            for machine in &policy.machines {
+                if machine.as_str() != LOCAL && !self.machines.contains_key(machine) {
+                    return Err(ConfigError::ProjectMachineUnknown {
+                        root: policy.root.clone(),
+                        machine: machine.clone(),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn project_policy(
+        &self,
+        root: &Path,
+    ) -> Result<(PathBuf, &LocalPolicy), ConfigError> {
+        let resolved =
+            std::fs::canonicalize(root).map_err(crate::failure::io("resolving", root))?;
+        let mut approved = None;
+        for policy in &self.project_jobs {
+            if std::fs::canonicalize(&policy.root).is_ok_and(|known| known == resolved) {
+                if approved.is_some() {
+                    return Err(ConfigError::DuplicateProjectRoot(resolved));
+                }
+                approved = Some(policy);
+            }
+        }
+        approved
+            .map(|policy| (resolved.clone(), policy))
+            .ok_or(ConfigError::ProjectNotApproved(resolved))
     }
 
     fn default_transport(&self) -> String {
@@ -945,6 +1026,43 @@ everything = ["@heavy", "pod"]
             .map(|(n, _)| n)
             .collect();
         assert_eq!(order, ["jj", "git"]);
+    }
+
+    #[test]
+    fn local_project_policy_rejects_ambiguous_or_unconfigured_grants() {
+        let relative = "[[project_jobs]]\nroot = 'relative'\nmachines = ['local']\n";
+        assert!(matches!(
+            Config::layered(relative, "relative"),
+            Err(ConfigError::ProjectRoot(_))
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().display();
+        let empty = format!("[[project_jobs]]\nroot = '{path}'\nmachines = []\n");
+        assert!(matches!(
+            Config::layered(&empty, "empty"),
+            Err(ConfigError::EmptyProjectMachines(_))
+        ));
+        let unknown = format!("[[project_jobs]]\nroot = '{path}'\nmachines = ['elsewhere']\n");
+        assert!(matches!(
+            Config::layered(&unknown, "unknown"),
+            Err(ConfigError::ProjectMachineUnknown { .. })
+        ));
+        let duplicate = format!(
+            "[[project_jobs]]\nroot = '{path}'\nmachines = ['local']\n[[project_jobs]]\nroot = '{path}'\nmachines = ['local']\n"
+        );
+        assert!(matches!(
+            Config::layered(&duplicate, "duplicate"),
+            Err(ConfigError::DuplicateProjectRoot(_))
+        ));
+        crate::state_file::private_dir(&root.path().join("inside")).unwrap();
+        let canonical_duplicate = format!(
+            "[[project_jobs]]\nroot = '{path}'\nmachines = ['local']\n[[project_jobs]]\nroot = '{path}/inside/..'\nmachines = ['local']\n"
+        );
+        let config = Config::layered(&canonical_duplicate, "same directory").unwrap();
+        assert!(matches!(
+            config.project_policy(root.path()),
+            Err(ConfigError::DuplicateProjectRoot(_))
+        ));
     }
 
     #[test]

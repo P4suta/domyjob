@@ -19,11 +19,6 @@ impl UserText {
         Self(text.into_string())
     }
 
-    #[must_use]
-    pub(crate) fn from_project_job_the_user_invoked(text: crate::cli::ProjectJobText) -> Self {
-        Self(text.into_string())
-    }
-
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn for_test(text: String) -> Self {

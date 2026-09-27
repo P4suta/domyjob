@@ -189,7 +189,8 @@ pub fn of_client(error: &ClientError) -> Diagnosis {
         ClientError::Snapshot(_)
         | ClientError::Io { .. }
         | ClientError::Index { .. }
-        | ClientError::State(_) => plain(Kind::Local),
+        | ClientError::State(_)
+        | ClientError::OutsideRoot { .. } => plain(Kind::Local),
         ClientError::NoFacts(_) | ClientError::Panicked => plain(Kind::Internal),
         ClientError::Unpacked { .. } => hinted(
             Kind::Protocol,

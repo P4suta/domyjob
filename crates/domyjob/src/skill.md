@@ -39,7 +39,19 @@ on = "@all"
 run = ["cargo", "test"]
 ```
 
-`domyjob do test` runs it where `on` says, `--on win` runs it elsewhere, and `domyjob do test @main` sends that revision instead of the directory on disk.
+Authorize that project's jobs in your local `config.toml` before running them:
+
+```toml
+[[project_jobs]]
+root = "/absolute/path/to/project"
+machines = ["linux", "win"]
+```
+
+The entry grants jobs from that exact project root permission to run arbitrary commands on the named machines.
+`on = "@all"` selects all machines in this local grant; a job may also name a permitted machine or a comma-separated list of permitted names.
+`domyjob do test` runs on the permitted machines the job requests, `--on win` chooses a permitted machine explicitly, and `domyjob do test @main` sends that revision instead of the directory on disk.
+Project jobs cannot use labels, groups other than `@all`, or ad hoc `ssh:HOST` targets.
+`dir` must be a relative path inside the project root; a directory that resolves outside it is refused.
 Each job may also set `runner`, `workspace` (`warm` or `fresh`), `dir`, and `env`.
 
 ## Looking at machines

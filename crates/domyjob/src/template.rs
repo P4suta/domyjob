@@ -298,6 +298,11 @@ impl Arg {
     }
 
     #[must_use]
+    pub fn project_word(word: &crate::project::ApprovedProjectWord) -> Self {
+        Self(word.as_str().to_owned())
+    }
+
+    #[must_use]
     pub fn rendered(text: Rendered) -> Self {
         Self(text.0)
     }

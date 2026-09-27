@@ -497,7 +497,7 @@ fn run(ctx: &Context, permitted: PermittedRun) -> Result<Value, ToolError> {
     } = permitted;
     let order = Order {
         queue: crate::protocol::Queue::Slot,
-        targets: machines,
+        targets: client::Targets::selector(machines),
         words: words.iter().map(Arg::user).collect(),
         runner: Some(runner.0),
         rev,

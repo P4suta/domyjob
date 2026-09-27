@@ -26,7 +26,9 @@ The remaining conditions below keep a green test run from being mistaken for com
 | 7. Dependencies are audited | `cargo deny` and `cargo audit` run as checks | Add a maintained `cargo vet` audit set and make an unvetted dependency fail CI |
 
 The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types and the internally generated `TransferId`.
-CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
+CLI and MCP text enter `UserText` through source-specific types with private fields.
+Repository job text remains in `RepositoryRequest` until an exact local root and machine grant produces an `ApprovedProjectJob`; its words then enter arguments through `ApprovedProjectWord` rather than `UserText`.
+Approved machine values and the canonical project root remain inside the proof used to construct `Order`, so a later selector expansion or caller-supplied root cannot widen the grant.
 Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
 Warm workspace paths include the submitter's owner or peer-key scope, with a test for cross-principal separation.
 State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.

@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::domain::JobName;
+use crate::config::{Config, ConfigError, Machine};
+use crate::domain::{EnvName, JobName, MachineName, RelPath};
 use crate::protocol::Workspace;
 
 pub const FILE: &str = "domyjob.toml";
@@ -23,28 +24,114 @@ pub enum ProjectError {
     NoSuchJob(JobName),
     #[error("{0} exists but is not a file")]
     NotFile(PathBuf),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
-    jobs: Option<BTreeMap<JobName, JobDef>>,
+    jobs: Option<BTreeMap<JobName, RepositoryRequest>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct JobDef {
-    pub on: String,
-    pub run: Vec<String>,
+pub struct RepositoryRequest {
+    on: ProjectSelector,
+    run: Vec<String>,
+    runner: Option<String>,
+    workspace: Option<Workspace>,
+    dir: Option<RelPath>,
+    env: Option<BTreeMap<EnvName, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ProjectSelector(RequestedTargets);
+
+#[derive(Debug, Clone)]
+enum RequestedTargets {
+    All,
+    Names(Vec<MachineName>),
+}
+
+impl TryFrom<String> for ProjectSelector {
+    type Error = ConfigError;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text == "@all" {
+            return Ok(Self(RequestedTargets::All));
+        }
+        let names = text
+            .split(',')
+            .map(str::trim)
+            .map(str::parse::<MachineName>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_invalid| ConfigError::ProjectSelector(text.clone()))?;
+        if names.is_empty()
+            || names.iter().any(|name| name.as_str().starts_with("ssh:"))
+            || names.iter().any(|name| name.as_str().starts_with('@'))
+        {
+            return Err(ConfigError::ProjectSelector(text));
+        }
+        Ok(Self(RequestedTargets::Names(names)))
+    }
+}
+
+impl std::str::FromStr for ProjectSelector {
+    type Err = ConfigError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::try_from(text.to_owned())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedProjectTargets(Vec<Machine>);
+
+impl ApprovedProjectTargets {
+    #[must_use]
+    pub(crate) fn into_machines(self) -> Vec<Machine> {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedProjectWord(String);
+
+impl ApprovedProjectWord {
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedProjectJob {
+    parts: ProjectOrderParts,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectOrderParts {
+    pub root: PathBuf,
+    pub targets: ApprovedProjectTargets,
+    pub words: Vec<ApprovedProjectWord>,
     pub runner: Option<String>,
-    pub workspace: Option<Workspace>,
-    pub dir: Option<String>,
-    pub env: Option<BTreeMap<String, String>>,
+    pub workspace: Workspace,
+    pub dir: Option<RelPath>,
+    pub env: BTreeMap<EnvName, String>,
+}
+
+impl ApprovedProjectJob {
+    #[must_use]
+    pub(crate) fn into_parts(self) -> ProjectOrderParts {
+        self.parts
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Project {
-    pub jobs: BTreeMap<JobName, JobDef>,
+    jobs: BTreeMap<JobName, RepositoryRequest>,
 }
 
 impl Project {
@@ -73,10 +160,53 @@ impl Project {
         }
     }
 
-    pub fn job(&self, name: &JobName) -> Result<&JobDef, ProjectError> {
+    pub fn job(&self, name: &JobName) -> Result<&RepositoryRequest, ProjectError> {
         self.jobs
             .get(name)
             .ok_or_else(|| ProjectError::NoSuchJob(name.clone()))
+    }
+}
+
+impl RepositoryRequest {
+    pub fn approve(
+        &self,
+        config: &Config,
+        root: &Path,
+        override_on: Option<&ProjectSelector>,
+    ) -> Result<ApprovedProjectJob, ProjectError> {
+        let (root, policy) = config.project_policy(root)?;
+        let selector = override_on.unwrap_or(&self.on);
+        let names = match &selector.0 {
+            RequestedTargets::All => policy.machines().iter().cloned().collect(),
+            RequestedTargets::Names(names) => names.clone(),
+        };
+        let mut machines = Vec::new();
+        for machine_name in names {
+            if !policy.machines().contains(&machine_name) {
+                return Err(ConfigError::ProjectMachineDenied {
+                    root: policy.root().to_path_buf(),
+                    machine: machine_name,
+                }
+                .into());
+            }
+            if !machines
+                .iter()
+                .any(|known: &Machine| known.name == machine_name)
+            {
+                machines.push(config.machine(&machine_name)?);
+            }
+        }
+        Ok(ApprovedProjectJob {
+            parts: ProjectOrderParts {
+                root,
+                targets: ApprovedProjectTargets(machines),
+                words: self.run.iter().cloned().map(ApprovedProjectWord).collect(),
+                runner: self.runner.clone(),
+                workspace: self.workspace.unwrap_or(Workspace::Warm),
+                dir: self.dir.clone(),
+                env: self.env.clone().unwrap_or_default(),
+            },
+        })
     }
 }
 
@@ -126,6 +256,97 @@ workspace = "fresh"
             Project::parse(with_notify, "x"),
             Err(ProjectError::Parse { .. })
         ));
+        let escaping = "[jobs.test]\non = 'local'\nrun = ['pwd']\ndir = '../outside'\n";
+        assert!(matches!(
+            Project::parse(escaping, "x"),
+            Err(ProjectError::Parse { .. })
+        ));
+        let invalid_env =
+            "[jobs.test]\non = 'local'\nrun = ['pwd']\n[jobs.test.env]\nDOMYJOB_SECRET = 'x'\n";
+        assert!(matches!(
+            Project::parse(invalid_env, "x"),
+            Err(ProjectError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn repository_requests_need_a_local_root_and_machine_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let project = Project::parse(SAMPLE, "sample").unwrap();
+        let test: JobName = "test".parse().unwrap();
+        let bench: JobName = "bench".parse().unwrap();
+        let no_policy = Config::builtin().unwrap();
+        assert!(matches!(
+            project
+                .job(&test)
+                .unwrap()
+                .approve(&no_policy, root.path(), None),
+            Err(ProjectError::Config(ConfigError::ProjectNotApproved(_)))
+        ));
+
+        let local = format!(
+            "[machines.win]\n[[project_jobs]]\nroot = '{}'\nmachines = ['local', 'win']\n",
+            root.path().display()
+        );
+        let config = Config::layered(&local, "local config").unwrap();
+        assert!(matches!(
+            project
+                .job(&test)
+                .unwrap()
+                .approve(&config, other.path(), None),
+            Err(ProjectError::Config(ConfigError::ProjectNotApproved(_)))
+        ));
+        assert!(matches!(
+            project
+                .job(&bench)
+                .unwrap()
+                .approve(&config, root.path(), None),
+            Err(ProjectError::Config(
+                ConfigError::ProjectMachineDenied { .. }
+            ))
+        ));
+
+        let all = project
+            .job(&test)
+            .unwrap()
+            .approve(&config, root.path(), None)
+            .unwrap()
+            .into_parts();
+        assert_eq!(all.root, std::fs::canonicalize(root.path()).unwrap());
+        let names: Vec<_> = all
+            .targets
+            .into_machines()
+            .into_iter()
+            .map(|machine| machine.name)
+            .collect();
+        assert_eq!(names, ["local".parse().unwrap(), "win".parse().unwrap()]);
+        assert_eq!(all.words.first().unwrap().as_str(), "cargo");
+
+        let win: ProjectSelector = "win".parse().unwrap();
+        let approved = project
+            .job(&test)
+            .unwrap()
+            .approve(&config, root.path(), Some(&win))
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            approved.targets.into_machines().first().unwrap().name,
+            "win".parse().unwrap()
+        );
+        let gpu: ProjectSelector = "gpu".parse().unwrap();
+        assert!(matches!(
+            project
+                .job(&test)
+                .unwrap()
+                .approve(&config, root.path(), Some(&gpu)),
+            Err(ProjectError::Config(
+                ConfigError::ProjectMachineDenied { .. }
+            ))
+        ));
+        "ssh:unlisted".parse::<ProjectSelector>().unwrap_err();
+        "@unknown".parse::<ProjectSelector>().unwrap_err();
+        "win,,local".parse::<ProjectSelector>().unwrap_err();
     }
 
     #[test]

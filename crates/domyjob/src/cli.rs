@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::client::{self, ClientError, Context, Order, Output, Sending, Submitted};
+use crate::client::{self, ClientError, Context, Order, Output, Sending, Submitted, Targets};
 use crate::clock::Timestamp;
 use crate::config::Machine;
 use crate::domain::{EnvName, JobId, JobName, MachineName, RelPath};
@@ -18,15 +18,6 @@ use crate::template::Arg;
 pub(crate) struct CliText(String);
 
 impl CliText {
-    pub(crate) fn into_string(self) -> String {
-        self.0
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ProjectJobText(String);
-
-impl ProjectJobText {
     pub(crate) fn into_string(self) -> String {
         self.0
     }
@@ -372,9 +363,9 @@ struct DoArgs {
     #[arg(
         long,
         value_name = "MACHINES",
-        help = "Run on these machines instead of the job's own"
+        help = "Use these permitted machine names, or @all, instead of the job's own"
     )]
-    on: Option<String>,
+    on: Option<crate::project::ProjectSelector>,
     #[command(flatten)]
     common: Common,
 }
@@ -1164,7 +1155,7 @@ fn on(args: &OnArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let order = Order {
         queue: crate::protocol::Queue::Now,
-        targets: args.targets.clone(),
+        targets: Targets::selector(args.targets.clone()),
         words: user_words(&args.input),
         runner: None,
         rev: None,
@@ -1199,7 +1190,7 @@ fn run(args: &RunArgs) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let order = Order {
         queue: crate::protocol::Queue::Slot,
-        targets: args.targets.clone(),
+        targets: Targets::selector(args.targets.clone()),
         words: user_words(&args.input),
         runner: args.runner.clone(),
         rev: parse_rev(args.rev.as_ref())?,
@@ -1233,39 +1224,20 @@ fn run_named(args: &DoArgs) -> Result<ExitCode, CliError> {
         .ok_or_else(|| {
             ClientError::from(crate::project::ProjectError::NoSuchJob(args.job.clone()))
         })?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(crate::failure::io("resolving", &root))
+        .map_err(ClientError::from)?;
     let project = crate::project::Project::load(&root)
         .map_err(ClientError::from)?
         .ok_or_else(|| {
             ClientError::from(crate::project::ProjectError::NoSuchJob(args.job.clone()))
         })?;
-    let def = project.job(&args.job).map_err(ClientError::from)?;
-    let job_dir = match &def.dir {
-        Some(dir) => root.join(dir),
-        None => root.clone(),
-    };
-
-    let order = Order {
-        queue: crate::protocol::Queue::Slot,
-        targets: args.on.clone().unwrap_or_else(|| def.on.clone()),
-        words: def
-            .run
-            .iter()
-            .map(|w| {
-                Arg::user(&crate::input::UserText::from_project_job_the_user_invoked(
-                    ProjectJobText(w.clone()),
-                ))
-            })
-            .collect(),
-        runner: def.runner.clone(),
-        rev: parse_rev(args.rev.as_ref())?,
-        sending: Sending::Directory,
-        workspace: def.workspace.unwrap_or(Workspace::Warm),
-        start: job_dir,
-        root: Some(root),
-        env: client::env_map(def.env.as_ref())?,
-        shell: None,
-        name: Some(args.job.clone()),
-    };
+    let approved = project
+        .job(&args.job)
+        .map_err(ClientError::from)?
+        .approve(&ctx.config, &root, args.on.as_ref())
+        .map_err(ClientError::from)?;
+    let order = Order::from_project(approved, args.job.clone(), parse_rev(args.rev.as_ref())?);
     follow_through(&ctx, &order, &args.common)
 }
 

@@ -113,7 +113,7 @@ fn fire(ctx: &Context, firing: &Firing<'_>) -> Result<(), ClientError> {
     let prepared = client::prepared(ctx, &root, snapshot, None)?;
     let order = Order {
         queue: crate::protocol::Queue::Slot,
-        targets: rule.on.clone(),
+        targets: client::Targets::selector(rule.on.clone()),
         words: rule.run.iter().map(Arg::config).collect(),
         runner: rule.runner.clone(),
         rev: Some(fired.rev.clone()),
