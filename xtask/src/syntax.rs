@@ -127,6 +127,8 @@ const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 const UNBOUNDED_TEXT_RULE: &str =
     "read text files only through bounded::text_file with an explicit byte budget";
+const UNBOUNDED_FILE_RULE: &str =
+    "read binary files through bounded::file_bytes with an explicit byte budget";
 const EXCLUSIVE_CREATE_RULE: &str =
     "create_new is only for approved exclusive file creation, never a hand-made lock";
 const INCOMING_RULE: &str =
@@ -331,6 +333,13 @@ impl Gate {
                 .filter(|segment| segment.ident == "read_to_string")
         {
             self.flag(segment.ident.span(), UNBOUNDED_TEXT_RULE);
+        }
+        if self.file.starts_with("crates/domyjob/src/")
+            && !self.file_is(&["bounded.rs", "cas.rs", "snapshot.rs"])
+            && path_ends_with(path, &["fs", "read"])
+            && let Some(segment) = path.segments.last()
+        {
+            self.flag(segment.ident.span(), UNBOUNDED_FILE_RULE);
         }
         if !self.file_is(&["bounded.rs"])
             && let Some(segment) = path
@@ -778,6 +787,26 @@ mod tests {
         assert!(check_file(bounded, file).unwrap().is_empty());
         assert!(
             check_file(raw, "crates/domyjob/src/bounded.rs")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn production_binary_file_reads_require_a_byte_budget() {
+        let raw = "fn f() { let _ = std::fs::read(path); }";
+        let bounded = "fn f() { let _ = crate::bounded::file_bytes(path, 1024); }";
+        let file = "crates/domyjob/src/remote.rs";
+        assert_eq!(
+            check_file(raw, file)
+                .unwrap()
+                .first()
+                .map(|finding| finding.rule),
+            Some(UNBOUNDED_FILE_RULE)
+        );
+        assert!(check_file(bounded, file).unwrap().is_empty());
+        assert!(
+            check_file(raw, "crates/domyjob/src/cas.rs")
                 .unwrap()
                 .is_empty()
         );

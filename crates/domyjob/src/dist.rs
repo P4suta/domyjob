@@ -423,7 +423,7 @@ fn fetch_archive(
 }
 
 fn read_text(path: &Path) -> Result<Vec<u8>, DistError> {
-    std::fs::read(path)
+    crate::bounded::file_bytes(path, crate::bounded::SIGNED_METADATA)
         .map_err(io("reading", path))
         .map_err(Into::into)
 }

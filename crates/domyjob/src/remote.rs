@@ -1514,8 +1514,8 @@ impl<'a> Link<'a> {
         binary: &crate::dist::Binary,
         transfer: &TransferId,
     ) -> Result<String, RemoteError> {
-        let bytes =
-            std::fs::read(binary.path()).map_err(crate::failure::io("reading", binary.path()))?;
+        let bytes = crate::bounded::file_bytes(binary.path(), crate::bounded::IN_MEMORY_FILE)
+            .map_err(crate::failure::io("reading", binary.path()))?;
         let payload = match self.family {
             Family::Unix => bytes,
             Family::Windows => base64_lines(&bytes).into_bytes(),
