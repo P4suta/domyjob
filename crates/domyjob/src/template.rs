@@ -248,6 +248,12 @@ approved_word!(
 pub struct Arg(String);
 
 impl Arg {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_test(text: String) -> Self {
+        Self(text)
+    }
+
     #[must_use]
     pub fn literal(text: &'static str) -> Self {
         Self(text.to_owned())

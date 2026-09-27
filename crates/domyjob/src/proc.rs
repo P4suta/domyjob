@@ -508,7 +508,7 @@ mod platform {
         WaitForSingleObject,
     };
 
-    use super::{Next, ProcError};
+    use super::{Next, ProcArg, ProcError};
     use crate::domain::BlobId;
 
     const WATCH: u32 = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;

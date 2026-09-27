@@ -522,3 +522,109 @@ pub fn push_arg(command: &mut std::process::Command, word: &str, cmd: bool) {
 pub fn push_arg(command: &mut std::process::Command, word: &str, _cmd: bool) {
     command.arg(word);
 }
+
+#[cfg(all(test, windows))]
+mod windows_source_build_tests {
+    use std::io::Write as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Output, Stdio};
+
+    use crate::template::Arg;
+
+    fn absent(path: &Path) -> bool {
+        matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup failures should fail the test immediately"
+    )]
+    fn run_build(main: &str) -> (tempfile::TempDir, PathBuf, Output) {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".cache").join("domyjob");
+        let artifact = cache.join("build/release/domyjob.exe");
+        crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
+        crate::state_file::write_bytes(
+            &cache.join("build/CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
+
+        let mut archive = tar::Builder::new(Vec::new());
+        for (name, contents) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"domyjob\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "Cargo.lock",
+                "version = 4\n\n[[package]]\nname = \"domyjob\"\nversion = \"0.0.0\"\n",
+            ),
+            ("src/main.rs", main),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len().try_into().unwrap());
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, contents.as_bytes())
+                .unwrap();
+        }
+        let source = crate::remote::base64_lines(&archive.into_inner().unwrap());
+        let script = crate::remote::windows_source_build_for_test(&cache);
+        let mut child =
+            crate::spawn::Invocation::new(Arg::literal("cmd"), vec![Arg::literal("/c"), script])
+                .command()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        (temp, cache, output)
+    }
+
+    #[test]
+    fn failed_source_build_cannot_stage_an_old_executable() {
+        let (_temp, cache, output) = run_build("compile_error!(\"build must fail\");\n");
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{errors}");
+        assert!(errors.contains("build must fail"), "{errors}");
+        assert!(absent(&cache.join("build/release/domyjob.exe")));
+        assert!(absent(
+            &cache
+                .join("bin")
+                .join(crate::protocol::build_key())
+                .join("domyjob.incoming.exe")
+        ));
+    }
+
+    #[test]
+    fn successful_source_build_replaces_the_old_executable_and_cleans_source() {
+        let (_temp, cache, output) = run_build("fn main() {}\n");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let staged = cache
+            .join("bin")
+            .join(crate::protocol::build_key())
+            .join("domyjob.incoming.exe");
+        assert!(std::fs::metadata(staged).unwrap().len() > 1000);
+        assert!(std::fs::read_dir(cache).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("source-")
+        }));
+    }
+}

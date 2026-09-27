@@ -395,7 +395,7 @@ fn build_unix() -> Arg {
         "tar -x -m -C \"$s\"; cd \"$s\"; ",
         "MISE_TRUSTED_CONFIG_PATHS=\"$s\"; export MISE_TRUSTED_CONFIG_PATHS; ",
         "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null' EXIT; ",
-        "cargo clean -p domyjob --target-dir \"$c/build\" >&2; ",
+        "cargo clean -p domyjob --target-dir \"$c/build\" >&2; rm -f \"$c/build/release/domyjob\"; ",
         "DOMYJOB_EXPECTED_BUILD_STAMP=",
         crate::protocol::BUILD_STAMP,
         " cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
@@ -417,32 +417,50 @@ fn build_windows_script() -> Arg {
         ".b64'; $t = \"$s.tar\"; ",
         "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String(((Get-Content -Raw $b) -replace '\\s', ''))); Remove-Item -Force $b; ",
         "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
-        "$env:MISE_TRUSTED_CONFIG_PATHS = $s; ",
-        "$clean = Start-Process cargo -ArgumentList 'clean','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -Wait -PassThru; ",
-        "if ($clean.ExitCode) { exit $clean.ExitCode }; ",
+        "Set-Location $s; $env:MISE_TRUSTED_CONFIG_PATHS = $s; ",
+        "& cargo clean -p domyjob --target-dir (Join-Path $c 'build'); if ($LASTEXITCODE -ne 0) { throw 'cargo clean failed' }; ",
+        "$exe = Join-Path $c 'build\\release\\domyjob.exe'; if (Test-Path $exe) { Remove-Item -Force $exe }; ",
         "$env:DOMYJOB_EXPECTED_BUILD_STAMP = '",
         crate::protocol::BUILD_STAMP,
         "'; ",
-        "$cargo = Start-Process cargo -ArgumentList 'build','--release','--locked','-p','domyjob','--target-dir',(Join-Path $c 'build') -WorkingDirectory $s -NoNewWindow -PassThru; ",
-        "while (-not $cargo.WaitForExit(5000)) { [Console]::Error.Write('.') }; $built = $cargo.ExitCode; ",
-        "if ($built) { exit $built }; ",
+        "$job = Start-Job -ArgumentList $s,(Join-Path $c 'build'),$env:DOMYJOB_EXPECTED_BUILD_STAMP -ScriptBlock { param($source,$target,$expected) Set-Location $source; $env:MISE_TRUSTED_CONFIG_PATHS = $source; $env:DOMYJOB_EXPECTED_BUILD_STAMP = $expected; & cargo build --release --locked -p domyjob --target-dir $target; if ($LASTEXITCODE -ne 0) { throw \"cargo build exited with $LASTEXITCODE\" } }; ",
+        "while ($job.State -eq 'NotStarted' -or $job.State -eq 'Running') { Wait-Job $job -Timeout 5 | Out-Null; [Console]::Error.Write('.') }; ",
+        "Receive-Job $job -ErrorAction Continue | ForEach-Object { [Console]::Error.WriteLine($_) }; ",
+        "if ($job.State -ne 'Completed') { throw 'cargo build failed' }; Remove-Job $job; ",
+        "if (-not (Test-Path $exe)) { throw 'cargo build produced no domyjob.exe' }; ",
         "$d = Join-Path $c 'bin\\",
         build_key(),
         "'; New-Item -ItemType Directory -Force $d | Out-Null; ",
-        "Copy-Item -Force (Join-Path $c 'build\\release\\domyjob.exe') (Join-Path $d 'domyjob.incoming.exe'); ",
-        "Remove-Item -Recurse -Force $s, $t",
+        "Copy-Item -Force $exe (Join-Path $d 'domyjob.incoming.exe'); ",
+        "Set-Location $c; Remove-Item -Recurse -Force $s, $t",
     ])
 }
 
 fn build_windows() -> Arg {
+    build_windows_with(&build_windows_script())
+}
+
+fn build_windows_with(script: &Arg) -> Arg {
     Arg::concat(&[
         Arg::joined(&[
             "findstr . > %TEMP%\\domyjob-source-",
             session(),
             ".b64 && powershell -NoProfile -NonInteractive -InputFormat None -EncodedCommand ",
         ]),
-        Arg::powershell_encoded(&build_windows_script()),
+        Arg::powershell_encoded(script),
     ])
+}
+
+#[cfg(test)]
+pub(crate) fn windows_source_build_for_test(cache: &std::path::Path) -> Arg {
+    let original = build_windows_script().into_string();
+    let assignment = "$c = Join-Path $env:USERPROFILE '.cache\\domyjob';";
+    assert!(original.contains(assignment));
+    let assigned = format!(
+        "$c = {};",
+        crate::shell::powershell_quote(&cache.display().to_string())
+    );
+    build_windows_with(&Arg::for_test(original.replacen(assignment, &assigned, 1)))
 }
 
 const PROBE_WINDOWS: &str = "[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture";
@@ -1743,16 +1761,34 @@ mod tests {
         );
         assert!(text(Remote::Install(Family::Windows)).starts_with("cmd /c \"mkdir %USERPROFILE%"));
         assert!(text(Remote::Install(Family::Windows)).contains("domyjob.incoming.exe"));
-        assert!(text(Remote::Build(Family::Unix)).contains(&format!(
+        assert!(
+            text(Remote::Promote(Family::Windows)).contains("move /y domyjob.exe domyjob.old-")
+        );
+        assert!(text(Remote::Staged(Family::Unix)).contains("domyjob.incoming"));
+        assert!(text(Remote::WindowsArch).contains("-InputFormat None -EncodedCommand"));
+        assert_eq!(base64_lines(&[0u8; 60]).lines().count(), 2);
+    }
+
+    #[test]
+    fn source_build_scripts_require_a_fresh_artifact() {
+        let unix = Remote::Build(Family::Unix).text();
+        let text = unix.as_arg_str();
+        assert!(
+            windows_source_build_for_test(std::path::Path::new("build-fixture"))
+                .as_arg_str()
+                .contains("findstr . > %TEMP%")
+        );
+        assert!(text.contains(&format!(
             "DOMYJOB_EXPECTED_BUILD_STAMP={}",
             crate::protocol::BUILD_STAMP
         )));
-        assert!(text(Remote::Build(Family::Unix)).contains("cargo clean -p domyjob"));
-        assert!(text(Remote::Build(Family::Unix)).contains("MISE_TRUSTED_CONFIG_PATHS=\"$s\""));
+        assert!(text.contains("cargo clean -p domyjob"));
+        assert!(text.contains("rm -f \"$c/build/release/domyjob\""));
+        assert!(text.contains("MISE_TRUSTED_CONFIG_PATHS=\"$s\""));
         assert!(
             build_windows_script()
                 .as_arg_str()
-                .contains("'clean','-p','domyjob'")
+                .contains("& cargo clean -p domyjob")
         );
         assert!(
             build_windows_script()
@@ -1764,10 +1800,14 @@ mod tests {
             crate::protocol::BUILD_STAMP
         )));
         assert!(
-            text(Remote::Promote(Family::Windows)).contains("move /y domyjob.exe domyjob.old-")
+            build_windows_script()
+                .as_arg_str()
+                .contains("$job.State -ne 'Completed'")
         );
-        assert!(text(Remote::Staged(Family::Unix)).contains("domyjob.incoming"));
-        assert!(text(Remote::WindowsArch).contains("-InputFormat None -EncodedCommand"));
-        assert_eq!(base64_lines(&[0u8; 60]).lines().count(), 2);
+        assert!(
+            build_windows_script()
+                .as_arg_str()
+                .contains("Remove-Item -Force $exe")
+        );
     }
 }
