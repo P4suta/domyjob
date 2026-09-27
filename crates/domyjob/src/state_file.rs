@@ -51,6 +51,16 @@ fn check_private_file(path: &Path, file: &std::fs::File) -> Result<(), StateErro
     check_owner_only(path, &meta)
 }
 
+fn classify_open_error(path: &Path, error: std::io::Error) -> StateError {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        StateError::NotFile {
+            path: path.to_path_buf(),
+        }
+    } else {
+        StateError::Io(io("opening", path)(error))
+    }
+}
+
 fn create_private_dir(path: &Path) -> Result<(), StateError> {
     crate::platform::create_private_dir(path)
         .map_err(io("securing", path))
@@ -80,7 +90,7 @@ pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
     let mut file = match private_options().read(true).open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(io("opening", path)(e).into()),
+        Err(e) => return Err(classify_open_error(path, e)),
     };
     check_private_file(path, &file)?;
     let mut bytes = Vec::new();
@@ -136,7 +146,7 @@ pub fn open_append(path: &Path) -> Result<std::fs::File, StateError> {
         .append(true)
         .create(true)
         .open(path)
-        .map_err(io("opening", path))?;
+        .map_err(|error| classify_open_error(path, error))?;
     check_private_file(path, &file)?;
     Ok(file)
 }
@@ -147,7 +157,7 @@ pub fn overwrite_in_place(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     let mut file = private_options()
         .write(true)
         .open(path)
-        .map_err(io("opening", path))?;
+        .map_err(|error| classify_open_error(path, error))?;
     check_private_file(path, &file)?;
     file.write_all(bytes).map_err(io("writing", path))?;
     file.sync_all()
@@ -160,7 +170,7 @@ pub fn cut_to(path: &Path, len: u64) -> Result<(), StateError> {
     let file = private_options()
         .write(true)
         .open(path)
-        .map_err(io("opening", path))?;
+        .map_err(|error| classify_open_error(path, error))?;
     check_private_file(path, &file)?;
     file.set_len(len).map_err(io("cutting", path))?;
     file.sync_all()
@@ -177,7 +187,7 @@ pub fn open_lock(path: &Path) -> Result<std::fs::File, StateError> {
         .create(true)
         .truncate(false)
         .open(path)
-        .map_err(io("opening", path))?;
+        .map_err(|error| classify_open_error(path, error))?;
     check_private_file(path, &file)?;
     Ok(file)
 }
@@ -190,7 +200,7 @@ pub fn open_existing_lock(path: &Path) -> Result<Option<std::fs::File>, StateErr
             Ok(Some(file))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io("opening", path)(error).into()),
+        Err(error) => Err(classify_open_error(path, error)),
     }
 }
 
@@ -418,5 +428,13 @@ mod tests {
         overwrite_in_place(&alias, b"changed").unwrap_err();
         cut_to(&alias, 0).unwrap_err();
         assert_eq!(read_bytes(&target).unwrap(), Some(b"safe".to_vec()));
+    }
+
+    #[test]
+    fn a_directory_as_a_state_file_has_the_same_error_on_each_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join("directory");
+        private_dir(&path).unwrap();
+        assert!(matches!(read_bytes(&path), Err(StateError::NotFile { .. })));
     }
 }
