@@ -8,7 +8,7 @@ The implementation status of the seven overarching laws is recorded in [laws.md]
 | Class | What made it writable | Required mechanism | Required check |
 | --- | --- | --- | --- |
 | RC-A. Trust decided by plain values | `bool` for "paired", `Option` for "has checksum", `Option<psk>` choosing a Noise pattern, pinning as a separate step | Proof types with private constructors: `Verified<T>`, `Authorized<R>`, `Channel` returned only after the peer matched an `Expect` | Rust privacy; handlers accept only the proof type |
-| RC-B. Unbounded resources | `read_line`, `read_to_end`, `thread::spawn` per accept | Bounded readers with a byte budget, and a connection `Permit` counted overall and per source address | `clippy.toml` disallows the unbounded std calls outside `bounded.rs` |
+| RC-B. Unbounded resources | `read_line`, `read_to_end`, `read_to_string`, `thread::spawn` per accept | Bounded readers and text file loads with an explicit byte budget, and a connection `Permit` counted overall and per source address | The syntax gate rejects unbounded stream and production text file reads outside `bounded.rs`; tests exercise the size boundary |
 | RC-C. Ambiguous stream end | Raw EOF and an authenticated close meant the same thing | `Frame::{Data, Close}` inside the ciphertext and a reader state machine `Open, Closed` | Exhaustive match on the frame enum |
 | RC-D. Secrets in ordinary types | `Vec<u8>` secret with derived `Debug` and `Clone` | `Secret<T>`: no `Clone`, redacted `Debug`, zeroized on drop | The gate refuses `Debug`/`Clone` derives on types holding `Secret` |
 | RC-E. State files written ad hoc | `fs::write` with default permissions, read-modify-write races | One `StateFile<T>`: owner-only directory and file, permission check on read, atomic replace, a lock around updates | `clippy.toml` disallows `fs::write`, `fs::read`, `File::create` outside `state_file.rs` |
@@ -39,7 +39,7 @@ So the crate also denies `clippy::wildcard_enum_match_arm`, `clippy::match_wildc
 
 ## Known open classes
 
-RC-B remains open because the syntax gate covers direct `read_to_end` and `read_line` calls but not every allocating read or per-request thread spawn; the content store and some transport paths still need end-to-end limits or streaming.
+RC-B remains open because the syntax gate covers direct `read_to_end`, `read_line`, and production `read_to_string` calls but not every allocating read or per-request thread spawn; the content store and some transport paths still need end-to-end limits or streaming.
 RC-E remains open because the state layer exposes functions rather than the required `StateFile<T>` capability.
 RC-F and RC-L remain open because source-specific argument types cover only some flows; wire and repository values do not yet carry a general provenance label, and `Arg::path` still accepts an ordinary `Path`.
 RC-K remains open because the code does not yet have distinct `LocalPolicy` and `RepositoryRequest` types.

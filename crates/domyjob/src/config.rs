@@ -48,6 +48,8 @@ pub enum ConfigError {
         origin: String,
         source: Box<toml::de::Error>,
     },
+    #[error("{origin} exceeds its {limit}-byte config budget")]
+    TooLarge { origin: String, limit: u64 },
     #[error("{kind} {name}: {source}")]
     Template {
         kind: &'static str,
@@ -433,6 +435,12 @@ pub fn path(dirs: &crate::paths::Dirs) -> PathBuf {
 }
 
 fn parse(text: &str, origin: &str) -> Result<Config, ConfigError> {
+    if crate::domain::len_u64(text.len()) > crate::bounded::CONFIG_TEXT {
+        return Err(ConfigError::TooLarge {
+            origin: origin.to_owned(),
+            limit: crate::bounded::CONFIG_TEXT,
+        });
+    }
     crate::ingress::toml::<File>(text)
         .map(File::into_config)
         .map_err(|source| ConfigError::Parse {
@@ -449,7 +457,7 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        match std::fs::read_to_string(path) {
+        match crate::bounded::text_file(path, crate::bounded::CONFIG_TEXT) {
             Ok(text) => Self::layered(&text, &path.display().to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::builtin(),
             Err(source) => Err(crate::failure::io("reading", path)(source).into()),
@@ -814,7 +822,7 @@ fn edit(
     path: &Path,
     change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), ConfigError>,
 ) -> Result<(), ConfigError> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match crate::bounded::text_file(path, crate::bounded::CONFIG_TEXT) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => return Err(crate::failure::io("reading", path)(source).into()),
@@ -1114,5 +1122,18 @@ everything = ["@heavy", "pod"]
             Config::layered(&trigger(&"*".repeat(1025)), "oversized"),
             Err(ConfigError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn oversized_config_is_rejected_before_parsing_or_editing() {
+        let huge = " ".repeat(4_194_305);
+        assert!(matches!(
+            Config::layered(&huge, "oversized"),
+            Err(ConfigError::TooLarge { .. })
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, huge).unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::Io(_))));
     }
 }

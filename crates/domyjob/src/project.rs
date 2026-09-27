@@ -17,6 +17,8 @@ pub enum ProjectError {
         origin: String,
         source: Box<toml::de::Error>,
     },
+    #[error("{origin} exceeds its {limit}-byte project config budget")]
+    TooLarge { origin: String, limit: u64 },
     #[error("no job named {0} in {FILE}")]
     NoSuchJob(JobName),
     #[error("{0} exists but is not a file")]
@@ -47,6 +49,12 @@ pub struct Project {
 
 impl Project {
     pub fn parse(text: &str, origin: &str) -> Result<Self, ProjectError> {
+        if crate::domain::len_u64(text.len()) > crate::bounded::CONFIG_TEXT {
+            return Err(ProjectError::TooLarge {
+                origin: origin.to_owned(),
+                limit: crate::bounded::CONFIG_TEXT,
+            });
+        }
         let file: File = crate::ingress::toml(text).map_err(|source| ProjectError::Parse {
             origin: origin.to_owned(),
             source: Box::new(source),
@@ -58,7 +66,7 @@ impl Project {
 
     pub fn load(root: &Path) -> Result<Option<Self>, ProjectError> {
         let path = root.join(FILE);
-        match std::fs::read_to_string(&path) {
+        match crate::bounded::text_file(&path, crate::bounded::CONFIG_TEXT) {
             Ok(text) => Self::parse(&text, &path.display().to_string()).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(crate::failure::io("reading", &path)(source).into()),
@@ -136,5 +144,20 @@ workspace = "fresh"
         }
         crate::state_file::private_dir(&marker).unwrap();
         assert!(matches!(find_root(&child), Err(ProjectError::NotFile(_))));
+    }
+
+    #[test]
+    fn oversized_project_config_is_rejected_before_parsing() {
+        let huge = " ".repeat(4_194_305);
+        assert!(matches!(
+            Project::parse(&huge, "oversized"),
+            Err(ProjectError::TooLarge { .. })
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        crate::user_files::write(&dir.path().join(FILE), huge.as_bytes()).unwrap();
+        assert!(matches!(
+            Project::load(dir.path()),
+            Err(ProjectError::Io(_))
+        ));
     }
 }

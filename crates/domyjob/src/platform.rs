@@ -53,7 +53,10 @@ pub const fn boot_identity() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn boot_identity_on_this_system() -> Option<String> {
-    let Ok(identity) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+    let Ok(identity) = crate::bounded::text_file(
+        std::path::Path::new("/proc/sys/kernel/random/boot_id"),
+        crate::bounded::BOOT_ID,
+    ) else {
         return None;
     };
     let identity = identity.trim().to_owned();

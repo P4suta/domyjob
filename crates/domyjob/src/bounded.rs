@@ -1,4 +1,5 @@
 use std::io::{BufRead, ErrorKind, Read};
+use std::path::Path;
 
 pub const REQUEST_LINE: u64 = 1 << 20;
 pub const REPLY_LINE: u64 = 64 << 20;
@@ -8,6 +9,8 @@ pub const TAIL_WINDOW: u64 = 4 << 20;
 pub const IN_MEMORY_FILE: u64 = 64 << 20;
 pub const CAPTURE: u64 = 4 << 20;
 pub const CONTROL_LINE: u64 = 1024;
+pub const CONFIG_TEXT: u64 = 4 << 20;
+pub const BOOT_ID: u64 = 128;
 
 fn too_long(limit: u64) -> std::io::Error {
     std::io::Error::new(
@@ -23,6 +26,12 @@ pub fn to_end(reader: &mut dyn Read, limit: u64) -> std::io::Result<Vec<u8>> {
         return Err(too_long(limit));
     }
     Ok(out)
+}
+
+pub fn text_file(path: &Path, limit: u64) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let bytes = to_end(&mut file, limit)?;
+    String::from_utf8(bytes).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
 }
 
 pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -148,6 +157,27 @@ mod tests {
         assert_eq!(
             to_end(&mut long, 4).unwrap_err().kind(),
             ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn text_files_refuse_excess_bytes_and_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::user_files::write(&path, b"abc").unwrap();
+        assert_eq!(text_file(&path, 3).unwrap(), "abc");
+        assert_eq!(
+            text_file(&path, 2).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        crate::user_files::write(&path, &[0xff]).unwrap();
+        assert_eq!(
+            text_file(&path, 2).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        assert_eq!(
+            text_file(&dir.path().join("absent"), 2).unwrap_err().kind(),
+            ErrorKind::NotFound
         );
     }
 }
