@@ -105,6 +105,21 @@ struct AuthorizedDirectory {
 struct PermittedRun {
     directory: AuthorizedDirectory,
     runner: AuthorizedRunner,
+    machines: String,
+    words: Vec<crate::input::UserText>,
+    rev: Option<crate::domain::Revision>,
+    wait: bool,
+    workspace: Workspace,
+    name: Option<crate::domain::JobName>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AgentText(String);
+
+impl AgentText {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
 }
 
 #[derive(Debug)]
@@ -151,7 +166,7 @@ fn authorized_directory(
     Err(ToolError::Directory(shown.to_owned()))
 }
 
-fn permitted(ctx: &Context, args: &RunArgs) -> Result<PermittedRun, ToolError> {
+fn permitted(ctx: &Context, args: RunArgs) -> Result<PermittedRun, ToolError> {
     let policy = &ctx.config.mcp;
     let allowed: Vec<crate::domain::MachineName> = if policy.machines.is_empty() {
         Vec::new()
@@ -168,7 +183,31 @@ fn permitted(ctx: &Context, args: &RunArgs) -> Result<PermittedRun, ToolError> {
     }
     let directory = authorized_directory(policy, Path::new(&args.directory), &args.directory)?;
     let runner = authorized_runner(policy, args.runner.as_deref(), args.command.len())?;
-    Ok(PermittedRun { directory, runner })
+    let rev = match &args.rev {
+        Some(text) => Some(
+            text.parse::<crate::domain::Revision>()
+                .map_err(|_bad| ToolError::Revision(text.clone()))?,
+        ),
+        None => None,
+    };
+    Ok(PermittedRun {
+        directory,
+        runner,
+        machines: args.machines,
+        words: args
+            .command
+            .into_iter()
+            .map(|word| crate::input::UserText::from_agent(AgentText(word)))
+            .collect(),
+        rev,
+        wait: args.wait == Some(true),
+        workspace: if args.fresh == Some(true) {
+            Workspace::Fresh
+        } else {
+            Workspace::Warm
+        },
+        name: args.name,
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -445,39 +484,33 @@ fn ran(ctx: &Context, item: &client::Submitted, waiting: bool) -> Value {
     }
 }
 
-fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
-    let permitted = permitted(ctx, &args)?;
-    let rev = match &args.rev {
-        Some(text) => Some(
-            text.parse::<crate::domain::Revision>()
-                .map_err(|_bad| ToolError::Revision(text.clone()))?,
-        ),
-        None => None,
-    };
+fn run(ctx: &Context, permitted: PermittedRun) -> Result<Value, ToolError> {
+    let PermittedRun {
+        directory,
+        runner,
+        machines,
+        words,
+        rev,
+        wait,
+        workspace,
+        name,
+    } = permitted;
     let order = Order {
         queue: crate::protocol::Queue::Slot,
-        targets: args.machines,
-        words: args
-            .command
-            .into_iter()
-            .map(|w| Arg::user(&crate::input::UserText::from_agent(w)))
-            .collect(),
-        runner: Some(permitted.runner.0),
+        targets: machines,
+        words: words.iter().map(Arg::user).collect(),
+        runner: Some(runner.0),
         rev,
         sending: Sending::Directory,
-        workspace: if args.fresh == Some(true) {
-            Workspace::Fresh
-        } else {
-            Workspace::Warm
-        },
-        start: permitted.directory.path,
+        workspace,
+        start: directory.path,
         root: None,
         env: std::collections::BTreeMap::new(),
         shell: None,
-        name: args.name,
+        name,
     };
     let (submitted, rejected) = client::submit(ctx, &order, &client::quietly)?;
-    let waiting = args.wait == Some(true);
+    let waiting = wait;
     let jobs: Vec<Value> = std::thread::scope(|scope| {
         #[expect(
             clippy::needless_collect,
@@ -544,7 +577,7 @@ fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError
         return Err(ToolError::NotAllowed(tool_name(tool)));
     }
     match tool {
-        McpTool::Run => run(ctx, parse(arguments)?),
+        McpTool::Run => run(ctx, permitted(ctx, parse(arguments)?)?),
         McpTool::ListJobs => list_jobs(ctx, &parse(arguments)?),
         McpTool::JobStatus => {
             let args: JobArgs = parse(arguments)?;

@@ -14,6 +14,24 @@ use crate::paths::Dirs;
 use crate::protocol::{Job, Phase, Request, Workspace};
 use crate::template::Arg;
 
+#[derive(Debug)]
+pub(crate) struct CliText(String);
+
+impl CliText {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ProjectJobText(String);
+
+impl ProjectJobText {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "domyjob",
@@ -1118,7 +1136,7 @@ fn parse_rev(rev: Option<&String>) -> Result<Option<crate::domain::Revision>, Cl
 fn user_words(words: &[String]) -> Vec<Arg> {
     words
         .iter()
-        .map(|w| Arg::user(&crate::input::UserText::from_cli(w.clone())))
+        .map(|w| Arg::user(&crate::input::UserText::from_cli(CliText(w.clone()))))
         .collect()
 }
 
@@ -1133,7 +1151,7 @@ fn notify_targets(ctx: &Context, user: &[String]) -> Vec<NotifyTarget> {
             .collect()
     } else {
         user.iter()
-            .map(|t| NotifyTarget::from_user(&crate::input::UserText::from_cli(t.clone())))
+            .map(|t| NotifyTarget::from_user(&crate::input::UserText::from_cli(CliText(t.clone()))))
             .collect()
     }
 }
@@ -1234,7 +1252,7 @@ fn run_named(args: &DoArgs) -> Result<ExitCode, CliError> {
             .iter()
             .map(|w| {
                 Arg::user(&crate::input::UserText::from_project_job_the_user_invoked(
-                    w.clone(),
+                    ProjectJobText(w.clone()),
                 ))
             })
             .collect(),
@@ -1377,7 +1395,9 @@ fn spawn_watch(submitted: &[Submitted], notify: &[String]) -> Result<(), CliErro
     }
     for target in notify {
         args.push(Arg::literal("--notify"));
-        args.push(Arg::user(&crate::input::UserText::from_cli(target.clone())));
+        args.push(Arg::user(&crate::input::UserText::from_cli(CliText(
+            target.clone(),
+        ))));
     }
     for item in submitted {
         args.push(Arg::concat(&[
@@ -2708,7 +2728,7 @@ fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
         crate::serve::Exposure::parse(&expose).map_err(ClientError::from)?;
         let serve_args = vec![
             Arg::literal("--expose"),
-            Arg::user(&crate::input::UserText::from_cli(expose)),
+            Arg::user(&crate::input::UserText::from_cli(CliText(expose))),
             Arg::literal("--port"),
             Arg::number(u64::from(args.port)),
         ];

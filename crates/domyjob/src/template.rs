@@ -204,9 +204,45 @@ impl fmt::Display for Argv {
     }
 }
 
-pub trait SafeWord {
+mod approved_word {
+    pub(super) trait Sealed {}
+}
+
+#[expect(
+    private_bounds,
+    reason = "only the listed domain types can become process words"
+)]
+pub trait SafeWord: approved_word::Sealed {
     fn safe_word(&self) -> &str;
 }
+
+macro_rules! approved_word {
+    ($($name:ident),* $(,)?) => {
+        $(
+            impl approved_word::Sealed for crate::domain::$name {}
+
+            impl SafeWord for crate::domain::$name {
+                fn safe_word(&self) -> &str {
+                    self.as_str()
+                }
+            }
+        )*
+    };
+}
+
+approved_word!(
+    WindowsSid,
+    JobId,
+    BlobId,
+    Nonce,
+    ProjectKey,
+    MachineName,
+    RelPath,
+    TargetTriple,
+    CommitId,
+    Revision,
+    Host,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg(String);
@@ -306,8 +342,18 @@ impl Arg {
     }
 
     #[must_use]
-    pub(crate) const fn authorized_job_text(text: String) -> Self {
-        Self(text)
+    pub(crate) fn shell_text(text: shell::ShellArg) -> Self {
+        Self(text.into_string())
+    }
+
+    #[must_use]
+    pub fn process_text(text: crate::proc::ProcArg) -> Self {
+        Self(text.into_string())
+    }
+
+    #[must_use]
+    pub(crate) fn service_text(text: crate::service::ServiceArg) -> Self {
+        Self(text.into_string())
     }
 }
 

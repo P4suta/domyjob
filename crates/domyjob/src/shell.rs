@@ -1,5 +1,14 @@
 use crate::protocol::Command;
 
+#[derive(Debug)]
+pub(crate) struct ShellArg(String);
+
+impl ShellArg {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Posix,
@@ -151,11 +160,11 @@ pub fn process(command: &Command, shell: Option<&str>) -> crate::spawn::Invocati
     let shell = shell.map_or_else(default_shell, str::to_owned);
     let kind = kind_of(&shell);
     let body = script(command, kind);
-    let text = Arg::authorized_job_text(match kind {
+    let text = Arg::shell_text(ShellArg(match kind {
         Kind::PowerShell => format!("{POWERSHELL_PLAIN_OUTPUT}{body}"),
         Kind::Posix | Kind::Cmd => body,
-    });
-    let program = Arg::authorized_job_text(shell);
+    }));
+    let program = Arg::shell_text(ShellArg(shell));
     let args = match kind {
         Kind::Posix => vec![Arg::literal("-lc"), text],
         Kind::PowerShell => vec![

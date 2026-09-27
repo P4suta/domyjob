@@ -248,30 +248,6 @@ text_newtype!(
     JobName
 );
 
-macro_rules! safe_word {
-    ($($name:ident),*) => {
-        $(impl crate::template::SafeWord for $name {
-            fn safe_word(&self) -> &str {
-                &self.0
-            }
-        })*
-    };
-}
-
-safe_word!(
-    WindowsSid,
-    JobId,
-    BlobId,
-    Nonce,
-    ProjectKey,
-    MachineName,
-    RelPath,
-    TargetTriple,
-    CommitId,
-    Revision,
-    Host
-);
-
 impl Nonce {
     pub fn generate() -> Result<Self, Invalid> {
         let mut random = [0u8; 16];

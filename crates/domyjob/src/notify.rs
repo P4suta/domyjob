@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn an_ntfy_target_is_a_topic_on_ntfy_sh() {
         let config = Config::layered("", "t").unwrap();
-        let target = NotifyTarget::from_user(&crate::input::UserText::from_cli(
+        let target = NotifyTarget::from_user(&crate::input::UserText::for_test(
             "ntfy:my-topic".to_owned(),
         ));
         let shown = invocation_for(&config, &target).unwrap().display();
@@ -291,7 +291,7 @@ mod tests {
         .unwrap();
         let machine: MachineName = "box".parse().unwrap();
         let target = |name: &str| {
-            NotifyTarget::from_user(&crate::input::UserText::from_cli(name.to_owned()))
+            NotifyTarget::from_user(&crate::input::UserText::for_test(name.to_owned()))
         };
         send(
             &config,

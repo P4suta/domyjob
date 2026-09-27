@@ -1560,7 +1560,7 @@ mod tests {
             targets: "local".into(),
             words: words
                 .iter()
-                .map(|w| Arg::user(&crate::input::UserText::from_cli((*w).to_owned())))
+                .map(|w| Arg::user(&crate::input::UserText::for_test((*w).to_owned())))
                 .collect(),
             runner: runner.map(str::to_owned),
             rev: None,

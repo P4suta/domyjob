@@ -2,6 +2,15 @@ use std::io::{PipeReader, PipeWriter, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
+#[derive(Debug)]
+pub struct ProcArg(String);
+
+impl ProcArg {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProcError {
     #[error("starting {what}: {source}")]
@@ -659,16 +668,16 @@ mod platform {
             line.push_str(&crate::shell::msvc_quote(arg.as_arg_str()));
         }
         let dir = match invocation.dir() {
-            Some(dir) => {
-                Arg::authorized_job_text(crate::shell::powershell_quote(&dir.display().to_string()))
-            }
+            Some(dir) => Arg::process_text(ProcArg(crate::shell::powershell_quote(
+                &dir.display().to_string(),
+            ))),
             None => Arg::literal("$null"),
         };
         let script = Arg::concat(&[
             Arg::literal(
                 "$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{CreateFlags=[uint32]4}; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=",
             ),
-            Arg::authorized_job_text(crate::shell::powershell_quote(&line)),
+            Arg::process_text(ProcArg(crate::shell::powershell_quote(&line))),
             Arg::literal("; CurrentDirectory="),
             dir,
             Arg::literal(

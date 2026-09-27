@@ -8,7 +8,8 @@ Each one names the property it guarantees, the mechanism that guarantees it, and
 These are design targets, not a claim that every mechanism and check below is implemented.
 The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, `workspace.rs`, `mcp.rs`, and `node.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
-The syntax gate currently limits raw `Arg::authorized_job_text` assembly to `shell.rs`, `proc.rs`, and `service.rs`.
+The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types.
+CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
 
 ## 1. No ambient authority
 

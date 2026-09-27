@@ -3,6 +3,15 @@ use std::path::{Path, PathBuf};
 use crate::paths::Dirs;
 use crate::template::{Arg, Argv, Bindings, Text};
 
+#[derive(Debug)]
+pub(crate) struct ServiceArg(String);
+
+impl ServiceArg {
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -59,14 +68,17 @@ fn bindings(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Bindings {
         .with("exe", Arg::path(exe))
         .with(
             "exe_xml",
-            Arg::authorized_job_text(xml(&exe.display().to_string())),
+            Arg::service_text(ServiceArg(xml(&exe.display().to_string()))),
         )
         .with("arguments", Arg::spaced(args))
-        .with("plist_arguments", Arg::authorized_job_text(plist_arguments))
+        .with(
+            "plist_arguments",
+            Arg::service_text(ServiceArg(plist_arguments)),
+        )
         .with("log", Arg::path(&log))
         .with(
             "log_xml",
-            Arg::authorized_job_text(xml(&log.display().to_string())),
+            Arg::service_text(ServiceArg(xml(&log.display().to_string()))),
         )
         .with(
             "uid",

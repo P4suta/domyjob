@@ -3,8 +3,8 @@ pub struct UserText(String);
 
 impl UserText {
     #[must_use]
-    pub const fn from_cli(text: String) -> Self {
-        Self(text)
+    pub(crate) fn from_cli(text: crate::cli::CliText) -> Self {
+        Self(text.into_string())
     }
 
     #[must_use]
@@ -15,12 +15,18 @@ impl UserText {
 
 impl UserText {
     #[must_use]
-    pub const fn from_agent(text: String) -> Self {
-        Self(text)
+    pub(crate) fn from_agent(text: crate::mcp::AgentText) -> Self {
+        Self(text.into_string())
     }
 
     #[must_use]
-    pub const fn from_project_job_the_user_invoked(text: String) -> Self {
+    pub(crate) fn from_project_job_the_user_invoked(text: crate::cli::ProjectJobText) -> Self {
+        Self(text.into_string())
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn for_test(text: String) -> Self {
         Self(text)
     }
 

@@ -90,26 +90,6 @@ const RESTRICTIONS: &[Restriction] = &[
         rule: "decode input only in ingress.rs, into a type that implements Ingress",
     },
     Restriction {
-        path: &["UserText", "from_cli"],
-        allowed_in: &["cli.rs"],
-        rule: "only the command line may declare text as the user's",
-    },
-    Restriction {
-        path: &["UserText", "from_agent"],
-        allowed_in: &["mcp.rs"],
-        rule: "only the MCP server may declare text as the agent's",
-    },
-    Restriction {
-        path: &["UserText", "from_project_job_the_user_invoked"],
-        allowed_in: &["cli.rs"],
-        rule: "only `domyjob do` may run a project file's command",
-    },
-    Restriction {
-        path: &["authorized_job_text"],
-        allowed_in: &["shell.rs", "proc.rs", "service.rs"],
-        rule: "only the shell, supervisor, and service modules may assemble text into an argument",
-    },
-    Restriction {
         path: &["InsecureUnsigned", "acknowledged_on_the_command_line"],
         allowed_in: &["cli.rs"],
         rule: "only an explicit command-line flag may accept an unsigned binary",
@@ -610,20 +590,6 @@ mod tests {
             .unwrap()
             .is_empty()
         );
-        let declare = "fn f() { let _t = crate::input::UserText::from_cli(String::new()); }";
-        assert_eq!(check_file(declare, "src/serve.rs").unwrap().len(), 1);
-        assert!(check_file(declare, "src/cli.rs").unwrap().is_empty());
-        let assembled =
-            "fn f() { let _a = crate::template::Arg::authorized_job_text(String::new()); }";
-        assert_eq!(check_file(assembled, "src/client.rs").unwrap().len(), 1);
-        let aliased = "use crate::template::Arg as A; fn f() { let _a = A::authorized_job_text(String::new()); }";
-        assert_eq!(check_file(aliased, "src/client.rs").unwrap().len(), 1);
-        for allowed in ["src/shell.rs", "src/proc.rs", "src/service.rs"] {
-            assert!(
-                check_file(assembled, allowed).unwrap().is_empty(),
-                "{allowed}"
-            );
-        }
         for file in [
             "src/authz.rs",
             "src/supervisor.rs",

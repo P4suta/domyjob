@@ -1,9 +1,11 @@
-# Root causes and the mechanisms that close them
+# Root causes and required mechanisms
 
-Every review finding is traced to a class of mistake, and every class is closed by a mechanism that makes the mistake unwritable, not by a patch at the site that was found.
-A finding is only resolved when its class has a mechanism and a test that would fail if the class came back.
+Every review finding is traced to a class of mistake.
+The table states the mechanism and check required to close each class; naming them here does not establish that they are implemented.
+A class is closed only when the production API prevents the unsafe flow, a build gate rejects bypasses, and a test exercises the property at its boundary.
+The implementation status of the seven overarching laws is recorded in [laws.md](laws.md).
 
-| Class | What made it writable | Mechanism | Enforced by |
+| Class | What made it writable | Required mechanism | Required check |
 | --- | --- | --- | --- |
 | RC-A. Trust decided by plain values | `bool` for "paired", `Option` for "has checksum", `Option<psk>` choosing a Noise pattern, pinning as a separate step | Proof types with private constructors: `Verified<T>`, `Authorized<R>`, `Channel` returned only after the peer matched an `Expect` | Rust privacy; handlers accept only the proof type |
 | RC-B. Unbounded resources | `read_line`, `read_to_end`, `thread::spawn` per accept | Bounded readers with a byte budget, and a connection `Permit` counted overall and per source address | `clippy.toml` disallows the unbounded std calls outside `bounded.rs` |
@@ -29,3 +31,12 @@ A finding is only resolved when its class has a mechanism and a test that would 
 
 The classes above share one habit: a default branch or a default value silently decided a security question.
 So the crate also denies `clippy::wildcard_enum_match_arm`, `clippy::match_wildcard_for_single_variants`, and `clippy::fallible_impl_from`, and the gate refuses `#[derive(Default)]` on any type in a security module.
+
+## Known open classes
+
+RC-B remains open because the current Clippy configuration does not prohibit every unbounded read or per-request thread spawn outside `bounded.rs`.
+RC-E remains open because the state layer exposes functions rather than the required `StateFile<T>` capability.
+RC-F and RC-L remain open because source-specific argument types cover only some flows; wire and repository values do not yet carry a general provenance label, and `Arg::path` still accepts an ordinary `Path`.
+RC-K remains open because the code does not yet have distinct `LocalPolicy` and `RepositoryRequest` types.
+RC-M remains open because the claimed `create_new` gate is absent from `clippy.toml`.
+RC-O remains open as a type invariant because `JobId::generate` is callable from `client.rs` for the client origin identifier.
