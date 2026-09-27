@@ -5,6 +5,7 @@
 
 use crate::failure::io;
 use std::io::{ErrorKind, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -378,6 +379,75 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StateError
     write_bytes(path, &bytes)
 }
 
+#[derive(Debug)]
+pub struct StateFile<T> {
+    path: PathBuf,
+    value: PhantomData<fn() -> T>,
+}
+
+#[derive(Debug)]
+pub struct LockedStateFile<T> {
+    file: StateFile<T>,
+    lock: crate::lock::OsLock,
+}
+
+impl<T> StateFile<T> {
+    #[must_use]
+    pub fn at(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            value: PhantomData,
+        }
+    }
+
+    pub fn lock(self) -> Result<LockedStateFile<T>, StateError> {
+        let mut lock_path = self.path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = crate::lock::OsLock::exclusive(Path::new(&lock_path)).map_err(|error| {
+            StateError::Io(crate::failure::IoFailure {
+                action: "locking",
+                path: self.path.clone(),
+                source: std::io::Error::other(error.to_string()),
+            })
+        })?;
+        Ok(LockedStateFile { file: self, lock })
+    }
+}
+
+impl<T> LockedStateFile<T> {
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "an exclusive borrow prevents concurrent reads and writes through one lock guard"
+    )]
+    pub fn read(&mut self) -> Result<Option<T>, StateError>
+    where
+        T: crate::ingress::Ingress,
+    {
+        read_json(&self.file.path)
+    }
+
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "an exclusive borrow prevents concurrent reads and writes through one lock guard"
+    )]
+    pub fn write(&mut self, value: &T) -> Result<(), StateError>
+    where
+        T: Serialize,
+    {
+        write_json(&self.file.path, value)
+    }
+
+    pub fn release(self) -> Result<(), StateError> {
+        self.lock.release().map_err(|error| {
+            StateError::Io(crate::failure::IoFailure {
+                action: "unlocking",
+                path: self.file.path,
+                source: std::io::Error::other(error.to_string()),
+            })
+        })
+    }
+}
+
 pub fn update_json<T, R>(
     path: &Path,
     empty: impl FnOnce() -> T,
@@ -386,25 +456,11 @@ pub fn update_json<T, R>(
 where
     T: Serialize + crate::ingress::Ingress,
 {
-    let mut lock_path = path.as_os_str().to_owned();
-    lock_path.push(".lock");
-    let lock = crate::lock::OsLock::exclusive(Path::new(&lock_path)).map_err(|e| {
-        StateError::Io(crate::failure::IoFailure {
-            action: "locking",
-            path: path.to_path_buf(),
-            source: std::io::Error::other(e.to_string()),
-        })
-    })?;
-    let mut value = read_json(path)?.unwrap_or_else(empty);
+    let mut file = StateFile::<T>::at(path).lock()?;
+    let mut value = file.read()?.unwrap_or_else(empty);
     let result = change(&mut value);
-    write_json(path, &value)?;
-    lock.release().map_err(|e| {
-        StateError::Io(crate::failure::IoFailure {
-            action: "unlocking",
-            path: path.to_path_buf(),
-            source: std::io::Error::other(e.to_string()),
-        })
-    })?;
+    file.write(&value)?;
+    file.release()?;
     Ok(result)
 }
 
@@ -453,6 +509,27 @@ mod tests {
                 Err(StateError::Exposed { .. })
             ));
         }
+    }
+
+    #[test]
+    fn typed_state_file_serializes_concurrent_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join("counter.json");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let mut file = StateFile::<Vec<u8>>::at(path).lock().unwrap();
+                        let mut values = file.read().unwrap().unwrap_or_default();
+                        values.push(1);
+                        file.write(&values).unwrap();
+                        file.release().unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(read_json::<Vec<u8>>(&path).unwrap().unwrap().len(), 64);
     }
 
     #[test]

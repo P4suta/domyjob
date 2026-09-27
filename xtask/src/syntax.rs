@@ -127,6 +127,8 @@ const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 const UNBOUNDED_CHILD_OUTPUT_RULE: &str =
     "capture child output only through bounded.rs with an explicit byte budget";
+const RELEASE_STATE_RULE: &str =
+    "release high-water state must be read and written through a locked StateFile";
 const UNBOUNDED_TEXT_RULE: &str =
     "read text files only through bounded::text_file with an explicit byte budget";
 const UNBOUNDED_FILE_RULE: &str =
@@ -327,6 +329,7 @@ impl Gate {
         if self.test_depth > 0 {
             return;
         }
+        self.check_release_state_path(path);
         if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
             && let Some(segment) = path
@@ -351,8 +354,7 @@ impl Gate {
         {
             self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
         }
-        if self.test_depth == 0
-            && self.file.starts_with("crates/domyjob/src/")
+        if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
             && (path_ends_with(path, &["Command", "output"])
                 || path_ends_with(path, &["Child", "wait_with_output"]))
@@ -396,6 +398,17 @@ impl Gate {
                     .map_or_else(Span::call_site, |s| s.ident.span());
                 self.flag(span, restriction.rule);
             }
+        }
+    }
+
+    fn check_release_state_path(&mut self, path: &syn::Path) {
+        if self.file_is(&["dist.rs"])
+            && let Some(segment) = path
+                .segments
+                .last()
+                .filter(|segment| segment.ident == "read_json" || segment.ident == "write_json")
+        {
+            self.flag(segment.ident.span(), RELEASE_STATE_RULE);
         }
     }
 
@@ -990,6 +1003,29 @@ mod tests {
                 check_file(
                     &format!("#[cfg(test)] mod tests {{ {source} }}"),
                     "crates/domyjob/src/snapshot.rs"
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn release_high_water_requires_the_locked_state_file() {
+        for source in [
+            "fn f(path: &Path) { state_file::read_json::<HighWater>(path); }",
+            "fn f(path: &Path, value: &HighWater) { state_file::write_json(path, value); }",
+        ] {
+            assert_eq!(
+                check_file(source, "crates/domyjob/src/dist.rs")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                check_file(
+                    &format!("#[cfg(test)] mod tests {{ {source} }}"),
+                    "crates/domyjob/src/dist.rs"
                 )
                 .unwrap()
                 .is_empty()

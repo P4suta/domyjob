@@ -571,6 +571,14 @@ struct HighWater {
     version: String,
 }
 
+impl HighWater {
+    fn advanced(seen: Version, installed: Version) -> Self {
+        Self {
+            version: seen.max(installed).to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Downgrade {
     Refuse,
@@ -585,6 +593,8 @@ pub fn self_update(
     let Some(distribution) = &config.distribution else {
         return Ok(None);
     };
+    let high_water_path = dirs.state.join("highest-release.json");
+    let mut high_water = crate::state_file::StateFile::<HighWater>::at(&high_water_path).lock()?;
     let target = TargetTriple::try_from(OWN_TARGET.to_owned())?;
     let exe = crate::platform::EXE_SUFFIX;
     let dir = dirs.cache.join("update");
@@ -596,8 +606,7 @@ pub fn self_update(
     )?;
     let found = Version::parse(&manifest.get().version)?;
     let current = Version::current()?;
-    let high_water_path = dirs.state.join("highest-release.json");
-    let seen = match crate::state_file::read_json::<HighWater>(&high_water_path)? {
+    let seen = match high_water.read()? {
         Some(mark) => Version::parse(&mark.version)?.max(current),
         None => current,
     };
@@ -634,12 +643,8 @@ pub fn self_update(
         &dir.join(render(&distribution.binary, &bindings, "binary")?.as_str()),
     )?;
     replace_running(fresh.get().path())?;
-    crate::state_file::write_json(
-        &high_water_path,
-        &HighWater {
-            version: found.to_string(),
-        },
-    )?;
+    high_water.write(&HighWater::advanced(seen, found))?;
+    high_water.release()?;
     Ok(Some(found))
 }
 
@@ -660,6 +665,14 @@ mod tests {
         assert!(Version::parse("0.10.0").unwrap() > Version::parse("0.9.9").unwrap());
         Version::parse("1.2").unwrap_err();
         Version::parse("1.2.x").unwrap_err();
+    }
+
+    #[test]
+    fn an_explicit_downgrade_does_not_lower_the_release_high_water_mark() {
+        let seen = Version::parse("2.0.0").unwrap();
+        let installed = Version::parse("1.0.0").unwrap();
+        assert_eq!(HighWater::advanced(seen, installed).version, "2.0.0");
+        assert_eq!(HighWater::advanced(installed, seen).version, "2.0.0");
     }
 
     #[test]
