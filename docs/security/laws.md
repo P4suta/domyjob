@@ -40,6 +40,8 @@ The syntax gate rejects direct `read_to_end`, `read_until`, `read_line`, `fill_b
 Log search keeps at most a 64 KiB prefix of each line while counting its full byte length and line number, and returns at most 1024 displayed lines.
 Child command output is captured through `bounded::command_output` or `bounded::child_output` with a fixed per-purpose budget for both pipes; exceeding either budget stops and reaps the child, and the syntax gate rejects direct `.output()` and `.wait_with_output()` in production code.
 The local supervisor control socket accepts at most 32 active sessions, and only a private `ControlPermit` can spawn an answer thread; dropping it releases the slot.
+The MCP server accepts at most 1 MiB per input line and at most 32 active request workers; a private permit holds each slot through response writing and tracks cancellation only for active request IDs.
+The syntax gate confines MCP worker spawning to a dispatch function that requires the permit and rejects unbounded line iteration in that module.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
 Source archives stream each origin into a 64 MiB capped archive and verify its digest; job uploads also stream origins and verify their digest before accepting success.
 Directory snapshots retain a confined directory handle and validated relative paths for their disk origins, so a later path replacement cannot move a read outside the selected root.

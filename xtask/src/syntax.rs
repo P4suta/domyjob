@@ -145,6 +145,9 @@ const REFERENCE_TYPE_RULE: &str =
 const PROJECT_APPROVAL_RULE: &str =
     "project jobs must pass from RepositoryRequest through local approval before becoming an Order";
 const PROJECT_PROOF_PRIVACY_RULE: &str = "project approval proof and request fields must stay private so callers cannot forge or reclassify them";
+const MCP_LINE_RULE: &str = "MCP input lines must use bounded::line with an explicit byte budget";
+const MCP_WORKER_RULE: &str =
+    "MCP workers must be spawned only through dispatch with an McpDispatch permit";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -366,6 +369,7 @@ impl Gate {
         if self.test_depth > 0 {
             return;
         }
+        self.check_mcp_path(path);
         self.check_locked_state_path(path);
         if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
@@ -436,6 +440,21 @@ impl Gate {
                     .map_or_else(Span::call_site, |s| s.ident.span());
                 self.flag(span, restriction.rule);
             }
+        }
+    }
+
+    fn check_mcp_path(&mut self, path: &syn::Path) {
+        if self.file_is(&["mcp.rs"])
+            && (path_ends_with(path, &["BufRead", "lines"])
+                || path_ends_with(path, &["thread", "spawn"]))
+            && let Some(segment) = path.segments.last()
+        {
+            let rule = if segment.ident == "lines" {
+                MCP_LINE_RULE
+            } else {
+                MCP_WORKER_RULE
+            };
+            self.flag(segment.ident.span(), rule);
         }
     }
 
@@ -590,6 +609,14 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if self.test_depth == 0 && self.file_is(&["mcp.rs"]) {
+            if method == "lines" {
+                self.flag(call.method.span(), MCP_LINE_RULE);
+            }
+            if method == "spawn" && self.function.as_deref() != Some("dispatch") {
+                self.flag(call.method.span(), MCP_WORKER_RULE);
+            }
+        }
         if method == "create_new" && self.test_depth == 0 && !self.exclusive_create_allowed() {
             self.flag(call.method.span(), EXCLUSIVE_CREATE_RULE);
         }
@@ -632,6 +659,15 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         self.check_signature(&item.sig);
+        if self.file_is(&["mcp.rs"])
+            && item.sig.ident == "dispatch"
+            && !item.sig.inputs.iter().any(|argument| {
+                matches!(argument, syn::FnArg::Typed(typed)
+                    if is_named_type(&typed.ty, "McpDispatch"))
+            })
+        {
+            self.flag(item.sig.ident.span(), MCP_WORKER_RULE);
+        }
         let before = self.function.replace(item.sig.ident.to_string());
         syn::visit::visit_item_fn(self, item);
         self.function = before;
@@ -707,6 +743,16 @@ impl<'ast> Visit<'ast> for Gate {
             has_named_fields(&item.fields),
         );
         self.check_project_structure(item);
+        if self.file_is(&["mcp.rs"])
+            && item.ident == "McpDispatch"
+            && !item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == "permit")
+                    && is_named_type(&field.ty, "McpPermit")
+                    && matches!(field.vis, syn::Visibility::Inherited)
+            })
+        {
+            self.flag(item.ident.span(), MCP_WORKER_RULE);
+        }
         let required = if self.file_is(&["config.rs"]) && item.ident == "TriggerConf" {
             Some(("refs", "RefPattern", true))
         } else if self.file_is(&["hook.rs"]) && item.ident == "Event" {
@@ -742,6 +788,19 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
+        if self.test_depth == 0
+            && self.file_is(&["mcp.rs"])
+            && path_ends_with(&expr.path, &["McpPermit"])
+            && self.function.as_deref() != Some("take")
+        {
+            self.flag(
+                expr.path
+                    .segments
+                    .last()
+                    .map_or_else(Span::call_site, |segment| segment.ident.span()),
+                MCP_WORKER_RULE,
+            );
+        }
         if self.file_is(&["cli.rs"])
             && self.function.as_deref() == Some("run_named")
             && path_ends_with(&expr.path, &["Order"])
@@ -1184,6 +1243,33 @@ mod tests {
                 .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn mcp_input_and_worker_spawns_require_the_bounded_dispatch_path() {
+        for source in [
+            "fn serve(input: R) { for line in input.lines() {} }",
+            "fn serve(scope: S) { scope.spawn(|| {}); }",
+            "fn serve() { std::thread::spawn(|| {}); }",
+            "fn dispatch(scope: S) { scope.spawn(|| {}); }",
+            "struct McpDispatch { other: McpPermit }",
+            "fn serve() { let permit = McpPermit { calls, key }; }",
+        ] {
+            assert!(
+                !check_file(source, "crates/domyjob/src/mcp.rs")
+                    .unwrap()
+                    .is_empty(),
+                "{source}"
+            );
+        }
+        assert!(
+            check_file(
+                "fn dispatch(job: McpDispatch<'_, W>, scope: S) { scope.spawn(|| {}); }",
+                "crates/domyjob/src/mcp.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

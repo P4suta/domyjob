@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -505,29 +507,19 @@ fn run(ctx: &Context, permitted: PermittedRun) -> Result<Value, ToolError> {
         workspace,
         start: directory.path,
         root: None,
-        env: std::collections::BTreeMap::new(),
+        env: BTreeMap::new(),
         shell: None,
         name,
     };
     let (submitted, rejected) = client::submit(ctx, &order, &client::quietly)?;
     let waiting = wait;
-    let jobs: Vec<Value> = std::thread::scope(|scope| {
-        #[expect(
-            clippy::needless_collect,
-            reason = "every wait must start before the first is joined, or they run one after another"
-        )]
-        let handles: Vec<_> = submitted
-            .iter()
-            .map(|item| scope.spawn(move || ran(ctx, item, waiting)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(entry) => entry,
-                Err(_panicked) => Value::String("a worker panicked".to_owned()),
-            })
-            .collect()
-    });
+    let jobs: Vec<Value> = crate::fanout::gathered(&submitted, |item| ran(ctx, item, waiting))
+        .into_iter()
+        .map(|result| match result {
+            Ok(entry) => entry,
+            Err(crate::fanout::Panicked) => Value::String("a worker panicked".to_owned()),
+        })
+        .collect();
     jobs_answer(jobs, &rejected)
 }
 
@@ -675,21 +667,165 @@ fn respond(ctx: Option<&Context>, method: &str, params: &Value) -> Option<Value>
     }
 }
 
-pub fn serve() -> Result<(), McpError> {
-    let ctx = match Context::load() {
-        Ok(ctx) => Some(ctx),
-        Err(error) => {
-            eprintln!("domyjob: {error}");
-            None
+const MAX_MCP_CALLS: usize = 32;
+
+struct McpId {
+    wire: Value,
+    key: String,
+}
+
+impl McpId {
+    fn parse(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(_) | Value::Number(_) => Some(Self {
+                wire: value.clone(),
+                key: value.to_string(),
+            }),
+            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
         }
-    };
-    let stdin = std::io::stdin();
-    let out = std::sync::Mutex::new(std::io::stdout());
-    let cancelled = std::sync::Mutex::new(std::collections::BTreeSet::<String>::new());
+    }
+}
+
+#[derive(Default)]
+struct McpCalls(Mutex<BTreeMap<String, bool>>);
+
+#[derive(Debug)]
+enum McpRefusal {
+    Full,
+    Duplicate,
+    Poisoned,
+}
+
+impl McpRefusal {
+    const fn message(&self) -> &'static str {
+        match self {
+            Self::Full => "too many active requests",
+            Self::Duplicate => "request id is already active",
+            Self::Poisoned => "request state is unavailable",
+        }
+    }
+}
+
+struct McpPermit<'a> {
+    calls: &'a McpCalls,
+    key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyDisposition {
+    Send,
+    Suppress,
+}
+
+impl McpCalls {
+    fn take(&self, id: &McpId) -> Result<McpPermit<'_>, McpRefusal> {
+        let mut active = self.0.lock().map_err(|_poisoned| McpRefusal::Poisoned)?;
+        if active.contains_key(&id.key) {
+            return Err(McpRefusal::Duplicate);
+        }
+        if active.len() >= MAX_MCP_CALLS {
+            return Err(McpRefusal::Full);
+        }
+        active.insert(id.key.clone(), false);
+        drop(active);
+        Ok(McpPermit {
+            calls: self,
+            key: id.key.clone(),
+        })
+    }
+
+    fn cancel(&self, id: &McpId) {
+        if let Ok(mut active) = self.0.lock()
+            && let Some(withdrawn) = active.get_mut(&id.key)
+        {
+            *withdrawn = true;
+        }
+    }
+}
+
+impl McpPermit<'_> {
+    fn disposition(&self) -> ReplyDisposition {
+        match self.calls.0.lock() {
+            Ok(active) => match active.get(&self.key) {
+                Some(false) => ReplyDisposition::Send,
+                Some(true) | None => ReplyDisposition::Suppress,
+            },
+            Err(_poisoned) => ReplyDisposition::Suppress,
+        }
+    }
+}
+
+impl Drop for McpPermit<'_> {
+    fn drop(&mut self) {
+        match self.calls.0.lock() {
+            Ok(mut active) => {
+                active.remove(&self.key);
+            }
+            Err(mut poisoned) => {
+                poisoned.get_mut().remove(&self.key);
+            }
+        }
+    }
+}
+
+fn write_reply<W: Write>(out: &Mutex<W>, reply: &Value) -> Result<(), McpError> {
+    let mut out = out.lock().map_err(|_poisoned| {
+        McpError::Output(std::io::Error::other("MCP output lock is poisoned"))
+    })?;
+    writeln!(out, "{reply}")
+        .and_then(|()| out.flush())
+        .map_err(McpError::Output)
+}
+
+struct McpRequest {
+    id: McpId,
+    method: String,
+    params: Value,
+}
+
+struct McpDispatch<'a, W> {
+    permit: McpPermit<'a>,
+    ctx: Option<&'a Context>,
+    out: &'a Mutex<W>,
+    request: McpRequest,
+}
+
+fn dispatch<'scope, 'env, W: Write + Send>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    job: McpDispatch<'env, W>,
+) {
+    scope.spawn(move || {
+        let reply = match respond(job.ctx, &job.request.method, &job.request.params) {
+            Some(result) => json!({"jsonrpc": "2.0", "id": job.request.id.wire, "result": result}),
+            None => {
+                json!({"jsonrpc": "2.0", "id": job.request.id.wire, "error": {"code": -32601, "message": format!("unknown method {}", job.request.method)}})
+            }
+        };
+        if job.permit.disposition() == ReplyDisposition::Send {
+            match write_reply(job.out, &reply) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    });
+}
+
+fn serve_stream<R: BufRead, W: Write + Send>(
+    input: &mut R,
+    out: &Mutex<W>,
+    ctx: Option<&Context>,
+) -> Result<(), McpError> {
+    let calls = McpCalls::default();
     std::thread::scope(|scope| -> Result<(), McpError> {
-        for line in stdin.lock().lines() {
-            let line = line.map_err(McpError::Input)?;
-            let Ok(message) = crate::ingress::foreign_json_envelope(&line) else {
+        loop {
+            let line = crate::bounded::line(input, crate::bounded::REQUEST_LINE)
+                .map_err(McpError::Input)?;
+            if line.is_empty() {
+                return Ok(());
+            }
+            let line = std::str::from_utf8(&line).map_err(|error| {
+                McpError::Input(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            })?;
+            let Ok(message) = crate::ingress::foreign_json_envelope(line) else {
                 continue;
             };
             let method = message
@@ -698,41 +834,51 @@ pub fn serve() -> Result<(), McpError> {
                 .unwrap_or("")
                 .to_owned();
             if method == "notifications/cancelled" {
-                if let (Some(request), Ok(mut set)) =
-                    (message.pointer("/params/requestId"), cancelled.lock())
-                {
-                    set.insert(request.to_string());
+                if let Some(id) = message.pointer("/params/requestId").and_then(McpId::parse) {
+                    calls.cancel(&id);
                 }
                 continue;
             }
-            let Some(id) = message.get("id").cloned() else {
+            let Some(id) = message.get("id").and_then(McpId::parse) else {
                 continue;
             };
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let (ctx, out, cancelled) = (ctx.as_ref(), &out, &cancelled);
-            scope.spawn(move || {
-                let reply = match respond(ctx, &method, &params) {
-                    Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                    None => {
-                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("unknown method {method}")}})
-                    }
-                };
-                let withdrawn = match cancelled.lock() {
-                    Ok(mut set) => set.remove(&id.to_string()),
-                    Err(_poisoned) => false,
-                };
-                if withdrawn {
-                    return;
+            let request = McpRequest {
+                id,
+                method,
+                params: message.get("params").cloned().unwrap_or(Value::Null),
+            };
+            match calls.take(&request.id) {
+                Ok(permit) => dispatch(
+                    scope,
+                    McpDispatch {
+                        permit,
+                        ctx,
+                        out,
+                        request,
+                    },
+                ),
+                Err(refusal) => {
+                    let reply = json!({"jsonrpc": "2.0", "id": request.id.wire, "error": {"code": -32000, "message": refusal.message()}});
+                    write_reply(out, &reply)?;
                 }
-                if let Ok(mut out) = out.lock() {
-                    match writeln!(out, "{reply}").and_then(|()| out.flush()) {
-                        Ok(()) | Err(_) => {}
-                    }
-                }
-            });
+            }
         }
-        Ok(())
     })
+}
+
+pub fn serve() -> Result<(), McpError> {
+    let ctx = match Context::load() {
+        Ok(ctx) => Some(ctx),
+        Err(error) => {
+            eprintln!("domyjob: {error}");
+            None
+        }
+    };
+    serve_stream(
+        &mut std::io::stdin().lock(),
+        &Mutex::new(std::io::stdout()),
+        ctx.as_ref(),
+    )
 }
 
 impl crate::ingress::Ingress for RunArgs {}
@@ -823,5 +969,66 @@ mod tests {
         parse::<LogArgs>(&json!({"job": "latest", "lines": 0})).unwrap_err();
         parse::<LogArgs>(&json!({"job": "latest", "lines": 1001})).unwrap_err();
         parse::<EmptyArgs>(&json!({"unexpected": true})).unwrap_err();
+    }
+
+    #[test]
+    fn mcp_input_lines_have_a_byte_budget() {
+        let out = Mutex::new(Vec::new());
+        serve_stream(
+            &mut b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".as_slice(),
+            &out,
+            None,
+        )
+        .unwrap();
+        let locked = out.lock().unwrap();
+        let reply = serde_json::from_slice::<Value>(&locked).unwrap();
+        assert_eq!(reply.pointer("/result"), Some(&json!({})));
+        drop(locked);
+
+        let mut line = vec![b'x'; usize::try_from(crate::bounded::REQUEST_LINE).unwrap() + 1];
+        line.push(b'\n');
+        let failure =
+            serve_stream(&mut line.as_slice(), &Mutex::new(Vec::new()), None).unwrap_err();
+        assert!(
+            matches!(failure, McpError::Input(error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn only_active_ids_use_the_mcp_worker_budget() {
+        let calls = McpCalls::default();
+        let ids: Vec<_> = (0..MAX_MCP_CALLS)
+            .map(|number| McpId::parse(&json!(number)).unwrap())
+            .collect();
+        let permits: Vec<_> = ids.iter().map(|id| calls.take(id).unwrap()).collect();
+        let extra = McpId::parse(&json!(MAX_MCP_CALLS)).unwrap();
+        assert!(matches!(calls.take(&extra), Err(McpRefusal::Full)));
+        assert!(matches!(
+            calls.take(ids.first().unwrap()),
+            Err(McpRefusal::Duplicate)
+        ));
+        calls.cancel(&extra);
+        assert_eq!(calls.0.lock().unwrap().len(), MAX_MCP_CALLS);
+        assert_eq!(
+            permits.first().unwrap().disposition(),
+            ReplyDisposition::Send
+        );
+        calls.cancel(ids.first().unwrap());
+        assert_eq!(
+            permits.first().unwrap().disposition(),
+            ReplyDisposition::Suppress
+        );
+        drop(permits);
+        assert!(calls.0.lock().unwrap().is_empty());
+        drop(calls.take(&extra).unwrap());
+    }
+
+    #[test]
+    fn request_ids_have_json_rpc_value_types() {
+        assert!(McpId::parse(&json!("a")).is_some());
+        assert!(McpId::parse(&json!(3)).is_some());
+        for invalid in [Value::Null, json!(true), json!([]), json!({})] {
+            assert!(McpId::parse(&invalid).is_none());
+        }
     }
 }
