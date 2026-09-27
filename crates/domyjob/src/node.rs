@@ -1510,11 +1510,7 @@ impl Node {
                             std::io::copy(&mut file.take(*size), framed)
                                 .map_err(NodeError::Output)?
                         }
-                        None => {
-                            let bytes = self.cas.get(blob)?;
-                            framed.write_all(&bytes).map_err(NodeError::Output)?;
-                            crate::domain::len_u64(bytes.len())
-                        }
+                        None => self.cas.stream(blob, framed)?,
                     };
                     if copied != *size {
                         return Err(NodeError::Output(std::io::Error::other(format!(

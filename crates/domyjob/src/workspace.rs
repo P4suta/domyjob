@@ -20,6 +20,12 @@ pub enum WorkspaceError {
     NotAFile(PathBuf),
     #[error("the workspace {0} is gone")]
     Gone(PathBuf),
+    #[error("{path} declares {expected} bytes but its content has {actual}")]
+    SizeMismatch {
+        path: RelPath,
+        expected: u64,
+        actual: u64,
+    },
     #[error(transparent)]
     Snapshot(#[from] crate::snapshot::SnapshotError),
 }
@@ -69,8 +75,25 @@ impl Workspace {
         self.0.make_parents(rel, Blockers::Replace)?;
         self.0.clear(rel, Contents::Anything)?;
         match entry {
-            Entry::File { blob, mode, .. } => {
-                self.0.create(rel, Placed::File(&cas.get(blob)?, *mode))?;
+            Entry::File { blob, mode, size } => {
+                let mut file = self.0.create_file(rel, *mode)?;
+                let streamed = cas.stream(blob, &mut file);
+                drop(file);
+                let actual = match streamed {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        self.0.clear(rel, Contents::Anything)?;
+                        return Err(error.into());
+                    }
+                };
+                if actual != *size {
+                    self.0.clear(rel, Contents::Anything)?;
+                    return Err(WorkspaceError::SizeMismatch {
+                        path: rel.clone(),
+                        expected: *size,
+                        actual,
+                    });
+                }
             }
             Entry::Symlink { target } => self.0.create(rel, Placed::Link(target))?,
         }
@@ -170,6 +193,49 @@ mod tests {
     use crate::snapshot::Mode;
     use crate::snapshot::from_directory;
     use std::io::ErrorKind;
+
+    #[test]
+    fn a_manifest_size_mismatch_leaves_no_partial_workspace_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("cas")).unwrap();
+        let blob = crate::domain::BlobId::of(b"actual");
+        cas.put(&blob, b"actual").unwrap();
+        let workspace = Workspace::open(&tmp.path().join("workspace")).unwrap();
+        let path: RelPath = "file.txt".parse().unwrap();
+        let entry = Entry::File {
+            blob: blob.clone(),
+            size: 999,
+            mode: Mode::Regular,
+        };
+        assert!(matches!(
+            workspace.place(&cas, &path, &entry),
+            Err(WorkspaceError::SizeMismatch { .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(workspace.root().join("file.txt"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        let (fan, leaf) = blob.split();
+        crate::state_file::write_bytes(&tmp.path().join("cas").join(fan).join(leaf), b"broken")
+            .unwrap();
+        let valid_size = Entry::File {
+            blob,
+            size: 6,
+            mode: Mode::Regular,
+        };
+        assert!(matches!(
+            workspace.place(&cas, &path, &valid_size),
+            Err(WorkspaceError::Cas(CasError::Damaged(_)))
+        ));
+        assert_eq!(
+            std::fs::metadata(workspace.root().join("file.txt"))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+    }
 
     #[test]
     fn a_fill_cut_short_leaves_nothing_behind_once_its_intent_was_recorded() {

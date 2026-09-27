@@ -13,8 +13,11 @@ CLI, MCP, and explicitly invoked project-job text each enter `UserText` through 
 Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
 Warm workspace paths include the submitter's owner or peer-key scope, with a test for cross-principal separation.
 State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.
+Local configuration and project definitions have a 4 MiB parsing and file-read budget; signed release metadata also has a 4 MiB file budget, and setup reads executables only within a 64 MiB budget.
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
-The syntax gate rejects direct `read_to_end` and `read_line` calls outside `bounded.rs`; setup output, tree reads, and log tails use explicit byte limits.
+The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`, with the remaining raw snapshot read identified as an exception.
+CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
+Setup output, tree reads, and log tails use explicit byte limits.
 Builds and installs now receive a fresh random `TransferId`; setup fails if entropy fails.
 The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.
 SSH multiplexing has its own shorter `SshSessionId`, and the rendered control socket path is checked before SSH starts.

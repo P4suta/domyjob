@@ -416,7 +416,7 @@ impl Rooted {
         clippy::disallowed_methods,
         reason = "a confined tree file is created exclusively so an existing path is never overwritten"
     )]
-    fn write_new(&self, rel: &RelPath, bytes: &[u8], mode: Mode) -> Result<(), TreeError> {
+    pub fn create_file(&self, rel: &RelPath, mode: Mode) -> Result<cap_std::fs::File, TreeError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let kept = if self.family.modes() {
@@ -427,12 +427,17 @@ impl Rooted {
         crate::platform::create_as(&mut options, kept);
         crate::faults::at("tree::create", &self.shown(rel))
             .map_err(io("creating", &self.shown(rel)))?;
-        let mut file = self
+        let file = self
             .dir
             .open_with(rel.to_local(), &options)
             .map_err(io("creating", &self.shown(rel)))?;
         crate::faults::at("tree::write", &self.shown(rel))
             .map_err(io("writing", &self.shown(rel)))?;
+        Ok(file)
+    }
+
+    fn write_new(&self, rel: &RelPath, bytes: &[u8], mode: Mode) -> Result<(), TreeError> {
+        let mut file = self.create_file(rel, mode)?;
         file.write_all(bytes)
             .map_err(io("writing", &self.shown(rel)))
             .map_err(Into::into)

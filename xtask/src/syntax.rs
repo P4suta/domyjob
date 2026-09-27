@@ -140,7 +140,7 @@ const REFERENCE_TYPE_RULE: &str =
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
-    ("crates/domyjob/src/tree.rs", "write_new"),
+    ("crates/domyjob/src/tree.rs", "create_file"),
     ("xtask/src/release.rs", "keygen"),
 ];
 
@@ -335,7 +335,7 @@ impl Gate {
             self.flag(segment.ident.span(), UNBOUNDED_TEXT_RULE);
         }
         if self.file.starts_with("crates/domyjob/src/")
-            && !self.file_is(&["bounded.rs", "cas.rs", "snapshot.rs"])
+            && !self.file_is(&["bounded.rs", "snapshot.rs"])
             && path_ends_with(path, &["fs", "read"])
             && let Some(segment) = path.segments.last()
         {
@@ -805,8 +805,15 @@ mod tests {
             Some(UNBOUNDED_FILE_RULE)
         );
         assert!(check_file(bounded, file).unwrap().is_empty());
-        assert!(
+        assert_eq!(
             check_file(raw, "crates/domyjob/src/cas.rs")
+                .unwrap()
+                .first()
+                .map(|finding| finding.rule),
+            Some(UNBOUNDED_FILE_RULE)
+        );
+        assert!(
+            check_file(raw, "crates/domyjob/src/snapshot.rs")
                 .unwrap()
                 .is_empty()
         );

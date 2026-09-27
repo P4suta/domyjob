@@ -1,5 +1,5 @@
 use crate::failure::io;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ pub enum CasError {
     Corrupt { expected: BlobId, actual: BlobId },
     #[error("blob {blob} announces {size} bytes, more than a blob may hold")]
     TooLarge { blob: BlobId, size: u64 },
+    #[error("blob {blob} has {size} bytes, exceeding the {limit}-byte in-memory budget")]
+    InMemoryLimit { blob: BlobId, size: u64, limit: u64 },
     #[error(transparent)]
     State(#[from] crate::state_file::StateError),
     #[error("the manifest cannot be placed here: {0}")]
@@ -113,20 +115,62 @@ impl Cas {
     }
 
     pub fn get(&self, blob: &BlobId) -> Result<Vec<u8>, CasError> {
-        let path = self.path(blob);
-        crate::faults::at("cas::read", &path).map_err(io("reading", &path))?;
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(CasError::Missing(blob.clone()));
-            }
-            Err(e) => return Err(io("reading", &path)(e).into()),
-        };
+        let (path, mut file) = self.open_blob(blob)?;
+        let size = file.metadata().map_err(io("checking", &path))?.len();
+        if size > crate::bounded::IN_MEMORY_FILE {
+            return Err(CasError::InMemoryLimit {
+                blob: blob.clone(),
+                size,
+                limit: crate::bounded::IN_MEMORY_FILE,
+            });
+        }
+        let bytes = crate::bounded::to_end(&mut file, crate::bounded::IN_MEMORY_FILE)
+            .map_err(io("reading", &path))?;
         if &BlobId::of(&bytes) != blob {
             crate::state_file::remove_file(&path)?;
             return Err(CasError::Damaged(blob.clone()));
         }
         Ok(bytes)
+    }
+
+    fn open_blob(&self, blob: &BlobId) -> Result<(PathBuf, std::fs::File), CasError> {
+        let path = self.path(blob);
+        crate::faults::at("cas::read", &path).map_err(io("reading", &path))?;
+        let file =
+            crate::state_file::open_read(&path)?.ok_or_else(|| CasError::Missing(blob.clone()))?;
+        Ok((path, file))
+    }
+
+    pub fn stream(&self, blob: &BlobId, output: &mut dyn Write) -> Result<u64, CasError> {
+        let (path, mut file) = self.open_blob(blob)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut size = 0u64;
+        let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let count = match file.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(io("reading", &path)(error).into()),
+            };
+            if count == 0 {
+                break;
+            }
+            size = size.saturating_add(crate::domain::len_u64(count));
+            if size > crate::bounded::BLOB {
+                return Err(CasError::TooLarge {
+                    blob: blob.clone(),
+                    size,
+                });
+            }
+            let chunk = buffer.get(..count).unwrap_or(&[]);
+            hasher.update(chunk);
+            output.write_all(chunk).map_err(io("writing", &path))?;
+        }
+        if &BlobId::from_hash(&hasher.finalize()) != blob {
+            crate::state_file::remove_file(&path)?;
+            return Err(CasError::Damaged(blob.clone()));
+        }
+        Ok(size)
     }
 
     pub fn stored(&self) -> Result<Vec<BlobId>, CasError> {
@@ -328,5 +372,39 @@ mod tests {
         );
         cas.put(&good, b"exact").unwrap();
         assert_eq!(cas.get(&good).unwrap(), b"exact");
+    }
+
+    #[test]
+    fn large_blobs_stream_in_fixed_memory_and_are_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("objects")).unwrap();
+        let content = vec![b'x'; 200_000];
+        let blob = BlobId::of(&content);
+        cas.put(&blob, &content).unwrap();
+        let mut copied = Vec::new();
+        assert_eq!(cas.stream(&blob, &mut copied).unwrap(), 200_000);
+        assert_eq!(copied, content);
+        crate::state_file::write_bytes(&cas.path(&blob), b"changed").unwrap();
+        assert!(matches!(
+            cas.stream(&blob, &mut Vec::new()),
+            Err(CasError::Damaged(_))
+        ));
+        assert!(!cas.has(&blob).unwrap());
+    }
+
+    #[test]
+    fn in_memory_reads_refuse_a_large_blob_before_allocating_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("objects")).unwrap();
+        let blob = BlobId::of(b"small");
+        cas.put(&blob, b"small").unwrap();
+        crate::state_file::cut_to(&cas.path(&blob), 67_108_865).unwrap();
+        assert!(matches!(
+            cas.get(&blob),
+            Err(CasError::InMemoryLimit {
+                limit: crate::bounded::IN_MEMORY_FILE,
+                ..
+            })
+        ));
     }
 }
