@@ -105,7 +105,7 @@ const RESTRICTIONS: &[Restriction] = &[
         rule: "only `domyjob do` may run a project file's command",
     },
     Restriction {
-        path: &["Arg", "authorized_job_text"],
+        path: &["authorized_job_text"],
         allowed_in: &["shell.rs", "proc.rs", "service.rs"],
         rule: "only the shell, supervisor, and service modules may assemble text into an argument",
     },
@@ -616,6 +616,8 @@ mod tests {
         let assembled =
             "fn f() { let _a = crate::template::Arg::authorized_job_text(String::new()); }";
         assert_eq!(check_file(assembled, "src/client.rs").unwrap().len(), 1);
+        let aliased = "use crate::template::Arg as A; fn f() { let _a = A::authorized_job_text(String::new()); }";
+        assert_eq!(check_file(aliased, "src/client.rs").unwrap().len(), 1);
         for allowed in ["src/shell.rs", "src/proc.rs", "src/service.rs"] {
             assert!(
                 check_file(assembled, allowed).unwrap().is_empty(),
