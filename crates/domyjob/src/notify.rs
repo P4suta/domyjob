@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::process::Stdio;
 
 use crate::config::{Config, ConfigError};
@@ -184,22 +183,14 @@ fn deliver(
             serde_json::to_vec(json).map_err(|e| failed(name, program, &e.to_string()))?
         }
     };
-    let mut child = invocation
+    let child = invocation
         .command()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| failed(name, program, &e.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        match stdin.write_all(&payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => return Err(failed(name, program, &e.to_string())),
-        }
-    }
-    let out = child
-        .wait_with_output()
+    let out = crate::bounded::child_output(child, Some(payload), crate::bounded::Capture::Notifier)
         .map_err(|e| failed(name, program, &e.to_string()))?;
     if out.status.success() {
         Ok(())

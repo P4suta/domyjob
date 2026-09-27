@@ -1,5 +1,7 @@
 use std::io::{BufRead, ErrorKind, Read, Write};
 use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 
 pub const REQUEST_LINE: u64 = 1 << 20;
 pub const REPLY_LINE: u64 = 64 << 20;
@@ -13,6 +15,122 @@ pub const CONFIG_TEXT: u64 = 4 << 20;
 pub const BOOT_ID: u64 = 128;
 pub const SIGNED_METADATA: u64 = 4 << 20;
 pub const SOURCE_ARCHIVE: u64 = 64 << 20;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Capture {
+    BootIdentity,
+    SshConfig,
+    SourceListing,
+    Notifier,
+    WmiPid,
+}
+
+impl Capture {
+    const fn limits(self) -> (u64, u64) {
+        match self {
+            Self::BootIdentity | Self::WmiPid => (4 << 10, 4 << 10),
+            Self::SshConfig => (1 << 20, 64 << 10),
+            Self::SourceListing => (64 << 20, 64 << 10),
+            Self::Notifier => (0, 64 << 10),
+        }
+    }
+}
+
+enum Captured {
+    Stdout(std::io::Result<Vec<u8>>),
+    Stderr(std::io::Result<Vec<u8>>),
+    Input(std::io::Result<()>),
+}
+
+fn read_pipe<R: Read + Send + 'static>(
+    mut reader: R,
+    limit: u64,
+    sender: mpsc::Sender<Captured>,
+    wrap: fn(std::io::Result<Vec<u8>>) -> Captured,
+) {
+    std::thread::spawn(move || {
+        let result = to_end(&mut reader, limit);
+        drop(sender.send(wrap(result)));
+    });
+}
+
+pub fn command_output(command: &mut Command, capture: Capture) -> std::io::Result<Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child_output(child, None, capture)
+}
+
+pub fn child_output(
+    mut child: Child,
+    input: Option<Vec<u8>>,
+    capture: Capture,
+) -> std::io::Result<Output> {
+    let (stdout_limit, stderr_limit) = capture.limits();
+    let (sender, receiver) = mpsc::channel();
+    let mut waiting: usize = 0;
+    if let Some(stdout) = child.stdout.take() {
+        read_pipe(stdout, stdout_limit, sender.clone(), Captured::Stdout);
+        waiting = waiting.saturating_add(1);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        read_pipe(stderr, stderr_limit, sender.clone(), Captured::Stderr);
+        waiting = waiting.saturating_add(1);
+    }
+    if let Some(input) = input {
+        let Some(mut stdin) = child.stdin.take() else {
+            drop(child.kill());
+            drop(child.wait());
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "the child has no input pipe",
+            ));
+        };
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let result = match stdin.write_all(&input) {
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+                result => result,
+            };
+            drop(sender.send(Captured::Input(result)));
+        });
+        waiting = waiting.saturating_add(1);
+    }
+    drop(sender);
+    let (mut stdout, mut stderr, mut failure) = (Vec::new(), Vec::new(), None);
+    for _ in 0..waiting {
+        let result = receiver.recv().map_err(|_disconnected| {
+            std::io::Error::other("a child output reader ended without reporting its result")
+        });
+        match result {
+            Ok(Captured::Stdout(Ok(bytes))) => stdout = bytes,
+            Ok(Captured::Stderr(Ok(bytes))) => stderr = bytes,
+            Ok(Captured::Input(Ok(()))) => {}
+            Ok(
+                Captured::Stdout(Err(error))
+                | Captured::Stderr(Err(error))
+                | Captured::Input(Err(error)),
+            )
+            | Err(error) => {
+                if failure.is_none() {
+                    drop(child.kill());
+                    failure = Some(error);
+                }
+            }
+        }
+    }
+    let status = child.wait()?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 fn too_long(limit: u64) -> std::io::Error {
     std::io::Error::new(
@@ -147,6 +265,56 @@ pub fn exactly(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_output_fixture() {
+        match std::env::var("DOMYJOB_CAPTURE_FIXTURE") {
+            Ok(mode) if mode == "overflow" => {
+                std::io::stdout().write_all(&[b'x'; 8192]).unwrap();
+                std::io::stderr().write_all(&[b'y'; 8192]).unwrap();
+            }
+            Ok(mode) if mode == "input" => {
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                eprintln!("received {} bytes", input.len());
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    fn fixture(mode: &str) -> Command {
+        let exe = std::env::current_exe().unwrap();
+        let mut command = crate::spawn::Invocation::new(
+            crate::template::Arg::path(&exe),
+            vec![
+                crate::template::Arg::literal("--exact"),
+                crate::template::Arg::literal("bounded::tests::child_output_fixture"),
+                crate::template::Arg::literal("--nocapture"),
+            ],
+        )
+        .command();
+        command.env("DOMYJOB_CAPTURE_FIXTURE", mode);
+        command
+    }
+
+    #[test]
+    fn child_output_budget_rejects_a_chatty_process() {
+        let error = command_output(&mut fixture("overflow"), Capture::BootIdentity).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn child_output_drains_stderr_while_sending_input() {
+        let child = fixture("input")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child_output(child, Some(vec![b'a'; 128 * 1024]), Capture::Notifier).unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("received 131072 bytes"));
+    }
 
     proptest::proptest! {
         #[test]

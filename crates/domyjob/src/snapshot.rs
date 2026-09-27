@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -610,9 +609,7 @@ fn run_template(
     for name in source.unset.iter().flatten() {
         command.env_remove(name);
     }
-    let out = command
-        .stdin(Stdio::null())
-        .output()
+    let out = crate::bounded::command_output(&mut command, crate::bounded::Capture::SourceListing)
         .map_err(|error| SnapshotError::Start {
             source_name: source_name.to_owned(),
             program: invocation.display(),

@@ -125,6 +125,8 @@ const TIME_TYPES: &[&str] = &["SystemTime", "Instant", "Duration", "UNIX_EPOCH"]
 const TIME_METHODS: &[&str] = &["sleep", "modified", "accessed", "elapsed"];
 const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
+const UNBOUNDED_CHILD_OUTPUT_RULE: &str =
+    "capture child output only through bounded.rs with an explicit byte budget";
 const UNBOUNDED_TEXT_RULE: &str =
     "read text files only through bounded::text_file with an explicit byte budget";
 const UNBOUNDED_FILE_RULE: &str =
@@ -349,6 +351,15 @@ impl Gate {
         {
             self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
         }
+        if self.test_depth == 0
+            && self.file.starts_with("crates/domyjob/src/")
+            && !self.file_is(&["bounded.rs"])
+            && (path_ends_with(path, &["Command", "output"])
+                || path_ends_with(path, &["Child", "wait_with_output"]))
+            && let Some(segment) = path.segments.last()
+        {
+            self.flag(segment.ident.span(), UNBOUNDED_CHILD_OUTPUT_RULE);
+        }
         if !self.file_is(&["bounded.rs"])
             && let Some(segment) = path
                 .segments
@@ -479,6 +490,13 @@ impl<'ast> Visit<'ast> for Gate {
             && method == "read_to_string"
         {
             self.flag(call.method.span(), UNBOUNDED_TEXT_RULE);
+        }
+        if self.test_depth == 0
+            && self.file.starts_with("crates/domyjob/src/")
+            && !self.file_is(&["bounded.rs"])
+            && (method == "output" || method == "wait_with_output")
+        {
+            self.flag(call.method.span(), UNBOUNDED_CHILD_OUTPUT_RULE);
         }
         if method == "as_raw_str" && self.file_is(TERMINAL_FILES) {
             self.flag(
@@ -943,6 +961,35 @@ mod tests {
                 check_file(
                     &format!("#[cfg(test)] mod tests {{ {source} }}"),
                     "src/remote.rs"
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn child_output_capture_is_confined_to_bounded() {
+        for source in [
+            "fn f(command: &mut Command) { command.output(); }",
+            "fn f(child: Child) { child.wait_with_output(); }",
+            "fn f(command: &mut Command) { Command::output(command); }",
+        ] {
+            assert_eq!(
+                check_file(source, "crates/domyjob/src/snapshot.rs")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                check_file(source, "crates/domyjob/src/bounded.rs")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                check_file(
+                    &format!("#[cfg(test)] mod tests {{ {source} }}"),
+                    "crates/domyjob/src/snapshot.rs"
                 )
                 .unwrap()
                 .is_empty()

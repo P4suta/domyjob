@@ -283,17 +283,15 @@ fn configured_agent(home: &Path) -> Option<PathBuf> {
     if !crate::platform::FAMILY.agent_socket() {
         return None;
     }
-    let asked = crate::spawn::Invocation::new(
+    let mut command = crate::spawn::Invocation::new(
         crate::template::Arg::literal("ssh"),
         vec![
             crate::template::Arg::literal("-G"),
             crate::template::Arg::literal("localhost"),
         ],
     )
-    .command()
-    .stdin(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .output();
+    .command();
+    let asked = crate::bounded::command_output(&mut command, crate::bounded::Capture::SshConfig);
     let printed = match asked {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(_) | Err(_) => return None,

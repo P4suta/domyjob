@@ -711,7 +711,7 @@ mod platform {
         let helper_id = helper.id();
         let output =
             crate::liveness::unless_abandoned(crate::liveness::Helper::Process(helper_id), || {
-                helper.wait_with_output()
+                crate::bounded::child_output(helper, None, crate::bounded::Capture::WmiPid)
             })
             .map_err(asking)?;
         if !output.status.success() {

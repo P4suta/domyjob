@@ -65,15 +65,17 @@ fn boot_identity_on_this_system() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn boot_identity_on_this_system() -> Option<String> {
-    let Ok(output) = crate::spawn::Invocation::new(
+    let mut command = crate::spawn::Invocation::new(
         crate::template::Arg::literal("sysctl"),
         vec![
             crate::template::Arg::literal("-n"),
             crate::template::Arg::literal("kern.bootsessionuuid"),
         ],
     )
-    .command()
-    .output() else {
+    .command();
+    let Ok(output) =
+        crate::bounded::command_output(&mut command, crate::bounded::Capture::BootIdentity)
+    else {
         return None;
     };
     if !output.status.success() {
