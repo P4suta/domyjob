@@ -1,5 +1,5 @@
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -96,7 +96,62 @@ fn tool_named(name: &str) -> Option<McpTool> {
     .find(|tool| tool_name(*tool) == name)
 }
 
-fn permitted(ctx: &Context, args: &RunArgs) -> Result<(), ToolError> {
+#[derive(Debug)]
+struct AuthorizedDirectory {
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PermittedRun {
+    directory: AuthorizedDirectory,
+    runner: AuthorizedRunner,
+}
+
+#[derive(Debug)]
+struct AuthorizedRunner(String);
+
+fn authorized_runner(
+    policy: &crate::config::McpPolicy,
+    requested: Option<&str>,
+    words: usize,
+) -> Result<AuthorizedRunner, ToolError> {
+    let name = client::runner_name(requested, words);
+    if policy.runners.contains(&name) {
+        Ok(AuthorizedRunner(name))
+    } else {
+        Err(ToolError::NotAllowed("that runner"))
+    }
+}
+
+fn authorized_directory(
+    policy: &crate::config::McpPolicy,
+    path: &Path,
+    shown: &str,
+) -> Result<AuthorizedDirectory, ToolError> {
+    let resolved =
+        std::fs::canonicalize(path).map_err(|_missing| ToolError::Directory(shown.to_owned()))?;
+    if !std::fs::metadata(&resolved)
+        .map_err(|_unreadable| ToolError::Directory(shown.to_owned()))?
+        .is_dir()
+    {
+        return Err(ToolError::Directory(shown.to_owned()));
+    }
+    for allowed_dir in &policy.directories {
+        match std::fs::canonicalize(allowed_dir) {
+            Ok(root) if resolved.starts_with(&root) => {
+                return Ok(AuthorizedDirectory { path: resolved });
+            }
+            Ok(_) => {}
+            Err(_missing) => eprintln!(
+                "domyjob: the [mcp] directory {} does not exist",
+                allowed_dir.display()
+            ),
+        }
+    }
+    Err(ToolError::Directory(shown.to_owned()))
+}
+
+fn permitted(ctx: &Context, args: &RunArgs) -> Result<PermittedRun, ToolError> {
     let policy = &ctx.config.mcp;
     let allowed: Vec<crate::domain::MachineName> = if policy.machines.is_empty() {
         Vec::new()
@@ -111,33 +166,9 @@ fn permitted(ctx: &Context, args: &RunArgs) -> Result<(), ToolError> {
             return Err(ToolError::Machine(machine.name.to_string()));
         }
     }
-    let directory = std::fs::canonicalize(&args.directory)
-        .map_err(|_missing| ToolError::Directory(args.directory.clone()))?;
-    let mut inside = false;
-    for allowed_dir in &policy.directories {
-        match std::fs::canonicalize(allowed_dir) {
-            Ok(resolved) => inside |= directory.starts_with(resolved),
-            Err(_missing) => eprintln!(
-                "domyjob: the [mcp] directory {} does not exist",
-                allowed_dir.display()
-            ),
-        }
-    }
-    if !inside {
-        return Err(ToolError::Directory(args.directory.clone()));
-    }
-    let runner = args.runner.clone().unwrap_or_else(|| {
-        if args.command.len() == 1 {
-            "shell".to_owned()
-        } else {
-            "exec".to_owned()
-        }
-    });
-    if policy.runners.contains(&runner) {
-        Ok(())
-    } else {
-        Err(ToolError::NotAllowed("that runner"))
-    }
+    let directory = authorized_directory(policy, Path::new(&args.directory), &args.directory)?;
+    let runner = authorized_runner(policy, args.runner.as_deref(), args.command.len())?;
+    Ok(PermittedRun { directory, runner })
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -371,17 +402,10 @@ fn inside_allowed(ctx: &Context, destination: &str) -> Result<PathBuf, ToolError
     let parent = path
         .parent()
         .ok_or_else(|| ToolError::Directory(destination.to_owned()))?;
-    let resolved = std::fs::canonicalize(parent)
-        .map_err(|_missing| ToolError::Directory(destination.to_owned()))?;
-    let allowed = ctx
-        .config
-        .mcp
-        .directories
-        .iter()
-        .any(|dir| std::fs::canonicalize(dir).is_ok_and(|root| resolved.starts_with(root)));
-    match (allowed, path.file_name()) {
-        (true, Some(name)) => Ok(resolved.join(name)),
-        (true, None) | (false, _) => Err(ToolError::Directory(destination.to_owned())),
+    let directory = authorized_directory(&ctx.config.mcp, parent, destination)?;
+    match path.file_name() {
+        Some(name) => Ok(directory.path.join(name)),
+        None => Err(ToolError::Directory(destination.to_owned())),
     }
 }
 
@@ -422,7 +446,7 @@ fn ran(ctx: &Context, item: &client::Submitted, waiting: bool) -> Value {
 }
 
 fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
-    permitted(ctx, &args)?;
+    let permitted = permitted(ctx, &args)?;
     let rev = match &args.rev {
         Some(text) => Some(
             text.parse::<crate::domain::Revision>()
@@ -438,7 +462,7 @@ fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
             .into_iter()
             .map(|w| Arg::user(&crate::input::UserText::from_agent(w)))
             .collect(),
-        runner: args.runner,
+        runner: Some(permitted.runner.0),
         rev,
         sending: Sending::Directory,
         workspace: if args.fresh == Some(true) {
@@ -446,7 +470,7 @@ fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
         } else {
             Workspace::Warm
         },
-        start: PathBuf::from(&args.directory),
+        start: permitted.directory.path,
         root: None,
         env: std::collections::BTreeMap::new(),
         shell: None,
@@ -690,6 +714,49 @@ impl crate::ingress::Ingress for EmptyArgs {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_policy_checks_the_runner_sent_to_execution() {
+        let mut policy = crate::config::McpPolicy::read_only();
+        policy.runners = vec!["shell".to_owned()];
+        assert_eq!(authorized_runner(&policy, None, 1).unwrap().0, "shell");
+        authorized_runner(&policy, None, 2).unwrap_err();
+        authorized_runner(&policy, Some("exec"), 1).unwrap_err();
+        policy.runners.push("exec".to_owned());
+        assert_eq!(authorized_runner(&policy, None, 2).unwrap().0, "exec");
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test lays out user-controlled directories and a file outside state"
+    )]
+    fn directory_policy_returns_the_path_it_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let child = allowed.join("child");
+        let sibling = tmp.path().join("allowed-sibling");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = allowed.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let policy = crate::config::McpPolicy {
+            tools: std::collections::BTreeSet::new(),
+            machines: String::new(),
+            runners: Vec::new(),
+            directories: vec![allowed.clone()],
+        };
+
+        let request = child.join("..");
+        assert_eq!(
+            authorized_directory(&policy, &request, "request")
+                .unwrap()
+                .path,
+            std::fs::canonicalize(&allowed).unwrap()
+        );
+        authorized_directory(&policy, &sibling, "sibling").unwrap_err();
+        authorized_directory(&policy, &file, "file").unwrap_err();
+    }
 
     #[test]
     fn advertises_tools_and_rejects_unknown_methods() {

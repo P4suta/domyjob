@@ -6,7 +6,7 @@ These laws are the kinds.
 Each one names the property it guarantees, the mechanism that guarantees it, and the check that fails the build when the mechanism is bypassed.
 
 These are design targets, not a claim that every mechanism and check below is implemented.
-The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, and `workspace.rs`, and CI does not run `cargo vet`.
+The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, `workspace.rs`, and `mcp.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
 
 ## 1. No ambient authority

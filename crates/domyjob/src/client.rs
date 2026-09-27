@@ -347,14 +347,16 @@ pub struct Rejected {
     pub error: RemoteError,
 }
 
+pub(crate) fn runner_name(requested: Option<&str>, words: usize) -> String {
+    match requested {
+        Some(name) => name.to_owned(),
+        None if words == 1 => "shell".to_owned(),
+        None => "exec".to_owned(),
+    }
+}
+
 fn command(config: &Config, order: &Order) -> Result<Command, ClientError> {
-    let runner_name = order.runner.clone().unwrap_or_else(|| {
-        if order.words.len() == 1 {
-            "shell".to_owned()
-        } else {
-            "exec".to_owned()
-        }
-    });
+    let runner_name = runner_name(order.runner.as_deref(), order.words.len());
     if order.words.is_empty() {
         return Err(ClientError::NoInput);
     }
