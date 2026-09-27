@@ -89,8 +89,9 @@ pub enum NodeError {
 
 impl NodeError {
     fn code(&self) -> RefusalCode {
-        if out_of_space(self) == ErrorCause::DiskFull {
-            return RefusalCode::DiskFull;
+        match out_of_space(self) {
+            ErrorCause::DiskFull => return RefusalCode::DiskFull,
+            ErrorCause::Other => {}
         }
         match self {
             Self::Store(StoreError::NoSuchJob(_)) => RefusalCode::NoSuchJob,
@@ -131,13 +132,13 @@ impl NodeError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum WatchedPath {
     JobChange,
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum WatchWake {
     Changed,
     ClientGone,
@@ -240,7 +241,7 @@ fn hundredths(value: f64) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum DiskPressure {
     Enough,
     Short,
@@ -254,13 +255,13 @@ fn pressure(available: u64, total: u64) -> DiskPressure {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Reclamation {
     Busy,
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum WorkspaceFreshness {
     Current,
     Stale,
@@ -313,7 +314,7 @@ fn identity_agent(printed: &str, home: &Path) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum ErrorCause {
     DiskFull,
     Other,
@@ -870,10 +871,10 @@ impl Node {
             Ok(stats) => crate::protocol::DiskSpace::Measured {
                 total: stats.total_space(),
                 available: stats.available_space(),
-                short: matches!(
-                    pressure(stats.available_space(), stats.total_space()),
-                    DiskPressure::Short
-                ),
+                short: match pressure(stats.available_space(), stats.total_space()) {
+                    DiskPressure::Enough => false,
+                    DiskPressure::Short => true,
+                },
             },
             Err(error) => crate::protocol::DiskSpace::Unavailable {
                 reason: RemoteText::new(error.to_string()),
@@ -912,19 +913,26 @@ impl Node {
         pressure: &impl Fn() -> Result<DiskPressure, NodeError>,
         _commanded: &Commanded,
     ) -> Result<(), NodeError> {
-        if pressure()? == DiskPressure::Enough {
-            return Ok(());
+        match pressure()? {
+            DiskPressure::Enough => return Ok(()),
+            DiskPressure::Short => {}
         }
         for (workspace, lock) in self.idle_workspaces()? {
-            if self.evict(&workspace, &lock)? == Reclamation::Done
-                && pressure()? == DiskPressure::Enough
-            {
-                return Ok(());
+            match self.evict(&workspace, &lock)? {
+                Reclamation::Busy => {}
+                Reclamation::Done => match pressure()? {
+                    DiskPressure::Enough => return Ok(()),
+                    DiskPressure::Short => {}
+                },
             }
         }
         for id in self.finished_largest_log_first()? {
-            if self.discard_log(&id)? == Reclamation::Done && pressure()? == DiskPressure::Enough {
-                return Ok(());
+            match self.discard_log(&id)? {
+                Reclamation::Busy => {}
+                Reclamation::Done => match pressure()? {
+                    DiskPressure::Enough => return Ok(()),
+                    DiskPressure::Short => {}
+                },
             }
         }
         self.collect(Keep::Unfinished)
@@ -978,12 +986,16 @@ impl Node {
         let mut items = Vec::new();
         for (workspace, lock) in self.idle_workspaces()? {
             let freshness = self.freshness(&workspace)?;
-            if freshness == WorkspaceFreshness::Current && !idle {
-                continue;
+            match freshness {
+                WorkspaceFreshness::Current if !idle => continue,
+                WorkspaceFreshness::Current | WorkspaceFreshness::Stale => {}
             }
             let bytes = size_of(&workspace)?;
-            if apply && self.evict(&workspace, &lock)? == Reclamation::Busy {
-                continue;
+            if apply {
+                match self.evict(&workspace, &lock)? {
+                    Reclamation::Busy => continue,
+                    Reclamation::Done => {}
+                }
             }
             let shown = match workspace.strip_prefix(&work) {
                 Ok(inside) => inside,
@@ -1007,8 +1019,11 @@ impl Node {
             let mut count = 0u64;
             for id in &finished {
                 let size = size_of(&self.store.log_path(id))?;
-                if apply && self.discard_log(id)? == Reclamation::Busy {
-                    continue;
+                if apply {
+                    match self.discard_log(id)? {
+                        Reclamation::Busy => continue,
+                        Reclamation::Done => {}
+                    }
                 }
                 bytes = bytes
                     .saturating_add(size.saturating_sub(crate::domain::len_u64(DISCARDED.len())));
@@ -1519,10 +1534,10 @@ impl Node {
         let mut notifier =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if let Ok(event) = event
-                    && event
-                        .paths
-                        .iter()
-                        .any(|path| telling(&area, path) == WatchedPath::JobChange)
+                    && event.paths.iter().any(|path| match telling(&area, path) {
+                        WatchedPath::JobChange => true,
+                        WatchedPath::Other => false,
+                    })
                 {
                     match changed.send(WatchWake::Changed) {
                         Ok(()) | Err(_) => {}
@@ -1557,10 +1572,10 @@ impl Node {
                 framed.flush().map_err(NodeError::Output)?;
                 match woken.recv() {
                     Ok(WatchWake::Changed) => {
-                        if woken
-                            .try_iter()
-                            .any(|signal| signal == WatchWake::ClientGone)
-                        {
+                        if woken.try_iter().any(|signal| match signal {
+                            WatchWake::Changed => false,
+                            WatchWake::ClientGone => true,
+                        }) {
                             return Ok(());
                         }
                     }
@@ -2159,11 +2174,23 @@ mod tests {
     #[test]
     fn a_disk_is_short_below_a_tenth_of_its_size_or_ten_gigabytes() {
         let gib: u64 = 1 << 30;
-        assert_eq!(pressure(ROOM_AT_LEAST - 1, 500 * gib), DiskPressure::Short);
-        assert_eq!(pressure(ROOM_AT_LEAST, 500 * gib), DiskPressure::Enough);
-        assert_eq!(pressure(50 * gib / 10 - 1, 50 * gib), DiskPressure::Short);
-        assert_eq!(pressure(50 * gib / 10, 50 * gib), DiskPressure::Enough);
-        assert_eq!(pressure(1, 0), DiskPressure::Enough);
+        assert!(matches!(
+            pressure(ROOM_AT_LEAST - 1, 500 * gib),
+            DiskPressure::Short
+        ));
+        assert!(matches!(
+            pressure(ROOM_AT_LEAST, 500 * gib),
+            DiskPressure::Enough
+        ));
+        assert!(matches!(
+            pressure(50 * gib / 10 - 1, 50 * gib),
+            DiskPressure::Short
+        ));
+        assert!(matches!(
+            pressure(50 * gib / 10, 50 * gib),
+            DiskPressure::Enough
+        ));
+        assert!(matches!(pressure(1, 0), DiskPressure::Enough));
     }
 
     #[test]
