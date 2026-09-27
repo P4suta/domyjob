@@ -36,7 +36,8 @@ State-file reads now have bounded metadata, audit, and client-history budgets, a
 The client origin also uses the typed lock for one-time initialization, preserving its existing raw-file format while making concurrent first use choose one persisted ID.
 Local configuration and project definitions have a 4 MiB parsing and file-read budget; signed release metadata also has a 4 MiB file budget, and setup reads executables only within a 64 MiB budget.
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
-The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`.
+The syntax gate rejects direct `read_to_end`, `read_until`, `read_line`, `fill_buf`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`.
+Log search keeps at most a 64 KiB prefix of each line while counting its full byte length and line number, and returns at most 1024 displayed lines.
 Child command output is captured through `bounded::command_output` or `bounded::child_output` with a fixed per-purpose budget for both pipes; exceeding either budget stops and reaps the child, and the syntax gate rejects direct `.output()` and `.wait_with_output()` in production code.
 The local supervisor control socket accepts at most 32 active sessions, and only a private `ControlPermit` can spawn an answer thread; dropping it releases the slot.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.

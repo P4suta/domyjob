@@ -219,6 +219,39 @@ pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
     }
 }
 
+pub fn scan_lines(
+    reader: &mut dyn BufRead,
+    prefix_limit: usize,
+    mut each: impl FnMut(u64, u64, &[u8]),
+) -> std::io::Result<u64> {
+    let mut number = 0u64;
+    let mut raw = Vec::new();
+    let mut bytes = 0u64;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if bytes > 0 {
+                number = number.saturating_add(1);
+                each(number, bytes, &raw);
+            }
+            return Ok(number);
+        }
+        let ending = available.iter().position(|byte| *byte == b'\n');
+        let take = ending.map_or(available.len(), |at| at.saturating_add(1));
+        let chunk = available.get(..take).unwrap_or(&[]);
+        bytes = bytes.saturating_add(crate::domain::len_u64(chunk.len()));
+        let prefix = prefix_limit.saturating_sub(raw.len()).min(chunk.len());
+        raw.extend_from_slice(chunk.get(..prefix).unwrap_or(&[]));
+        reader.consume(take);
+        if ending.is_some() {
+            number = number.saturating_add(1);
+            each(number, bytes, &raw);
+            raw.clear();
+            bytes = 0;
+        }
+    }
+}
+
 pub fn line_unread_past(reader: &mut dyn Read, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut byte = [0u8; 1];

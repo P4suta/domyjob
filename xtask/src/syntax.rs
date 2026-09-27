@@ -384,10 +384,11 @@ impl Gate {
             self.flag(segment.ident.span(), UNBOUNDED_FILE_RULE);
         }
         if !self.file_is(&["bounded.rs"])
-            && let Some(segment) = path
-                .segments
-                .last()
-                .filter(|segment| segment.ident == "read_to_end")
+            && let Some(segment) = path.segments.last().filter(|segment| {
+                segment.ident == "read_to_end"
+                    || segment.ident == "read_until"
+                    || segment.ident == "fill_buf"
+            })
         {
             self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
         }
@@ -594,7 +595,10 @@ impl<'ast> Visit<'ast> for Gate {
         }
         if self.test_depth == 0
             && !self.file_is(&["bounded.rs"])
-            && (method == "read_to_end" || method == "read_line")
+            && (method == "read_to_end"
+                || method == "read_line"
+                || method == "read_until"
+                || method == "fill_buf")
         {
             self.flag(call.method.span(), UNBOUNDED_READ_RULE);
         }
@@ -1161,8 +1165,12 @@ mod tests {
     fn unbounded_read_calls_are_confined_to_bounded() {
         for source in [
             "fn f(r: &mut R, out: &mut Vec<u8>) { r.read_to_end(out); }",
+            "fn f(r: &mut R, out: &mut Vec<u8>) { r.read_until(b'\\n', out); }",
+            "fn f(r: &mut R) { r.fill_buf(); }",
             "fn f(r: &mut R, out: &mut String) { r.read_line(out); }",
             "fn f(r: &mut R, out: &mut Vec<u8>) { std::io::Read::read_to_end(r, out); }",
+            "fn f(r: &mut R, out: &mut Vec<u8>) { std::io::BufRead::read_until(r, b'\\n', out); }",
+            "fn f(r: &mut R) { std::io::BufRead::fill_buf(r); }",
             "fn f(r: &mut R, out: &mut String) { std::io::BufRead::read_line(r, out); }",
         ] {
             assert_eq!(check_file(source, "src/remote.rs").unwrap().len(), 1);
