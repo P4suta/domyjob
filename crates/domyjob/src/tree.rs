@@ -412,6 +412,10 @@ impl Rooted {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a confined tree file is created exclusively so an existing path is never overwritten"
+    )]
     fn write_new(&self, rel: &RelPath, bytes: &[u8], mode: Mode) -> Result<(), TreeError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);

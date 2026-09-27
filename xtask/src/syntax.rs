@@ -55,6 +55,7 @@ pub struct Gate {
     pub findings: Vec<Finding>,
     file: String,
     test_depth: u32,
+    function: Option<String>,
 }
 
 struct Restriction {
@@ -114,6 +115,14 @@ const TIME_TYPES: &[&str] = &["SystemTime", "Instant", "Duration", "UNIX_EPOCH"]
 const TIME_METHODS: &[&str] = &["sleep", "modified", "accessed", "elapsed"];
 const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
+const EXCLUSIVE_CREATE_RULE: &str =
+    "create_new is only for approved exclusive file creation, never a hand-made lock";
+const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
+    ("crates/domyjob/src/state_file.rs", "create_empty"),
+    ("crates/domyjob/src/durable.rs", "beside"),
+    ("crates/domyjob/src/tree.rs", "write_new"),
+    ("xtask/src/release.rs", "keygen"),
+];
 
 fn is_time_method(name: &str) -> bool {
     TIME_METHODS.contains(&name) || TIME_METHOD_PARTS.iter().any(|part| name.contains(part))
@@ -282,6 +291,28 @@ impl Gate {
         {
             self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
         }
+        if !self.file_is(&["bounded.rs"])
+            && let Some(segment) = path
+                .segments
+                .last()
+                .filter(|segment| segment.ident == "read_line")
+            && path
+                .segments
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|prior| prior.ident == "BufRead")
+        {
+            self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
+        }
+        if let Some(segment) = path
+            .segments
+            .last()
+            .filter(|segment| segment.ident == "create_new")
+            && !self.exclusive_create_allowed()
+        {
+            self.flag(segment.ident.span(), EXCLUSIVE_CREATE_RULE);
+        }
         let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
         for restriction in RESTRICTIONS {
             let tail = segments.len().saturating_sub(restriction.path.len());
@@ -306,6 +337,12 @@ impl Gate {
                 "security decisions return an enum, never bool",
             );
         }
+    }
+
+    fn exclusive_create_allowed(&self) -> bool {
+        EXCLUSIVE_CREATE.iter().any(|(file, function)| {
+            self.file == *file && self.function.as_deref() == Some(*function)
+        })
     }
 }
 
@@ -349,6 +386,9 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if method == "create_new" && self.test_depth == 0 && !self.exclusive_create_allowed() {
+            self.flag(call.method.span(), EXCLUSIVE_CREATE_RULE);
+        }
         if self.test_depth == 0
             && !self.file_is(&["bounded.rs"])
             && (method == "read_to_end" || method == "read_line")
@@ -371,12 +411,16 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         self.check_signature(&item.sig);
+        let before = self.function.replace(item.sig.ident.to_string());
         syn::visit::visit_item_fn(self, item);
+        self.function = before;
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         self.check_signature(&item.sig);
+        let before = self.function.replace(item.sig.ident.to_string());
         syn::visit::visit_impl_item_fn(self, item);
+        self.function = before;
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
@@ -529,6 +573,7 @@ pub fn check_file(source: &str, name: &str) -> Result<Vec<Finding>, syn::Error> 
         findings: Vec::new(),
         file: name.to_owned(),
         test_depth: 0,
+        function: None,
     };
     gate.visit_file(&file);
     Ok(gate.findings)
@@ -673,6 +718,7 @@ mod tests {
             "fn f(r: &mut R, out: &mut Vec<u8>) { r.read_to_end(out); }",
             "fn f(r: &mut R, out: &mut String) { r.read_line(out); }",
             "fn f(r: &mut R, out: &mut Vec<u8>) { std::io::Read::read_to_end(r, out); }",
+            "fn f(r: &mut R, out: &mut String) { std::io::BufRead::read_line(r, out); }",
         ] {
             assert_eq!(check_file(source, "src/remote.rs").unwrap().len(), 1);
             assert!(check_file(source, "src/bounded.rs").unwrap().is_empty());
@@ -683,6 +729,37 @@ mod tests {
                 )
                 .unwrap()
                 .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn exclusive_create_is_not_a_lock_primitive() {
+        let unapproved = "fn f(options: &mut OpenOptions) { options.create_new(true); }";
+        assert_eq!(
+            check_file(unapproved, "crates/domyjob/src/lock.rs")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            check_file(
+                "fn f(o: &mut O) { O::create_new(o, true); }",
+                "crates/domyjob/src/lock.rs"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        for (file, function) in EXCLUSIVE_CREATE {
+            let source =
+                format!("fn {function}(options: &mut OpenOptions) {{ options.create_new(true); }}");
+            assert!(check_file(&source, file).unwrap().is_empty(), "{file}");
+            assert_eq!(
+                check_file(source.as_str(), "crates/domyjob/src/lock.rs")
+                    .unwrap()
+                    .len(),
+                1
             );
         }
     }

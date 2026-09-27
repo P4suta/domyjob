@@ -8,7 +8,7 @@ Each one names the property it guarantees, the mechanism that guarantees it, and
 These are design targets, not a claim that every mechanism and check below is implemented.
 The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, `workspace.rs`, `mcp.rs`, and `node.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
-The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types.
+The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types and the internally generated `TransferId`.
 CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
 Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
 Warm workspace paths include the submitter's owner or peer-key scope, with a test for cross-principal separation.
@@ -16,6 +16,7 @@ State-file reads now have bounded metadata, audit, and client-history budgets, a
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
 The syntax gate rejects direct `read_to_end` and `read_line` calls outside `bounded.rs`; setup output, tree reads, and log tails use explicit byte limits.
 Windows builds and installs now receive a transfer-specific ID, which prevents parallel operations in one client process from sharing a temporary upload file.
+Clippy and the syntax gate now confine exclusive file creation to four ordinary-file constructors, leaving liveness and serialization to operating-system locks.
 
 ## 1. No ambient authority
 

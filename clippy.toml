@@ -34,6 +34,8 @@ disallowed-methods = [
   { path = "std::fs::create_dir_all", reason = "create directories through state_file::private_dir" },
   { path = "std::fs::File::create", reason = "create files through state_file or user_files" },
   { path = "std::fs::OpenOptions::new", reason = "open files for writing through state_file or user_files" },
+  { path = "std::fs::OpenOptions::create_new", reason = "exclusive file creation belongs only in the approved creation functions" },
+  { path = "cap_std::fs::OpenOptions::create_new", reason = "exclusive file creation belongs only in tree::write_new", allow-invalid = true },
   { path = "std::fs::remove_file", reason = "remove files through state_file or user_files" },
   { path = "std::fs::remove_dir_all", reason = "remove directories through state_file" },
   { path = "std::fs::rename", reason = "replace files through state_file or user_files" },
