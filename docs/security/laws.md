@@ -17,6 +17,7 @@ Local configuration and project definitions have a 4 MiB parsing and file-read b
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
 The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`.
 Child command output is captured through `bounded::command_output` or `bounded::child_output` with a fixed per-purpose budget for both pipes; exceeding either budget stops and reaps the child, and the syntax gate rejects direct `.output()` and `.wait_with_output()` in production code.
+The local supervisor control socket accepts at most 32 active sessions, and only a private `ControlPermit` can spawn an answer thread; dropping it releases the slot.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
 Source archives stream each origin into a 64 MiB capped archive and verify its digest; job uploads also stream origins and verify their digest before accepting success.
 Directory snapshots retain a confined directory handle and validated relative paths for their disk origins, so a later path replacement cannot move a read outside the selected root.

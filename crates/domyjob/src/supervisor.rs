@@ -330,9 +330,20 @@ struct Connections {
     changed: Condvar,
 }
 
-struct Open(Arc<Connections>);
+const MAX_CONTROL_CONNECTIONS: usize = 32;
 
-impl Drop for Open {
+struct ControlPermit(Arc<Connections>);
+
+impl ControlPermit {
+    fn respond(self, shared: Arc<Shared>, stream: Stream) {
+        std::thread::spawn(move || {
+            answer(&shared, &stream);
+            drop(self);
+        });
+    }
+}
+
+impl Drop for ControlPermit {
     fn drop(&mut self) {
         if let Ok(mut tally) = self.0.tally.lock() {
             tally.open = tally.open.saturating_sub(1);
@@ -342,17 +353,17 @@ impl Drop for Open {
     }
 }
 
-trait Counting {
-    fn open(&self) -> Open;
-    fn retrying<T, E>(&self, attempt: impl FnMut() -> Result<T, E>) -> Result<T, E>;
-}
-
-impl Counting for Arc<Connections> {
-    fn open(&self) -> Open {
-        if let Ok(mut tally) = self.tally.lock() {
-            tally.open = tally.open.saturating_add(1);
+impl Connections {
+    fn admit(self: &Arc<Self>) -> Option<ControlPermit> {
+        let Ok(mut tally) = self.tally.lock() else {
+            return None;
+        };
+        if tally.open >= MAX_CONTROL_CONNECTIONS {
+            return None;
         }
-        Open(Self::clone(self))
+        tally.open = tally.open.saturating_add(1);
+        drop(tally);
+        Some(ControlPermit(Arc::clone(self)))
     }
 
     fn retrying<T, E>(&self, mut attempt: impl FnMut() -> Result<T, E>) -> Result<T, E> {
@@ -385,12 +396,10 @@ fn serve_control(listener: Listener, shared: Arc<Shared>) {
         loop {
             match connections.retrying(|| listener.accept()) {
                 Ok(stream) => {
-                    let shared = Arc::clone(&shared);
-                    let open = connections.open();
-                    std::thread::spawn(move || {
-                        answer(&shared, &stream);
-                        drop(open);
-                    });
+                    let Some(permit) = connections.admit() else {
+                        continue;
+                    };
+                    permit.respond(Arc::clone(&shared), stream);
                 }
                 Err(error) => {
                     shared.say(&format!("the control socket stopped accepting: {error}"));
@@ -1129,8 +1138,8 @@ mod tests {
         });
         assert_eq!(nothing_open, Err(1));
 
-        let first = connections.open();
-        let second = connections.open();
+        let first = connections.admit().unwrap();
+        let second = connections.admit().unwrap();
         let mut pending = Some(first);
         let mut during = 0;
         let ended_before_the_wait = connections.retrying(|| {
@@ -1157,5 +1166,16 @@ mod tests {
         });
         ending.join().unwrap();
         assert_eq!(ended_while_waiting, Ok(2));
+    }
+
+    #[test]
+    fn local_control_admission_is_bounded_and_released_on_drop() {
+        let connections = Arc::new(Connections::default());
+        let open: Vec<_> = (0..MAX_CONTROL_CONNECTIONS)
+            .map(|_| connections.admit().unwrap())
+            .collect();
+        assert!(connections.admit().is_none());
+        drop(open);
+        assert!(connections.admit().is_some());
     }
 }

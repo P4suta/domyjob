@@ -40,7 +40,7 @@ So the crate also denies `clippy::wildcard_enum_match_arm`, `clippy::match_wildc
 
 ## Known open classes
 
-RC-B remains open because local control connections still spawn a thread per accept without a permit, and other allocating reads still need an end-to-end budget; source archives are capped at 64 MiB, child output has per-purpose budgets, and blobs are streamed when they may be larger.
+RC-B remains open because other allocating reads and thread-spawn paths still need an end-to-end resource audit; network connections have overall and per-source permits, local control connections have a 32-session permit, source archives are capped at 64 MiB, child output has per-purpose budgets, and blobs are streamed when they may be larger.
 RC-E remains open because the state layer exposes functions rather than the required `StateFile<T>` capability.
 RC-F and RC-L remain open because source-specific argument types cover only some flows; wire and repository values do not yet carry a general provenance label, and `Arg::path` still accepts an ordinary `Path`.
 RC-K remains open because the code does not yet have distinct `LocalPolicy` and `RepositoryRequest` types.
