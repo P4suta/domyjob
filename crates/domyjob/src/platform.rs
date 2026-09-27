@@ -183,6 +183,7 @@ pub fn make_dir_link(target: &Path, at: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy)]
 enum LinkKind {
     File,
     Directory,
