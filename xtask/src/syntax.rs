@@ -105,6 +105,11 @@ const RESTRICTIONS: &[Restriction] = &[
         rule: "only `domyjob do` may run a project file's command",
     },
     Restriction {
+        path: &["Arg", "authorized_job_text"],
+        allowed_in: &["shell.rs", "proc.rs", "service.rs"],
+        rule: "only the shell, supervisor, and service modules may assemble text into an argument",
+    },
+    Restriction {
         path: &["InsecureUnsigned", "acknowledged_on_the_command_line"],
         allowed_in: &["cli.rs"],
         rule: "only an explicit command-line flag may accept an unsigned binary",
@@ -608,6 +613,15 @@ mod tests {
         let declare = "fn f() { let _t = crate::input::UserText::from_cli(String::new()); }";
         assert_eq!(check_file(declare, "src/serve.rs").unwrap().len(), 1);
         assert!(check_file(declare, "src/cli.rs").unwrap().is_empty());
+        let assembled =
+            "fn f() { let _a = crate::template::Arg::authorized_job_text(String::new()); }";
+        assert_eq!(check_file(assembled, "src/client.rs").unwrap().len(), 1);
+        for allowed in ["src/shell.rs", "src/proc.rs", "src/service.rs"] {
+            assert!(
+                check_file(assembled, allowed).unwrap().is_empty(),
+                "{allowed}"
+            );
+        }
         for file in [
             "src/authz.rs",
             "src/supervisor.rs",

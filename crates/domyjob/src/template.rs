@@ -306,7 +306,7 @@ impl Arg {
     }
 
     #[must_use]
-    pub const fn authorized_job_text(text: String) -> Self {
+    pub(crate) const fn authorized_job_text(text: String) -> Self {
         Self(text)
     }
 }

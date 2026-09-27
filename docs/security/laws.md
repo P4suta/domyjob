@@ -8,6 +8,7 @@ Each one names the property it guarantees, the mechanism that guarantees it, and
 These are design targets, not a claim that every mechanism and check below is implemented.
 The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decision-signature gate covers only `authz.rs`, `trust.rs`, `audit.rs`, `supervisor.rs`, `serve.rs`, `store.rs`, `tree.rs`, `pull.rs`, `workspace.rs`, `mcp.rs`, and `node.rs`, and CI does not run `cargo vet`.
 Passing `mise run check` therefore does not establish all seven laws.
+The syntax gate currently limits raw `Arg::authorized_job_text` assembly to `shell.rs`, `proc.rs`, and `service.rs`.
 
 ## 1. No ambient authority
 
