@@ -150,9 +150,10 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         RemoteError::Tampered { .. }
         | RemoteError::AuditRolledBack { .. }
         | RemoteError::AuditRewritten { .. } => plain(Kind::Security),
-        RemoteError::State(_) | RemoteError::Snapshot(_) | RemoteError::Io { .. } => {
-            plain(Kind::Local)
-        }
+        RemoteError::TransferId(_)
+        | RemoteError::State(_)
+        | RemoteError::Snapshot(_)
+        | RemoteError::Io { .. } => plain(Kind::Local),
     }
 }
 

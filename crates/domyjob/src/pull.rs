@@ -925,7 +925,7 @@ mod tests {
             };
             let journal = Journal::open(&pulls, "m-job").unwrap();
             let kept = checked.keep(&tree, &journal).unwrap();
-            let injected = fault.map(|passes| crate::faults::inject_after("pull::swap", passes, ""));
+            let injected = fault.map(|passes| crate::faults::inject_after("pull::swap", passes, &root));
             let pulled = kept.apply(&tree, &journal);
             drop(injected);
             drop(journal);

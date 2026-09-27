@@ -15,7 +15,13 @@ Warm workspace paths include the submitter's owner or peer-key scope, with a tes
 State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
 The syntax gate rejects direct `read_to_end` and `read_line` calls outside `bounded.rs`; setup output, tree reads, and log tails use explicit byte limits.
-Windows builds and installs now receive a transfer-specific ID, which prevents parallel operations in one client process from sharing a temporary upload file.
+Builds and installs now receive a fresh random `TransferId`; setup fails if entropy fails.
+The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.
+Source builds use the archive's `BlobId` under the client build stamp for their Cargo target directory, so different sources cannot share an executable cache entry.
+The syntax gate rejects a fixed incoming filename, and a Windows test builds two sources in one cache at once, then runs and promotes each staged executable.
+Source build scripts remove their extraction directory on ordinary failure, and setup discards only its own staged files when it receives an error.
+Recovery after an abrupt client or remote crash remains part of the open RC-R work.
+Test fault guards now own distinct rules with path scopes; concurrent tests cannot overwrite another guard's plan, and a delayed fault counts only operations inside its declared `Path`.
 Clippy and the syntax gate now confine exclusive file creation to four ordinary-file constructors, leaving liveness and serialization to operating-system locks.
 
 ## 1. No ambient authority
@@ -87,8 +93,8 @@ It never touches a job: the job keeps running, its state stays whatever its lock
 - ProVerif models of the paired connection prove that a recording stays secret if either X25519 or ML-KEM holds, and that a server accepts only sessions its client started (`docs/security/proverif`).
 - The terminal sanitizer parses escape sequences with `vte`, the parser Alacritty uses, rather than a hand-written state machine; property tests and the `terminal` fuzz target check that no steering character comes out for any input.
 - Kani proves that a concurrency is exactly one to sixty-four.
-- Disk failures are injected with the `fail` crate at every file operation of the state layer, the content store, and the audit log; tests check that each is reported as an error, never taken as an absence or a success, and that the next run heals what a failed write left behind.
-  A fault names the path it hits, so it never reaches another test running at the same time.
+- Disk failures are injected with path-scoped test guards at file operations of the state layer, the content store, and the audit log; tests check that each is reported as an error, never taken as an absence or a success, and that the next run heals what a failed write left behind.
+  Each guard owns its rules and removes only those rules on drop, so parallel tests cannot replace each other's fault plans.
 - Property tests cover the sanitizer across arbitrary byte splits, both quoting rules against reference parsers, key encodings, path confinement, and ML-KEM's reaction to every flipped ciphertext bit.
 - Fuzz targets cover every decoder at the border and the release verifier, run for a fixed number of inputs rather than a time.
 - Fault injection makes every read and write of every handshake fail in turn and requires an error, never a panic and never a success.

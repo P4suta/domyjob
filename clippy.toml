@@ -29,6 +29,7 @@ avoid-breaking-exported-api = false
 pass-by-value-size-limit = 128
 
 disallowed-methods = [
+  { path = "fail::cfg", reason = "test faults must be scoped by a guard and path through faults::inject" },
   { path = "std::fs::write", reason = "write domyjob state through state_file, user files through user_files" },
   { path = "std::fs::create_dir", reason = "create directories through state_file::private_dir" },
   { path = "std::fs::create_dir_all", reason = "create directories through state_file::private_dir" },

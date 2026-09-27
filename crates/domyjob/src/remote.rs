@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Binary, Config, ConfigError, Machine};
 use crate::dist::Deliverable;
-use crate::domain::{BlobId, MachineName};
+use crate::domain::{BlobId, MachineName, Nonce};
 use crate::paths::{Dirs, Family};
 use crate::protocol::{Frame, Hello, Refusal, Reply, Request, VERSION, build_key, wire};
 use crate::snapshot::{Origin, SnapshotError};
@@ -49,7 +49,8 @@ impl RemoteError {
             | Self::AuditRewritten { machine, .. }
             | Self::Outdated { machine, .. }
             | Self::Unbuilt { machine, .. } => Some(machine),
-            Self::Config(_)
+            Self::TransferId(_)
+            | Self::Config(_)
             | Self::Template { .. }
             | Self::Dist(_)
             | Self::State(_)
@@ -209,19 +210,17 @@ fn shared_lock(
 }
 
 static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static NEXT_TRANSFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransferId(String);
+pub(crate) struct TransferId(Nonce);
 
 impl TransferId {
-    fn fresh() -> Self {
-        let next = NEXT_TRANSFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self(format!("{}-{next:016x}", session()))
+    fn fresh() -> Result<Self, crate::domain::Invalid> {
+        Ok(Self(Nonce::generate()?))
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -237,6 +236,8 @@ fn session() -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {
+    #[error("could not generate a unique setup ID: {0}")]
+    TransferId(crate::domain::Invalid),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error("transport {transport}: {source}")]
@@ -433,62 +434,87 @@ enum Remote {
     Probe,
     WindowsArch,
     Install(Family, TransferId),
-    Staged(Family),
-    Promote(Family),
+    Staged(Family, TransferId),
+    Promote(Family, TransferId),
+    Discard(Family, TransferId),
     Uninstall(Family, Placement),
     Scrub(Family),
-    Build(Family, TransferId),
+    Build(Family, TransferId, BlobId),
 }
 
 impl Remote {
-    fn install(family: Family) -> Self {
-        Self::Install(family, TransferId::fresh())
+    fn install(family: Family, transfer: &TransferId) -> Self {
+        Self::Install(family, transfer.clone())
     }
 
-    fn build(family: Family) -> Self {
-        Self::Build(family, TransferId::fresh())
+    fn build(family: Family, transfer: &TransferId, source: &BlobId) -> Self {
+        Self::Build(family, transfer.clone(), source.clone())
+    }
+
+    fn staged(family: Family, transfer: &TransferId) -> Self {
+        Self::Staged(family, transfer.clone())
+    }
+
+    fn promote(family: Family, transfer: &TransferId) -> Self {
+        Self::Promote(family, transfer.clone())
+    }
+
+    fn discard(family: Family, transfer: &TransferId) -> Self {
+        Self::Discard(family, transfer.clone())
     }
 }
 
-fn build_unix() -> Arg {
-    Arg::joined(&[
-        "set -e; PATH=\"$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH\"; ",
-        "c=\"$HOME/.cache/domyjob\"; s=\"$c/source-$$\"; rm -rf \"$s\"; mkdir -p \"$s\"; ",
-        "tar -x -m -C \"$s\"; cd \"$s\"; ",
-        "MISE_TRUSTED_CONFIG_PATHS=\"$s\"; export MISE_TRUSTED_CONFIG_PATHS; ",
-        "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null' EXIT; ",
-        "cargo clean -p domyjob --target-dir \"$c/build\" >&2; rm -f \"$c/build/release/domyjob\"; ",
-        "DOMYJOB_EXPECTED_BUILD_STAMP=",
-        crate::protocol::BUILD_STAMP,
-        " cargo build --release --locked -p domyjob --target-dir \"$c/build\" >&2; ",
-        "d=\"$c/bin/",
-        build_key(),
-        "\"; mkdir -p \"$d\"; cp \"$c/build/release/domyjob\" \"$d/domyjob.$$\"; ",
-        "chmod 755 \"$d/domyjob.$$\"; mv -f \"$d/domyjob.$$\" \"$d/domyjob.incoming\"; ",
-        "cd /; rm -rf \"$s\"",
+fn build_unix(transfer: &TransferId, source: &BlobId) -> Arg {
+    Arg::concat(&[
+        Arg::literal("set -e; transfer='"),
+        Arg::word(transfer),
+        Arg::joined(&[
+            "'; PATH=\"$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH\"; ",
+            "c=\"$HOME/.cache/domyjob\"; s=\"$c/source-$$\"; t=\"$c/build/",
+            build_key(),
+            "/",
+        ]),
+        Arg::word(source),
+        Arg::joined(&[
+            "\"; trap 'cd /; rm -rf \"$s\"' EXIT; rm -rf \"$s\"; mkdir -p \"$s\"; ",
+            "tar -x -m -C \"$s\"; cd \"$s\"; ",
+            "MISE_TRUSTED_CONFIG_PATHS=\"$s\"; export MISE_TRUSTED_CONFIG_PATHS; ",
+            "(while :; do sleep 5; printf . >&2; done) & beat=$!; trap 'kill $beat 2>/dev/null; cd /; rm -rf \"$s\"' EXIT; ",
+            "DOMYJOB_EXPECTED_BUILD_STAMP=",
+            crate::protocol::BUILD_STAMP,
+            " cargo build --release --locked -p domyjob --target-dir \"$t\" >&2; ",
+            "d=\"$c/bin/",
+            build_key(),
+            "\"; p=\"$d/domyjob.incoming-$transfer\"; mkdir -p \"$d\"; cp \"$t/release/domyjob\" \"$p.$$\"; ",
+            "chmod 755 \"$p.$$\"; mv -f \"$p.$$\" \"$p\"",
+        ]),
     ])
 }
 
-fn build_windows_script(transfer: &TransferId) -> Arg {
+fn build_windows_script(transfer: &TransferId, source: &BlobId) -> Arg {
     Arg::concat(&[
-        Arg::joined(&[
-            "$ErrorActionPreference = 'Stop'; ",
-            "$c = Join-Path $env:USERPROFILE '.cache\\domyjob'; $s = Join-Path $c \"source-$PID\"; ",
-            "if (Test-Path $s) { Remove-Item -Recurse -Force $s }; New-Item -ItemType Directory -Force $s | Out-Null; ",
-            "$b = Join-Path $env:TEMP 'domyjob-source-",
-        ]),
+        Arg::literal("$ErrorActionPreference = 'Stop'; $transfer = '"),
         Arg::word(transfer),
         Arg::joined(&[
-            ".b64'; $t = \"$s.tar\"; ",
+            "'; ",
+            "$c = Join-Path $env:USERPROFILE '.cache\\domyjob'; $s = Join-Path $c \"source-$PID\"; ",
+            "$t = \"$s.tar\"; try { ",
+            "if (Test-Path $s) { Remove-Item -Recurse -Force $s }; New-Item -ItemType Directory -Force $s | Out-Null; ",
+            "$b = Join-Path $env:TEMP ('domyjob-source-' + $transfer + '.b64'); ",
             "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String(((Get-Content -Raw $b) -replace '\\s', ''))); Remove-Item -Force $b; ",
-            "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { exit $LASTEXITCODE }; ",
+            "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { throw \"tar exited with $LASTEXITCODE\" }; ",
             "Set-Location $s; $env:MISE_TRUSTED_CONFIG_PATHS = $s; ",
-            "& cargo clean -p domyjob --target-dir (Join-Path $c 'build'); if ($LASTEXITCODE -ne 0) { throw 'cargo clean failed' }; ",
-            "$exe = Join-Path $c 'build\\release\\domyjob.exe'; if (Test-Path $exe) { Remove-Item -Force $exe }; ",
+            "$target = Join-Path $c 'build\\",
+            build_key(),
+            "\\",
+        ]),
+        Arg::word(source),
+        Arg::joined(&[
+            "'; $exe = Join-Path $target 'release\\domyjob.exe'; ",
             "$env:DOMYJOB_EXPECTED_BUILD_STAMP = '",
             crate::protocol::BUILD_STAMP,
             "'; ",
-            "$job = Start-Job -ArgumentList $s,(Join-Path $c 'build'),$env:DOMYJOB_EXPECTED_BUILD_STAMP -ScriptBlock { param($source,$target,$expected) Set-Location $source; $env:MISE_TRUSTED_CONFIG_PATHS = $source; $env:DOMYJOB_EXPECTED_BUILD_STAMP = $expected; & cargo build --release --locked -p domyjob --target-dir $target; if ($LASTEXITCODE -ne 0) { throw \"cargo build exited with $LASTEXITCODE\" } }; ",
+            "$job = Start-Job -ArgumentList $s,$target,$env:DOMYJOB_EXPECTED_BUILD_STAMP -ScriptBlock { param($source,$target,$expected) Set-Location $source; $env:MISE_TRUSTED_CONFIG_PATHS = $source; $env:DOMYJOB_EXPECTED_BUILD_STAMP = $expected; & cargo build --release --locked -p domyjob --target-dir $target; if ($LASTEXITCODE -ne 0) { throw \"cargo build exited with $LASTEXITCODE\" } }; ",
             "while ($job.State -eq 'NotStarted' -or $job.State -eq 'Running') { Wait-Job $job -Timeout 5 | Out-Null; [Console]::Error.Write('.') }; ",
             "Receive-Job $job -ErrorAction Continue | ForEach-Object { [Console]::Error.WriteLine($_) }; ",
             "if ($job.State -ne 'Completed') { throw 'cargo build failed' }; Remove-Job $job; ",
@@ -496,14 +522,14 @@ fn build_windows_script(transfer: &TransferId) -> Arg {
             "$d = Join-Path $c 'bin\\",
             build_key(),
             "'; New-Item -ItemType Directory -Force $d | Out-Null; ",
-            "Copy-Item -Force $exe (Join-Path $d 'domyjob.incoming.exe'); ",
-            "Set-Location $c; Remove-Item -Recurse -Force $s, $t",
+            "$stage = Join-Path $d ('domyjob.incoming-' + $transfer + '.exe'); Copy-Item -Force $exe $stage; ",
+            "} finally { Set-Location $env:USERPROFILE; Remove-Item -LiteralPath $s,$t -Recurse -Force -ErrorAction SilentlyContinue }",
         ]),
     ])
 }
 
-fn build_windows(transfer: &TransferId) -> Arg {
-    build_windows_with(&build_windows_script(transfer), transfer)
+fn build_windows(transfer: &TransferId, source: &BlobId) -> Arg {
+    build_windows_with(&build_windows_script(transfer, source), transfer)
 }
 
 fn build_windows_with(script: &Arg, transfer: &TransferId) -> Arg {
@@ -518,18 +544,24 @@ fn build_windows_with(script: &Arg, transfer: &TransferId) -> Arg {
 }
 
 #[cfg(test)]
-pub(crate) fn windows_source_build_for_test(cache: &std::path::Path) -> Arg {
-    let transfer = TransferId::fresh();
-    let original = build_windows_script(&transfer).into_string();
+pub(crate) fn windows_source_build_for_test(
+    cache: &std::path::Path,
+    source: &BlobId,
+) -> (Arg, TransferId) {
+    let transfer = TransferId::fresh().unwrap();
+    let original = build_windows_script(&transfer, source).into_string();
     let assignment = "$c = Join-Path $env:USERPROFILE '.cache\\domyjob';";
     assert!(original.contains(assignment));
     let assigned = format!(
         "$c = {};",
         crate::shell::powershell_quote(&cache.display().to_string())
     );
-    build_windows_with(
-        &Arg::for_test(original.replacen(assignment, &assigned, 1)),
-        &transfer,
+    (
+        build_windows_with(
+            &Arg::for_test(original.replacen(assignment, &assigned, 1)),
+            &transfer,
+        ),
+        transfer,
     )
 }
 
@@ -554,10 +586,10 @@ fn install_windows_script(transfer: &TransferId) -> Arg {
         Arg::joined(&[
             ".b64 %USERPROFILE%\\.cache\\domyjob\\bin\\",
             build_key(),
-            "\\domyjob.incoming.exe >nul && del %TEMP%\\domyjob-",
-            build_key(),
-            "-",
+            "\\domyjob.incoming-",
         ]),
+        Arg::word(transfer),
+        Arg::joined(&[".exe >nul && del %TEMP%\\domyjob-", build_key(), "-"]),
         Arg::word(transfer),
         Arg::literal(".b64"),
     ])
@@ -612,27 +644,72 @@ fn uninstall_windows() -> Arg {
     ])
 }
 
-fn staged_windows() -> Arg {
-    Arg::joined(&[
-        ".\\.cache\\domyjob\\bin\\",
-        build_key(),
-        "\\domyjob.incoming.exe node",
+fn staged_windows(transfer: &TransferId) -> Arg {
+    Arg::concat(&[
+        Arg::joined(&[
+            ".\\.cache\\domyjob\\bin\\",
+            build_key(),
+            "\\domyjob.incoming-",
+        ]),
+        Arg::word(transfer),
+        Arg::literal(".exe node"),
     ])
 }
 
-fn promote_windows_script() -> Arg {
-    Arg::joined(&[
-        "cd /d %USERPROFILE%\\.cache\\domyjob\\bin\\",
-        build_key(),
-        " && (del /q domyjob.old-*.exe 2>nul & if exist domyjob.exe move /y domyjob.exe domyjob.old-%RANDOM%%RANDOM%.exe >nul) && move /y domyjob.incoming.exe domyjob.exe >nul",
+pub(crate) fn promote_windows_script(transfer: &TransferId) -> Arg {
+    Arg::concat(&[
+        Arg::joined(&[
+            "cd /d %USERPROFILE%\\.cache\\domyjob\\bin\\",
+            build_key(),
+            " && (del /q domyjob.old-*.exe 2>nul & if exist domyjob.exe move /y domyjob.exe domyjob.old-%RANDOM%%RANDOM%.exe >nul) && move /y domyjob.incoming-",
+        ]),
+        Arg::word(transfer),
+        Arg::literal(".exe domyjob.exe >nul"),
     ])
 }
 
-fn install_unix_script() -> Arg {
-    Arg::joined(&[
-        "d=\"$HOME/.cache/domyjob/bin/",
-        build_key(),
-        "\"; mkdir -p \"$d\" && cat > \"$d/domyjob.$$\" && chmod 755 \"$d/domyjob.$$\" && mv -f \"$d/domyjob.$$\" \"$d/domyjob.incoming\"",
+fn discard_windows_script(transfer: &TransferId) -> Arg {
+    Arg::concat(&[
+        Arg::literal("$transfer = '"),
+        Arg::word(transfer),
+        Arg::joined(&[
+            "'; $d = Join-Path $env:USERPROFILE '.cache\\domyjob\\bin\\",
+            build_key(),
+            "'; $stage = Join-Path $d ('domyjob.incoming-' + $transfer + '.exe'); ",
+            "$upload = Join-Path $env:TEMP ('domyjob-",
+            build_key(),
+            "-' + $transfer + '.b64'); ",
+            "$source = Join-Path $env:TEMP ('domyjob-source-' + $transfer + '.b64'); ",
+            "Remove-Item -LiteralPath $stage,$upload,$source -Force -ErrorAction SilentlyContinue",
+        ]),
+    ])
+}
+
+pub(crate) fn discard_windows_argv(transfer: &TransferId) -> Vec<Arg> {
+    powershell(&discard_windows_script(transfer))
+}
+
+fn discard_unix_script(transfer: &TransferId) -> Arg {
+    Arg::concat(&[
+        Arg::joined(&[
+            "p=\"$HOME/.cache/domyjob/bin/",
+            build_key(),
+            "/domyjob.incoming-",
+        ]),
+        Arg::word(transfer),
+        Arg::literal("\"; rm -f \"$p\" \"$p\".*"),
+    ])
+}
+
+fn install_unix_script(transfer: &TransferId) -> Arg {
+    Arg::concat(&[
+        Arg::literal("transfer='"),
+        Arg::word(transfer),
+        Arg::joined(&[
+            "'; d=\"$HOME/.cache/domyjob/bin/",
+            build_key(),
+            "\"; p=\"$d/domyjob.incoming-$transfer\"; mkdir -p \"$d\" && cat > \"$p.$$\" && chmod 755 \"$p.$$\" && mv -f \"$p.$$\" \"$p\"",
+        ]),
     ])
 }
 
@@ -677,38 +754,56 @@ impl Remote {
             }
             Self::Probe => vec![Arg::literal("uname"), Arg::literal("-sm")],
             Self::WindowsArch => powershell(&Arg::literal(PROBE_WINDOWS)),
-            Self::Install(Family::Unix, _) => vec![
+            Self::Install(Family::Unix, transfer) => vec![
                 Arg::literal("sh"),
                 Arg::literal("-c"),
-                install_unix_script(),
+                install_unix_script(transfer),
             ],
             Self::Install(Family::Windows, transfer) => cmd(install_windows_script(transfer)),
-            Self::Staged(Family::Unix) => vec![
+            Self::Staged(Family::Unix, transfer) => vec![
                 Arg::literal("sh"),
                 Arg::literal("-c"),
-                Arg::joined(&[
-                    "exec \"$HOME/.cache/domyjob/bin/",
-                    build_key(),
-                    "/domyjob.incoming\" node",
+                Arg::concat(&[
+                    Arg::joined(&[
+                        "exec \"$HOME/.cache/domyjob/bin/",
+                        build_key(),
+                        "/domyjob.incoming-",
+                    ]),
+                    Arg::word(transfer),
+                    Arg::literal("\" node"),
                 ]),
             ],
-            Self::Staged(Family::Windows) => cmd(staged_windows()),
-            Self::Promote(Family::Unix) => vec![
+            Self::Staged(Family::Windows, transfer) => cmd(staged_windows(transfer)),
+            Self::Promote(Family::Unix, transfer) => vec![
                 Arg::literal("sh"),
                 Arg::literal("-c"),
-                Arg::joined(&[
-                    "d=\"$HOME/.cache/domyjob/bin/",
-                    build_key(),
-                    "\"; mv -f \"$d/domyjob.incoming\" \"$d/domyjob\"",
+                Arg::concat(&[
+                    Arg::joined(&[
+                        "d=\"$HOME/.cache/domyjob/bin/",
+                        build_key(),
+                        "\"; mv -f \"$d/domyjob.incoming-",
+                    ]),
+                    Arg::word(transfer),
+                    Arg::literal("\" \"$d/domyjob\""),
                 ]),
             ],
-            Self::Promote(Family::Windows) => cmd(promote_windows_script()),
+            Self::Promote(Family::Windows, transfer) => cmd(promote_windows_script(transfer)),
+            Self::Discard(Family::Unix, transfer) => vec![
+                Arg::literal("sh"),
+                Arg::literal("-c"),
+                discard_unix_script(transfer),
+            ],
+            Self::Discard(Family::Windows, transfer) => discard_windows_argv(transfer),
             Self::Uninstall(family, placement) => uninstall_argv(*family, *placement),
             Self::Scrub(family) => scrub_argv(*family),
-            Self::Build(Family::Unix, _) => {
-                vec![Arg::literal("sh"), Arg::literal("-c"), build_unix()]
+            Self::Build(Family::Unix, transfer, source) => {
+                vec![
+                    Arg::literal("sh"),
+                    Arg::literal("-c"),
+                    build_unix(transfer, source),
+                ]
             }
-            Self::Build(Family::Windows, transfer) => cmd(build_windows(transfer)),
+            Self::Build(Family::Windows, transfer, source) => cmd(build_windows(transfer, source)),
         }
     }
 
@@ -723,8 +818,10 @@ impl Remote {
             Self::Install(Family::Windows, transfer) => {
                 Arg::cmd_wrapped(&install_windows_script(transfer))
             }
-            Self::Staged(Family::Windows) => Arg::cmd_wrapped(&staged_windows()),
-            Self::Promote(Family::Windows) => Arg::cmd_wrapped(&promote_windows_script()),
+            Self::Staged(Family::Windows, transfer) => Arg::cmd_wrapped(&staged_windows(transfer)),
+            Self::Promote(Family::Windows, transfer) => {
+                Arg::cmd_wrapped(&promote_windows_script(transfer))
+            }
             Self::Uninstall(Family::Windows, Placement::Managed) => {
                 Arg::cmd_wrapped(&uninstall_windows())
             }
@@ -732,14 +829,17 @@ impl Remote {
                 Arg::cmd_wrapped(&Arg::literal("domyjob self uninstall --yes"))
             }
             Self::Scrub(Family::Windows) => Arg::cmd_wrapped(&Arg::literal(SCRUB_WINDOWS)),
-            Self::Build(Family::Windows, transfer) => Arg::cmd_wrapped(&build_windows(transfer)),
-            Self::WindowsArch => Arg::spaced(&self.argv()),
-            Self::Build(Family::Unix, _)
+            Self::Build(Family::Windows, transfer, source) => {
+                Arg::cmd_wrapped(&build_windows(transfer, source))
+            }
+            Self::WindowsArch | Self::Discard(Family::Windows, _) => Arg::spaced(&self.argv()),
+            Self::Build(Family::Unix, _, _)
             | Self::Probe
             | Self::Node(Family::Unix, _)
             | Self::Install(Family::Unix, _)
-            | Self::Staged(Family::Unix)
-            | Self::Promote(Family::Unix)
+            | Self::Staged(Family::Unix, _)
+            | Self::Promote(Family::Unix, _)
+            | Self::Discard(Family::Unix, _)
             | Self::Uninstall(Family::Unix, _)
             | Self::Scrub(Family::Unix) => Arg::posix_command(&self.argv()),
         }
@@ -1313,16 +1413,29 @@ impl<'a> Link<'a> {
     }
 
     fn install_for(&mut self, deliverable: &Deliverable) -> Result<Hello, RemoteError> {
+        let transfer = TransferId::fresh().map_err(RemoteError::TransferId)?;
+        let result = self.install_staged(deliverable, &transfer);
+        if result.is_err() {
+            let _cleanup = self.capture(&Remote::discard(self.family, &transfer), &[]);
+        }
+        result
+    }
+
+    fn install_staged(
+        &mut self,
+        deliverable: &Deliverable,
+        transfer: &TransferId,
+    ) -> Result<Hello, RemoteError> {
         let expected = match deliverable.binary() {
-            Some(binary) => Some(self.upload(deliverable, binary)?),
+            Some(binary) => Some(self.upload(deliverable, binary, transfer)?),
             None => None,
         };
         if let Deliverable::Source { archive, .. } = deliverable {
-            self.build(archive)?;
+            self.build(archive, transfer)?;
         }
         let hello = self
             .exchange_with(
-                &Remote::Staged(self.family),
+                &Remote::staged(self.family, transfer),
                 &Request::Hello,
                 (&[], &mut std::io::sink()),
             )?
@@ -1346,7 +1459,7 @@ impl<'a> Link<'a> {
                 reported: hello.build,
             });
         }
-        let promoted = self.capture(&Remote::Promote(self.family), &[])?;
+        let promoted = self.capture(&Remote::promote(self.family, transfer), &[])?;
         if !promoted.status.success() {
             return Err(RemoteError::Exited {
                 machine: self.name(),
@@ -1363,6 +1476,7 @@ impl<'a> Link<'a> {
         &self,
         deliverable: &Deliverable,
         binary: &crate::dist::Binary,
+        transfer: &TransferId,
     ) -> Result<String, RemoteError> {
         let bytes =
             std::fs::read(binary.path()).map_err(crate::failure::io("reading", binary.path()))?;
@@ -1386,13 +1500,14 @@ impl<'a> Link<'a> {
             }
         }
         self.expect_success(
-            &self.capture(&Remote::install(self.family), &payload)?,
+            &self.capture(&Remote::install(self.family, transfer), &payload)?,
             "staging",
         )?;
         Ok(binary.sha256().to_owned())
     }
 
-    fn build(&self, archive: &[u8]) -> Result<(), RemoteError> {
+    fn build(&self, archive: &[u8], transfer: &TransferId) -> Result<(), RemoteError> {
+        let source = BlobId::of(archive);
         eprintln!(
             "domyjob: {}: building domyjob {VERSION} from the sent source",
             self.machine.name
@@ -1409,7 +1524,11 @@ impl<'a> Link<'a> {
             }
         };
         self.expect_success(
-            &self.capture_telling(&Remote::build(self.family), &payload, &tell)?,
+            &self.capture_telling(
+                &Remote::build(self.family, transfer, &source),
+                &payload,
+                &tell,
+            )?,
             "building from source",
         )
     }
@@ -1829,24 +1948,31 @@ mod tests {
             text(Remote::Node(Family::Windows, Placement::Installed)),
             "cmd /c \"domyjob node 2>nul\""
         );
-        assert!(text(Remote::install(Family::Windows)).starts_with("cmd /c \"mkdir %USERPROFILE%"));
-        assert!(text(Remote::install(Family::Windows)).contains("domyjob.incoming.exe"));
+        let transfer = TransferId::fresh().unwrap();
         assert!(
-            text(Remote::Promote(Family::Windows)).contains("move /y domyjob.exe domyjob.old-")
+            text(Remote::install(Family::Windows, &transfer))
+                .starts_with("cmd /c \"mkdir %USERPROFILE%")
         );
-        assert!(text(Remote::Staged(Family::Unix)).contains("domyjob.incoming"));
+        assert!(text(Remote::install(Family::Windows, &transfer)).contains("domyjob.incoming-"));
+        assert!(
+            text(Remote::promote(Family::Windows, &transfer))
+                .contains("move /y domyjob.exe domyjob.old-")
+        );
+        assert!(text(Remote::staged(Family::Unix, &transfer)).contains("domyjob.incoming"));
         assert!(text(Remote::WindowsArch).contains("-InputFormat None -EncodedCommand"));
         assert_eq!(base64_lines(&[0u8; 60]).lines().count(), 2);
     }
 
     #[test]
     fn source_build_scripts_require_a_fresh_artifact() {
-        let unix = Remote::build(Family::Unix).text();
-        let text = unix.as_arg_str();
-        let transfer = TransferId::fresh();
-        let windows = build_windows_script(&transfer);
+        let transfer = TransferId::fresh().unwrap();
+        let source = BlobId::of(b"source fixture");
+        let unix = Remote::build(Family::Unix, &transfer, &source).argv();
+        let text = unix.get(2).unwrap().as_arg_str();
+        let windows = build_windows_script(&transfer, &source);
         assert!(
-            windows_source_build_for_test(std::path::Path::new("build-fixture"))
+            windows_source_build_for_test(std::path::Path::new("build-fixture"), &source)
+                .0
                 .as_arg_str()
                 .contains("findstr . > %TEMP%")
         );
@@ -1854,10 +1980,16 @@ mod tests {
             "DOMYJOB_EXPECTED_BUILD_STAMP={}",
             crate::protocol::BUILD_STAMP
         )));
-        assert!(text.contains("cargo clean -p domyjob"));
-        assert!(text.contains("rm -f \"$c/build/release/domyjob\""));
+        assert!(text.contains("--target-dir \"$t\""));
+        assert!(text.contains(&format!("build/{}/{source}", build_key())));
+        assert!(text.contains("domyjob.incoming-$transfer"));
         assert!(text.contains("MISE_TRUSTED_CONFIG_PATHS=\"$s\""));
-        assert!(windows.as_arg_str().contains("& cargo clean -p domyjob"));
+        assert!(windows.as_arg_str().contains("$target = Join-Path $c"));
+        assert!(
+            windows
+                .as_arg_str()
+                .contains(&format!("build\\{}\\{source}", build_key()))
+        );
         assert!(
             windows
                 .as_arg_str()
@@ -1868,23 +2000,43 @@ mod tests {
             crate::protocol::BUILD_STAMP
         )));
         assert!(windows.as_arg_str().contains("$job.State -ne 'Completed'"));
-        assert!(windows.as_arg_str().contains("Remove-Item -Force $exe"));
+        assert!(
+            windows
+                .as_arg_str()
+                .contains("Copy-Item -Force $exe $stage")
+        );
     }
 
     #[test]
-    fn separate_windows_transfers_never_share_a_temporary_input() {
-        let build = Remote::build(Family::Windows);
+    fn separate_transfers_keep_their_own_inputs_and_staged_binaries() {
+        let first = TransferId::fresh().unwrap();
+        let second = TransferId::fresh().unwrap();
+        let source = BlobId::of(b"source fixture");
+        let other_source = BlobId::of(b"different source");
+        let build = Remote::build(Family::Windows, &first, &source);
         let first_build = build.text();
         assert_eq!(first_build, Arg::cmd_wrapped(build.argv().get(2).unwrap()));
-        let second_build = Remote::build(Family::Windows).text();
+        let second_build = Remote::build(Family::Windows, &second, &source).text();
         assert_ne!(first_build.as_arg_str(), second_build.as_arg_str());
-        let install = Remote::install(Family::Windows);
+        for family in [Family::Unix, Family::Windows] {
+            let same_source_build = Remote::build(family, &first, &source).text();
+            let other_build = Remote::build(family, &first, &other_source).text();
+            assert_ne!(same_source_build.as_arg_str(), other_build.as_arg_str());
+        }
+        let install = Remote::install(Family::Windows, &first);
         let first_install = install.text();
         assert_eq!(
             first_install,
             Arg::cmd_wrapped(install.argv().get(2).unwrap())
         );
-        let second_install = Remote::install(Family::Windows).text();
+        let second_install = Remote::install(Family::Windows, &second).text();
         assert_ne!(first_install.as_arg_str(), second_install.as_arg_str());
+        for family in [Family::Unix, Family::Windows] {
+            let staged = Remote::staged(family, &first).text();
+            let promoted = Remote::promote(family, &first).text();
+            assert!(staged.as_arg_str().contains(first.as_str()));
+            assert!(promoted.as_arg_str().contains(first.as_str()));
+            assert!(!staged.as_arg_str().contains(second.as_str()));
+        }
     }
 }

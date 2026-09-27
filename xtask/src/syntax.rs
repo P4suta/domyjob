@@ -13,6 +13,16 @@ fn line_of(span: Span) -> usize {
     span.start().line
 }
 
+fn path_ends_with(path: &syn::Path, tail: &[&str]) -> bool {
+    path.segments.len() >= tail.len()
+        && path
+            .segments
+            .iter()
+            .rev()
+            .zip(tail.iter().rev())
+            .all(|(actual, expected)| actual.ident == *expected)
+}
+
 fn serde_words(attrs: &[syn::Attribute]) -> Vec<String> {
     let mut words = Vec::new();
     for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
@@ -117,6 +127,10 @@ const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 const EXCLUSIVE_CREATE_RULE: &str =
     "create_new is only for approved exclusive file creation, never a hand-made lock";
+const INCOMING_RULE: &str =
+    "setup staging paths must include the transfer ID; a fixed incoming name mixes operations";
+const FAULT_SCENARIO_RULE: &str =
+    "test fault scenarios belong only in faults.rs; use a path-scoped guard elsewhere";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -347,6 +361,17 @@ impl Gate {
 }
 
 impl<'ast> Visit<'ast> for Gate {
+    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+        if self.test_depth == 0 && self.file.starts_with("crates/domyjob/src/") {
+            let value = literal.value();
+            let stem = "domyjob.incoming";
+            if value.split(stem).skip(1).any(|tail| !tail.starts_with('-')) {
+                self.flag(literal.span(), INCOMING_RULE);
+            }
+        }
+        syn::visit::visit_lit_str(self, literal);
+    }
+
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if self.test_depth == 0
             && !self.file_is(JSON_FILES)
@@ -370,6 +395,15 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path_ends_with(path, &["fail", "FailScenario", "setup"]) && !self.file_is(&["faults.rs"])
+        {
+            self.flag(
+                path.segments
+                    .last()
+                    .map_or_else(Span::call_site, |segment| segment.ident.span()),
+                FAULT_SCENARIO_RULE,
+            );
+        }
         self.check_path(path);
         if self.test_depth == 0 && self.file_is(WIRE_FILES) {
             for segment in &path.segments {
@@ -602,6 +636,33 @@ mod tests {
         let source = "fn f(t: &RemoteText) -> String { t.as_raw_str().to_owned() }";
         assert_eq!(check_file(source, "src/view.rs").unwrap().len(), 1);
         assert!(check_file(source, "src/remote.rs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn setup_staging_cannot_use_a_fixed_incoming_name() {
+        let fixed = r#"fn f() { let _ = "domyjob.incoming.exe"; }"#;
+        let scoped = r#"fn f() { let _ = "domyjob.incoming-"; }"#;
+        let file = "crates/domyjob/src/remote.rs";
+        assert_eq!(
+            check_file(fixed, file).unwrap().first().map(|f| f.rule),
+            Some(INCOMING_RULE)
+        );
+        assert!(check_file(scoped, file).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tests_cannot_install_a_process_global_fault_scenario() {
+        let source = "#[cfg(test)] mod tests { fn f() { fail::FailScenario::setup(); } }";
+        let file = "crates/domyjob/src/pull.rs";
+        assert_eq!(
+            check_file(source, file).unwrap().first().map(|f| f.rule),
+            Some(FAULT_SCENARIO_RULE)
+        );
+        assert!(
+            check_file(source, "crates/domyjob/src/faults.rs")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

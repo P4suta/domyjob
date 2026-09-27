@@ -537,20 +537,41 @@ mod windows_source_build_tests {
 
     #[expect(
         clippy::unwrap_used,
+        reason = "unreadable fixture directories fail the test"
+    )]
+    fn source_is_clean(cache: &Path) -> bool {
+        std::fs::read_dir(cache).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("source-")
+        })
+    }
+
+    #[expect(
+        clippy::unwrap_used,
         reason = "fixture setup failures should fail the test immediately"
     )]
-    fn run_build(main: &str) -> (tempfile::TempDir, PathBuf, Output) {
+    fn run_build(
+        main: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::remote::TransferId,
+        Output,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join(".cache").join("domyjob");
-        let artifact = cache.join("build/release/domyjob.exe");
-        crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
-        crate::state_file::write_bytes(
-            &cache.join("build/CACHEDIR.TAG"),
-            b"Signature: 8a477f597d28d172789f06886806bc55\n",
-        )
-        .unwrap();
-        crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
+        let (transfer, output) = run_build_in_cache(&cache, main);
+        (temp, cache, transfer, output)
+    }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup failures should fail the test immediately"
+    )]
+    fn run_build_in_cache(cache: &Path, main: &str) -> (crate::remote::TransferId, Output) {
         let mut archive = tar::Builder::new(Vec::new());
         for (name, contents) in [
             (
@@ -571,8 +592,26 @@ mod windows_source_build_tests {
                 .append_data(&mut header, name, contents.as_bytes())
                 .unwrap();
         }
-        let source = crate::remote::base64_lines(&archive.into_inner().unwrap());
-        let script = crate::remote::windows_source_build_for_test(&cache);
+        let archive = archive.into_inner().unwrap();
+        let digest = crate::domain::BlobId::of(&archive);
+        let (script, transfer) = crate::remote::windows_source_build_for_test(cache, &digest);
+        let artifact = cache
+            .join("build")
+            .join(crate::protocol::build_key())
+            .join(digest.as_str())
+            .join("release/domyjob.exe");
+        crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
+        crate::state_file::write_bytes(
+            &cache
+                .join("build")
+                .join(crate::protocol::build_key())
+                .join(digest.as_str())
+                .join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
+        let source = crate::remote::base64_lines(&archive);
         let mut child =
             crate::spawn::Invocation::new(Arg::literal("cmd"), vec![Arg::literal("/c"), script])
                 .command()
@@ -588,27 +627,59 @@ mod windows_source_build_tests {
             .write_all(source.as_bytes())
             .unwrap();
         let output = child.wait_with_output().unwrap();
-        (temp, cache, output)
+        (transfer, output)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup and cleanup failures should fail the test immediately"
+    )]
+    fn discard_staged_for_test(
+        profile: &Path,
+        staged: &Path,
+        transfer: &crate::remote::TransferId,
+    ) {
+        crate::state_file::write_bytes(staged, b"abandoned stage").unwrap();
+        let upload = profile.join(format!(
+            "domyjob-{}-{}.b64",
+            crate::protocol::build_key(),
+            transfer.as_str()
+        ));
+        let source = profile.join(format!("domyjob-source-{}.b64", transfer.as_str()));
+        crate::state_file::write_bytes(&upload, b"abandoned upload").unwrap();
+        crate::state_file::write_bytes(&source, b"abandoned source").unwrap();
+        let mut discard =
+            crate::spawn::Invocation::from_words(crate::remote::discard_windows_argv(transfer))
+                .unwrap()
+                .command();
+        discard.env("USERPROFILE", profile).env("TEMP", profile);
+        let discarded = discard.output().unwrap();
+        assert!(
+            discarded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&discarded.stderr)
+        );
+        assert!(absent(staged) && absent(&upload) && absent(&source));
     }
 
     #[test]
     fn failed_source_build_cannot_stage_an_old_executable() {
-        let (_temp, cache, output) = run_build("compile_error!(\"build must fail\");\n");
+        let (_temp, cache, transfer, output) = run_build("compile_error!(\"build must fail\");\n");
         let errors = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{errors}");
         assert!(errors.contains("build must fail"), "{errors}");
-        assert!(absent(&cache.join("build/release/domyjob.exe")));
         assert!(absent(
             &cache
                 .join("bin")
                 .join(crate::protocol::build_key())
-                .join("domyjob.incoming.exe")
+                .join(format!("domyjob.incoming-{}.exe", transfer.as_str()))
         ));
+        assert!(source_is_clean(&cache));
     }
 
     #[test]
     fn successful_source_build_replaces_the_old_executable_and_cleans_source() {
-        let (_temp, cache, output) = run_build("fn main() {}\n");
+        let (_temp, cache, transfer, output) = run_build("fn main() {}\n");
         assert!(
             output.status.success(),
             "{}",
@@ -617,14 +688,70 @@ mod windows_source_build_tests {
         let staged = cache
             .join("bin")
             .join(crate::protocol::build_key())
-            .join("domyjob.incoming.exe");
+            .join(format!("domyjob.incoming-{}.exe", transfer.as_str()));
         assert!(std::fs::metadata(staged).unwrap().len() > 1000);
-        assert!(std::fs::read_dir(cache).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("source-")
-        }));
+        assert!(source_is_clean(&cache));
+    }
+
+    #[test]
+    fn concurrent_source_builds_in_one_cache_stage_their_own_executables() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join(".cache").join("domyjob");
+        let ((first, first_output), (second, second_output)) = std::thread::scope(|scope| {
+            let first =
+                scope.spawn(|| run_build_in_cache(&cache, "fn main() { println!(\"first\"); }\n"));
+            let second =
+                scope.spawn(|| run_build_in_cache(&cache, "fn main() { println!(\"second\"); }\n"));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert!(
+            first_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first_output.stderr)
+        );
+        assert!(
+            second_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second_output.stderr)
+        );
+        assert_ne!(first, second);
+        let run = |path: &Path| {
+            let output = crate::spawn::Invocation::new(Arg::path(path), vec![])
+                .command()
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        for (transfer, expected) in [(first, "first\n"), (second, "second\n")] {
+            let staged = cache
+                .join("bin")
+                .join(crate::protocol::build_key())
+                .join(format!("domyjob.incoming-{}.exe", transfer.as_str()));
+            assert_eq!(run(&staged), expected);
+            let mut promote = crate::spawn::Invocation::new(
+                Arg::literal("cmd"),
+                vec![
+                    Arg::literal("/c"),
+                    crate::remote::promote_windows_script(&transfer),
+                ],
+            )
+            .command();
+            promote.env("USERPROFILE", temp.path());
+            let result = promote.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(absent(&staged));
+            let current = cache
+                .join("bin")
+                .join(crate::protocol::build_key())
+                .join("domyjob.exe");
+            assert_eq!(run(&current), expected);
+            discard_staged_for_test(temp.path(), &staged, &transfer);
+            assert_eq!(run(&current), expected);
+        }
     }
 }

@@ -952,8 +952,7 @@ mod tests {
         log.head().unwrap_err();
         log.hash_at(0, 1).unwrap_err();
         drop(unreadable);
-        let entries = log.path().display().to_string();
-        let unreadable_on_the_walk = crate::faults::inject_after("state_file::read", 2, &entries);
+        let unreadable_on_the_walk = crate::faults::inject_after("state_file::read", 0, log.path());
         log.verify().unwrap_err();
         drop(unreadable_on_the_walk);
         let written = log.verify().unwrap();
