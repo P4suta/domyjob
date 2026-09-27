@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{BlobId, RelPath};
 use crate::lock::OsLock;
 use crate::snapshot::{Entry, Left, Manifest};
-use crate::tree::{Blockers, Contents, Placed, Removed, Rooted, TreeError};
+use crate::tree::{Blockers, Clearance, Contents, EntryMatch, Placed, Removed, Rooted, TreeError};
 
 const KEPT_PULLS: usize = 32;
 
@@ -232,14 +232,10 @@ impl<Towards: Direction> Plan<Towards> {
         let mut pending = Vec::new();
         let mut already = 0usize;
         for step in self.steps {
-            if tree.holds(&step.path, step.after.as_ref(), &Removed::new())? {
-                already = already.saturating_add(1);
-            } else if tree.holds(&step.path, step.before.as_ref(), &removed)?
-                && (step.after.is_none() || tree.placeable(&step.path, &removed)?)
-            {
-                pending.push(step);
-            } else {
-                stuck.push(step.path);
+            match disposition(tree, &step, &removed)? {
+                StepDisposition::Already => already = already.saturating_add(1),
+                StepDisposition::Pending => pending.push(step),
+                StepDisposition::Stuck => stuck.push(step.path),
             }
         }
         if !stuck.is_empty() {
@@ -256,6 +252,29 @@ impl<Towards: Direction> Plan<Towards> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepDisposition {
+    Already,
+    Pending,
+    Stuck,
+}
+
+fn disposition(tree: &Tree, step: &Step, removed: &Removed) -> Result<StepDisposition, PullError> {
+    match tree.holds(&step.path, step.after.as_ref(), &Removed::new())? {
+        EntryMatch::Matches => Ok(StepDisposition::Already),
+        EntryMatch::Differs => match tree.holds(&step.path, step.before.as_ref(), removed)? {
+            EntryMatch::Differs => Ok(StepDisposition::Stuck),
+            EntryMatch::Matches => match &step.after {
+                None => Ok(StepDisposition::Pending),
+                Some(_) => match tree.placeable(&step.path, removed)? {
+                    Clearance::Clear => Ok(StepDisposition::Pending),
+                    Clearance::Obstructed => Ok(StepDisposition::Stuck),
+                },
+            },
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct Checked<Towards> {
     pending: Plan<Towards>,
@@ -269,10 +288,13 @@ impl Checked<Forward> {
     pub fn keep(self, tree: &Tree, journal: &Journal) -> Result<Kept, PullError> {
         journal.record(tree, &self.pending.steps)?;
         for step in &self.pending.steps {
-            if let Some(entry @ Entry::File { blob, .. }) = &step.before
-                && tree.holds(&step.path, Some(entry), &Removed::new())?
-            {
-                journal.keep(blob, &tree.read(&step.path)?, &step.path)?;
+            if let Some(entry @ Entry::File { blob, .. }) = &step.before {
+                match tree.holds(&step.path, Some(entry), &Removed::new())? {
+                    EntryMatch::Matches => {
+                        journal.keep(blob, &tree.read(&step.path)?, &step.path)?;
+                    }
+                    EntryMatch::Differs => {}
+                }
             }
         }
         Ok(Kept(self))
@@ -330,9 +352,12 @@ fn apply<Towards: Direction>(
     };
     for step in ordered(plan) {
         let none = Removed::new();
-        if tree.holds(&step.path, step.after.as_ref(), &none)? {
-            applied.already = applied.already.saturating_add(1);
-            continue;
+        match tree.holds(&step.path, step.after.as_ref(), &none)? {
+            EntryMatch::Matches => {
+                applied.already = applied.already.saturating_add(1);
+                continue;
+            }
+            EntryMatch::Differs => {}
         }
         let Some(seen) = tree.see(&step.path, step.before.as_ref())? else {
             return Err(Towards::stuck(vec![step.path.clone()]));
@@ -393,19 +418,22 @@ impl Tree {
         rel: &RelPath,
         expected: Option<&Entry>,
         removed: &Removed,
-    ) -> Result<bool, PullError> {
+    ) -> Result<EntryMatch, PullError> {
         Ok(self.0.holds(rel, expected, removed)?)
     }
 
-    fn placeable(&self, rel: &RelPath, removed: &Removed) -> Result<bool, PullError> {
+    fn placeable(&self, rel: &RelPath, removed: &Removed) -> Result<Clearance, PullError> {
         Ok(self.0.placeable(rel, removed)?)
     }
 
     fn see(&self, rel: &RelPath, expected: Option<&Entry>) -> Result<Option<Seen<'_>>, PullError> {
-        Ok(self.holds(rel, expected, &Removed::new())?.then(|| Seen {
-            path: rel.clone(),
-            tree: PhantomData,
-        }))
+        Ok(match self.holds(rel, expected, &Removed::new())? {
+            EntryMatch::Matches => Some(Seen {
+                path: rel.clone(),
+                tree: PhantomData,
+            }),
+            EntryMatch::Differs => None,
+        })
     }
 
     fn read(&self, rel: &RelPath) -> Result<Vec<u8>, PullError> {

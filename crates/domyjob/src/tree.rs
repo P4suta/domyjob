@@ -37,6 +37,24 @@ pub enum Parents {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryMatch {
+    Matches,
+    Differs,
+}
+
+impl EntryMatch {
+    const fn of(equal: bool) -> Self {
+        if equal { Self::Matches } else { Self::Differs }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clearance {
+    Clear,
+    Obstructed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blockers {
     Refuse,
     Replace,
@@ -148,25 +166,27 @@ impl Rooted {
         rel: &RelPath,
         expected: Option<&Entry>,
         removed: &Removed,
-    ) -> Result<bool, TreeError> {
+    ) -> Result<EntryMatch, TreeError> {
         Ok(match (self.found(rel, removed)?, expected) {
-            (Found::Nothing | Found::Directory, Some(_)) | (Found::Entry(_), None) => false,
-            (Found::Nothing | Found::Directory, None) => true,
-            (Found::Entry(meta), Some(Entry::File { blob, size, mode })) => {
+            (Found::Nothing | Found::Directory, Some(_)) | (Found::Entry(_), None) => {
+                EntryMatch::Differs
+            }
+            (Found::Nothing | Found::Directory, None) => EntryMatch::Matches,
+            (Found::Entry(meta), Some(Entry::File { blob, size, mode })) => EntryMatch::of(
                 meta.is_file()
                     && meta.len() == *size
                     && (!self.family.modes() || meta.mode() == *mode)
-                    && self.digest(rel)? == *blob
-            }
+                    && self.digest(rel)? == *blob,
+            ),
             (Found::Entry(meta), Some(Entry::Symlink { target })) => {
-                if meta.is_symlink() {
+                EntryMatch::of(if meta.is_symlink() {
                     self.link(rel)? == *target
                 } else {
                     !self.family.links()
                         && meta.is_file()
                         && meta.len() == crate::domain::len_u64(target.len())
                         && self.digest(rel)? == BlobId::of(target.as_bytes())
-                }
+                })
             }
         })
     }
@@ -184,10 +204,11 @@ impl Rooted {
         if !meta.is_file() {
             return Ok(None);
         }
-        if let Some(link @ Entry::Symlink { .. }) = sent
-            && self.holds(rel, Some(link), &Removed::new())?
-        {
-            return Ok(Some(link.clone()));
+        if let Some(link @ Entry::Symlink { .. }) = sent {
+            match self.holds(rel, Some(link), &Removed::new())? {
+                EntryMatch::Matches => return Ok(Some(link.clone())),
+                EntryMatch::Differs => {}
+            }
         }
         let mode = match sent {
             _ if self.family.modes() => meta.mode(),
@@ -246,17 +267,18 @@ impl Rooted {
             .ok_or_else(|| TreeError::Unportable(self.shown(rel)))
     }
 
-    pub fn placeable(&self, rel: &RelPath, removed: &Removed) -> Result<bool, TreeError> {
-        if self.parents(rel, removed)? == Parents::Blocked {
-            return Ok(false);
+    pub fn placeable(&self, rel: &RelPath, removed: &Removed) -> Result<Clearance, TreeError> {
+        match self.parents(rel, removed)? {
+            Parents::Blocked => return Ok(Clearance::Obstructed),
+            Parents::Directories | Parents::Missing => {}
         }
         match self.found(rel, removed)? {
             Found::Directory => self.emptied(rel, removed),
-            Found::Nothing | Found::Entry(_) => Ok(true),
+            Found::Nothing | Found::Entry(_) => Ok(Clearance::Clear),
         }
     }
 
-    pub fn emptied(&self, rel: &RelPath, removed: &Removed) -> Result<bool, TreeError> {
+    fn emptied(&self, rel: &RelPath, removed: &Removed) -> Result<Clearance, TreeError> {
         let listing = self
             .dir
             .read_dir(rel.to_local())
@@ -264,21 +286,24 @@ impl Rooted {
         for item in listing {
             let item = item.map_err(io("listing", &self.shown(rel)))?;
             let Some(child) = child_of(rel, &item.file_name()) else {
-                return Ok(false);
+                return Ok(Clearance::Obstructed);
             };
             let meta = item
                 .metadata()
                 .map_err(io("checking", &self.shown(&child)))?;
-            let gone = if meta.is_dir() && !meta.is_symlink() {
+            let clearance = if meta.is_dir() && !meta.is_symlink() {
                 self.emptied(&child, removed)?
+            } else if removed.contains(&child) {
+                Clearance::Clear
             } else {
-                removed.contains(&child)
+                Clearance::Obstructed
             };
-            if !gone {
-                return Ok(false);
+            match clearance {
+                Clearance::Clear => {}
+                Clearance::Obstructed => return Ok(Clearance::Obstructed),
             }
         }
-        Ok(true)
+        Ok(Clearance::Clear)
     }
 
     pub fn make_parents(&self, rel: &RelPath, blockers: Blockers) -> Result<(), TreeError> {

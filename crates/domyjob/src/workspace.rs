@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::cas::{Applied, Cas, CasError};
 use crate::domain::RelPath;
 use crate::snapshot::{Entry, Left, Manifest};
-use crate::tree::{Blockers, Contents, Placed, Removed, Rooted, TreeError};
+use crate::tree::{Blockers, Contents, EntryMatch, Placed, Removed, Rooted, TreeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -61,7 +61,7 @@ impl Workspace {
         self.0.root()
     }
 
-    fn holds(&self, rel: &RelPath, entry: &Entry) -> Result<bool, WorkspaceError> {
+    fn holds(&self, rel: &RelPath, entry: &Entry) -> Result<EntryMatch, WorkspaceError> {
         Ok(self.0.holds(rel, Some(entry), &Removed::new())?)
     }
 
@@ -98,11 +98,12 @@ impl Workspace {
             if stop.load(Ordering::SeqCst) {
                 return Err(WorkspaceError::Stopped);
             }
-            if self.holds(rel, entry)? {
-                changes.kept = changes.kept.saturating_add(1);
-            } else {
-                self.place(cas, rel, entry)?;
-                changes.written = changes.written.saturating_add(1);
+            match self.holds(rel, entry)? {
+                EntryMatch::Matches => changes.kept = changes.kept.saturating_add(1),
+                EntryMatch::Differs => {
+                    self.place(cas, rel, entry)?;
+                    changes.written = changes.written.saturating_add(1);
+                }
             }
             next.insert(rel.clone());
         }
@@ -119,11 +120,12 @@ impl Workspace {
     pub fn left(&self, sent: &Manifest) -> Result<Vec<Left>, WorkspaceError> {
         let mut left = Vec::new();
         for (rel, entry) in &sent.entries {
-            if !self.holds(rel, entry)? {
-                left.push(Left {
+            match self.holds(rel, entry)? {
+                EntryMatch::Matches => {}
+                EntryMatch::Differs => left.push(Left {
                     path: rel.clone(),
                     now: self.0.entry(rel, Some(entry))?,
-                });
+                }),
             }
         }
         for rel in crate::snapshot::inside_paths(self.root())? {

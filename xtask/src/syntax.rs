@@ -130,6 +130,9 @@ const DECISION_FILES: &[&str] = &[
     "supervisor.rs",
     "serve.rs",
     "store.rs",
+    "tree.rs",
+    "pull.rs",
+    "workspace.rs",
 ];
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &[
