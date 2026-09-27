@@ -10,6 +10,7 @@ The current code has no `effects::*` or `Labeled<T, L>` abstraction, the decisio
 Passing `mise run check` therefore does not establish all seven laws.
 The argument builder now accepts raw assembled text only through types constructed inside `shell.rs`, `proc.rs`, and `service.rs`, and its `SafeWord` trait is sealed to the listed domain types.
 CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
+Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
 
 ## 1. No ambient authority
 

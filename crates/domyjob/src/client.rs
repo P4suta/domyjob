@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ConfigError, Machine, RunnerConf};
 use crate::domain::{
-    BlobId, EnvName, Invalid, JobId, JobName, JobRef, MachineName, ProjectKey, RelPath,
+    BlobId, ClientOriginId, EnvName, Invalid, JobId, JobName, JobRef, MachineName, ProjectKey,
+    RelPath,
 };
 use crate::paths::Dirs;
 use crate::project::{self, ProjectError};
@@ -101,13 +102,13 @@ impl Context {
         self.dirs.state.join("client").join("index.jsonl")
     }
 
-    fn origin(&self) -> Result<String, ClientError> {
+    fn origin(&self) -> Result<ClientOriginId, ClientError> {
         let path = self.dirs.state.join("client").join("origin");
         if let Some(bytes) = crate::state_file::read_bytes(&path)? {
-            return Ok(String::from_utf8_lossy(&bytes).trim().to_owned());
+            return Ok(String::from_utf8_lossy(&bytes).trim().parse()?);
         }
-        let id = JobId::generate()?.to_string();
-        crate::state_file::write_bytes(&path, id.as_bytes())?;
+        let id = ClientOriginId::generate()?;
+        crate::state_file::write_bytes(&path, id.as_str().as_bytes())?;
         Ok(id)
     }
 }
@@ -443,7 +444,7 @@ pub fn project_here(
 }
 
 fn project_key(
-    origin: &str,
+    origin: &ClientOriginId,
     root: &Path,
     named: &std::ffi::OsStr,
 ) -> Result<ProjectKey, ClientError> {
@@ -1305,6 +1306,19 @@ impl crate::ingress::Ingress for EarlierEntry {}
 mod tests {
     use super::*;
 
+    fn context(tmp: &tempfile::TempDir) -> Context {
+        Context {
+            config: Config::layered("[machines.linux]", "test").unwrap(),
+            dirs: Dirs {
+                home: tmp.path().to_path_buf(),
+                state: tmp.path().join("state"),
+                config: tmp.path().join("config"),
+                cache: tmp.path().join("cache"),
+                keys: crate::keystore::KeyStore::OwnerOnlyFile,
+            },
+        }
+    }
+
     fn entry(job: usize, root: Option<&str>, name: Option<&str>) -> IndexEntry {
         IndexEntry {
             job: format!("0{job:015}").replace('0', "A").parse().unwrap(),
@@ -1360,16 +1374,7 @@ mod tests {
     #[test]
     fn unreadable_machine_facts_are_an_error_to_label_selection() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = Context {
-            config: Config::layered("[machines.linux]", "test").unwrap(),
-            dirs: Dirs {
-                home: tmp.path().to_path_buf(),
-                state: tmp.path().join("state"),
-                config: tmp.path().join("config"),
-                cache: tmp.path().join("cache"),
-                keys: crate::keystore::KeyStore::OwnerOnlyFile,
-            },
-        };
+        let ctx = context(&tmp);
         let machine = ctx.config.machine(&"linux".parse().unwrap()).unwrap();
         let tag = ctx
             .dirs
@@ -1382,6 +1387,20 @@ mod tests {
         assert!(matches!(
             ctx.facts(&machine),
             Err(ClientError::Remote(RemoteError::State(_)))
+        ));
+    }
+
+    #[test]
+    fn client_origin_is_stable_and_rejects_a_corrupt_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        let origin = ctx.origin().unwrap();
+        assert_eq!(ctx.origin().unwrap(), origin);
+        let path = ctx.dirs.state.join("client").join("origin");
+        crate::state_file::write_bytes(&path, b"../corrupt").unwrap();
+        assert!(matches!(
+            ctx.origin(),
+            Err(ClientError::Invalid(Invalid::ClientOriginId(_)))
         ));
     }
 
@@ -1528,17 +1547,19 @@ mod tests {
     #[test]
     fn project_keys_are_stable_and_safe() {
         let named = std::ffi::OsStr::new("my project");
-        let a = project_key("origin", Path::new("/work/my project"), named).unwrap();
-        let b = project_key("origin", Path::new("/work/my project"), named).unwrap();
-        let c = project_key("other", Path::new("/work/my project"), named).unwrap();
-        let elsewhere = project_key("origin", Path::new("/work/elsewhere"), named).unwrap();
+        let origin: ClientOriginId = "0123456789ABCDEF".parse().unwrap();
+        let other: ClientOriginId = "FEDCBA9876543210".parse().unwrap();
+        let a = project_key(&origin, Path::new("/work/my project"), named).unwrap();
+        let b = project_key(&origin, Path::new("/work/my project"), named).unwrap();
+        let c = project_key(&other, Path::new("/work/my project"), named).unwrap();
+        let elsewhere = project_key(&origin, Path::new("/work/elsewhere"), named).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, elsewhere);
         assert!(a.as_str().starts_with("my_project-"));
         assert!(
             project_key(
-                "o",
+                &origin,
                 Path::new("/srv/hub.git"),
                 std::ffi::OsStr::new("hub.git")
             )

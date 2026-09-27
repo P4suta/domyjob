@@ -230,7 +230,7 @@ mod tests {
     fn finished(outcome: Outcome) -> Job {
         Job {
             spec: Spec {
-                id: JobId::generate().unwrap(),
+                id: "0123456789ABCDEF".parse::<JobId>().unwrap(),
                 name: None,
                 command: Command::Script("cargo test".into()),
                 location: Location::Home,

@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub enum Invalid {
     #[error("{0:?} is not a job id: expected 16 Crockford base32 characters")]
     JobId(String),
+    #[error("{0:?} is not a client origin id: expected 16 Crockford base32 characters")]
+    ClientOriginId(String),
     #[error("{0:?} is not a job reference: expected 1 to 16 Crockford base32 characters")]
     JobRef(String),
     #[error("{0:?} is not a full commit id")]
@@ -134,6 +136,11 @@ macro_rules! text_newtype {
 
 text_newtype!(JobId, |s| s.len() == 16 && crockford(s), JobId);
 text_newtype!(
+    ClientOriginId,
+    |s| s.len() == 16 && crockford(s),
+    ClientOriginId
+);
+text_newtype!(
     JobRef,
     |s| (1..=16).contains(&s.len()) && crockford(s),
     JobRef
@@ -260,13 +267,19 @@ const CROCKFORD_BASE32: data_encoding::Encoding = data_encoding_macro::new_encod
     symbols: "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
 };
 
-impl JobId {
-    pub fn generate() -> Result<Self, Invalid> {
-        let mut random = [0u8; 10];
-        getrandom::fill(&mut random).map_err(Invalid::Random)?;
-        Self::try_from(CROCKFORD_BASE32.encode(&random))
-    }
+pub(crate) fn random_crockford_id() -> Result<String, Invalid> {
+    let mut random = [0u8; 10];
+    getrandom::fill(&mut random).map_err(Invalid::Random)?;
+    Ok(CROCKFORD_BASE32.encode(&random))
+}
 
+impl ClientOriginId {
+    pub fn generate() -> Result<Self, Invalid> {
+        Self::try_from(random_crockford_id()?)
+    }
+}
+
+impl JobId {
     #[must_use]
     pub fn matches(&self, reference: &JobRef) -> bool {
         self.0.starts_with(reference.as_str())
@@ -395,11 +408,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_ids_are_random_and_valid() {
-        let a = JobId::generate().unwrap();
-        let b = JobId::generate().unwrap();
+    fn client_origin_ids_are_random_and_valid() {
+        let a = ClientOriginId::generate().unwrap();
+        let b = ClientOriginId::generate().unwrap();
         assert_ne!(a, b);
         assert_eq!(a.as_str().len(), 16);
+    }
+
+    #[test]
+    fn job_ids_match_prefixes() {
+        let a: JobId = "0123456789ABCDEF".parse().unwrap();
         let prefix: String = a.as_str().chars().take(6).collect();
         assert!(a.matches(&JobRef::parse_loose(&prefix.to_lowercase()).unwrap()));
     }
@@ -472,8 +490,8 @@ mod tests {
         }
 
         #[test]
-        fn generated_job_ids_are_always_valid_and_prefix_resolvable(cut in 1usize..=16) {
-            let id = JobId::generate().unwrap();
+        fn random_crockford_ids_are_valid_job_references(cut in 1usize..=16) {
+            let id: JobId = random_crockford_id().unwrap().parse().unwrap();
             let prefix: String = id.as_str().chars().take(cut).collect();
             proptest::prop_assert!(id.matches(&JobRef::parse_loose(&prefix.to_lowercase()).unwrap()));
         }

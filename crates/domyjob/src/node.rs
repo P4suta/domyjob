@@ -19,6 +19,12 @@ use crate::protocol::{
 use crate::store::{Publication, Store, StoreError};
 use crate::terminal::RemoteText;
 
+impl JobId {
+    fn generate() -> Result<Self, Invalid> {
+        Self::try_from(crate::domain::random_crockford_id()?)
+    }
+}
+
 pub trait Input: BufRead + Send + 'static {}
 
 impl<T: BufRead + Send + 'static> Input for T {}
