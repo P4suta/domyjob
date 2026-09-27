@@ -45,16 +45,6 @@ pub struct Project {
     pub jobs: BTreeMap<JobName, JobDef>,
 }
 
-#[must_use]
-pub fn glob(pattern: &str, text: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == text,
-        Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
-            (0..=rest.len()).any(|cut| rest.get(cut..).is_some_and(|end| glob(tail, end)))
-        }),
-    }
-}
-
 impl Project {
     pub fn parse(text: &str, origin: &str) -> Result<Self, ProjectError> {
         let file: File = crate::ingress::toml(text).map_err(|source| ProjectError::Parse {
@@ -128,14 +118,6 @@ workspace = "fresh"
             Project::parse(with_notify, "x"),
             Err(ProjectError::Parse { .. })
         ));
-    }
-
-    #[test]
-    fn globs() {
-        assert!(glob("refs/heads/*", "refs/heads/main"));
-        assert!(glob("*", ""));
-        assert!(glob("a*b*c", "aXbYc"));
-        assert!(!glob("a*b", "ac"));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use crate::client::{self, ClientError, Context, Order, Sending};
 use crate::config::ConfigError;
-use crate::domain::Revision;
+use crate::domain::{EventRef, Revision};
 use crate::notify::NotifyTarget;
 use crate::protocol::Workspace;
 use crate::snapshot::{self, Detected};
@@ -31,7 +31,7 @@ pub struct Event {
     #[arg(long = "event", help = "What happened, such as push")]
     pub kind: String,
     #[arg(long = "ref", help = "The ref it happened to, such as refs/heads/main")]
-    pub reference: String,
+    pub reference: EventRef,
     #[arg(long, help = "The revision to send")]
     pub rev: Revision,
     #[arg(
@@ -73,7 +73,7 @@ fn consider(
     if rule
         .refs
         .iter()
-        .any(|pattern| crate::project::glob(pattern, &fired.reference))
+        .any(|pattern| pattern.matches(&fired.reference))
     {
         Consideration::Accepts
     } else {

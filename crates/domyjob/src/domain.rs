@@ -37,6 +37,10 @@ pub enum Invalid {
     CommitId(String),
     #[error("{0:?} is not a revision")]
     Revision(String),
+    #[error("an event reference must contain 1 to 1024 bytes without control characters")]
+    EventRef(String),
+    #[error("a reference pattern must contain 1 to 1024 bytes without control characters")]
+    RefPattern(String),
     #[error("{0:?} is not a Windows security identifier")]
     WindowsSid(String),
     #[error(
@@ -203,6 +207,45 @@ text_newtype!(
             .all(|b| b.is_ascii_alphanumeric() || b"._/@^~:-+".contains(&b)),
     Revision
 );
+text_newtype!(
+    EventRef,
+    |s| (1..=1024).contains(&s.len()) && !s.chars().any(char::is_control),
+    EventRef
+);
+text_newtype!(
+    RefPattern,
+    |s| (1..=1024).contains(&s.len()) && !s.chars().any(char::is_control),
+    RefPattern
+);
+
+impl RefPattern {
+    #[must_use]
+    pub fn matches(&self, reference: &EventRef) -> bool {
+        let Some((prefix, rest)) = self.0.split_once('*') else {
+            return self.0 == reference.0;
+        };
+        let Some(mut remaining) = reference.0.strip_prefix(prefix) else {
+            return false;
+        };
+        let mut pieces = rest.split('*').peekable();
+        while let Some(piece) = pieces.next() {
+            if pieces.peek().is_none() {
+                return remaining.ends_with(piece);
+            }
+            let Some(start) = remaining.find(piece) else {
+                return false;
+            };
+            let Some(end) = start.checked_add(piece.len()) else {
+                return false;
+            };
+            let Some(tail) = remaining.get(end..) else {
+                return false;
+            };
+            remaining = tail;
+        }
+        false
+    }
+}
 text_newtype!(
     WindowsSid,
     |s| (5..=184).contains(&s.len())
@@ -407,6 +450,31 @@ impl crate::ingress::Ingress for EnvName {}
 mod tests {
     use super::*;
 
+    fn reference_glob_oracle(pattern: &str, text: &str) -> bool {
+        let pattern = pattern.as_bytes();
+        let text = text.as_bytes();
+        let mut previous = vec![false; text.len().saturating_add(1)];
+        if let Some(first) = previous.first_mut() {
+            *first = true;
+        }
+        for byte in pattern {
+            let mut current = vec![false; previous.len()];
+            if *byte == b'*' {
+                let mut accepting = false;
+                for (now, before) in current.iter_mut().zip(&previous) {
+                    accepting |= *before;
+                    *now = accepting;
+                }
+            } else {
+                for ((now, before), actual) in current.iter_mut().skip(1).zip(&previous).zip(text) {
+                    *now = *before && *byte == *actual;
+                }
+            }
+            previous = current;
+        }
+        previous.last().copied().unwrap_or(false)
+    }
+
     #[test]
     fn client_origin_ids_are_random_and_valid() {
         let a = ClientOriginId::generate().unwrap();
@@ -445,6 +513,38 @@ mod tests {
     }
 
     #[test]
+    fn event_references_and_patterns_have_a_byte_budget() {
+        "".parse::<EventRef>().unwrap_err();
+        "".parse::<RefPattern>().unwrap_err();
+        "x\n".parse::<EventRef>().unwrap_err();
+        "x\n".parse::<RefPattern>().unwrap_err();
+        "x".repeat(1024).parse::<EventRef>().unwrap();
+        "x".repeat(1025).parse::<EventRef>().unwrap_err();
+        "*".repeat(1024).parse::<RefPattern>().unwrap();
+        "*".repeat(1025).parse::<RefPattern>().unwrap_err();
+    }
+
+    #[test]
+    fn reference_globs_handle_anchors_and_unicode_without_recursion() {
+        for (pattern, reference, expected) in [
+            ("refs/heads/*", "refs/heads/main", true),
+            ("*", "refs/heads/main", true),
+            ("a*b*c", "aXbYc", true),
+            ("a*b", "ac", false),
+            ("a*bc", "abc", true),
+            ("ab*bc", "abc", false),
+            ("**é*界", "aébc界", true),
+        ] {
+            let pattern: RefPattern = pattern.parse().unwrap();
+            let reference: EventRef = reference.parse().unwrap();
+            assert_eq!(pattern.matches(&reference), expected);
+        }
+        let pattern: RefPattern = "*a".repeat(512).parse().unwrap();
+        let reference: EventRef = "a".repeat(1024).parse().unwrap();
+        assert!(pattern.matches(&reference));
+    }
+
+    #[test]
     fn paths_must_survive_every_operating_system() {
         for bad in [
             "CON",
@@ -478,6 +578,19 @@ mod tests {
     }
 
     proptest::proptest! {
+        #[test]
+        fn reference_globs_agree_with_a_dynamic_programming_oracle(
+            pattern in "[ab*]{1,24}",
+            reference in "[ab]{1,24}",
+        ) {
+            let parsed_pattern: RefPattern = pattern.parse().unwrap();
+            let parsed_reference: EventRef = reference.parse().unwrap();
+            proptest::prop_assert_eq!(
+                parsed_pattern.matches(&parsed_reference),
+                reference_glob_oracle(&pattern, &reference)
+            );
+        }
+
         #[test]
         fn accepted_paths_never_leave_the_root(text in "[a-zA-Z0-9._/ \\:-]{1,40}") {
             if let Ok(path) = text.parse::<RelPath>() {

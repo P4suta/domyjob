@@ -131,6 +131,8 @@ const INCOMING_RULE: &str =
     "setup staging paths must include the transfer ID; a fixed incoming name mixes operations";
 const FAULT_SCENARIO_RULE: &str =
     "test fault scenarios belong only in faults.rs; use a path-scoped guard elsewhere";
+const REFERENCE_TYPE_RULE: &str =
+    "trigger references and patterns must use their bounded domain types";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
@@ -262,6 +264,28 @@ fn type_carries_bool(ty: &syn::Type) -> bool {
     } else {
         false
     }
+}
+
+fn is_named_type(ty: &syn::Type, name: &str) -> bool {
+    matches!(ty, syn::Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == name))
+}
+
+fn is_vec_of(ty: &syn::Type, name: &str) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path
+        .path
+        .segments
+        .last()
+        .filter(|segment| segment.ident == "Vec")
+    else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    matches!(arguments.args.first(), Some(syn::GenericArgument::Type(inner)) if is_named_type(inner, name))
 }
 
 fn returns_bool(output: &syn::ReturnType) -> bool {
@@ -495,6 +519,26 @@ impl<'ast> Visit<'ast> for Gate {
             item.ident.span(),
             has_named_fields(&item.fields),
         );
+        let required = if self.file_is(&["config.rs"]) && item.ident == "TriggerConf" {
+            Some(("refs", "RefPattern", true))
+        } else if self.file_is(&["hook.rs"]) && item.ident == "Event" {
+            Some(("reference", "EventRef", false))
+        } else {
+            None
+        };
+        if let Some((field_name, type_name, vec)) = required {
+            let valid = item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == field_name)
+                    && if vec {
+                        is_vec_of(&field.ty, type_name)
+                    } else {
+                        is_named_type(&field.ty, type_name)
+                    }
+            });
+            if !valid {
+                self.flag(item.ident.span(), REFERENCE_TYPE_RULE);
+            }
+        }
         for field in &item.fields {
             let words = serde_words(&field.attrs);
             if derives(&item.attrs, "Deserialize")
@@ -662,6 +706,42 @@ mod tests {
             check_file(source, "crates/domyjob/src/faults.rs")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn trigger_refs_and_event_reference_cannot_regress_to_plain_strings() {
+        let config = "struct TriggerConf { refs: Vec<String> }";
+        let hook = "struct Event { reference: String }";
+        assert_eq!(
+            check_file(config, "crates/domyjob/src/config.rs")
+                .unwrap()
+                .first()
+                .map(|finding| finding.rule),
+            Some(REFERENCE_TYPE_RULE)
+        );
+        assert_eq!(
+            check_file(hook, "crates/domyjob/src/hook.rs")
+                .unwrap()
+                .first()
+                .map(|finding| finding.rule),
+            Some(REFERENCE_TYPE_RULE)
+        );
+        assert!(
+            check_file(
+                "struct TriggerConf { refs: Vec<RefPattern> }",
+                "crates/domyjob/src/config.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            check_file(
+                "struct Event { reference: EventRef }",
+                "crates/domyjob/src/hook.rs"
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

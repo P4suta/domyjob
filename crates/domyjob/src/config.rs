@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::domain::{Host, MachineName};
+use crate::domain::{Host, MachineName, RefPattern};
 use crate::template::{Argv, TemplateError, Text};
 
 const BUILTIN: &str = include_str!("builtin.toml");
@@ -176,7 +176,7 @@ pub struct TriggerConf {
     pub source: String,
     pub repository: PathBuf,
     pub event: String,
-    pub refs: Vec<String>,
+    pub refs: Vec<RefPattern>,
     pub on: String,
     pub run: Vec<ConfigText>,
     pub runner: Option<String>,
@@ -1096,6 +1096,22 @@ everything = ["@heavy", "pod"]
         ));
         assert!(matches!(
             Config::layered("[typo]\n", "bad"),
+            Err(ConfigError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn trigger_patterns_are_validated_while_loading_config() {
+        let trigger = |pattern: &str| {
+            format!(
+                "[triggers.push]\nsource = \"git\"\nrepository = \".\"\nevent = \"push\"\nrefs = [\"{pattern}\"]\non = \"@all\"\nrun = [\"cargo test\"]\n"
+            )
+        };
+        let config = Config::layered(&trigger("refs/heads/*"), "valid").unwrap();
+        let pattern = config.triggers.get("push").unwrap().refs.first().unwrap();
+        assert!(pattern.matches(&"refs/heads/main".parse().unwrap()));
+        assert!(matches!(
+            Config::layered(&trigger(&"*".repeat(1025)), "oversized"),
             Err(ConfigError::Parse { .. })
         ));
     }
