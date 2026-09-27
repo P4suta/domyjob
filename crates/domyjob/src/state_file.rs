@@ -417,6 +417,27 @@ impl<T> StateFile<T> {
 impl<T> LockedStateFile<T> {
     #[expect(
         clippy::needless_pass_by_ref_mut,
+        reason = "an exclusive borrow prevents concurrent initialization through one lock guard"
+    )]
+    pub fn load_or_create<E>(
+        &mut self,
+        decode: impl FnOnce(&[u8]) -> Result<T, E>,
+        create: impl FnOnce() -> Result<T, E>,
+        encode: impl FnOnce(&T) -> Vec<u8>,
+    ) -> Result<T, E>
+    where
+        E: From<StateError>,
+    {
+        if let Some(bytes) = read_bytes(&self.file.path)? {
+            return decode(&bytes);
+        }
+        let value = create()?;
+        write_bytes(&self.file.path, &encode(&value))?;
+        Ok(value)
+    }
+
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
         reason = "an exclusive borrow prevents concurrent reads and writes through one lock guard"
     )]
     pub fn read(&mut self) -> Result<Option<T>, StateError>

@@ -129,6 +129,7 @@ const UNBOUNDED_CHILD_OUTPUT_RULE: &str =
     "capture child output only through bounded.rs with an explicit byte budget";
 const RELEASE_STATE_RULE: &str =
     "release high-water state must be read and written through a locked StateFile";
+const ORIGIN_STATE_RULE: &str = "the client origin must be initialized through a locked StateFile";
 const UNBOUNDED_TEXT_RULE: &str =
     "read text files only through bounded::text_file with an explicit byte budget";
 const UNBOUNDED_FILE_RULE: &str =
@@ -329,7 +330,7 @@ impl Gate {
         if self.test_depth > 0 {
             return;
         }
-        self.check_release_state_path(path);
+        self.check_locked_state_path(path);
         if self.file.starts_with("crates/domyjob/src/")
             && !self.file_is(&["bounded.rs"])
             && let Some(segment) = path
@@ -401,7 +402,7 @@ impl Gate {
         }
     }
 
-    fn check_release_state_path(&mut self, path: &syn::Path) {
+    fn check_locked_state_path(&mut self, path: &syn::Path) {
         if self.file_is(&["dist.rs"])
             && let Some(segment) = path
                 .segments
@@ -409,6 +410,15 @@ impl Gate {
                 .filter(|segment| segment.ident == "read_json" || segment.ident == "write_json")
         {
             self.flag(segment.ident.span(), RELEASE_STATE_RULE);
+        }
+        if self.file_is(&["client.rs"])
+            && self.function.as_deref() == Some("origin")
+            && let Some(segment) = path
+                .segments
+                .last()
+                .filter(|segment| segment.ident == "read_bytes" || segment.ident == "write_bytes")
+        {
+            self.flag(segment.ident.span(), ORIGIN_STATE_RULE);
         }
     }
 
@@ -1029,6 +1039,26 @@ mod tests {
                 )
                 .unwrap()
                 .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn client_origin_requires_locked_initialization() {
+        for source in [
+            "fn origin() { state_file::read_bytes(path); }",
+            "fn origin() { state_file::write_bytes(path, bytes); }",
+        ] {
+            assert_eq!(
+                check_file(source, "crates/domyjob/src/client.rs")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(
+                check_file(source, "crates/domyjob/src/store.rs")
+                    .unwrap()
+                    .is_empty()
             );
         }
     }

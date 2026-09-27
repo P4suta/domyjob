@@ -14,6 +14,7 @@ Client origins and node-assigned job identifiers now have distinct types, and on
 Warm workspace paths include the submitter's owner or peer-key scope, with a test for cross-principal separation.
 State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.
 `StateFile<T>` now owns the lock for JSON read-modify-write operations; self-update holds a `StateFile<HighWater>` lock across checking and replacing the executable, and even an explicit downgrade leaves the recorded high-water mark monotonic.
+The client origin also uses the typed lock for one-time initialization, preserving its existing raw-file format while making concurrent first use choose one persisted ID.
 Local configuration and project definitions have a 4 MiB parsing and file-read budget; signed release metadata also has a 4 MiB file budget, and setup reads executables only within a 64 MiB budget.
 The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
 The syntax gate rejects direct `read_to_end`, `read_line`, production `read_to_string`, and ordinary `fs::read` calls outside `bounded.rs`.

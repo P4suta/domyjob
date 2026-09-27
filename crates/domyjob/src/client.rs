@@ -104,12 +104,14 @@ impl Context {
 
     fn origin(&self) -> Result<ClientOriginId, ClientError> {
         let path = self.dirs.state.join("client").join("origin");
-        if let Some(bytes) = crate::state_file::read_bytes(&path)? {
-            return Ok(String::from_utf8_lossy(&bytes).trim().parse()?);
-        }
-        let id = ClientOriginId::generate()?;
-        crate::state_file::write_bytes(&path, id.as_str().as_bytes())?;
-        Ok(id)
+        let mut file = crate::state_file::StateFile::<ClientOriginId>::at(&path).lock()?;
+        let origin = file.load_or_create::<ClientError>(
+            |bytes| Ok(String::from_utf8_lossy(bytes).trim().parse()?),
+            || Ok(ClientOriginId::generate()?),
+            |id| id.as_str().as_bytes().to_vec(),
+        )?;
+        file.release()?;
+        Ok(origin)
     }
 }
 
@@ -1402,6 +1404,23 @@ mod tests {
             ctx.origin(),
             Err(ClientError::Invalid(Invalid::ClientOriginId(_)))
         ));
+    }
+
+    #[test]
+    fn concurrent_clients_share_the_first_persisted_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = std::sync::Arc::new(context(&tmp));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let ctx = std::sync::Arc::clone(&ctx);
+            threads.push(std::thread::spawn(move || ctx.origin().unwrap()));
+        }
+        let origins: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        let persisted = ctx.origin().unwrap();
+        assert!(origins.iter().all(|origin| origin == &persisted));
     }
 
     #[test]
