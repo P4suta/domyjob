@@ -12,6 +12,10 @@ The argument builder now accepts raw assembled text only through types construct
 CLI, MCP, and explicitly invoked project-job text each enter `UserText` through a source-specific type with a private field, so renaming an import cannot forge their origin.
 Client origins and node-assigned job identifiers now have distinct types, and only `node.rs` defines the job ID generator.
 Warm workspace paths include the submitter's owner or peer-key scope, with a test for cross-principal separation.
+State-file reads now have bounded metadata, audit, and client-history budgets, and the gate confines the two larger budgets to their owning modules.
+The append-only job notes file is read through a checked handle one bounded line at a time, retaining only the last twenty notes.
+The syntax gate rejects direct `read_to_end` and `read_line` calls outside `bounded.rs`; setup output, tree reads, and log tails use explicit byte limits.
+Windows builds and installs now receive a transfer-specific ID, which prevents parallel operations in one client process from sharing a temporary upload file.
 
 ## 1. No ambient authority
 

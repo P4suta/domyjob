@@ -1,6 +1,6 @@
 use crate::failure::io;
-use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use crate::protocol::{Job, Phase, Settings, Spec, Supervisor};
 const SCHEMA: &str = "v3";
 
 const OUTCOME_RESERVED: usize = 4096;
+const NOTES_LINE: u64 = 64 << 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -576,17 +577,29 @@ impl Store {
     }
 
     fn notes(&self, id: &JobId) -> Result<Vec<crate::terminal::RemoteText>, StoreError> {
-        let Some(bytes) = crate::state_file::read_bytes(&self.notes_path(id))? else {
+        let path = self.notes_path(id);
+        let Some(file) = crate::state_file::open_read(&path)? else {
             return Ok(Vec::new());
         };
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-        Ok(lines
-            .get(lines.len().saturating_sub(NOTES_KEPT)..)
-            .unwrap_or_default()
-            .iter()
-            .map(|line| crate::terminal::RemoteText::new((*line).to_owned()))
-            .collect())
+        let mut reader = BufReader::new(file);
+        let mut latest = VecDeque::with_capacity(NOTES_KEPT);
+        loop {
+            let line =
+                crate::bounded::line(&mut reader, NOTES_LINE).map_err(io("reading", &path))?;
+            if line.is_empty() {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let text = text.strip_suffix('\r').unwrap_or(text);
+            if !text.is_empty() {
+                if latest.len() == NOTES_KEPT {
+                    let _oldest = latest.pop_front();
+                }
+                latest.push_back(crate::terminal::RemoteText::new(text.to_owned()));
+            }
+        }
+        Ok(latest.into_iter().collect())
     }
 
     #[must_use]
@@ -718,6 +731,27 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_long_notes_file_does_not_hide_the_last_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
+        store
+            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
+            .unwrap();
+        store.publish(&id).unwrap();
+        let mut notes = crate::state_file::open_append(&store.notes_path(&id)).unwrap();
+        let large_line = format!("{}\n", "x".repeat(60 << 10));
+        for _ in 0..18 {
+            std::io::Write::write_all(&mut notes, large_line.as_bytes()).unwrap();
+        }
+        std::io::Write::write_all(&mut notes, b"last\n").unwrap();
+        assert_eq!(
+            store.job(&id).unwrap().notes.last().unwrap().to_string(),
+            "last"
         );
     }
     use crate::domain::Concurrency;

@@ -164,7 +164,7 @@ fn record(
 
 fn index(ctx: &Context) -> Result<Vec<IndexEntry>, ClientError> {
     let path = ctx.index_path();
-    let text = match crate::state_file::read_bytes(&path)? {
+    let text = match crate::state_file::read_history_bytes(&path)? {
         Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         None => return Ok(Vec::new()),
     };

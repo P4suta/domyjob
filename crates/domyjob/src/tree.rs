@@ -1,6 +1,6 @@
 use crate::failure::io;
 use std::collections::BTreeSet;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::{Dir, OpenOptions};
@@ -233,12 +233,14 @@ impl Rooted {
     }
 
     pub fn read(&self, rel: &RelPath) -> Result<Vec<u8>, TreeError> {
-        let mut bytes = Vec::new();
-        self.dir
+        let mut file = self
+            .dir
             .open(rel.to_local())
-            .and_then(|mut file| file.read_to_end(&mut bytes))
             .map_err(io("reading", &self.shown(rel)))?;
-        Ok(bytes)
+        Ok(
+            crate::bounded::to_end(&mut file, crate::bounded::IN_MEMORY_FILE)
+                .map_err(io("reading", &self.shown(rel)))?,
+        )
     }
 
     pub fn open_file(&self, rel: &RelPath) -> Result<Option<std::fs::File>, TreeError> {

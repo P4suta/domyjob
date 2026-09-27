@@ -244,6 +244,14 @@ approved_word!(
     Host,
 );
 
+impl approved_word::Sealed for crate::remote::TransferId {}
+
+impl SafeWord for crate::remote::TransferId {
+    fn safe_word(&self) -> &str {
+        self.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg(String);
 

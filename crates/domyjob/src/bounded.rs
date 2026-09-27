@@ -5,13 +5,24 @@ pub const REPLY_LINE: u64 = 64 << 20;
 pub const BLOB: u64 = 8 << 30;
 pub const UPLOAD_COUNT: u64 = 2_000_000;
 pub const TAIL_WINDOW: u64 = 4 << 20;
+pub const IN_MEMORY_FILE: u64 = 64 << 20;
+pub const CAPTURE: u64 = 4 << 20;
 pub const CONTROL_LINE: u64 = 1024;
 
 fn too_long(limit: u64) -> std::io::Error {
     std::io::Error::new(
         ErrorKind::InvalidData,
-        format!("a line longer than {limit} bytes was refused"),
+        format!("input longer than {limit} bytes was refused"),
     )
+}
+
+pub fn to_end(reader: &mut dyn Read, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut out)?;
+    if crate::domain::len_u64(out.len()) > limit {
+        return Err(too_long(limit));
+    }
+    Ok(out)
 }
 
 pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -126,6 +137,17 @@ mod tests {
         assert_eq!(
             exactly(&mut short, 4, &mut |_| Ok(())).unwrap_err().kind(),
             ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn to_end_rejects_a_reader_that_grows_past_its_budget() {
+        let mut exact: &[u8] = b"abcd";
+        assert_eq!(to_end(&mut exact, 4).unwrap(), b"abcd");
+        let mut long: &[u8] = b"abcde";
+        assert_eq!(
+            to_end(&mut long, 4).unwrap_err().kind(),
+            ErrorKind::InvalidData
         );
     }
 }

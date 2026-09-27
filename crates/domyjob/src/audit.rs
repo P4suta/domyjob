@@ -290,8 +290,8 @@ impl AuditLog {
             return Ok(());
         };
         let archive = self.archive_path(rotation.from.epoch);
-        if state_file::read_bytes(&archive)?.is_none() {
-            let active = state_file::read_bytes(&self.path)?.unwrap_or_default();
+        if state_file::read_audit_bytes(&archive)?.is_none() {
+            let active = state_file::read_audit_bytes(&self.path)?.unwrap_or_default();
             state_file::write_bytes(&archive, &active)?;
         }
         let archive_base = self.archive_base_path(rotation.from.epoch);
@@ -337,7 +337,7 @@ impl AuditLog {
     }
 
     fn repair(&self) -> Result<Option<Head>, AuditError> {
-        let Some(mut bytes) = state_file::read_bytes(&self.path)? else {
+        let Some(mut bytes) = state_file::read_audit_bytes(&self.path)? else {
             return Ok(None);
         };
         if bytes.last().is_some_and(|b| *b != b'\n') {
@@ -487,7 +487,7 @@ impl AuditLog {
             Some(head) => Ok(Some(head.clone())),
             None => state_file::read_json::<Head>(&self.head_path()),
         };
-        let Some(bytes) = state_file::read_bytes(&self.path)? else {
+        let Some(bytes) = state_file::read_audit_bytes(&self.path)? else {
             return match recorded()? {
                 None if base == Head::genesis()? => Ok((base, 0)),
                 Some(_) => Err(AuditError::Broken {
@@ -519,7 +519,7 @@ impl AuditLog {
         expected: &Head,
     ) -> Result<(Head, u64), AuditError> {
         let path = self.archive_path(epoch);
-        let bytes = state_file::read_bytes(&path)?.ok_or_else(|| AuditError::Broken {
+        let bytes = state_file::read_audit_bytes(&path)?.ok_or_else(|| AuditError::Broken {
             path: path.clone(),
             line: expected.seq,
             why: "an archive is missing",
@@ -609,7 +609,7 @@ impl AuditLog {
                 } else {
                     self.archive_path(epoch)
                 };
-                let Some(bytes) = state_file::read_bytes(&path)? else {
+                let Some(bytes) = state_file::read_audit_bytes(&path)? else {
                     continue;
                 };
                 for raw in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {

@@ -94,6 +94,16 @@ const RESTRICTIONS: &[Restriction] = &[
         allowed_in: &["cli.rs"],
         rule: "only an explicit command-line flag may accept an unsigned binary",
     },
+    Restriction {
+        path: &["read_audit_bytes"],
+        allowed_in: &["audit.rs"],
+        rule: "only audit.rs may request the larger audit state-file budget",
+    },
+    Restriction {
+        path: &["read_history_bytes"],
+        allowed_in: &["client.rs"],
+        rule: "only client.rs may request the larger history state-file budget",
+    },
 ];
 
 const TIME_RULE: &str = "time decides nothing; wait for the event itself, and observe the clock only through clock::Timestamp";
@@ -103,6 +113,7 @@ const LIVENESS_TIME: &[&str] = &["Instant", "Duration", "wait_timeout", "elapsed
 const TIME_TYPES: &[&str] = &["SystemTime", "Instant", "Duration", "UNIX_EPOCH"];
 const TIME_METHODS: &[&str] = &["sleep", "modified", "accessed", "elapsed"];
 const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
+const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 
 fn is_time_method(name: &str) -> bool {
     TIME_METHODS.contains(&name) || TIME_METHOD_PARTS.iter().any(|part| name.contains(part))
@@ -263,6 +274,14 @@ impl Gate {
         if self.test_depth > 0 {
             return;
         }
+        if !self.file_is(&["bounded.rs"])
+            && let Some(segment) = path
+                .segments
+                .last()
+                .filter(|segment| segment.ident == "read_to_end")
+        {
+            self.flag(segment.ident.span(), UNBOUNDED_READ_RULE);
+        }
         let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
         for restriction in RESTRICTIONS {
             let tail = segments.len().saturating_sub(restriction.path.len());
@@ -330,6 +349,12 @@ impl<'ast> Visit<'ast> for Gate {
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        if self.test_depth == 0
+            && !self.file_is(&["bounded.rs"])
+            && (method == "read_to_end" || method == "read_line")
+        {
+            self.flag(call.method.span(), UNBOUNDED_READ_RULE);
+        }
         if method == "as_raw_str" && self.file_is(TERMINAL_FILES) {
             self.flag(
                 call.method.span(),
@@ -624,6 +649,42 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn larger_state_read_budgets_are_confined_to_their_owners() {
+        let audit = "fn f(p: &Path) { state_file::read_audit_bytes(p); }";
+        let history = "fn f(p: &Path) { state_file::read_history_bytes(p); }";
+        assert_eq!(check_file(audit, "src/node.rs").unwrap().len(), 1);
+        assert!(check_file(audit, "src/audit.rs").unwrap().is_empty());
+        assert_eq!(check_file(history, "src/node.rs").unwrap().len(), 1);
+        assert!(check_file(history, "src/client.rs").unwrap().is_empty());
+        assert_eq!(
+            check_file("fn f(p: &Path) { read_history_bytes(p); }", "src/node.rs")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unbounded_read_calls_are_confined_to_bounded() {
+        for source in [
+            "fn f(r: &mut R, out: &mut Vec<u8>) { r.read_to_end(out); }",
+            "fn f(r: &mut R, out: &mut String) { r.read_line(out); }",
+            "fn f(r: &mut R, out: &mut Vec<u8>) { std::io::Read::read_to_end(r, out); }",
+        ] {
+            assert_eq!(check_file(source, "src/remote.rs").unwrap().len(), 1);
+            assert!(check_file(source, "src/bounded.rs").unwrap().is_empty());
+            assert!(
+                check_file(
+                    &format!("#[cfg(test)] mod tests {{ {source} }}"),
+                    "src/remote.rs"
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
     }
 
     #[test]

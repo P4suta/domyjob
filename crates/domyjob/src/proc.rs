@@ -398,13 +398,14 @@ mod platform {
     }
 
     pub(super) fn reap(group: i32) {
-        let mut heard = Vec::new();
-        let read = std::io::stdin().lock().read_to_end(&mut heard);
-        match read {
-            Ok(_) | Err(_) => {}
-        }
-        if heard.contains(&b'd') {
-            return;
+        let mut input = std::io::stdin().lock();
+        let mut chunk = [0u8; 256];
+        loop {
+            match input.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if chunk.get(..read).is_some_and(|part| part.contains(&b'd')) => return,
+                Ok(_) => {}
+            }
         }
         if let Some(group) = Pid::from_raw(group) {
             match kill_process_group(group, Signal::KILL) {

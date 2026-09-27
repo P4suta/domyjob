@@ -618,11 +618,10 @@ fn confirm_on_terminal(
     println!("Confirmation words: {sas}");
     print!("Do the same words appear on the other machine? Type yes to pair: ");
     std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(match answer.trim() {
-        "yes" => Confirmation::Confirmed(Confirmed(())),
-        _ => Confirmation::Declined,
+    let answer = crate::bounded::line(&mut std::io::stdin().lock(), crate::bounded::CONTROL_LINE)?;
+    Ok(match std::str::from_utf8(&answer) {
+        Ok(text) if text.trim() == "yes" => Confirmation::Confirmed(Confirmed(())),
+        Ok(_) | Err(_) => Confirmation::Declined,
     })
 }
 

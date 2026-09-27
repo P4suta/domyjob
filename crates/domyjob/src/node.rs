@@ -1424,10 +1424,11 @@ impl Node {
         let start = size.saturating_sub(crate::bounded::TAIL_WINDOW);
         file.seek(SeekFrom::Start(start))
             .map_err(NodeError::Input)?;
-        let mut window = Vec::new();
-        file.take(crate::bounded::TAIL_WINDOW)
-            .read_to_end(&mut window)
-            .map_err(NodeError::Input)?;
+        let window = crate::bounded::to_end(
+            &mut file.take(crate::bounded::TAIL_WINDOW),
+            crate::bounded::TAIL_WINDOW,
+        )
+        .map_err(NodeError::Input)?;
         let wanted = crate::domain::to_usize(lines);
         let starts: Vec<usize> = std::iter::once(0)
             .chain(

@@ -4,7 +4,7 @@
 )]
 
 use crate::failure::io;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -26,6 +26,25 @@ pub enum StateError {
     Foreign { path: PathBuf },
     #[error("{path} is not a regular state file")]
     NotFile { path: PathBuf },
+    #[error("{path} exceeds its {limit}-byte state file budget")]
+    TooLarge { path: PathBuf, limit: u64 },
+}
+
+#[derive(Clone, Copy)]
+enum ReadBudget {
+    Metadata,
+    Audit,
+    History,
+}
+
+impl ReadBudget {
+    const fn bytes(self) -> u64 {
+        match self {
+            Self::Metadata => 1 << 20,
+            Self::Audit => 16 << 20,
+            Self::History => 64 << 20,
+        }
+    }
 }
 
 fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateError> {
@@ -41,14 +60,15 @@ fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateEr
     }
 }
 
-fn check_private_file(path: &Path, file: &std::fs::File) -> Result<(), StateError> {
+fn check_private_file(path: &Path, file: &std::fs::File) -> Result<std::fs::Metadata, StateError> {
     let meta = file.metadata().map_err(io("checking", path))?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(StateError::NotFile {
             path: path.to_path_buf(),
         });
     }
-    check_owner_only(path, &meta)
+    check_owner_only(path, &meta)?;
+    Ok(meta)
 }
 
 fn classify_open_error(path: &Path, error: std::io::Error) -> StateError {
@@ -81,21 +101,46 @@ pub fn private_dir(path: &Path) -> Result<(), StateError> {
     }
 }
 
-#[expect(
-    clippy::verbose_file_reads,
-    reason = "read from the checked handle; fs::read would reopen the untrusted path"
-)]
-pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
+fn opened_read(path: &Path) -> Result<Option<(std::fs::File, std::fs::Metadata)>, StateError> {
     crate::faults::at("state_file::read", path).map_err(io("reading", path))?;
-    let mut file = match private_options().read(true).open(path) {
+    let file = match private_options().read(true).open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(classify_open_error(path, e)),
     };
-    check_private_file(path, &file)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(io("reading", path))?;
+    let meta = check_private_file(path, &file)?;
+    Ok(Some((file, meta)))
+}
+
+pub fn open_read(path: &Path) -> Result<Option<std::fs::File>, StateError> {
+    Ok(opened_read(path)?.map(|(file, _meta)| file))
+}
+
+fn read_limited(path: &Path, budget: ReadBudget) -> Result<Option<Vec<u8>>, StateError> {
+    let Some((mut file, meta)) = opened_read(path)? else {
+        return Ok(None);
+    };
+    let limit = budget.bytes();
+    if meta.len() > limit {
+        return Err(StateError::TooLarge {
+            path: path.to_path_buf(),
+            limit,
+        });
+    }
+    let bytes = crate::bounded::to_end(&mut file, limit).map_err(io("reading", path))?;
     Ok(Some(bytes))
+}
+
+pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
+    read_limited(path, ReadBudget::Metadata)
+}
+
+pub fn read_audit_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
+    read_limited(path, ReadBudget::Audit)
+}
+
+pub fn read_history_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
+    read_limited(path, ReadBudget::History)
 }
 
 pub fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, StateError> {
@@ -436,5 +481,25 @@ mod tests {
         let path = tmp.path().join("state").join("directory");
         private_dir(&path).unwrap();
         assert!(matches!(read_bytes(&path), Err(StateError::NotFile { .. })));
+    }
+
+    #[test]
+    fn each_state_read_budget_refuses_a_larger_file_before_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join("oversized");
+        write_bytes(&path, b"").unwrap();
+        let file = private_options().write(true).open(&path).unwrap();
+        for budget in [ReadBudget::Metadata, ReadBudget::Audit, ReadBudget::History] {
+            file.set_len(budget.bytes() + 1).unwrap();
+            let read = match budget {
+                ReadBudget::Metadata => read_bytes(&path),
+                ReadBudget::Audit => read_audit_bytes(&path),
+                ReadBudget::History => read_history_bytes(&path),
+            };
+            assert!(matches!(
+                read,
+                Err(StateError::TooLarge { limit, .. }) if limit == budget.bytes()
+            ));
+        }
     }
 }
