@@ -28,3 +28,10 @@ path = "fuzz_targets/state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "chat_ledger"
+path = "fuzz_targets/chat_ledger.rs"
+test = false
+doc = false
+bench = false

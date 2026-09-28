@@ -11,10 +11,10 @@ use serde::Serialize;
 
 use crate::lock::OsLock;
 use crate::state_io;
-pub(crate) use domyjob_core::chat::{
+pub(crate) use domyjob_core::chat_v0::{
     AgentTool, Audience, BATCH, Event, EventData, MAX_TEXT, MessageMode, TurnFailure, direct,
 };
-use domyjob_core::chat::{
+use domyjob_core::chat_v0::{
     ChatValidationError, MAX_EVENT_BYTES, valid_event_id, valid_origin, validate_response,
 };
 

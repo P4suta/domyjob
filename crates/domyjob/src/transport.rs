@@ -366,8 +366,8 @@ pub(crate) fn doctor(machine: &MachineName) -> Result<(), TransportError> {
 
 pub(crate) fn chat(
     machine: &MachineName,
-    request: domyjob_core::chat_wire::ChatRequest,
-) -> Result<domyjob_core::chat_wire::ChatReply, TransportError> {
+    request: domyjob_core::chat_wire_v0::ChatRequest,
+) -> Result<domyjob_core::chat_wire_v0::ChatReply, TransportError> {
     match call(machine, &Request::Chat(request))? {
         Reply::Chat(reply) => Ok(reply),
         Reply::Error { code } => Err(TransportError::Refused(code)),

@@ -46,13 +46,14 @@ description = "Run the complete workspace test suite"
 run = "cargo test --locked --workspace --all-targets"
 
 [tasks.fuzz]
-description = "Fuzz the wire ingress and state transition boundaries"
+description = "Fuzz the wire ingress, job state transitions, and chat ledger convergence"
 dir = "fuzz"
 run = [
   "mkdir -p corpus/wire",
   "cp seeds/wire/* corpus/wire/",
   "cargo +nightly-2026-08-21 fuzz run wire -- -runs=20000 -seed=1 -verbosity=0",
   "cargo +nightly-2026-08-21 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-08-21 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
 [tasks.deny]

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use domyjob_core::chat_wire::{BATCH, Batch, ChatReply, ChatRequest, Origin};
+use domyjob_core::chat_wire_v0::{BATCH, Batch, ChatReply, ChatRequest, Origin};
 use domyjob_core::domain::MachineName;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

@@ -23,51 +23,33 @@ pub enum Invalid {
     RemoteText,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct MachineName(String);
-
-impl TryFrom<String> for MachineName {
-    type Error = Invalid;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let bytes = value.as_bytes();
-        let Some(first) = bytes.first() else {
-            return Err(Invalid::Machine);
-        };
-        if bytes.len() > 128
-            || !first.is_ascii_alphanumeric()
-            || !bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'@')
-            })
-        {
-            return Err(Invalid::Machine);
-        }
-        Ok(Self(value))
-    }
-}
-
-macro_rules! identifier {
-    ($name:ident, $invalid:expr) => {
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-        #[serde(try_from = "String", into = "String")]
-        pub struct $name(String);
-
-        impl TryFrom<String> for $name {
-            type Error = Invalid;
-
-            fn try_from(value: String) -> Result<Self, Self::Error> {
-                if !valid_identifier(&value) {
-                    return Err($invalid);
-                }
-                Ok(Self(value))
-            }
-        }
+fn check_machine(value: &str) -> Result<(), Invalid> {
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        return Err(Invalid::Machine);
     };
+    if bytes.len() > 128
+        || !first.is_ascii_alphanumeric()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'@'))
+    {
+        return Err(Invalid::Machine);
+    }
+    Ok(())
 }
 
-identifier!(JobId, Invalid::JobId);
-identifier!(SubmissionId, Invalid::SubmissionId);
+validated_string!(MachineName, Invalid, check_machine);
+validated_string!(JobId, Invalid, |value| if valid_identifier(value) {
+    Ok(())
+} else {
+    Err(Invalid::JobId)
+});
+validated_string!(SubmissionId, Invalid, |value| if valid_identifier(value) {
+    Ok(())
+} else {
+    Err(Invalid::SubmissionId)
+});
 
 fn valid_identifier(value: &str) -> bool {
     value.len() == 32
@@ -117,27 +99,21 @@ impl JobReference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RelativePath(String);
-
-impl TryFrom<String> for RelativePath {
-    type Error = Invalid;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.is_empty() || value.len() > 4096 {
+fn check_relative_path(value: &str) -> Result<(), Invalid> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err(Invalid::RelativePath);
+    }
+    let mut count = 0_usize;
+    for component in value.split('/') {
+        count = count.saturating_add(1);
+        if count > 64 || !safe_component(component) {
             return Err(Invalid::RelativePath);
         }
-        let mut count = 0_usize;
-        for component in value.split('/') {
-            count = count.saturating_add(1);
-            if count > 64 || !safe_component(component) {
-                return Err(Invalid::RelativePath);
-            }
-        }
-        Ok(Self(value))
     }
+    Ok(())
 }
+
+validated_string!(RelativePath, Invalid, check_relative_path);
 
 fn safe_component(component: &str) -> bool {
     if component.is_empty()
@@ -181,28 +157,6 @@ fn safe_component(component: &str) -> bool {
             | "LPT9"
     )
 }
-
-macro_rules! string_value {
-    ($name:ident) => {
-        impl From<$name> for String {
-            fn from(value: $name) -> Self {
-                value.0
-            }
-        }
-
-        impl $name {
-            #[must_use]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-    };
-}
-
-string_value!(MachineName);
-string_value!(JobId);
-string_value!(SubmissionId);
-string_value!(RelativePath);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]
