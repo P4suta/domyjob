@@ -9,7 +9,7 @@ Ingress validates bounded wire messages before dispatch.
 A source snapshot is checked for size, digest, portable paths, case collisions, and regular file types before confined extraction.
 State files are private and checked for owner and access permissions before use.
 Log replies read at most the final 16 KiB of the output file and terminal text is neutralized.
-Persisted output files can grow with the command's output.
+The output file stores at most the first 256 MiB of a job's output, and one final line counts any later bytes that were discarded.
 Jobs receive an explicit environment allowlist, so SSH agent and connection variables are not passed to the command.
 
 The client builds and installs remote code from its embedded build source over an authenticated SSH connection.

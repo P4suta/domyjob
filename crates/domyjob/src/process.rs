@@ -310,3 +310,28 @@ impl Group {
         }
     }
 }
+
+/// A command that writes `0123456789` to standard output and then `abcdefghij` to standard error.
+#[cfg(all(test, unix))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "job output tests run this real command"
+)]
+pub(crate) fn stdout_then_stderr() -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "printf 0123456789; printf abcdefghij >&2"]);
+    command
+}
+
+#[cfg(all(test, windows))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "job output tests run this real command"
+)]
+pub(crate) fn stdout_then_stderr() -> Command {
+    use std::os::windows::process::CommandExt as _;
+
+    let mut command = Command::new("cmd.exe");
+    command.raw_arg("/d /c echo 0123456789& echo abcdefghij>&2");
+    command
+}

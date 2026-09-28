@@ -8,10 +8,12 @@
 )]
 
 use std::fmt::Display;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::process::{Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 use domyjob_core::domain::{Command, JobId, RemoteText};
 use domyjob_core::state::{Event, PhaseKind};
@@ -25,6 +27,8 @@ use crate::process::{self, Group, ProcessError, ReadyToken};
 use crate::state_io as state_file;
 use crate::store::{ReceivedArchive, Store, StoreError};
 use crate::watch_event::{self, Notice};
+
+const MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
@@ -135,6 +139,67 @@ fn job_command(command: &Command, home: &std::path::Path) -> Process {
     process
 }
 
+/// Writes stored output and remembers whether it stops inside a line.
+#[derive(Debug)]
+struct Log<W> {
+    file: W,
+    open_line: bool,
+}
+
+impl<W: Write> Write for Log<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.file.write(bytes)?;
+        if let Some(last) = bytes.get(..count).and_then(<[u8]>::last) {
+            self.open_line = *last != b'\n';
+        }
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// Stores at most `limit` bytes of `output` in `log` and returns the bytes written and discarded.
+/// Output past the limit is still read, so the job never blocks on a full pipe, and one final line counts it.
+fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Result<(u64, u64)> {
+    let mut log = Log {
+        file: log,
+        open_line: false,
+    };
+    let mut kept = output.take(limit);
+    let stored = std::io::copy(&mut kept, &mut log);
+    // A failed log write must not cut the job off from its output, so draining continues and the failure is reported at the end.
+    let discarded = std::io::copy(&mut kept.into_inner(), &mut std::io::sink())?;
+    let written = stored?;
+    if discarded != 0 {
+        let separator = if log.open_line { "\n" } else { "" };
+        writeln!(
+            log,
+            "{separator}[domyjob: {discarded} bytes of output were discarded after the 256 MiB limit]"
+        )?;
+    }
+    Ok((written, discarded))
+}
+
+type Relay = JoinHandle<std::io::Result<(u64, u64)>>;
+
+/// Starts the job with standard output and standard error on one pipe, which a relay thread stores in `log`.
+fn spawn_logged(process: Process, log: File, limit: u64) -> Result<(Group, Relay), ProcessError> {
+    let piping = |source: std::io::Error| ProcessError::Spawn {
+        what: "the job output pipe",
+        source,
+    };
+    let (reader, writer) = std::io::pipe().map_err(piping)?;
+    let errors = writer.try_clone().map_err(piping)?;
+    // The command owns the only write ends and drops them once the job starts, so the relay reaches EOF when the process tree exits.
+    let group = Group::spawn_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
+    Ok((
+        group,
+        std::thread::spawn(move || relay_output(reader, log, limit)),
+    ))
+}
+
 fn launch_failure_reason(error: &impl Display) -> Result<RemoteText, AppError> {
     let detail: String = error.to_string().chars().take(4096).collect();
     RemoteText::try_from(detail).map_err(|_invalid| AppError::InvalidErrorText)
@@ -241,11 +306,17 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
     };
     let process = job_command(&command, &directory);
     let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
-    match Group::spawn_stdio(process, Stdio::from(log.try_clone()?), Stdio::from(log)) {
-        Ok(child) => {
+    match spawn_logged(process, log, MAX_LOG_BYTES) {
+        Ok((child, relay)) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
             let completion = cancellation.wait(&store, job, &child)?;
+            // The relay ends at EOF after the process tree exits, so the log is complete before the job finishes.
+            // Its failure is reported after the transition so that the job keeps its own outcome.
+            let relayed = relay.join();
             store.transition(job, &completion)?;
+            relayed.map_err(|_panic| {
+                AppError::Io(std::io::Error::other("the job output relay panicked"))
+            })??;
         }
         Err(error) => {
             let reason = launch_failure_reason(&error)?;
@@ -271,4 +342,59 @@ pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppE
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{relay_output, spawn_logged};
+    use crate::process;
+    use crate::state_io as state_file;
+
+    const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
+
+    #[test]
+    fn output_past_the_limit_is_drained_counted_and_marked_on_its_own_line() {
+        for (output, limit, counts, expected) in [
+            ("", 4, (0, 0), String::new()),
+            ("0123", 4, (4, 0), "0123".to_owned()),
+            ("0123abc", 4, (4, 3), format!("0123\n{MARKER}")),
+            ("012\nabc", 4, (4, 3), format!("012\n{MARKER}")),
+            ("abc", 0, (0, 3), MARKER.to_owned()),
+        ] {
+            let mut log = Vec::new();
+            let relayed = relay_output(output.as_bytes(), &mut log, limit).expect("relayed output");
+            assert_eq!(relayed, counts, "{output:?}");
+            assert_eq!(String::from_utf8(log).expect("text log"), expected);
+        }
+    }
+
+    #[test]
+    fn a_failed_log_write_still_drains_the_job_output() {
+        let mut output: &[u8] = b"0123456789";
+        let mut log = [0_u8; 4];
+        let error = relay_output(&mut output, log.as_mut_slice(), 8).expect_err("full log");
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert!(output.is_empty());
+        assert_eq!(&log, b"0123");
+    }
+
+    #[test]
+    fn a_real_job_logs_both_streams_through_one_bounded_pipe() {
+        let reference = process::stdout_then_stderr()
+            .output()
+            .expect("reference run");
+        let combined = [reference.stdout, reference.stderr].concat();
+        let mut expected = Vec::new();
+        let counts = relay_output(combined.as_slice(), &mut expected, 4).expect("reference relay");
+        assert!(counts.1 > 0, "the command must write past the limit");
+        let root = tempfile::tempdir().expect("temporary job directory");
+        let path = root.path().join("job").join("output.log");
+        let log = state_file::open_append(&path).expect("job log");
+        let (_group, relay) =
+            spawn_logged(process::stdout_then_stderr(), log, 4).expect("started job");
+        // Nothing kills the job here, so the relay reaches EOF only if no write end outlives the job itself.
+        let relayed = relay.join().expect("relay thread").expect("relayed output");
+        assert_eq!(relayed, counts);
+        assert_eq!(std::fs::read(&path).expect("stored log"), expected);
+    }
 }

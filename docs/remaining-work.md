@@ -197,7 +197,7 @@ No provider was invoked and no chat test worker was left running when this check
 
 ## Existing rewrite limitations that still apply
 
-- Persisted job output is not size-bounded; returned log tails are bounded.
+- On Unix, a descendant that leaves the job's process group while holding its output open keeps even a cancelled job from finishing until that output closes.
 - There is no old-state migration, separate network service/pairing layer, or remote file pullback in the rewritten job runner.
 - Old build versions are retained so active workers can finish; automatic cache pruning is not implemented here.
 - Local Windows source refresh avoids replacing its own running output path, but contention with another process holding the alternate/primary build output has not been exhaustively tested.
