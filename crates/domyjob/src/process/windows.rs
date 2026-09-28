@@ -200,6 +200,11 @@ impl Tree {
             Ok(())
         }
     }
+
+    /// Stop what remains of the job after its leader exited.
+    pub(super) fn kill_remaining(&self) -> Result<(), ProcessError> {
+        self.kill_all()
+    }
 }
 
 #[derive(Debug)]

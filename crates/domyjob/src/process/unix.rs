@@ -90,6 +90,17 @@ impl Tree {
             Err(error) => Err(ProcessError::Signal(error.into())),
         }
     }
+
+    /// Stop what remains of the group after its leader exited but before the leader is reaped.
+    ///
+    /// macOS answers `EPERM` when the unreaped leader is the group's only member,
+    /// so that answer means nothing is left to stop.
+    pub(super) fn kill_remaining(&self) -> Result<(), ProcessError> {
+        match kill_process_group(self.group, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
+            Err(error) => Err(ProcessError::Signal(error.into())),
+        }
+    }
 }
 
 #[derive(Debug)]

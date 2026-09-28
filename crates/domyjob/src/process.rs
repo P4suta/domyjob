@@ -183,7 +183,7 @@ impl Group {
                 return Err(ProcessError::Wait(io::Error::other("already reaped")));
             }
         };
-        self.tree.kill_all()?;
+        self.tree.kill_remaining()?;
         let status = child.wait().map_err(ProcessError::Wait);
         drop(guard);
         let reaper = self
