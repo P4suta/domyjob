@@ -1,7 +1,7 @@
 # First-release rewrite
 
 The first release has no compatibility requirement with the previous CLI, wire format, or stored jobs.
-The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` binary supplies verified operating-system adapters and source deployment.
+The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies verified operating-system adapters.
 
 ## Enforced boundaries
 
@@ -24,11 +24,12 @@ Completed jobs can be removed individually or in a batch, while active jobs are 
 `run` snapshots the current directory, including uncommitted work, and verifies the archive size, digest, portable paths, and file types before extraction.
 The source archive limit is 64 MiB, and the control-frame limit is 1 MiB.
 On client startup, source files are compared with the compiled fingerprint and the local client is rebuilt when they differ.
-Before an RPC, the client checks the remote fingerprint and uses the existing `domyjob` source-transfer command to rebuild and install a matching remote binary when needed.
-This automatic rebuild currently requires the development checkout and the old `domyjob` binary.
+Before an RPC, the client checks the remote fingerprint and transfers a validated checkout archive over SSH to rebuild and install a matching remote binary when needed.
+The remote installer keeps a persistent Cargo target directory so subsequent updates reuse compiled dependencies.
+Automatic rebuild requires the development checkout and `mise` on the remote host.
 
 ## Cutover conditions
 
 The default binary is still the previous `domyjob` CLI, and `domyjob-next` is the replacement under test.
-Cutover requires a standalone source-deployment path, extraction of the needed operating-system adapters from the old application crate, and a final review of the new command surface and storage limits.
+Cutover requires extraction of the needed operating-system adapters from the old application crate and a final review of the new command surface and storage limits.
 The old CLI and its duplicated application logic can then be removed without weakening the process, filesystem, or transport boundaries.

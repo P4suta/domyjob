@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 blake3.workspace = true
 clap.workspace = true
+data-encoding.workspace = true
 domyjob = { path = "../domyjob" }
 domyjob-core = { path = "../domyjob-core" }
 getrandom.workspace = true

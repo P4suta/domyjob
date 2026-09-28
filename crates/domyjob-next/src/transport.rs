@@ -51,6 +51,8 @@ pub(crate) enum TransportError {
     BuildMismatch,
     #[error("the source contains a symlink, which the first release cannot transfer")]
     SourceLink,
+    #[error("the remote host does not identify a supported shell")]
+    RemoteShell,
 }
 
 struct SshChild {
@@ -69,6 +71,14 @@ impl Drop for SshChild {
 
 impl SshChild {
     fn start(machine: &MachineName) -> Result<Self, TransportError> {
+        Self::start_command(machine, "~/.cargo/bin/domyjob-next node", Stdio::piped())
+    }
+
+    fn start_command(
+        machine: &MachineName,
+        remote_command: &str,
+        stdout: Stdio,
+    ) -> Result<Self, TransportError> {
         let child = Command::new("ssh")
             .args([
                 "-T",
@@ -76,10 +86,10 @@ impl SshChild {
                 "BatchMode=yes",
                 "--",
                 machine.as_str(),
-                "~/.cargo/bin/domyjob-next node",
+                remote_command,
             ])
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .spawn()?;
         Ok(Self {
             child,
@@ -206,43 +216,83 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteShell {
+    Unix,
+    Windows,
+}
+
+fn remote_shell(machine: &MachineName) -> Result<RemoteShell, TransportError> {
+    let mut child = SshChild::start_command(machine, "echo $env:OS", Stdio::piped())?;
+    drop(child.child.stdin.take());
+    let mut output = child
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64];
+    loop {
+        let count = output.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > 64 {
+            return Err(TransportError::RemoteShell);
+        }
+        bytes.extend_from_slice(buffer.get(..count).ok_or(TransportError::RemoteShell)?);
+    }
+    drop(output);
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(TransportError::Remote(status));
+    }
+    match std::str::from_utf8(&bytes)
+        .map_err(|_utf8| TransportError::RemoteShell)?
+        .trim()
+    {
+        "Windows_NT" => Ok(RemoteShell::Windows),
+        ":OS" => Ok(RemoteShell::Unix),
+        _ => Err(TransportError::RemoteShell),
+    }
+}
+
+fn install_command(shell: RemoteShell) -> String {
+    match shell {
+        RemoteShell::Unix => String::from(
+            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work" mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; cd "$HOME"; rm -rf -- "$work"'"#,
+        ),
+        RemoteShell::Windows => {
+            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#;
+            let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            format!(
+                "powershell.exe -NoProfile -EncodedCommand {}",
+                data_encoding::BASE64.encode(&utf16)
+            )
+        }
+    }
+}
+
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
-    let checkout = source_checkout()?;
+    let archive = archive_directory(source_checkout()?)?;
+    if u64::try_from(archive.len()).map_err(|_size| WireError::Snapshot)? > wire::MAX_SNAPSHOT_BYTES
+    {
+        return Err(WireError::Snapshot.into());
+    }
+    let command = install_command(remote_shell(machine)?);
     eprintln!(
         "{}: updating remote binary from this checkout",
         machine.as_str()
     );
-    let built = Command::new("mise")
-        .current_dir(checkout)
-        .env("RUSTC_WRAPPER", "")
-        .args(["x", "--", "cargo", "build", "--locked", "-p", "domyjob"])
-        .status()?;
-    if !built.success() {
-        return Err(TransportError::Deployment(built));
-    }
-    let executable = checkout
-        .join("target")
-        .join("debug")
-        .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX));
-    let status = Command::new(executable)
-        .current_dir(checkout)
-        .args([
-            "run",
-            machine.as_str(),
-            "--wait",
-            "--",
-            "mise",
-            "x",
-            "--",
-            "cargo",
-            "install",
-            "--debug",
-            "--locked",
-            "--path",
-            "crates/domyjob-next",
-            "--force",
-        ])
-        .status()?;
+    let mut child = SshChild::start_command(machine, &command, Stdio::inherit())?;
+    let mut input = child
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
+    input.write_all(&archive)?;
+    drop(input);
+    let status = child.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -265,7 +315,8 @@ fn stale(error: &TransportError) -> bool {
         | TransportError::Refused(_)
         | TransportError::Deployment(_)
         | TransportError::BuildMismatch
-        | TransportError::SourceLink => false,
+        | TransportError::SourceLink
+        | TransportError::RemoteShell => false,
     }
 }
 
@@ -390,9 +441,8 @@ fn finish_submission(
     Ok(result)
 }
 
-fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
-    let root = std::env::current_dir()?;
-    let source = domyjob::snapshot::from_directory(&root)?;
+fn archive_directory(root: &Path) -> Result<Vec<u8>, TransportError> {
+    let source = domyjob::snapshot::from_directory(root)?;
     for (path, entry) in &source.manifest.entries {
         RelativePath::try_from(path.as_str().to_owned())?;
         match entry {
@@ -401,6 +451,11 @@ fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
         }
     }
     let archive = domyjob::snapshot::archive(&source)?;
+    Ok(archive)
+}
+
+fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
+    let archive = archive_directory(&std::env::current_dir()?)?;
     let bytes = u64::try_from(archive.len()).map_err(|_length| WireError::Snapshot)?;
     let digest = blake3::hash(&archive).to_hex().to_string();
     let descriptor = wire::Snapshot::new(bytes, digest)?;
