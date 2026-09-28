@@ -42,13 +42,17 @@ Only the responder answers or fails an ask, and only the asker withdraws it.
 A later answer after an ending remains visible as a late reply.
 
 The same functions also build and apply exchange rounds, and an in-memory reference ledger uses them in tests.
-A stateful fuzz target drives three reference ledgers through random writes and synchronization orders and checks that they converge.
+A test visits every reachable state of an ask across three machines, in a room and directly,
+with every order of starting, answering, failing, withdrawing, and exchanging:
+each machine must end the ask with the earliest ending it stores, and exchanging until nothing moves must converge.
+A stateful fuzz target drives three reference ledgers through longer random histories.
 
 ## Store
 
 The store applies each admitted event and all of its projections in one transaction: the ordered index, conversation threads, cursors, profiles, rooms, open asks, and ask endings.
 Only the machine's own chat lock serializes access to the file.
-A schema version and the machine's identity are stored inside the file and checked by every transaction, so a process that outlives `chat reset` fails instead of writing under an old identity.
+The store's format and the machine's identity are stored inside the file and checked by every transaction, so a process that outlives `chat reset` fails instead of writing under an old identity.
+The format is the digest of a checked-in specimen of every table, key, event, and record, so it changes exactly when stored data would read differently.
 
 A managed turn has three durable points.
 Claiming the oldest open ask records the claim and a `turn_started` event.
@@ -57,6 +61,8 @@ A worker that finds its own earlier claims at start records them as `interrupted
 
 After every transaction that stored events, the store replaces a generation file in its own `bell` directory.
 Waiting processes watch only that directory, so reads and database writes never wake them.
+The doorbell is private to `Pulse`, the only way to wait, and every wake-up of a wait first dispatches this machine's asks,
+so a worker that died holding a claim is replaced, and the new worker records the claim as interrupted.
 
 ### Retention and capacity
 

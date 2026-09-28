@@ -11,9 +11,8 @@ Its request and reply enums require exhaustive handling when the protocol change
 Its job state has accepted, starting, running, and finished phases, with a terminal outcome that cannot transition again.
 Malformed stored states cannot deserialize into a running job with a zero process ID.
 
-The `xtask gates` check rejects `std` imports in core and OS branches outside the platform and process adapters.
-Workspace Clippy settings deny wildcard matches, unchecked unwraps, silent error conversion, and direct calls to selected effect APIs.
 The binary composes the pure decisions with SSH, filesystem, watch events, locks, and processes.
+Each effect has one owner module, and [the engineering rules](engineering.md) list how the compiler, lints, and gate enforce that and the other invariants.
 
 ## Submission and persistence
 
@@ -25,6 +24,9 @@ A worker lock is the evidence of liveness; a dead worker produces the explicit `
 Cancellation is persisted and delivered through a file change event before the process tree is terminated.
 Finished jobs may be removed; active jobs may not.
 
+Every path under the state root is defined in `layout`.
+The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs,
+and a stored format is the digest of a checked-in specimen rather than a version number.
 State records have a 1 MiB size bound and are written through a private, synchronized replacement path.
 The storage adapter checks ownership and Unix mode or Windows ACL before reading existing state.
 The command runs in a Unix process group or Windows Job Object, with a guard against a stranded Unix process group.
@@ -35,6 +37,7 @@ The node clears the SSH session environment before launching a job and adds a sm
 ## Transport and source
 
 Each SSH request contains one length prefixed JSON control frame with a 1 MiB limit.
+The frame carries no version, because a client only talks to a node of its own build.
 Calls carry deadlines, keep the connection alive with SSH keepalives, and share one connection per machine on Unix.
 A `run` request may carry a 64 MiB tar snapshot of the current directory, including uncommitted files.
 The source scanner rejects links, nonregular files, nonportable names, and case collisions.
@@ -58,8 +61,10 @@ OpenSSH authenticates the host and user; domyjob does not expose a separate list
 
 ## Verification
 
-`mise run lint` checks formatting, Clippy, architecture gates, spelling, workflow syntax, and duplicate code.
-`mise run test` tests the complete workspace, including an end-to-end suite that simulates several machines on one host with fake SSH and AI clients.
+`mise run lint` checks formatting, Clippy for the host, Linux, and Windows, architecture gates, spelling, workflow syntax, and duplicate code.
+`mise run test` tests the complete workspace, including the stored format specimens, a search of every reachable state of a chat ask across three machines,
+and an end-to-end suite that simulates several machines on one host with fake SSH and AI clients.
 `mise run fuzz` fuzzes wire ingress, job state transitions, and chat ledger convergence.
 `mise run check:fleet` sends this checkout to Linux and Windows and runs Clippy, gates, and tests there.
 The CI matrix runs Clippy and tests on macOS, Linux, and Windows.
+The `commit-msg` hook refuses a fix to product code that stages no test.
