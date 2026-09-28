@@ -84,11 +84,12 @@ run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mis
 
 [tasks."check:linux"]
 description = "Lint and test this checkout on Linux through domyjob"
-run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; mise run clippy && mise run gates && mise run test'"
+# Each job builds from its own workspace path, so its workspace artifacts are cleaned afterwards.
+run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
 
 [tasks."check:win"]
 description = "Lint and test this checkout on Windows through domyjob"
-run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; mise run gates; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; mise run test; exit $LASTEXITCODE'"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
 
 [tasks."check:fleet"]
 description = "Run this checkout's checks on Linux and Windows"
