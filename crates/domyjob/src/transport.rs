@@ -732,7 +732,22 @@ const fn error_code(error: &AppError) -> ErrorCode {
     }
 }
 
+/// Remove builds installed here that no process runs any more.
+fn prune_builds() {
+    let versions = match platform::home() {
+        Ok(home) => home.join(".cargo").join("domyjob").join("versions"),
+        Err(error) => {
+            eprintln!("domyjob node: locating installed builds failed: {error}");
+            return;
+        }
+    };
+    if let Err(error) = crate::builds::prune(&versions, &identity::tag()) {
+        eprintln!("domyjob node: removing unused builds failed: {error}");
+    }
+}
+
 pub(crate) fn node() -> Result<(), TransportError> {
+    prune_builds();
     let mut input = std::io::stdin().lock();
     let request = ingress::request(&read_frame(&mut input)?)?;
     let abandoned = Arc::new(AtomicBool::new(false));

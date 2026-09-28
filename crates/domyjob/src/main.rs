@@ -6,6 +6,7 @@ use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineNa
 use domyjob_core::wire::CleanTarget;
 
 mod app;
+mod builds;
 mod chat;
 #[path = "platform/file_kind.rs"]
 mod file_kind;
@@ -223,6 +224,13 @@ fn internal() -> bool {
 
 fn main() -> ExitCode {
     let internal = internal();
+    let _build = match builds::hold_current() {
+        Ok(held) => held,
+        Err(error) => {
+            eprintln!("domyjob: marking this build in use failed: {error}");
+            None
+        }
+    };
     if !internal {
         match transport::refresh_local() {
             Ok(Some(code)) => return code,
