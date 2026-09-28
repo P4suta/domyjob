@@ -90,6 +90,7 @@ Client retry classification now exhaustively matches every `RemoteError`, so add
 The decision-signature gate now rejects boolean-returning functions outside 36 named legacy signatures throughout the product crate; a parsed `cfg` condition grants test-only exemptions only when it requires `test`.
 Legacy exceptions are also tied to their owning type or free function, so a new type cannot inherit an old same-name exception.
 The repository gate counts every allowed boolean definition and fails when one disappears or is duplicated until its reviewed baseline is changed.
+It also checks trait method signatures and respects test-only conditions on whole implementations and traits rather than misclassifying their methods.
 Submission replies now retain the accepted job, the missing-content refusal, or the full unexpected reply in distinct typed outcomes; the client retries only the missing-content outcome, and both reply and refusal-code classification require exhaustive matches.
 Distribution failures now carry an explicit local-source or stop outcome; only the no-trust-root case permits automatic source fallback, and adding a failure variant requires revisiting that policy.
 Watch retries now also classify every `ClientError`, retrying transient remote transport failures while reporting local and invalid-input failures immediately.
@@ -139,8 +140,8 @@ Setup output, tree reads, and log tails use explicit byte limits.
 Builds and installs now receive a fresh random `TransferId`; setup fails if entropy fails.
 The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.
 SSH multiplexing has its own short `SshSessionId` and a fixed-length machine-specific `SshControlId`; the rendered control socket path reserves room for OpenSSH's temporary name and rejects unbounded expansion tokens before SSH starts.
-Source builds serialize Cargo and staging in one reusable target directory with an operating-system lock; Unix hosts without `flock` or `lockf` use a target directory keyed by build stamp and source archive instead.
-Before reusing a shared target, the locked build clears only domyjob's compiled artifacts, so an archive extracted before the previous build cannot make Cargo treat the old executable as current.
+Source builds serialize Cargo and staging with an operating-system lock; Windows uses a target directory keyed by the source archive and prunes older build directories after staging, while Unix hosts without `flock` or `lockf` use a target directory keyed by build stamp and source archive.
+Unix shared-target builds clear only domyjob's compiled artifacts under the lock; Windows source-addressed targets avoid both stale executables and an intermittent `cargo clean` access-denied failure during concurrent test runs.
 The source is moved to a stable compilation path only while that lock is held, and the path is removed before the lock is released.
 Windows source-build scripts and archives travel as framed stdin data; a fixed bootstrap command stays below the Windows command-line limit.
 Every source build verifies the staged executable's embedded build stamp before promotion.

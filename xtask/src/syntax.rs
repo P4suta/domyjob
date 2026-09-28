@@ -2702,6 +2702,10 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+        let test = is_test_module(&item.attrs);
+        if test {
+            self.test_depth = self.test_depth.saturating_add(1);
+        }
         if self.file_is(&["template.rs"])
             && item.ident == "SafePath"
             && !item.supertraits.iter().any(|bound| {
@@ -2721,9 +2725,21 @@ impl<'ast> Visit<'ast> for Gate {
             self.flag(item.ident.span(), AUTHORIZED_COMMAND_RULE);
         }
         syn::visit::visit_item_trait(self, item);
+        if test {
+            self.test_depth = self.test_depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        self.check_signature(&item.sig, &item.attrs);
+        syn::visit::visit_trait_item_fn(self, item);
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        let test = is_test_module(&item.attrs);
+        if test {
+            self.test_depth = self.test_depth.saturating_add(1);
+        }
         self.check_opaque_time_impl(item);
         if self.test_depth == 0
             && self.file.starts_with("crates/domyjob/src/")
@@ -2791,6 +2807,9 @@ impl<'ast> Visit<'ast> for Gate {
         syn::visit::visit_item_impl(self, item);
         self.state_impl = previous_state_impl;
         self.current_impl = previous_impl;
+        if test {
+            self.test_depth = self.test_depth.saturating_sub(1);
+        }
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
@@ -3957,8 +3976,11 @@ mod tests {
         for source in [
             "fn decision() -> bool { true }",
             "fn decision() -> Result<bool, Error> { Ok(true) }",
+            "trait Policy { fn decision(&self) -> bool; }",
+            "#[cfg(any(test, unix))] trait Policy { fn decision(&self) -> bool; }",
             "#[cfg(not(test))] fn decision() -> bool { true }",
             "#[cfg(any(test, unix))] fn decision() -> bool { true }",
+            "#[cfg(any(test, unix))] impl Policy { fn decision(&self) -> bool { true } }",
         ] {
             assert_rule(source, file, DECISION_SIGNATURE_RULE);
         }
@@ -3966,6 +3988,8 @@ mod tests {
             "#[cfg(test)] fn fixture() -> bool { true }",
             "#[cfg(all(test, unix))] fn fixture() -> bool { true }",
             "#[cfg(any(all(test, unix), all(test, windows)))] fn fixture() -> bool { true }",
+            "#[cfg(test)] impl Policy { fn fixture(&self) -> bool { true } }",
+            "#[cfg(test)] trait Policy { fn fixture(&self) -> bool; }",
         ] {
             assert!(check_file(source, file).unwrap().is_empty(), "{source}");
         }

@@ -645,7 +645,7 @@ fn build_unix(transfer: &TransferId, source: &BlobId) -> Arg {
     ])
 }
 
-fn build_windows_script(transfer: &TransferId) -> Arg {
+fn build_windows_script(transfer: &TransferId, source: &BlobId) -> Arg {
     Arg::concat(&[
         Arg::literal("$ErrorActionPreference = 'Stop'; $transfer = '"),
         Arg::word(transfer),
@@ -657,7 +657,11 @@ fn build_windows_script(transfer: &TransferId) -> Arg {
             "$b = Join-Path $env:TEMP ('domyjob-source-' + $transfer + '.b64'); ",
             "[IO.File]::WriteAllBytes($t, [Convert]::FromBase64String($archiveB64)); Remove-Item -Force $b; ",
             "tar -x -m -f $t -C $s; if ($LASTEXITCODE) { throw \"tar exited with $LASTEXITCODE\" }; ",
-            "$buildDir = Join-Path $c 'build'; $target = Join-Path $buildDir 'shared'; ",
+            "$buildDir = Join-Path $c 'build'; $target = Join-Path $buildDir '",
+        ]),
+        Arg::word(source),
+        Arg::joined(&[
+            "'; ",
             "$stable = Join-Path $buildDir 'source'; ",
             "$lockPath = Join-Path $buildDir 'source.lock'; ",
             "$d = Join-Path $c 'bin'; New-Item -ItemType Directory -Force $buildDir,$d | Out-Null; ",
@@ -677,14 +681,16 @@ fn build_windows_script(transfer: &TransferId) -> Arg {
             "try { if (Test-Path $stable) { Remove-Item -LiteralPath $stable -Recurse -Force }; ",
             "Move-Item -LiteralPath $source -Destination $stable; Set-Location $stable; ",
             "$env:MISE_TRUSTED_CONFIG_PATHS = $stable; $ErrorActionPreference = 'Continue'; ",
-            "& cargo clean --profile remote -p domyjob --target-dir $target; ",
-            "$cleanExit = $LASTEXITCODE; if ($cleanExit -ne 0) { throw \"cargo clean exited with $cleanExit\" }; ",
             "& cargo build --profile remote --locked -p domyjob --target-dir $target; ",
             "$buildExit = $LASTEXITCODE; $ErrorActionPreference = 'Stop'; ",
             "if ($buildExit -ne 0) { throw \"cargo build exited with $buildExit\" }; ",
             "$exe = Join-Path $target 'remote\\domyjob.exe'; ",
             "if (-not (Test-Path $exe)) { throw 'cargo build produced no domyjob.exe' }; ",
-            "Copy-Item -Force $exe $stage } finally { Set-Location $env:USERPROFILE; ",
+            "Copy-Item -Force $exe $stage; ",
+            "Get-ChildItem -LiteralPath (Split-Path $target -Parent) -Directory | ",
+            "Where-Object { $_.FullName -ne $target -and $_.Name -ne 'source' } | ",
+            "ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } ",
+            "} finally { Set-Location $env:USERPROFILE; ",
             "Remove-Item -LiteralPath $stable -Recurse -Force -ErrorAction SilentlyContinue; $buildLock.Dispose() } }; ",
             "while ($job.State -eq 'NotStarted' -or $job.State -eq 'Running') { Wait-Job $job -Timeout 5 | Out-Null; [Console]::Error.Write('.') }; ",
             "Receive-Job $job -ErrorAction Continue | ForEach-Object { [Console]::Error.WriteLine($_) }; ",
@@ -737,7 +743,7 @@ pub(crate) fn windows_source_build_for_test(
     archive: &[u8],
 ) -> (Arg, TransferId, Vec<u8>) {
     let transfer = TransferId::fresh().unwrap();
-    let original = build_windows_script(&transfer).into_string();
+    let original = build_windows_script(&transfer, &BlobId::of(archive)).into_string();
     let assignment = "$c = Join-Path $env:USERPROFILE '.cache\\domyjob';";
     assert!(original.contains(assignment));
     let assigned = format!(
@@ -1955,7 +1961,7 @@ impl<'a> Link<'a> {
         let payload = match self.family {
             Family::Unix => archive.to_vec(),
             Family::Windows => {
-                windows_source_build_payload(&build_windows_script(transfer), archive)
+                windows_source_build_payload(&build_windows_script(transfer, &source), archive)
             }
         };
         let name = self.name();
@@ -2649,7 +2655,7 @@ mod tests {
     fn windows_source_build_requires_a_fresh_artifact() {
         let transfer = TransferId::fresh().unwrap();
         let source = BlobId::of(b"source fixture");
-        let windows = build_windows_script(&transfer);
+        let windows = build_windows_script(&transfer, &source);
         assert!(
             windows_source_build_for_test(std::path::Path::new("build-fixture"), b"archive")
                 .0
@@ -2668,8 +2674,9 @@ mod tests {
                 .as_arg_str()
                 .contains("$target = Join-Path $buildDir")
         );
+        assert!(windows.as_arg_str().contains(source.as_str()));
         assert!(
-            windows
+            !windows
                 .as_arg_str()
                 .contains("Join-Path $buildDir 'shared'")
         );
@@ -2678,11 +2685,7 @@ mod tests {
                 .as_arg_str()
                 .contains("cargo build --profile remote --locked")
         );
-        assert!(
-            windows
-                .as_arg_str()
-                .contains("cargo clean --profile remote -p domyjob --target-dir $target")
-        );
+        assert!(!windows.as_arg_str().contains("cargo clean"));
         assert!(windows.as_arg_str().contains("remote\\domyjob.exe"));
         assert!(windows.as_arg_str().contains("[IO.FileShare]::None"));
         assert!(
