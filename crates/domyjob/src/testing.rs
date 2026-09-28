@@ -30,6 +30,10 @@ mod raw {
     pub(super) fn is_file(path: &Path) -> bool {
         path.is_file()
     }
+
+    pub(super) fn read_to_string(path: &Path) -> io::Result<String> {
+        std::fs::read_to_string(path)
+    }
 }
 
 /// Create a directory and its parents.
@@ -55,4 +59,8 @@ pub(crate) fn is_dir(path: &Path) -> bool {
 
 pub(crate) fn is_file(path: &Path) -> bool {
     raw::is_file(path)
+}
+
+pub(crate) fn read(path: &Path) -> String {
+    raw::read_to_string(path).expect("read a fixture file")
 }

@@ -76,9 +76,10 @@ enum OrphanKind {
 }
 
 impl JobPaths {
-    fn at(root: &Path, job: &JobId) -> Self {
+    /// The files of `job` inside `parent`, the directory of live or staged jobs.
+    fn at(parent: &Path, job: &JobId) -> Self {
         Self {
-            dir: root.join("jobs").join(job.as_str()),
+            dir: parent.join(job.as_str()),
         }
     }
 
@@ -121,20 +122,45 @@ impl JobPaths {
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
-        let root = crate::layout::State::here()?.runner();
+        let store = Self {
+            root: crate::layout::State::here()?.runner(),
+        };
         for dir in [
-            &root,
-            &root.join("jobs"),
-            &root.join("staging"),
-            &root.join("incoming"),
+            store.root.clone(),
+            store.jobs_dir(),
+            store.staging_dir(),
+            store.incoming_dir(),
         ] {
-            state_file::private_dir(dir)?;
+            state_file::private_dir(&dir)?;
         }
-        Ok(Self { root })
+        Ok(store)
+    }
+
+    /// Published jobs, one directory each.
+    fn jobs_dir(&self) -> PathBuf {
+        self.root.join("jobs")
+    }
+
+    /// Jobs being assembled before they are published.
+    fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
+    }
+
+    /// Source archives being received.
+    fn incoming_dir(&self) -> PathBuf {
+        self.root.join("incoming")
+    }
+
+    fn incoming_lock(&self) -> PathBuf {
+        self.root.join("incoming.lock")
+    }
+
+    fn staged(&self, job: &JobId) -> JobPaths {
+        JobPaths::at(&self.staging_dir(), job)
     }
 
     fn paths(&self, job: &JobId) -> JobPaths {
-        JobPaths::at(&self.root, job)
+        JobPaths::at(&self.jobs_dir(), job)
     }
 
     fn verified_directory(path: PathBuf) -> Result<PathBuf, StoreError> {
@@ -186,8 +212,8 @@ impl Store {
 
     fn cleanup_orphans(&self, kind: OrphanKind) -> Result<(), StoreError> {
         let directory = match kind {
-            OrphanKind::Staging => self.root.join("staging"),
-            OrphanKind::Incoming => self.root.join("incoming"),
+            OrphanKind::Staging => self.staging_dir(),
+            OrphanKind::Incoming => self.incoming_dir(),
         };
         for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
             if index >= 1024 {
@@ -218,10 +244,10 @@ impl Store {
         input: &mut impl Read,
         snapshot: &wire::Snapshot,
     ) -> Result<ReceivedArchive, StoreError> {
-        let lock = OsLock::exclusive(&self.root.join("incoming.lock"))?;
+        let lock = OsLock::exclusive(&self.incoming_lock())?;
         self.cleanup_orphans(OrphanKind::Incoming)?;
         let id = Self::new_job_id()?;
-        let path = self.root.join("incoming").join(id.as_str());
+        let path = self.incoming_dir().join(id.as_str());
         state_file::create_empty(&path)?;
         let mut file = state_file::open_append(&path)?;
         let received = ReceivedArchive {
@@ -253,8 +279,8 @@ impl Store {
         Ok(received)
     }
 
-    fn extract_archive(staged: &Path, archive: &ReceivedArchive) -> Result<(), StoreError> {
-        let workspace = staged.join("workspace");
+    fn extract_archive(staged: &JobPaths, archive: &ReceivedArchive) -> Result<(), StoreError> {
+        let workspace = staged.workspace();
         state_file::private_dir(&workspace)?;
         let rooted = Rooted::open(&workspace)?;
         let source = state_file::open_read(&archive.path)?.ok_or(StoreError::ArchiveMismatch)?;
@@ -297,8 +323,8 @@ impl Store {
         request: &Request,
         archive: Option<&ReceivedArchive>,
     ) -> Result<(), StoreError> {
-        let staged = self.root.join("staging").join(job.as_str());
-        state_file::private_dir(&staged)?;
+        let staged = self.staged(job);
+        state_file::private_dir(&staged.dir)?;
         match (request, archive) {
             (
                 Request::Run {
@@ -341,10 +367,10 @@ impl Store {
             ) => return Err(StoreError::ArchiveMismatch),
         }
         let encoded = wire::frame(request)?;
-        state_file::write_bytes(&staged.join("request.json"), wire::payload(&encoded)?)?;
+        state_file::write_bytes(&staged.spec(), wire::payload(&encoded)?)?;
         let initial = serde_json::to_vec(&JobState::accepted()).map_err(WireError::from)?;
-        state_file::write_bytes(&staged.join("state.json"), &initial)?;
-        state_file::publish_dir(&staged, &self.paths(job).dir)?;
+        state_file::write_bytes(&staged.state(), &initial)?;
+        state_file::publish_dir(&staged.dir, &self.paths(job).dir)?;
         Ok(())
     }
 
@@ -377,7 +403,7 @@ impl Store {
 
     pub(crate) fn list(&self) -> Result<Vec<JobId>, StoreError> {
         let mut jobs = Vec::new();
-        for entry in std::fs::read_dir(self.root.join("jobs"))? {
+        for entry in std::fs::read_dir(self.jobs_dir())? {
             let entry = entry?;
             if jobs.len() >= 1024 {
                 return Err(StoreError::Capacity);
@@ -540,11 +566,99 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use domyjob_core::domain::{Command, RemoteText, SubmissionId};
-    use domyjob_core::state::{Event, Outcome};
-    use domyjob_core::wire::{Input, Request};
+    use std::path::{Path, PathBuf};
+
+    use domyjob_core::domain::{Command, JobId, RemoteText, SubmissionId};
+    use domyjob_core::state::{Event, JobState, Outcome};
+    use domyjob_core::wire::{self, Input, Request, Snapshot};
 
     use super::{Store, state_file};
+
+    fn shown(path: &Path) -> String {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// One specimen of every path, stored request, and job state, whose digest is the store's format.
+    fn specimen() -> String {
+        let store = Store {
+            root: PathBuf::from("runner"),
+        };
+        let job = JobId::try_from("0".repeat(32)).unwrap();
+        let mut lines: Vec<String> = [
+            store.jobs_dir(),
+            store.staging_dir(),
+            store.incoming_dir(),
+            store.incoming_lock(),
+            store.admission_lock(),
+        ]
+        .iter()
+        .map(|path| format!("path {}", shown(path)))
+        .collect();
+        for paths in [store.paths(&job), store.staged(&job)] {
+            for path in [
+                paths.spec(),
+                paths.state(),
+                paths.state_lock(),
+                paths.alive_lock(),
+                paths.launch_lock(),
+                paths.cancel(),
+                paths.log(),
+                paths.supervisor_log(),
+                paths.workspace(),
+            ] {
+                lines.push(format!("path {}", shown(&path)));
+            }
+        }
+        for input in [
+            Input::Home,
+            Input::Snapshot(Snapshot::new(1, "0".repeat(64)).unwrap()),
+        ] {
+            let request = Request::Run {
+                submission: SubmissionId::try_from("1".repeat(32)).unwrap(),
+                command: Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap(),
+                input,
+            };
+            let framed = wire::frame(&request).unwrap();
+            lines.push(format!(
+                "request {}",
+                String::from_utf8(wire::payload(&framed).unwrap().to_vec()).unwrap()
+            ));
+        }
+        let reason = RemoteText::try_from("no such program".to_owned()).unwrap();
+        let mut running = JobState::accepted();
+        let mut states = vec![running.clone()];
+        running.advance(&Event::Starting).unwrap();
+        states.push(running.clone());
+        let mut launch_failed = running.clone();
+        launch_failed
+            .advance(&Event::LaunchFailed { reason })
+            .unwrap();
+        states.push(launch_failed);
+        running.advance(&Event::Spawned { pid: 42 }).unwrap();
+        states.push(running.clone());
+        for ending in [
+            Event::Exited { code: 0 },
+            Event::Exited { code: 3 },
+            Event::SupervisorGone,
+            Event::Killed,
+        ] {
+            let mut finished = running.clone();
+            finished.advance(&ending).unwrap();
+            states.push(finished);
+        }
+        for state in states {
+            lines.push(format!("state {}", serde_json::to_string(&state).unwrap()));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn the_runner_format_is_its_specimen() {
+        crate::formats::check("runner", &specimen());
+    }
 
     #[test]
     fn failed_supervisor_start_is_terminal_and_idempotent() {

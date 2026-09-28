@@ -5,7 +5,7 @@
 use serde::de::DeserializeOwned;
 
 use crate::state::JobState;
-use crate::wire::{self, Envelope, Reply, Request, WireError};
+use crate::wire::{self, Reply, Request, WireError};
 
 mod raw {
     #![expect(
@@ -60,11 +60,7 @@ fn decode_payload<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
     if bytes.len() > wire::MAX_CONTROL_BYTES {
         return Err(WireError::TooLarge);
     }
-    let envelope: Envelope<T> = raw::from_slice(bytes)?;
-    if envelope.version != wire::VERSION {
-        return Err(WireError::Version);
-    }
-    Ok(envelope.message)
+    Ok(raw::from_slice(bytes)?)
 }
 
 pub fn request(frame: &[u8]) -> Result<Request, WireError> {
@@ -99,7 +95,7 @@ mod tests {
     use super::request;
 
     #[test]
-    fn framed_requests_have_one_exact_version_and_length() {
+    fn framed_requests_have_one_exact_length() {
         let valid = wire::frame(&Request::Hello).unwrap();
         assert_eq!(request(&valid).unwrap(), Request::Hello);
         for end in 0..valid.len() {
@@ -108,21 +104,15 @@ mod tests {
         let mut trailing = valid;
         trailing.push(0);
         assert!(matches!(request(&trailing), Err(WireError::Trailing)));
-        let mut wrong_version = wire::frame(&Request::Hello).unwrap();
-        let json = br#"{"version":2,"message":{"request":"hello"}}"#;
-        wrong_version.clear();
-        wrong_version.extend_from_slice(&u32::try_from(json.len()).unwrap().to_be_bytes());
-        wrong_version.extend_from_slice(json);
-        assert!(matches!(request(&wrong_version), Err(WireError::Version)));
     }
 
     #[test]
     fn request_rejects_unknown_fields_and_oversized_snapshots() {
-        let unknown = br#"{"version":1,"message":{"request":"hello","extra":true}}"#;
+        let unknown = br#"{"request":"hello","extra":true}"#;
         let mut frame = Vec::from(u32::try_from(unknown.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(unknown);
         request(&frame).unwrap_err();
-        let oversized = br#"{"version":1,"message":{"request":"run","body":{"submission":"11111111111111111111111111111111","command":["cargo","test"],"input":{"source":"snapshot","detail":{"bytes":67108865,"digest":"0000000000000000000000000000000000000000000000000000000000000000"}}}}}"#;
+        let oversized = br#"{"request":"run","body":{"submission":"11111111111111111111111111111111","command":["cargo","test"],"input":{"source":"snapshot","detail":{"bytes":67108865,"digest":"0000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
         let mut oversized_frame = Vec::from(u32::try_from(oversized.len()).unwrap().to_be_bytes());
         oversized_frame.extend_from_slice(oversized);
         request(&oversized_frame).unwrap_err();

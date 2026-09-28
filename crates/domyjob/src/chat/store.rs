@@ -58,9 +58,10 @@ pub(crate) enum StoreError {
     #[error("the chat store was reset or replaced; restart this process")]
     IdentityChanged,
     #[error(
-        "the chat store has schema {0}; run the matching domyjob build or `domyjob chat reset`"
+        "the chat store was written in format {0}, which this build cannot read; \
+         run a build of that format, or `domyjob chat reset --yes` to start a new history"
     )]
-    Schema(String),
+    Format(String),
     #[error(transparent)]
     Rejected(#[from] Rejection),
     #[error(transparent)]
@@ -101,17 +102,18 @@ fn new_origin() -> Result<Origin, StoreError> {
     Ok(Origin::from_entropy(entropy))
 }
 
-/// Read or create the store's identity, refusing a store written by another schema.
+/// Read or create the store's identity, refusing a store written in another format.
 fn initialize(database: &Database) -> Result<Origin, StoreError> {
     let write = database.begin_write()?;
     tables::create_all(&write)?;
     let origin = {
         let mut meta = write.open_table(tables::META)?;
-        match tables::get_text(&meta, "schema")? {
-            Some(schema) if schema != tables::SCHEMA => return Err(StoreError::Schema(schema)),
+        let format = crate::formats::chat();
+        match tables::get_text(&meta, "format")? {
+            Some(found) if found != format => return Err(StoreError::Format(found)),
             Some(_) => {}
             None => {
-                meta.insert("schema", tables::SCHEMA)?;
+                meta.insert("format", format.as_str())?;
             }
         }
         if let Some(text) = tables::get_text(&meta, "origin")? {
@@ -240,5 +242,7 @@ impl Tx<'_> {
     }
 }
 
+#[cfg(test)]
+mod specimen;
 #[cfg(test)]
 mod tests;

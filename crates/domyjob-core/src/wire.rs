@@ -7,7 +7,6 @@ use thiserror::Error;
 use crate::domain::{Command, JobId, RemoteText, SubmissionId};
 use crate::state::JobState;
 
-pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
 
@@ -43,13 +42,6 @@ impl ControlLength {
     pub const fn bytes(self) -> usize {
         self.0
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Envelope<T> {
-    pub version: u16,
-    pub message: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,8 +249,6 @@ pub enum WireError {
     Trailing,
     #[error("control frame exceeds 1 MiB")]
     TooLarge,
-    #[error("unsupported wire version")]
-    Version,
     #[error("invalid snapshot size or digest")]
     Snapshot,
     #[error("invalid JSON: {0}")]
@@ -282,10 +272,7 @@ pub fn payload(frame: &[u8]) -> Result<&[u8], WireError> {
 }
 
 pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
-    let json = serde_json::to_vec(&Envelope {
-        version: VERSION,
-        message,
-    })?;
+    let json = serde_json::to_vec(message)?;
     if json.len() > MAX_CONTROL_BYTES {
         return Err(WireError::TooLarge);
     }

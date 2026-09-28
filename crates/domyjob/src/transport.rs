@@ -475,7 +475,7 @@ pub(crate) fn doctor(machine: &MachineName) -> Result<(), TransportError> {
     if build != identity::current() {
         return Err(TransportError::BuildMismatch);
     }
-    println!("{}: ready (wire {})", machine.as_str(), wire::VERSION);
+    println!("{}: ready (build {})", machine.as_str(), identity::tag());
     Ok(())
 }
 

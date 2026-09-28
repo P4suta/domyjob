@@ -45,8 +45,11 @@ impl State {
     }
 
     /// The job runner's store, which holds its jobs, staged submissions, and received archives.
+    ///
+    /// Each format has its own directory, so builds of different formats never read each other's jobs,
+    /// and a running job keeps its store when a build of another format arrives.
     pub(crate) fn runner(&self) -> PathBuf {
-        self.0.join("runner")
+        self.0.join(format!("runner-{}", crate::formats::runner()))
     }
 
     pub(crate) fn chat(&self) -> Chat {

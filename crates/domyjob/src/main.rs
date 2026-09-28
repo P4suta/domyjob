@@ -10,6 +10,7 @@ mod builds;
 mod chat;
 #[path = "platform/file_kind.rs"]
 mod file_kind;
+mod formats;
 mod identity;
 mod layout;
 mod lock;
