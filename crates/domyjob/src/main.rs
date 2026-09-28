@@ -11,6 +11,7 @@ mod lock;
 mod platform;
 mod process;
 mod source;
+mod source_archive;
 mod source_fingerprint;
 mod state_io;
 mod store;
