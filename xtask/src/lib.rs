@@ -5,6 +5,7 @@ pub mod dependencies;
 pub mod proverif;
 pub mod release;
 pub mod syntax;
+pub mod v1_boundary;
 pub mod v1_core;
 pub mod workflows;
 
@@ -112,6 +113,15 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
                     source,
                 })?
             {
+                eprintln!("{shown}:{finding}");
+                count = count.saturating_add(1);
+            }
+        }
+        if shown.starts_with("crates/domyjob-next/src/") {
+            for finding in v1_boundary::check(&source).map_err(|source| GateError::Parse {
+                path: path.clone(),
+                source,
+            })? {
                 eprintln!("{shown}:{finding}");
                 count = count.saturating_add(1);
             }

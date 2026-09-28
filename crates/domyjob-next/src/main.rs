@@ -10,7 +10,7 @@ mod store;
 mod transport;
 
 #[derive(Debug, Parser)]
-#[command(name = "domyjob-next", about = "SSH job runner under construction")]
+#[command(name = "domyjob-next", about = "Run persistent jobs over SSH")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -136,6 +136,22 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
 }
 
 fn main() -> ExitCode {
+    let internal = std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .is_some_and(|command| {
+            command == std::ffi::OsStr::new("node") || command == std::ffi::OsStr::new("worker")
+        });
+    if !internal {
+        match transport::refresh_local() {
+            Ok(Some(code)) => return code,
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("domyjob: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     match run(Cli::parse().command) {
         Ok(code) => code,
         Err(error) => {

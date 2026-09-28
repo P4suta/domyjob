@@ -45,7 +45,7 @@ pub(crate) enum TransportError {
     UnexpectedReply,
     #[error("remote node refused the request: {0:?}")]
     Refused(ErrorCode),
-    #[error("automatic remote build failed: {0}")]
+    #[error("automatic build failed: {0}")]
     Deployment(ExitStatus),
     #[error("remote node still has the wrong build after automatic installation")]
     BuildMismatch,
@@ -160,6 +160,50 @@ fn source_checkout() -> Result<&'static Path, TransportError> {
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| std::io::Error::other("the source checkout is unavailable").into())
+}
+
+pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
+    let Some(checkout_build) = identity::checkout()? else {
+        return Ok(None);
+    };
+    if checkout_build == identity::current() {
+        return Ok(None);
+    }
+    if std::env::var_os("DOMYJOB_LOCAL_REFRESHED").is_some() {
+        return Err(std::io::Error::other("the source changed during the local rebuild").into());
+    }
+    let checkout = source_checkout()?;
+    eprintln!("domyjob: rebuilding the local client from this checkout");
+    let built = Command::new("mise")
+        .current_dir(checkout)
+        .env("RUSTC_WRAPPER", "")
+        .args([
+            "x",
+            "--",
+            "cargo",
+            "build",
+            "--locked",
+            "-p",
+            "domyjob-next",
+        ])
+        .status()?;
+    if !built.success() {
+        return Err(TransportError::Deployment(built));
+    }
+    let executable = checkout
+        .join("target")
+        .join("debug")
+        .join(format!("domyjob-next{}", std::env::consts::EXE_SUFFIX));
+    let status = Command::new(executable)
+        .env("DOMYJOB_LOCAL_REFRESHED", "1")
+        .args(std::env::args_os().skip(1))
+        .status()?;
+    Ok(Some(
+        match status.code().and_then(|code| u8::try_from(code).ok()) {
+            Some(code) => ExitCode::from(code),
+            None => ExitCode::FAILURE,
+        },
+    ))
 }
 
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
