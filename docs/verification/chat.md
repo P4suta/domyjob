@@ -32,6 +32,8 @@ This records how the agent chat was verified on 2026-09-29, what the checks foun
 
 OpenCode on Windows is not signed in on that machine, and `chat doctor` there says so; its turns were not verified.
 
+Afterwards `chat reset` replaced each machine's chat identity and removed its service.
+
 ## Found while verifying
 
 Each of these was fixed with a test that fails without the fix.
@@ -44,6 +46,7 @@ Each of these was fixed with a test that fails without the fix.
 - FSEvents woke the launchd service late or never, so the hub pushed writes once a minute; waits now use kqueue on macOS.
 - `powershell.exe` was searched for as `powershell.exe.exe`, so the Windows service could not be installed.
 - A chat store without a recorded format was accepted, and reset, doctor, and the service commands could not handle a store they could not open.
+- Reset stopped the service only when it ran the current build, so a service of an older build kept running against the replaced store.
 
 ## Outside these checks
 
