@@ -1,4 +1,4 @@
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -219,9 +219,7 @@ fn tail(file: &mut std::fs::File) -> io::Result<String> {
     let limit = u64::try_from(MAX_DIAGNOSTIC).map_err(io::Error::other)?;
     let length = file.seek(io::SeekFrom::End(0))?;
     file.seek(io::SeekFrom::Start(length.saturating_sub(limit)))?;
-    let mut bytes = Vec::new();
-    file.take(limit).read_to_end(&mut bytes)?;
-    Ok(recent(&bytes))
+    Ok(recent(&crate::bounded::prefix(file, MAX_DIAGNOSTIC)?))
 }
 
 /// Run one turn and return the client's complete standard output.
@@ -238,19 +236,13 @@ pub(crate) fn run(invocation: &Invocation<'_>) -> Result<Vec<u8>, ChatProcessErr
         Stdio::from(writer),
         Stdio::from(errors.try_clone()?),
     )?;
-    let limit = u64::try_from(MAX_OUTPUT.saturating_add(1)).map_err(io::Error::other)?;
     let (status, bytes) = std::thread::scope(|scope| {
         let capture = scope.spawn(|| -> Result<Vec<u8>, ChatProcessError> {
-            let mut bytes = Vec::new();
-            let read = reader.take(limit).read_to_end(&mut bytes);
-            if read.is_err() || bytes.len() > MAX_OUTPUT {
+            let read = crate::bounded::read(reader, MAX_OUTPUT);
+            if !matches!(read, Ok(Some(_))) {
                 group.kill()?;
             }
-            read?;
-            if bytes.len() > MAX_OUTPUT {
-                return Err(ChatProcessError::TooLarge);
-            }
-            Ok(bytes)
+            read?.ok_or(ChatProcessError::TooLarge)
         });
         let status = group.wait();
         let bytes = capture

@@ -45,13 +45,14 @@ enum Wake {
 
 struct CancellationWatch {
     _watcher: notify::RecommendedWatcher,
-    sender: mpsc::Sender<Wake>,
+    sender: mpsc::SyncSender<Wake>,
     receiver: mpsc::Receiver<Wake>,
 }
 
 impl CancellationWatch {
     fn start(store: &Store, job: &JobId) -> Result<Self, AppError> {
-        let (sender, receiver) = mpsc::channel();
+        // One pending wake covers any number of changes, so a full queue drops the rest.
+        let (sender, receiver) = mpsc::sync_channel(1);
         let callback = sender.clone();
         let mut watcher = watch_event::watcher(move |notice| {
             let wake = match notice {
@@ -60,7 +61,7 @@ impl CancellationWatch {
                 Notice::Failed(error) => Some(Wake::Broken(error.to_string())),
             };
             if let Some(wake) = wake {
-                let _sent = callback.send(wake);
+                let _sent = callback.try_send(wake);
             }
         })?;
         watcher.watch(&store.watch_dir(job)?, notify::RecursiveMode::NonRecursive)?;
@@ -392,7 +393,7 @@ mod tests {
         // Nothing kills the job here, so the relay reaches EOF only if no write end outlives the job itself.
         let relayed = relay.join().expect("relay thread").expect("relayed output");
         assert_eq!(relayed, counts);
-        assert_eq!(std::fs::read(&path).expect("stored log"), expected);
+        assert_eq!(crate::testing::read(&path).into_bytes(), expected);
     }
 
     #[test]

@@ -144,14 +144,17 @@ pub(crate) enum ToolError {
     Run { program: String, source: io::Error },
 }
 
-const MAX_TOOL_OUTPUT: u64 = 1024 * 1024;
+const MAX_TOOL_OUTPUT: usize = 1024 * 1024;
 
-fn capture(stream: Option<impl io::Read>) -> String {
-    let mut bytes = Vec::new();
-    if let Some(stream) = stream {
-        let _read = io::Read::read_to_end(&mut io::Read::take(stream, MAX_TOOL_OUTPUT), &mut bytes);
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
+/// The first 1 MiB of a stream; the rest is read and dropped,
+/// because a tool blocked on a full pipe would never exit.
+fn capture(stream: Option<impl io::Read>) -> io::Result<String> {
+    let Some(mut stream) = stream else {
+        return Ok(String::new());
+    };
+    let bytes = crate::bounded::prefix(&mut stream, MAX_TOOL_OUTPUT)?;
+    io::copy(&mut stream, &mut io::sink())?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Run a tool to completion with no input, capturing at most 1 MiB of each output stream.
@@ -176,11 +179,12 @@ pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
     let mut child = command.spawn().map_err(failed)?;
     let errors = child.stderr.take();
     let reader = std::thread::spawn(move || capture(errors));
-    let stdout = capture(child.stdout.take());
+    let stdout = capture(child.stdout.take()).map_err(failed)?;
     let status = child.wait().map_err(failed)?;
     let stderr = reader
         .join()
-        .map_err(|_panic| failed(io::Error::other("the output reader panicked")))?;
+        .map_err(|_panic| failed(io::Error::other("the output reader panicked")))?
+        .map_err(failed)?;
     Ok(ToolOutput {
         success: status.success(),
         stdout,
@@ -357,4 +361,29 @@ pub(crate) fn stdout_then_stderr() -> Command {
     let mut command = command("cmd.exe");
     command.raw_arg("/d /c echo 0123456789& echo abcdefghij>&2");
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TOOL_OUTPUT, Tool, run_tool};
+
+    #[test]
+    fn a_tool_that_prints_past_the_limit_keeps_its_own_outcome() {
+        if cfg!(windows) {
+            // The shell below is Unix; the drain it proves is the same code on Windows.
+            return;
+        }
+        // Closing the pipe after the limit would kill the writer with SIGPIPE and fail the tool.
+        let script = [
+            "-c".to_owned(),
+            format!(
+                "echo started >&2; head -c {} /dev/zero",
+                MAX_TOOL_OUTPUT * 3
+            ),
+        ];
+        let output = run_tool(&Tool::new("sh", &script)).expect("the tool finishes");
+        assert!(output.success, "the tool succeeded: {output:?}");
+        assert_eq!(output.stdout.len(), MAX_TOOL_OUTPUT);
+        assert_eq!(output.stderr.trim(), "started");
+    }
 }

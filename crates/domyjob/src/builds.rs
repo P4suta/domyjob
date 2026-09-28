@@ -69,13 +69,17 @@ pub(crate) fn hold_current() -> io::Result<Option<File>> {
 /// When a build last started a process, in milliseconds since the Unix epoch;
 /// an unreadable record counts as never, and the in-use lock still protects a running build.
 fn last_used(directory: &Path) -> io::Result<Option<u64>> {
-    match fs::read_to_string(directory.join(LAST_USED)) {
-        Ok(text) => match text.trim().parse() {
+    let file = match File::open(directory.join(LAST_USED)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match crate::bounded::read(file, 32)?.map(String::from_utf8) {
+        Some(Ok(text)) => match text.trim().parse() {
             Ok(millis) => Ok(Some(millis)),
             Err(_unreadable) => Ok(None),
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+        Some(Err(_)) | None => Ok(None),
     }
 }
 

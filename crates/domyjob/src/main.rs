@@ -8,6 +8,7 @@ use domyjob_core::wire::CleanTarget;
 use crate::output::Output;
 
 mod app;
+mod bounded;
 mod builds;
 mod chat;
 #[path = "platform/file_kind.rs"]

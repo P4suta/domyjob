@@ -4,7 +4,7 @@
 //! It exchanges when this machine stores events or when the peer's long-poll wait reports new events there, and backs off while the peer is unreachable.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 use domyjob_core::chat::id::Origin;
@@ -40,7 +40,7 @@ enum Signal {
 }
 
 struct Worker {
-    sender: Sender<Signal>,
+    sender: SyncSender<Signal>,
     thread: JoinHandle<()>,
 }
 
@@ -63,7 +63,8 @@ pub(crate) fn serve() -> Result<(), ServeError> {
         reconcile(&store, &mut workers)?;
         if pulse.next(Deadline::after_millis(PEER_REFRESH_MILLIS))? {
             for worker in workers.values() {
-                let _delivered = worker.sender.send(Signal::Local);
+                // A pending local signal already makes the worker exchange.
+                let _delivered = worker.sender.try_send(Signal::Local);
             }
         }
     }
@@ -87,7 +88,7 @@ fn reconcile(store: &Store, workers: &mut BTreeMap<String, Worker>) -> Result<()
         if workers.contains_key(&alias) {
             continue;
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(4);
         let thread = std::thread::spawn({
             let store = store.clone();
             let sender = sender.clone();
@@ -106,7 +107,7 @@ fn reconcile(store: &Store, workers: &mut BTreeMap<String, Worker>) -> Result<()
 }
 
 /// Hold one long-poll wait on the peer and report its result to the worker.
-fn start_wait(store: &Store, alias: &str, peer: &Origin, sender: &Sender<Signal>) {
+fn start_wait(store: &Store, alias: &str, peer: &Origin, sender: &SyncSender<Signal>) {
     let request = store.read(|read| Ok(super::store::cursor(read, peer)?.seen));
     let (store_origin, alias, peer, sender) = (
         store.origin().clone(),
@@ -138,7 +139,12 @@ struct Peer<'a> {
 }
 
 /// One peer's loop: exchange, then wait for either side to change, backing off on failure.
-fn follow(store: &Store, peer: &Peer<'_>, sender: &Sender<Signal>, receiver: &Receiver<Signal>) {
+fn follow(
+    store: &Store,
+    peer: &Peer<'_>,
+    sender: &SyncSender<Signal>,
+    receiver: &Receiver<Signal>,
+) {
     let Peer {
         alias,
         origin: peer,

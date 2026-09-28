@@ -74,7 +74,8 @@ impl Bell {
     /// Start watching before the caller reads the state it waits to change.
     pub(super) fn watch(directory: &Path) -> Result<Self, BellError> {
         state_io::private_dir(directory)?;
-        let (sender, receiver) = mpsc::channel();
+        // One pending wake covers any number of changes, so a full queue drops the rest.
+        let (sender, receiver) = mpsc::sync_channel(1);
         let mut watcher = watch_event::watcher(move |notice| {
             let wake = match notice {
                 Notice::Changed => Some(Wake::Changed),
@@ -82,7 +83,7 @@ impl Bell {
                 Notice::Failed(error) => Some(Wake::Broken(error.to_string())),
             };
             if let Some(wake) = wake {
-                let _delivered = sender.send(wake);
+                let _delivered = sender.try_send(wake);
             }
         })?;
         watcher.watch(directory, notify::RecursiveMode::NonRecursive)?;

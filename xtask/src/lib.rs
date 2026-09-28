@@ -20,6 +20,11 @@ mod raw {
         Command::new(program)
     }
 
+    /// Repository files are read whole; the repository bounds them.
+    pub(super) fn read_to_string(path: &Path) -> io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
     }
@@ -134,7 +139,7 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
     files.sort();
     let mut findings = 0usize;
     for path in files {
-        let source = std::fs::read_to_string(&path).map_err(|source| GateError::Read {
+        let source = raw::read_to_string(&path).map_err(|source| GateError::Read {
             path: path.clone(),
             source,
         })?;

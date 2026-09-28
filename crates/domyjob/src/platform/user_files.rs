@@ -1,10 +1,10 @@
 //! Files outside domyjob's private state that setup installs for the user.
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{action} {path}: {source}")]
@@ -30,19 +30,12 @@ pub(crate) fn read(path: &Path) -> Result<Option<String>, UserFileError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(failed("reading", path)(error)),
     };
-    let mut text = String::new();
-    file.take(MAX_CONFIG_BYTES.saturating_add(1))
-        .read_to_string(&mut text)
-        .map_err(failed("reading", path))?;
-    if u64::try_from(text.len())
-        .map_err(|error| failed("reading", path)(io::Error::other(error)))?
-        > MAX_CONFIG_BYTES
-    {
-        return Err(failed("reading", path)(io::Error::other(
-            "the file exceeds 4 MiB",
-        )));
-    }
-    Ok(Some(text))
+    let bytes = crate::bounded::read(file, MAX_CONFIG_BYTES)
+        .map_err(failed("reading", path))?
+        .ok_or_else(|| failed("reading", path)(io::Error::other("the file exceeds 4 MiB")))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| failed("reading", path)(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 /// Replace a file atomically, creating its directory when needed.

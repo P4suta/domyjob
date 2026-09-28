@@ -91,7 +91,7 @@ fn git(root: &Path, arguments: &[&str]) -> Result<String, FixError> {
 
 /// The commit-msg hook: check the message at `path` against the staged change in `root`.
 pub fn commit_msg(root: &Path, path: &Path) -> Result<(), FixError> {
-    let message = std::fs::read_to_string(path).map_err(FixError::Message)?;
+    let message = crate::raw::read_to_string(path).map_err(FixError::Message)?;
     if !is_fix(&message) {
         return Ok(());
     }

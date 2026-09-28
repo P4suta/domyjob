@@ -153,14 +153,14 @@ impl SshChild {
 }
 
 /// Stops an SSH child that outlives its deadline; dropping the guard cancels the watch.
-struct Watchdog(Option<mpsc::Sender<()>>);
+struct Watchdog(Option<mpsc::SyncSender<()>>);
 
 impl Watchdog {
     fn start(child: &Child, deadline: Option<clock::Deadline>) -> Self {
         let Some(deadline) = deadline else {
             return Self(None);
         };
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         let pid = child.id();
         std::thread::spawn(move || {
             if matches!(clock::receive(&receiver, deadline), clock::Waited::Expired) {
@@ -174,7 +174,7 @@ impl Watchdog {
 impl Drop for Watchdog {
     fn drop(&mut self) {
         if let Some(sender) = self.0.take() {
-            let _stopped = sender.send(());
+            let _stopped = sender.try_send(());
         }
     }
 }
@@ -343,8 +343,7 @@ fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
-    let mut bytes = Vec::new();
-    (&mut output).take(65).read_to_end(&mut bytes)?;
+    let bytes = crate::bounded::prefix(&mut output, 65)?;
     drop(output);
     let status = child.wait()?;
     if status.code() == Some(255) {
