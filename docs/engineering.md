@@ -65,4 +65,6 @@ The wire protocol has no format of its own, because a client only ever talks to 
 - `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, spelling, workflows, and duplication.
 - `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and the end-to-end suite on one host.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
+- `mise run mutants` changes the core's code one mutation at a time and requires the tests to notice each change;
+  `.rust-mutants.toml` lists the few mutations that change nothing observable, each with its reason.
 - `mise run check:fleet` runs the checks on Linux and Windows through domyjob.

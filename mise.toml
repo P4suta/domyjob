@@ -66,6 +66,10 @@ run = [
   "cargo +nightly-2026-08-21 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
+[tasks.mutants]
+description = "Check that the core's tests notice every change of its behavior"
+run = "rust-mutants run --package domyjob-core --jobs auto"
+
 [tasks.deny]
 description = "Check dependency licenses, bans, and sources"
 run = "cargo xtask dependencies deny"
