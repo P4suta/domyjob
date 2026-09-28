@@ -121,7 +121,7 @@ impl JobPaths {
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
-        let root = platform::state()?.join("v1");
+        let root = crate::layout::State::here()?.runner();
         for dir in [
             &root,
             &root.join("jobs"),
@@ -550,7 +550,7 @@ mod tests {
     fn failed_supervisor_start_is_terminal_and_idempotent() {
         for starting in [false, true] {
             let temporary = tempfile::tempdir().expect("temporary state root");
-            let root = temporary.path().join("v1");
+            let root = temporary.path().join("state");
             for directory in ["", "jobs", "staging", "incoming"] {
                 state_file::private_dir(&root.join(directory)).expect("private store directory");
             }

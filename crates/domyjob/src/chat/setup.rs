@@ -88,7 +88,7 @@ struct Installed {
 }
 
 fn installed_path(store: &Store) -> PathBuf {
-    store.root().join("service.json")
+    store.paths().service_record()
 }
 
 fn installed(store: &Store) -> Result<Option<Installed>, SetupError> {
@@ -114,7 +114,7 @@ fn utf8(path: &Path) -> Result<&str, SetupError> {
 
 pub(crate) fn service_install(store: &Store) -> Result<Finding, SetupError> {
     let program = stable_program()?;
-    let place = manager::install(&program, &store.root().join("serve.log"))?;
+    let place = manager::install(&program, &store.paths().service_log())?;
     let record = Installed {
         program: utf8(&program)?.to_owned(),
     };
@@ -127,8 +127,8 @@ pub(crate) fn service_install(store: &Store) -> Result<Finding, SetupError> {
 
 pub(crate) fn service_uninstall(store: &Store) -> Result<Finding, SetupError> {
     let removed = manager::uninstall()?;
-    if OsLock::probe(&store.root().join("serve.lock"))? == Probe::Held
-        && let Some(bytes) = state_io::read_bytes(&store.root().join("serve.pid"))?
+    if OsLock::probe(&store.paths().service_lock())? == Probe::Held
+        && let Some(bytes) = state_io::read_bytes(&store.paths().service_pid())?
         && let Ok(Ok(pid)) = std::str::from_utf8(&bytes).map(|text| text.trim().parse::<u32>())
     {
         crate::process::terminate(pid)?;
@@ -146,7 +146,7 @@ pub(crate) fn service_uninstall(store: &Store) -> Result<Finding, SetupError> {
 
 /// Whether the service is installed, current, and running.
 pub(crate) fn service_status(store: &Store) -> Result<Finding, SetupError> {
-    let running = OsLock::probe(&store.root().join("serve.lock"))? == Probe::Held;
+    let running = OsLock::probe(&store.paths().service_lock())? == Probe::Held;
     let current = crate::platform::stable_program(&crate::identity::tag())?;
     Ok(match (installed(store)?, running) {
         (None, false) => Finding::problem(

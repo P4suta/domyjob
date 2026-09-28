@@ -279,7 +279,7 @@ impl Machine<'_> {
 
     /// The log a managed turn's worker writes its errors to.
     pub(crate) fn worker_log(&self) -> PathBuf {
-        self.state().join("v1").join("chat").join("worker.log")
+        self.state().join("chat").join("worker.log")
     }
 
     /// Creates `work/NAME`, a working directory of its own for one agent.

@@ -1,7 +1,5 @@
 //! The durable chat ledger: one redb file per machine, opened only under its OS lock.
 
-use std::path::{Path, PathBuf};
-
 use domyjob_core::chat::event::{Body, Event};
 use domyjob_core::chat::exchange::{self, Progress};
 use domyjob_core::chat::id::{AgentId, Invalid, Origin};
@@ -10,6 +8,7 @@ use domyjob_core::chat::policy::{self, Priority, Refusal};
 use domyjob_core::chat_wire::{Answer, Offer};
 use redb::{Database, ReadTransaction, ReadableDatabase, WriteTransaction};
 
+use crate::layout::{self, AgentLock};
 use crate::lock::{LockError, OsLock};
 use crate::state_io::{self, StateError};
 
@@ -87,12 +86,12 @@ impl From<Failure<Self>> for StoreError {
 /// A handle on this machine's chat ledger; every operation opens the file under the lock.
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
-    root: PathBuf,
+    paths: layout::Chat,
     origin: Origin,
 }
 
-fn open_database(root: &Path) -> Result<Database, StoreError> {
-    let file = state_io::open_lock(&root.join("chat.redb"))?;
+fn open_database(paths: &layout::Chat) -> Result<Database, StoreError> {
+    let file = state_io::open_lock(&paths.database())?;
     Ok(Database::builder().create_file(file)?)
 }
 
@@ -129,17 +128,17 @@ fn initialize(database: &Database) -> Result<Origin, StoreError> {
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
-        Self::open_in(&crate::platform::state()?.join("v1"))
+        Self::open_in(&layout::State::here()?)
     }
 
     /// Open or create the chat store inside a private state directory.
-    pub(crate) fn open_in(state: &Path) -> Result<Self, StoreError> {
-        let root = state.join("chat");
-        state_io::private_dir(&root)?;
-        let lock = OsLock::exclusive(&root.join("chat.lock"))?;
-        let origin = initialize(&open_database(&root)?)?;
+    pub(crate) fn open_in(state: &layout::State) -> Result<Self, StoreError> {
+        let paths = state.chat();
+        state_io::private_dir(paths.root())?;
+        let lock = OsLock::exclusive(&paths.lock())?;
+        let origin = initialize(&open_database(&paths)?)?;
         drop(lock);
-        Ok(Self { root, origin })
+        Ok(Self { paths, origin })
     }
 
     #[must_use]
@@ -147,25 +146,23 @@ impl Store {
         &self.origin
     }
 
+    /// Where this store's files live.
     #[must_use]
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn agent_lock_path(&self, agent: &AgentId, kind: &str) -> PathBuf {
-        let digest = blake3::hash(agent.to_string().as_bytes());
-        self.root.join(format!("{kind}-{}.lock", digest.to_hex()))
+    pub(crate) const fn paths(&self) -> &layout::Chat {
+        &self.paths
     }
 
     /// Serialize worker launches and final queue scans of one agent.
     pub(crate) fn launch_lock(&self, agent: &AgentId) -> Result<OsLock, StoreError> {
-        Ok(OsLock::exclusive(&self.agent_lock_path(agent, "launch"))?)
+        Ok(OsLock::exclusive(
+            &self.paths.agent_lock(agent, AgentLock::Launch),
+        )?)
     }
 
     /// The lock a running worker holds for its agent's whole queue.
     pub(crate) fn try_agent_lock(&self, agent: &AgentId) -> Result<Option<OsLock>, StoreError> {
         Ok(OsLock::try_exclusive(
-            &self.agent_lock_path(agent, "agent"),
+            &self.paths.agent_lock(agent, AgentLock::Queue),
         )?)
     }
 
@@ -181,8 +178,8 @@ impl Store {
         &self,
         work: impl FnOnce(&ReadTransaction) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let lock = OsLock::exclusive(&self.root.join("chat.lock"))?;
-        let database = open_database(&self.root)?;
+        let lock = OsLock::exclusive(&self.paths.lock())?;
+        let database = open_database(&self.paths)?;
         let read = database.begin_read()?;
         self.verify(&read)?;
         let value = work(&read);
@@ -197,8 +194,8 @@ impl Store {
         &self,
         work: impl FnOnce(&mut Tx<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let lock = OsLock::exclusive(&self.root.join("chat.lock"))?;
-        let database = open_database(&self.root)?;
+        let lock = OsLock::exclusive(&self.paths.lock())?;
+        let database = open_database(&self.paths)?;
         let write: WriteTransaction = database.begin_write()?;
         self.verify(&write)?;
         let mut tx = Tx::new(&write, &self.origin);
@@ -208,7 +205,7 @@ impl Store {
         write.commit()?;
         drop(database);
         if appended {
-            super::pulse::ring(&self.root, generation)?;
+            super::pulse::ring(&self.paths, generation)?;
         }
         drop(lock);
         Ok(value)

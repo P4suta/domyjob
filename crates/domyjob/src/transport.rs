@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
+use crate::layout::State;
 use crate::lock::{LockError, OsLock};
 use crate::platform::{self, clock};
 use crate::process;
@@ -112,7 +113,7 @@ fn ssh_arguments() -> Result<Vec<String>, TransportError> {
     .iter()
     .map(|word| (*word).to_owned())
     .collect();
-    if let Some(control) = platform::ssh_control_path(&platform::state()?.join("v1"))? {
+    if let Some(control) = platform::ssh_control_path(&State::here()?.ssh_sockets())? {
         arguments.extend([
             "-o".to_owned(),
             "ControlMaster=auto".to_owned(),
@@ -363,7 +364,7 @@ fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
 
 /// The remote shell of `machine`, detected once and then cached in private state.
 fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
-    let path = platform::state()?.join("v1").join("hosts.json");
+    let path = State::here()?.shells();
     let mut hosts: BTreeMap<String, Shell> = match state_io::read_bytes(&path)? {
         Some(bytes) => ingress::json(&bytes, wire::MAX_CONTROL_BYTES)?,
         None => BTreeMap::new(),
@@ -441,12 +442,7 @@ fn call_with(
         Err(TransportError::Missing) => {}
         other => return other,
     }
-    let _installing = OsLock::exclusive(
-        &platform::state()?
-            .join("v1")
-            .join("install")
-            .join(format!("{}.lock", machine.as_str())),
-    )?;
+    let _installing = OsLock::exclusive(&State::here()?.install_lock(machine))?;
     match call() {
         Err(TransportError::Missing) => {
             bootstrap(machine, shell)?;

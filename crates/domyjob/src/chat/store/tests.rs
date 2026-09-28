@@ -8,7 +8,7 @@ use super::views::LocalAgent;
 use super::{Completion, Store, StoreError};
 
 fn store(root: &tempfile::TempDir, name: &str) -> Store {
-    Store::open_in(&root.path().join(name)).unwrap()
+    Store::open_in(&crate::layout::State::at(&root.path().join(name))).unwrap()
 }
 
 fn card(tool: Tool, mode: Mode) -> Box<Card> {
@@ -107,7 +107,7 @@ fn a_store_keeps_its_identity_and_refuses_writes_after_a_reset() {
     let first = store(&root, "a");
     let again = store(&root, "a");
     assert_eq!(first.origin(), again.origin());
-    let replaced = Store::reset(&root.path().join("a")).unwrap();
+    let replaced = Store::reset(&crate::layout::State::at(&root.path().join("a"))).unwrap();
     assert_ne!(replaced.origin(), first.origin());
     assert!(matches!(
         first.write(|tx| tx.author(Priority::Ordinary, Body::Omitted {})),

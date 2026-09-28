@@ -133,8 +133,8 @@ impl Store {
 
     /// Delete a conversation's content here once every peer in its audience holds this machine's part.
     pub(crate) fn clean(&self, conversation: &Conversation) -> Result<usize, StoreError> {
-        let lock = OsLock::exclusive(&self.root().join("chat.lock"))?;
-        let mut database = super::open_database(self.root())?;
+        let lock = OsLock::exclusive(&self.paths().lock())?;
+        let mut database = super::open_database(self.paths())?;
         let write = database.begin_write()?;
         let removed = {
             let tx = Tx::new(&write, self.origin());
@@ -148,12 +148,12 @@ impl Store {
     }
 
     /// Replace this machine's chat identity and history with an empty store.
-    pub(crate) fn reset(state: &std::path::Path) -> Result<Self, StoreError> {
-        let root = state.join("chat");
-        state_io::private_dir(&root)?;
-        let lock = OsLock::exclusive(&root.join("chat.lock"))?;
-        state_io::remove_file(&root.join("chat.redb"))?;
-        super::super::pulse::forget(&root)?;
+    pub(crate) fn reset(state: &crate::layout::State) -> Result<Self, StoreError> {
+        let paths = state.chat();
+        state_io::private_dir(paths.root())?;
+        let lock = OsLock::exclusive(&paths.lock())?;
+        state_io::remove_file(&paths.database())?;
+        super::super::pulse::forget(&paths)?;
         drop(lock);
         Self::open_in(state)
     }

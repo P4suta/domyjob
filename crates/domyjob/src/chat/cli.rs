@@ -302,7 +302,7 @@ fn reset(json_mode: bool) -> Result<ExitCode, CliError> {
     if matches!(setup::service_status(&store)?, Finding { ok: true, .. }) {
         setup::service_uninstall(&store)?;
     }
-    let fresh = Store::reset(&crate::platform::state()?.join("v1"))?;
+    let fresh = Store::reset(&crate::layout::State::here()?)?;
     print(
         json_mode,
         &json!({"origin": fresh.origin()}),

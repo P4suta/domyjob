@@ -55,7 +55,7 @@ impl Net<'_> {
 }
 
 fn store(root: &tempfile::TempDir, name: &str) -> Store {
-    Store::open_in(&root.path().join(name)).unwrap()
+    Store::open_in(&crate::layout::State::at(&root.path().join(name))).unwrap()
 }
 
 fn register(store: &Store, name: &str) -> AgentId {
@@ -234,7 +234,7 @@ fn a_reset_peer_is_refused_until_its_new_identity_is_confirmed() {
     let root = tempfile::tempdir().unwrap();
     let (a, b) = (store(&root, "a"), store(&root, "b"));
     a.pin("b", b.origin(), false).unwrap();
-    let replaced = Store::reset(&root.path().join("b")).unwrap();
+    let replaced = Store::reset(&crate::layout::State::at(&root.path().join("b"))).unwrap();
     let net = Net {
         stores: BTreeMap::from([("b", &replaced)]),
         offline: RefCell::new(Vec::new()),

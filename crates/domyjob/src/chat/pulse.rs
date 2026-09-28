@@ -8,12 +8,11 @@
 
 mod bell;
 
-use std::path::Path;
-
 pub(crate) use bell::BellError;
 
 use super::runner::{self, RunnerError};
 use super::store::Store;
+use crate::layout;
 use crate::platform::clock::Deadline;
 use crate::state_io::StateError;
 
@@ -25,14 +24,14 @@ pub(crate) enum PulseError {
     Runner(#[from] RunnerError),
 }
 
-/// Announce that the store at `root` reached `generation`.
-pub(crate) fn ring(root: &Path, generation: u64) -> Result<(), StateError> {
-    bell::ring(root, generation)
+/// Announce that the store at `paths` reached `generation`.
+pub(crate) fn ring(paths: &layout::Chat, generation: u64) -> Result<(), StateError> {
+    bell::ring(&paths.bell(), generation)
 }
 
 /// Forget the announced generations of a store that is being reset.
-pub(crate) fn forget(root: &Path) -> Result<(), StateError> {
-    bell::forget(root)
+pub(crate) fn forget(paths: &layout::Chat) -> Result<(), StateError> {
+    bell::forget(&paths.bell())
 }
 
 /// A wait on one store that drives this machine's progress at every wake-up.
@@ -47,8 +46,9 @@ pub(crate) struct Pulse<'store> {
 impl<'store> Pulse<'store> {
     /// Start watching before the caller reads the state it waits for; wake at least every `tick_millis`.
     pub(crate) fn new(store: &'store Store, tick_millis: u64) -> Result<Self, PulseError> {
-        let bell = bell::Bell::watch(store.root())?;
-        let generation = bell::generation(store.root())?;
+        let directory = store.paths().bell();
+        let bell = bell::Bell::watch(&directory)?;
+        let generation = bell::generation(&directory)?;
         Ok(Self {
             store,
             bell,

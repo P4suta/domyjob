@@ -24,27 +24,23 @@ pub(crate) enum BellError {
     Broken(String),
 }
 
-fn directory(root: &Path) -> PathBuf {
-    root.join("bell")
-}
-
-fn file(root: &Path) -> PathBuf {
-    directory(root).join("generation")
+fn file(directory: &Path) -> PathBuf {
+    directory.join("generation")
 }
 
 /// Announce that the store reached `generation`.
-pub(super) fn ring(root: &Path, generation: u64) -> Result<(), StateError> {
-    state_io::write_bytes(&file(root), generation.to_string().as_bytes())
+pub(super) fn ring(directory: &Path, generation: u64) -> Result<(), StateError> {
+    state_io::write_bytes(&file(directory), generation.to_string().as_bytes())
 }
 
 /// Forget every announced generation.
-pub(super) fn forget(root: &Path) -> Result<(), StateError> {
-    state_io::remove_file(&file(root))
+pub(super) fn forget(directory: &Path) -> Result<(), StateError> {
+    state_io::remove_file(&file(directory))
 }
 
 /// The last announced generation, or zero before the first commit.
-pub(super) fn generation(root: &Path) -> Result<u64, BellError> {
-    match state_io::read_bytes(&file(root))? {
+pub(super) fn generation(directory: &Path) -> Result<u64, BellError> {
+    match state_io::read_bytes(&file(directory))? {
         None => Ok(0),
         Some(bytes) => match std::str::from_utf8(&bytes).map(|text| text.trim().parse::<u64>()) {
             Ok(Ok(generation)) => Ok(generation),
@@ -62,23 +58,22 @@ enum Wake {
 pub(super) struct Bell {
     _watcher: notify::RecommendedWatcher,
     receiver: mpsc::Receiver<Wake>,
-    root: PathBuf,
+    directory: PathBuf,
 }
 
 impl std::fmt::Debug for Bell {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Bell")
-            .field("root", &self.root)
+            .field("directory", &self.directory)
             .finish_non_exhaustive()
     }
 }
 
 impl Bell {
     /// Start watching before the caller reads the state it waits to change.
-    pub(super) fn watch(root: &Path) -> Result<Self, BellError> {
-        let directory = directory(root);
-        state_io::private_dir(&directory)?;
+    pub(super) fn watch(directory: &Path) -> Result<Self, BellError> {
+        state_io::private_dir(directory)?;
         let (sender, receiver) = mpsc::channel();
         let mut watcher = watch_event::watcher(move |notice| {
             let wake = match notice {
@@ -90,18 +85,18 @@ impl Bell {
                 let _delivered = sender.send(wake);
             }
         })?;
-        watcher.watch(&directory, notify::RecursiveMode::NonRecursive)?;
+        watcher.watch(directory, notify::RecursiveMode::NonRecursive)?;
         Ok(Self {
             _watcher: watcher,
             receiver,
-            root: root.to_path_buf(),
+            directory: directory.to_path_buf(),
         })
     }
 
     /// Wait until the generation exceeds `known`; `None` when `deadline` passes first.
     pub(super) fn beyond(&self, known: u64, deadline: Deadline) -> Result<Option<u64>, BellError> {
         loop {
-            let current = generation(&self.root)?;
+            let current = generation(&self.directory)?;
             if current > known {
                 return Ok(Some(current));
             }

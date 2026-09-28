@@ -106,7 +106,8 @@ pub(crate) enum Ownership {
     Exposed(Exposure),
 }
 
-fn variable(name: &str) -> Option<OsString> {
+/// An environment variable that is set and not empty.
+pub(crate) fn variable(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
@@ -117,33 +118,17 @@ pub(crate) fn home() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("the user home directory is unavailable"))
 }
 
-pub(crate) fn state() -> io::Result<PathBuf> {
-    if let Some(explicit) = variable("DOMYJOB_STATE") {
-        return Ok(PathBuf::from(explicit));
-    }
-    if cfg!(windows)
-        && let Some(local) = variable("LOCALAPPDATA")
-    {
-        return Ok(PathBuf::from(local).join("domyjob").join("state"));
-    }
-    if let Some(xdg) = variable("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(xdg).join("domyjob"));
-    }
-    Ok(home()?.join(".local").join("state").join("domyjob"))
-}
-
 /// The OpenSSH control socket path for connection sharing, when this system supports it.
 ///
 /// Windows OpenSSH shares no connections, and a socket path must stay short,
 /// so a state directory that is too deep disables sharing.
 pub(crate) fn ssh_control_path(
-    state: &Path,
+    directory: &Path,
 ) -> Result<Option<PathBuf>, crate::state_io::StateError> {
-    let directory = state.join("ssh");
     if cfg!(windows) || directory.as_os_str().len().saturating_add(41) > 100 {
         return Ok(None);
     }
-    crate::state_io::private_dir(&directory)?;
+    crate::state_io::private_dir(directory)?;
     Ok(Some(directory.join("%C")))
 }
 

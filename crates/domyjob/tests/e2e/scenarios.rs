@@ -904,7 +904,7 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
     alpha.chat(&["sync"])?.exited(0)?;
     alpha.set_offline(true)?;
     alpha.start_background(&["chat", "serve"])?;
-    let pid_file = alpha.state().join("v1").join("chat").join("serve.pid");
+    let pid_file = alpha.state().join("chat").join("serve.pid");
     wait_for("the chat service to start", || {
         Ok(crate::present(&pid_file)?.then_some(()))
     })?;

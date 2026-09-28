@@ -11,7 +11,9 @@ fn server(root: &tempfile::TempDir) -> Server<Vec<u8>> {
     Server {
         output: Mutex::new(Vec::new()),
         phase: Mutex::new(Phase::New),
-        session: Mutex::new(Session::with_store(Store::open_in(root.path()).unwrap())),
+        session: Mutex::new(Session::with_store(
+            Store::open_in(&crate::layout::State::at(root.path())).unwrap(),
+        )),
         client: Mutex::new(None),
         calls: Mutex::new(BTreeMap::new()),
     }

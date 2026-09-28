@@ -131,7 +131,7 @@ impl Session {
 
     /// Whether the background service holds its lock and keeps this machine synchronized.
     pub(crate) fn live(&self) -> Result<bool, OpsError> {
-        Ok(OsLock::probe(&self.store.root().join("serve.lock"))? == Probe::Held)
+        Ok(OsLock::probe(&self.store.paths().service_lock())? == Probe::Held)
     }
 
     pub(crate) fn book(&self) -> Result<Book, OpsError> {

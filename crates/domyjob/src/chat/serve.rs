@@ -47,12 +47,12 @@ struct Worker {
 /// Run until the process is stopped; a second service on the same machine exits at once.
 pub(crate) fn serve() -> Result<(), ServeError> {
     let store = Store::open()?;
-    let Some(_running) = OsLock::try_exclusive(&store.root().join("serve.lock"))? else {
+    let Some(_running) = OsLock::try_exclusive(&store.paths().service_lock())? else {
         eprintln!("domyjob: the chat service is already running");
         return Ok(());
     };
     crate::state_io::write_bytes(
-        &store.root().join("serve.pid"),
+        &store.paths().service_pid(),
         std::process::id().to_string().as_bytes(),
     )
     .map_err(StoreError::from)?;

@@ -39,7 +39,7 @@ pub(crate) fn dispatch(store: &Store) -> Result<(), RunnerError> {
         let _launch = store.launch_lock(&agent)?;
         if let Some(free) = store.try_agent_lock(&agent)? {
             drop(free);
-            let log = crate::state_io::open_append(&store.root().join("worker.log"))
+            let log = crate::state_io::open_append(&store.paths().worker_log())
                 .map_err(StoreError::from)?;
             crate::process::launch_chat_worker(&agent.to_string(), log)?;
         }
