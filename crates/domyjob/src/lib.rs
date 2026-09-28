@@ -57,5 +57,6 @@ pub mod trust;
 pub mod ui;
 pub mod user_files;
 pub mod view;
+pub mod watch_event;
 pub mod words;
 pub mod workspace;

@@ -45,6 +45,7 @@ enum Event {
     Changed,
     Released(PathBuf),
     LockFailed(crate::lock::LockError),
+    WatchFailed(notify::Error),
     Kill,
 }
 
@@ -842,20 +843,21 @@ impl Supervisor {
         let changed = self.shared.events.clone();
         let queue_changed = self.store.queue_changed_path();
         let settings_path = self.store.settings_path();
-        let mut notifier =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event
-                    && event
-                        .paths
-                        .iter()
-                        .any(|path| path == &queue_changed || path == &settings_path)
-                {
-                    match changed.try_send(Event::Changed) {
+        let mut notifier = crate::watch_event::watcher(
+            move |path| path == queue_changed || path == settings_path,
+            move |notice| match notice {
+                crate::watch_event::Notice::Relevant => match changed.try_send(Event::Changed) {
+                    Ok(()) | Err(_) => {}
+                },
+                crate::watch_event::Notice::Irrelevant => {}
+                crate::watch_event::Notice::Failed(error) => {
+                    match changed.send(Event::WatchFailed(error)) {
                         Ok(()) | Err(_) => {}
                     }
                 }
-            })
-            .map_err(|error| crate::node::watching(&watched, &error))?;
+            },
+        )
+        .map_err(|error| crate::node::watching(&watched, &error))?;
         notify::Watcher::watch(&mut notifier, &watched, notify::RecursiveMode::NonRecursive)
             .map_err(|error| crate::node::watching(&watched, &error))?;
         let mut watchers = QueueWatchers::new();
@@ -882,6 +884,9 @@ impl Supervisor {
                     watchers.released(&path);
                 }
                 Ok(Event::LockFailed(error)) => return Err(NodeError::Lock(error)),
+                Ok(Event::WatchFailed(error)) => {
+                    return Err(crate::node::watching(&watched, &error));
+                }
                 Ok(Event::Kill) => return Ok(None),
                 Err(_disconnected) => return Err(NodeError::QueueClosed),
             }
@@ -1331,6 +1336,7 @@ mod tests {
             Event::Released(released) => assert_eq!(released, path),
             Event::Changed => panic!("unexpected queue change"),
             Event::LockFailed(error) => panic!("queue watch failed: {error}"),
+            Event::WatchFailed(error) => panic!("filesystem watch failed: {error}"),
             Event::Kill => panic!("unexpected kill event"),
         }
         assert_eq!(

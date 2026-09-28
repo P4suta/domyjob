@@ -751,6 +751,16 @@ const REQUIRED_FIELDS: &[RequiredField] = &[
 
 const RESTRICTIONS: &[Restriction] = &[
     Restriction {
+        path: &["notify", "recommended_watcher"],
+        allowed_in: &["watch_event.rs", "crates/domyjob/tests/crash_process.rs"],
+        rule: "construct product file watchers through watch_event so rescan and errors cannot be ignored",
+    },
+    Restriction {
+        path: &["notify", "RecommendedWatcher", "new"],
+        allowed_in: &[],
+        rule: "construct product file watchers through watch_event so rescan and errors cannot be ignored",
+    },
+    Restriction {
         path: &["serde_json", "from_slice"],
         allowed_in: &["ingress.rs"],
         rule: "decode input only in ingress.rs, into a type that implements Ingress",
@@ -1847,6 +1857,7 @@ impl Gate {
                 &["std", "fs"],
                 &["std", "time"],
                 &["std", "thread"],
+                &["notify"],
                 &["crate", "state_file"],
             ]
             .iter()
@@ -3371,6 +3382,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [rule],
             "{source}",
+        );
+    }
+
+    #[test]
+    fn watcher_construction_cannot_bypass_rescan_and_error_classification() {
+        let rule = "construct product file watchers through watch_event so rescan and errors cannot be ignored";
+        assert_rule(
+            "fn f() { notify::recommended_watcher(|_| {}).unwrap(); }",
+            "crates/domyjob/src/node.rs",
+            rule,
+        );
+        assert_rule(
+            "use notify::recommended_watcher as raw;",
+            "crates/domyjob/src/supervisor.rs",
+            rule,
+        );
+        assert!(
+            check_file(
+                "fn f() { notify::recommended_watcher(|_| {}).unwrap(); }",
+                "crates/domyjob/src/watch_event.rs"
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

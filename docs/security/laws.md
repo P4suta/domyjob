@@ -7,7 +7,7 @@ Each one names the property it guarantees, the mechanism that guarantees it, and
 
 These are design targets, not a claim that every mechanism and check below is implemented.
 The current code has no `effects::*` abstraction, `Labeled<T, L>` covers only repository job text, and the decision-signature gate admits 35 explicitly listed legacy boolean signatures across product modules.
-CI runs `cargo vet` against locked imported audits, but 267 exact-version exemptions remain.
+The local `mise run check` and CI run a pinned `cargo vet` against locked imported audits, but 267 exact-version exemptions remain.
 Passing `mise run check` therefore does not establish all seven laws.
 
 ## Closure ledger
@@ -133,6 +133,8 @@ Survey decoding refuses more than 50 jobs, matching the sender's list limit, whi
 The live display holds at most one queued survey update; when its receiver closes, the next send fails and the client ends the watch connection before waiting for its writer thread; malformed survey JSON retains its peer-origin failure classification.
 The node coalesces file-change wakeups into a one-item channel, and its callback never waits for a full channel.
 The supervisor coalesces queue-change wakeups into a bounded event channel; its lock-release and kill events retain room and each kill request enqueues at most once.
+Both production filesystem watchers use one typed event classifier: a rescan notice triggers a fresh read, an irrelevant path is ignored, and a watcher error ends the affected operation with a reported failure.
+The syntax gate confines direct watcher construction to that classifier.
 CAS restores and difference replies stream through a fixed buffer while checking the blob digest; a small in-memory CAS read has an explicit 64 MiB limit.
 Source snapshots admit at most 100,000 entries and 16 MiB of path bytes; each disk blob can be up to 8 GiB and remains streamed, while materialized revision content has a 64 MiB total budget.
 Directory hashing reads no further than each inspected file size and uses at most four workers.

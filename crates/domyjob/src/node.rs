@@ -226,10 +226,11 @@ enum WatchedPath {
     Other,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum WatchWake {
     Changed,
     ClientGone,
+    Failed(notify::Error),
 }
 
 fn telling(jobs: &Path, path: &Path) -> WatchedPath {
@@ -2108,20 +2109,26 @@ impl Node {
         let (wake, woken) = std::sync::mpsc::sync_channel::<WatchWake>(1);
         let changed = wake.clone();
         let area = jobs.clone();
-        let mut notifier =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event
-                    && event.paths.iter().any(|path| match telling(&area, path) {
-                        WatchedPath::JobChange => true,
-                        WatchedPath::Other => false,
-                    })
-                {
+        let mut notifier = crate::watch_event::watcher(
+            move |path| match telling(&area, path) {
+                WatchedPath::JobChange => true,
+                WatchedPath::Other => false,
+            },
+            move |notice| match notice {
+                crate::watch_event::Notice::Relevant => {
                     match changed.try_send(WatchWake::Changed) {
                         Ok(()) | Err(_) => {}
                     }
                 }
-            })
-            .map_err(|error| watching(&jobs, &error))?;
+                crate::watch_event::Notice::Irrelevant => {}
+                crate::watch_event::Notice::Failed(error) => {
+                    match changed.send(WatchWake::Failed(error)) {
+                        Ok(()) | Err(_) => {}
+                    }
+                }
+            },
+        )
+        .map_err(|error| watching(&jobs, &error))?;
         notify::Watcher::watch(&mut notifier, &jobs, notify::RecursiveMode::Recursive)
             .map_err(|error| watching(&jobs, &error))?;
         std::thread::spawn(move || {
@@ -2153,13 +2160,15 @@ impl Node {
                 framed.flush().map_err(NodeError::Output)?;
                 match woken.recv() {
                     Ok(WatchWake::Changed) => {
-                        if woken.try_iter().any(|signal| match signal {
-                            WatchWake::Changed => false,
-                            WatchWake::ClientGone => true,
-                        }) {
-                            return Ok(());
+                        for signal in woken.try_iter() {
+                            match signal {
+                                WatchWake::Changed => {}
+                                WatchWake::ClientGone => return Ok(()),
+                                WatchWake::Failed(error) => return Err(watching(&jobs, &error)),
+                            }
                         }
                     }
+                    Ok(WatchWake::Failed(error)) => return Err(watching(&jobs, &error)),
                     Ok(WatchWake::ClientGone) | Err(_) => return Ok(()),
                 }
             }
