@@ -1394,8 +1394,27 @@ mod windows_source_build_tests {
     ) {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join(".cache").join("domyjob");
+        seed_stale_artifact(&cache);
         let (transfer, output) = run_build_in_cache(&cache, main);
         (temp, cache, transfer, output)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture setup failures should fail the test immediately"
+    )]
+    fn seed_stale_artifact(cache: &Path) {
+        let artifact = cache
+            .join("build")
+            .join("shared")
+            .join("remote/domyjob.exe");
+        crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
+        crate::state_file::write_bytes(
+            &cache.join("build").join("shared").join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
     }
 
     #[expect(
@@ -1426,17 +1445,6 @@ mod windows_source_build_tests {
         let archive = archive.into_inner().unwrap();
         let (script, transfer, payload) =
             crate::remote::windows_source_build_for_test(cache, &archive);
-        let artifact = cache
-            .join("build")
-            .join("shared")
-            .join("remote/domyjob.exe");
-        crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
-        crate::state_file::write_bytes(
-            &cache.join("build").join("shared").join("CACHEDIR.TAG"),
-            b"Signature: 8a477f597d28d172789f06886806bc55\n",
-        )
-        .unwrap();
-        crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
         let mut child =
             crate::spawn::Invocation::new(Arg::literal("cmd"), vec![Arg::literal("/c"), script])
                 .command()
@@ -1515,6 +1523,7 @@ mod windows_source_build_tests {
         let profile = temp.path().join("profile");
         crate::state_file::private_dir(&profile).unwrap();
         let cache = profile.join(".cache").join("domyjob");
+        crate::state_file::private_dir(&cache).unwrap();
         let ((first, first_output), (second, second_output)) = std::thread::scope(|scope| {
             let first =
                 scope.spawn(|| run_build_in_cache(&cache, "fn main() { println!(\"first\"); }\n"));

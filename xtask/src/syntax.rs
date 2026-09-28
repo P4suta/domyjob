@@ -883,6 +883,8 @@ const TIME_TYPES: &[&str] = &["SystemTime", "Instant", "Duration", "UNIX_EPOCH"]
 const TIME_METHODS: &[&str] = &["sleep", "modified", "accessed", "elapsed"];
 const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
 const OPAQUE_TIME_RULE: &str = "keep Timestamp and Elapsed opaque; time values may be recorded or displayed, never returned as numeric decision inputs";
+const EXPLICIT_PRESENTATION_TIME_RULE: &str =
+    "protocol timing methods take an explicit observation; presentation owns the clock read";
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 const UNBOUNDED_CHILD_OUTPUT_RULE: &str =
     "capture child output only through bounded.rs with an explicit byte budget";
@@ -1791,6 +1793,16 @@ impl Gate {
     }
 
     fn check_time_path(&mut self, path: &syn::Path) {
+        if self.test_depth == 0
+            && self.file_is(&["protocol.rs"])
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "observe")
+            && let Some(segment) = path.segments.last()
+        {
+            self.flag(segment.ident.span(), EXPLICIT_PRESENTATION_TIME_RULE);
+        }
         if self.file_is(CLOCK_FILES) {
             return;
         }
@@ -4634,6 +4646,28 @@ mod tests {
             "impl PartialEq for Timestamp {}",
             "src/protocol.rs",
             OPAQUE_TIME_RULE,
+        );
+    }
+
+    #[test]
+    fn protocol_timing_requires_an_explicit_observation() {
+        assert_rule(
+            "fn timing() { let _ = Timestamp::observe(); }",
+            "src/protocol.rs",
+            EXPLICIT_PRESENTATION_TIME_RULE,
+        );
+        assert_rule(
+            "fn timing() { let _ = Clock::observe(); }",
+            "src/protocol.rs",
+            EXPLICIT_PRESENTATION_TIME_RULE,
+        );
+        assert!(
+            check_file(
+                "fn timing(now: Timestamp) -> Timestamp { now }",
+                "src/protocol.rs"
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

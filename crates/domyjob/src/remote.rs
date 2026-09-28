@@ -625,7 +625,8 @@ fn build_unix(transfer: &TransferId, source: &BlobId) -> Arg {
             "cleanup() { if [ -n \"$stable\" ]; then cd /; rm -rf \"$stable\"; fi; }; trap cleanup EXIT; ",
             "if [ -n \"$stable\" ]; then rm -rf \"$stable\"; mv \"$source\" \"$stable\"; source=\"$stable\"; fi; ",
             "MISE_TRUSTED_CONFIG_PATHS=\"$source\"; export MISE_TRUSTED_CONFIG_PATHS; ",
-            "cd \"$source\"; cargo build --profile remote --locked -p domyjob --target-dir \"$2\" >&2; ",
+            "cd \"$source\"; cargo clean --profile remote -p domyjob --target-dir \"$2\" >&2; ",
+            "cargo build --profile remote --locked -p domyjob --target-dir \"$2\" >&2; ",
             "cp \"$2/remote/domyjob\" \"$3.$$\"; chmod 755 \"$3.$$\"; mv -f \"$3.$$\" \"$3\"'; ",
             "if command -v flock >/dev/null 2>&1; then locker=flock; ",
             "elif command -v lockf >/dev/null 2>&1; then locker=lockf; ",
@@ -668,6 +669,8 @@ fn build_windows_script(transfer: &TransferId) -> Arg {
             "try { if (Test-Path $stable) { Remove-Item -LiteralPath $stable -Recurse -Force }; ",
             "Move-Item -LiteralPath $source -Destination $stable; Set-Location $stable; ",
             "$env:MISE_TRUSTED_CONFIG_PATHS = $stable; $ErrorActionPreference = 'Continue'; ",
+            "& cargo clean --profile remote -p domyjob --target-dir $target; ",
+            "$cleanExit = $LASTEXITCODE; if ($cleanExit -ne 0) { throw \"cargo clean exited with $cleanExit\" }; ",
             "& cargo build --profile remote --locked -p domyjob --target-dir $target; ",
             "$buildExit = $LASTEXITCODE; $ErrorActionPreference = 'Stop'; ",
             "if ($buildExit -ne 0) { throw \"cargo build exited with $buildExit\" }; ",
@@ -2590,6 +2593,7 @@ mod tests {
         )));
         assert!(text.contains("--target-dir \"$2\""));
         assert!(text.contains("cargo build --profile remote --locked"));
+        assert!(text.contains("cargo clean --profile remote -p domyjob --target-dir \"$2\""));
         assert!(text.contains("$2/remote/domyjob"));
         assert!(text.contains("$c/build/shared"));
         assert!(text.contains(&format!("build/{}/{source}", build_key())));
@@ -2631,6 +2635,11 @@ mod tests {
             windows
                 .as_arg_str()
                 .contains("cargo build --profile remote --locked")
+        );
+        assert!(
+            windows
+                .as_arg_str()
+                .contains("cargo clean --profile remote -p domyjob --target-dir $target")
         );
         assert!(windows.as_arg_str().contains("remote\\domyjob.exe"));
         assert!(windows.as_arg_str().contains("[IO.FileShare]::None"));

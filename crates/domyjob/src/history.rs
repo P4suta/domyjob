@@ -19,7 +19,7 @@ pub struct Series {
 }
 
 #[must_use]
-pub fn series(jobs: &[(MachineName, Job)]) -> Vec<Series> {
+pub fn series(jobs: &[(MachineName, Job)], now: Timestamp) -> Vec<Series> {
     let mut grouped: BTreeMap<(MachineName, String), Vec<&Job>> = BTreeMap::new();
     for (machine, job) in jobs.iter().filter(|(_, job)| job.is_settled()) {
         grouped
@@ -35,7 +35,7 @@ pub fn series(jobs: &[(MachineName, Job)]) -> Vec<Series> {
             let mut took: Vec<Elapsed> = runs
                 .iter()
                 .filter(|job| job.state().has_timing_sample())
-                .filter_map(|job| job.took())
+                .filter_map(|job| job.took_at(now))
                 .collect();
             let typical = Elapsed::upper_median(&mut took);
             Some(Series {
@@ -110,7 +110,7 @@ mod tests {
             ),
             (linux, crate::view::tests::sample()),
         ];
-        let found = series(&jobs);
+        let found = series(&jobs, Timestamp::at_millis(30_000));
         assert_eq!(found.len(), 2);
         let (tests, build) = (found.first().unwrap(), found.last().unwrap());
         assert_eq!(

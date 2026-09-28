@@ -50,7 +50,12 @@ fn hint(out: &mut String, machine: &MachineName, job: &Job) -> std::fmt::Result 
 fn job_header(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Error> {
     let now = Timestamp::observe();
     let id = job.spec.id.as_str();
-    let mut out = ui::job_line(machine, job, (&[id], ui::Columns::default()), Some(now));
+    let mut out = ui::job_line(
+        machine,
+        job,
+        (&[id], ui::Columns::default()),
+        ui::TimeDisplay::Relative(now),
+    );
     out.push('\n');
     let command = job.spec.command.display();
     writeln!(out, "  {}", ui::paint(Tone::Dim, &command))?;
@@ -102,7 +107,12 @@ pub fn machine_listing(machine: &MachineName, jobs: &[Job]) -> Result<String, st
         writeln!(
             out,
             "  {}",
-            ui::job_line(machine, job, (&ids, columns), Some(now))
+            ui::job_line(
+                machine,
+                job,
+                (&ids, columns),
+                ui::TimeDisplay::Relative(now)
+            )
         )?;
     }
     Ok(out)
@@ -131,7 +141,13 @@ pub fn no_jobs() -> String {
 
 pub fn final_line(machine: &MachineName, job: &Job) -> Result<String, std::fmt::Error> {
     let id = job.spec.id.as_str();
-    let mut out = ui::job_line(machine, job, (&[id], ui::Columns::default()), None);
+    let now = Timestamp::observe();
+    let mut out = ui::job_line(
+        machine,
+        job,
+        (&[id], ui::Columns::default()),
+        ui::TimeDisplay::Final(now),
+    );
     if let Some(reason) = job.reason() {
         write!(out, "\n  {}", ui::paint(Tone::Bad, &reason.to_string()))?;
     }
@@ -175,7 +191,11 @@ pub fn machine_card(
         ui::machine(machine),
         resources(report)?.join(&ui::paint(Tone::Dim, " · "))
     )?;
-    writeln!(out, "  {}", activity(jobs, report.max_jobs)?.join("   "))?;
+    writeln!(
+        out,
+        "  {}",
+        activity(jobs, report.max_jobs, now)?.join("   ")
+    )?;
     attention(&mut out, machine, report, (jobs, now))?;
     Ok(out)
 }
@@ -230,6 +250,7 @@ fn resources(report: &crate::protocol::Report) -> Result<Vec<String>, std::fmt::
 fn activity(
     jobs: &[Job],
     at_once: crate::domain::Concurrency,
+    now: Timestamp,
 ) -> Result<Vec<String>, std::fmt::Error> {
     let running: Vec<&Job> = jobs
         .iter()
@@ -246,7 +267,7 @@ fn activity(
             .take(3)
             .map(|job| {
                 let took = job
-                    .took()
+                    .took_at(now)
                     .map_or_else(String::new, |took| format!(" {took}"));
                 format!(
                     "{}{}",

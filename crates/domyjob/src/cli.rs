@@ -11,7 +11,7 @@ use crate::config::Machine;
 use crate::domain::{EnvName, JobId, JobName, MachineName, RelPath};
 use crate::notify::NotifyTarget;
 use crate::paths::Dirs;
-use crate::protocol::{Job, Phase, Request, Workspace};
+use crate::protocol::{Job, Request, Workspace};
 use crate::template::Arg;
 
 #[derive(Debug)]
@@ -1890,20 +1890,9 @@ fn report_final(
 
 fn age(job: &Job, now: Timestamp) -> (String, String) {
     let age = job.spec.submitted_at.until(now).to_string();
-    let took = match &job.phase {
-        Phase::Finished {
-            started_at: Some(start),
-            finished_at,
-            ..
-        } => start.until(*finished_at).to_string(),
-        Phase::Running { started_at, .. }
-        | Phase::Starting { started_at, .. }
-        | Phase::Preparing { started_at } => started_at.until(now).to_string(),
-        Phase::Queued
-        | Phase::Finished {
-            started_at: None, ..
-        } => "-".to_owned(),
-    };
+    let took = job
+        .took_at(now)
+        .map_or_else(|| "-".to_owned(), |took| took.to_string());
     (age, took)
 }
 
@@ -2167,7 +2156,8 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
             crate::diagnosis::of_remote(&item.error).hint.as_deref(),
         );
     }
-    let series = crate::history::series(&jobs);
+    let now = Timestamp::observe();
+    let series = crate::history::series(&jobs, now);
     if args.json {
         crate::output::print(
             &mut std::io::stdout(),
@@ -2175,10 +2165,7 @@ fn history(args: &HistoryArgs) -> Result<ExitCode, CliError> {
         )
         .map_err(CliError::Output)?;
     } else {
-        show(crate::view::history(
-            &series,
-            (Timestamp::observe(), args.all),
-        ))?;
+        show(crate::view::history(&series, (now, args.all)))?;
     }
     Ok(if rejected.is_empty() {
         ExitCode::SUCCESS

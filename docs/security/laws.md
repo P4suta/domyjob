@@ -22,7 +22,7 @@ The remaining conditions below keep a green test run from being mistaken for com
 | 2. Every value carries its origin | Source-specific text types, an opaque inbound `PeerRequest`, and sealed argument traits protect some sinks | Label all peer and repository values and require a named validation or neutralization step at each sink |
 | 3. Parse once, at the border | `ingress` owns several JSON and TOML decoders; the node decodes requests only as `PeerRequest` | Audit every external input and make the gate reject decoding or parsing it outside its border |
 | 4. Decisions are total | Enum-match lints apply crate-wide, job phase transitions require exhaustive typed cases, production phase-tag checks use one exhaustive `Phase::kind` mapping, several lifecycle, authorization, presentation, and lock decisions use exhaustive matches, platform features use a typed capability matrix, revocation has a typed selector, remote version comparison separates invalid input, retry classification covers every remote error, and the decision-signature gate covers the modules named above | Extend decision types and the signature gate to every security decision and state transition |
-| 5. Time decides nothing | Clock and timeout gates exist, production time values and the records that carry them have no comparison traits, and the one silent-peer exception is documented | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
+| 5. Time decides nothing | Clock and timeout gates exist, production time values and the records that carry them have no comparison traits, presentation passes one observed timestamp through its duration calculations, and the one silent-peer exception is documented | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
 | 6. Proof obligations | CI pins and runs fuzz, Kani, ProVerif, and authorization and trust mutations | Extend reproducible mutation runs and reviewed proof results to the remaining security-critical modules |
 | 7. Dependencies are audited | `cargo deny`, `cargo audit`, and a locked `cargo vet` import set check every Cargo lockfile, including fuzz; the vet gate rejects a new version without audit evidence or a new explicit exemption | Review and remove the 267 existing exact-version exemptions, especially cryptography, input parsers, and process-control crates, and require explicit review of any new exemption |
 
@@ -126,6 +126,7 @@ Builds and installs now receive a fresh random `TransferId`; setup fails if entr
 The ID follows each operation through upload, staging, verification, and promotion, so parallel operations cannot select each other's staged binary.
 SSH multiplexing has its own short `SshSessionId` and a fixed-length machine-specific `SshControlId`; the rendered control socket path reserves room for OpenSSH's temporary name and rejects unbounded expansion tokens before SSH starts.
 Source builds serialize Cargo and staging in one reusable target directory with an operating-system lock; Unix hosts without `flock` or `lockf` use a target directory keyed by build stamp and source archive instead.
+Before reusing a shared target, the locked build clears only domyjob's compiled artifacts, so an archive extracted before the previous build cannot make Cargo treat the old executable as current.
 The source is moved to a stable compilation path only while that lock is held, and the path is removed before the lock is released.
 Windows source-build scripts and archives travel as framed stdin data; a fixed bootstrap command stays below the Windows command-line limit.
 Every source build verifies the staged executable's embedded build stamp before promotion.
@@ -203,6 +204,7 @@ Pairing offers, grants, and connections are bounded by counts and by explicit re
 The wall clock is read in one place, `clock::Timestamp::observe`, and its value only records when something happened for a person to read.
 `Timestamp` and `Elapsed` have no comparison traits in production, and that restriction also reaches job, reply, trust, and audit records that carry timestamps.
 `Elapsed` exposes no numeric getter; its median and relative age labels stay inside `clock`, while JSON output retains the existing numeric millisecond field.
+Job duration calculations take an explicit observed timestamp, so listing rows, dashboard activity, and history views share their caller's snapshot instead of reading the clock inside the protocol model.
 
 **The one exception: whether a silent peer is still there.** No event can tell a peer that has stopped from one that is slow: a machine that accepts ssh but never starts the command, or a network that drops without a reset, produces no byte, no EOF, and no exit.
 So time decides exactly one thing, and only in `liveness.rs`.
@@ -214,6 +216,7 @@ It never touches a job: the job keeps running, its state stays whatever its lock
 **Check.** `clippy.toml` disallows `SystemTime`, `Instant`, `Duration`, `thread::sleep`, every timeout setter and timed receive, and file timestamps; the gate refuses those types and any method whose name is a sleep, a timeout, a deadline, or a file time, in tests as much as in code, everywhere but `clock.rs`.
 `liveness.rs` alone may use `Instant`, `Duration`, `elapsed`, and a condition variable's `wait_timeout`; it may not read the wall clock, sleep, or set a timeout on I/O, and the gate's own tests check both halves.
 The syntax gate also fixes `Timestamp` and `Elapsed` as private numeric wrappers and rejects public numeric getters, production comparison derives, and comparison implementations.
+It rejects a wall-clock observation inside the protocol model, where timing functions must take an explicit presentation snapshot.
 
 ## 6. Proof obligations
 

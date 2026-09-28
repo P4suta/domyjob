@@ -236,13 +236,22 @@ pub fn stderr_is_live() -> bool {
     std::io::stderr().is_terminal() && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TimeDisplay {
+    Relative(Timestamp),
+    Final(Timestamp),
+}
+
 #[must_use]
 pub fn job_line(
     machine_name: &MachineName,
     job: &Job,
     (among, columns): (&[&str], Columns),
-    now: Option<Timestamp>,
+    time: TimeDisplay,
 ) -> String {
+    let now = match time {
+        TimeDisplay::Relative(now) | TimeDisplay::Final(now) => now,
+    };
     let state = job.state();
     let (mark, tone) = state_look(state);
     let label = fit(&label(job), LABEL_ROOM);
@@ -250,10 +259,10 @@ pub fn job_line(
     if let Some(code) = job.exit_code().filter(|code| *code != 0) {
         facts.push(paint(tone, &format!("exit {code}")));
     }
-    if let Some(took) = job.took() {
-        facts.push(match now {
-            Some(_) => took.to_string(),
-            None => format!("after {took}"),
+    if let Some(took) = job.took_at(now) {
+        facts.push(match time {
+            TimeDisplay::Relative(_) => took.to_string(),
+            TimeDisplay::Final(_) => format!("after {took}"),
         });
     }
     if !job.behind.is_empty() {
@@ -267,8 +276,11 @@ pub fn job_line(
             &format!("behind {}", holders.join(", ")),
         ));
     }
-    if let Some(now) = now {
-        facts.push(paint(Tone::Dim, &job.spec.submitted_at.ago(now)));
+    match time {
+        TimeDisplay::Relative(_) => {
+            facts.push(paint(Tone::Dim, &job.spec.submitted_at.ago(now)));
+        }
+        TimeDisplay::Final(_) => {}
     }
     format!(
         "{} {}{}{}  {}  {}",

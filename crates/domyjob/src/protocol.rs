@@ -811,7 +811,7 @@ impl Job {
     }
 
     #[must_use]
-    pub fn took(&self) -> Option<crate::clock::Elapsed> {
+    pub const fn took_at(&self, now: Timestamp) -> Option<crate::clock::Elapsed> {
         match &self.phase {
             Phase::Finished {
                 started_at: Some(start),
@@ -820,7 +820,7 @@ impl Job {
             } => Some(start.until(*finished_at)),
             Phase::Running { started_at, .. }
             | Phase::Starting { started_at, .. }
-            | Phase::Preparing { started_at } => Some(started_at.until(Timestamp::observe())),
+            | Phase::Preparing { started_at } => Some(started_at.until(now)),
             Phase::Finished {
                 started_at: None, ..
             }
@@ -1032,6 +1032,36 @@ mod tests {
         let text = serde_json::to_string(&phase).unwrap();
         assert_eq!(crate::ingress::json_text::<Phase>(&text).unwrap(), phase);
         assert!(text.contains(r#""outcome":"failed""#));
+    }
+
+    #[test]
+    fn active_duration_uses_the_supplied_snapshot() {
+        let mut job = crate::view::tests::sample();
+        let started_at = Timestamp::at_millis(1_000);
+        job.phase = Phase::Preparing { started_at };
+        assert_eq!(
+            job.took_at(Timestamp::at_millis(4_000))
+                .unwrap()
+                .to_string(),
+            "3s"
+        );
+        assert_eq!(
+            job.took_at(Timestamp::at_millis(6_000))
+                .unwrap()
+                .to_string(),
+            "5s"
+        );
+        job.phase = Phase::Finished {
+            started_at: Some(started_at),
+            finished_at: Timestamp::at_millis(4_000),
+            outcome: Outcome::Succeeded,
+        };
+        assert_eq!(
+            job.took_at(Timestamp::at_millis(6_000))
+                .unwrap()
+                .to_string(),
+            "3s"
+        );
     }
 
     #[test]
