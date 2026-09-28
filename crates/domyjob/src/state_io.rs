@@ -261,11 +261,31 @@ pub(crate) fn create_empty(path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Remove a private regular file; a missing file is already removed.
+/// Remove a regular file of this user's; a missing file is already removed.
+///
+/// A file that other users can read is still removed, because removing it trusts none of its content;
+/// that is how a store left with the wrong permissions is replaced.
 pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
-    match open_read(path)? {
-        Some(file) => drop(file),
-        None => return Ok(()),
+    let mut options = platform::private_options();
+    options.read(true);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(classify_open(path, error)),
+    };
+    let metadata = file.metadata().map_err(|error| io_at(path, error))?;
+    if !metadata.is_file() || platform::reparse_point(&metadata) {
+        return Err(StateError::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    match platform::ownership(&file).map_err(|error| io_at(path, error))? {
+        Ownership::Private | Ownership::Exposed(_) => drop(file),
+        Ownership::Foreign => {
+            return Err(StateError::Foreign {
+                path: path.to_path_buf(),
+            });
+        }
     }
     match raw::remove_file(path) {
         Ok(()) => Ok(()),
@@ -291,7 +311,7 @@ pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_read, read_bytes, write_bytes};
+    use super::{open_read, read_bytes, remove_file, write_bytes};
 
     #[test]
     fn state_replacement_keeps_a_private_regular_file() {
@@ -307,5 +327,21 @@ mod tests {
             .expect("private file")
             .expect("record exists");
         assert!(file.metadata().expect("file metadata").is_file());
+    }
+
+    #[test]
+    fn a_file_open_to_other_users_can_still_be_removed() {
+        if cfg!(windows) {
+            // Windows access lists are exercised on Windows machines; this file mode is Unix.
+            return;
+        }
+        let root = tempfile::tempdir().expect("temporary state root");
+        let path = root.path().join("state").join("record");
+        write_bytes(&path, b"record").expect("private record");
+        // Executable permissions let other users read the file too.
+        crate::platform::make_executable(&path).expect("open the record to others");
+        read_bytes(&path).expect_err("an exposed record is never read");
+        remove_file(&path).expect("an exposed record of this user's is removed");
+        assert_eq!(read_bytes(&path).expect("absent record"), None);
     }
 }
