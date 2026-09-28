@@ -334,6 +334,11 @@ pub(crate) fn doctor() -> Result<Vec<Finding>, SetupError> {
             format!("written in format {found}, which this build cannot read"),
             "domyjob chat reset --yes",
         )),
+        Err(StoreError::State(unsafe_file)) => findings.push(Finding::problem(
+            "store",
+            unsafe_file.to_string(),
+            "domyjob chat reset --yes",
+        )),
         Err(other) => return Err(other.into()),
     }
     let program = crate::platform::stable_program(&crate::identity::tag())?;

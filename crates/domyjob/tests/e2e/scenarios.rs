@@ -877,6 +877,23 @@ fn later_peer(alpha: &Machine<'_>, gamma: &Machine<'_>) -> Result<(), Failure> {
 
 /// A machine that reset its chat is refused until the other side confirms its new identity.
 fn reset_and_replace(alpha: &Machine<'_>, beta: &Machine<'_>) -> Result<(), Failure> {
+    if !cfg!(windows) {
+        // A store that others can read is never opened, but doctor names it and reset replaces it.
+        expose(&beta.state().join("chat").join("chat.redb"))?;
+        let doctor = beta.chat(&["doctor"])?;
+        let findings = doctor.json()?;
+        let store = findings
+            .pointer("/findings")
+            .and_then(Value::as_array)
+            .and_then(|all| all.iter().find(|finding| finding["area"] == "store"))
+            .cloned();
+        ensure!(
+            store.as_ref().is_some_and(|finding| {
+                finding["ok"] == false && finding["fix"] == "domyjob chat reset --yes"
+            }),
+            "doctor should name the unreadable store and its fix: {doctor}"
+        );
+    }
     let reset = beta.chat(&["reset", "--yes"])?;
     let origin = text(&reset.exited(0)?.json()?, "/origin")?.to_owned();
     let refused = alpha.chat(&["sync", "beta"])?;
@@ -890,6 +907,21 @@ fn reset_and_replace(alpha: &Machine<'_>, beta: &Machine<'_>) -> Result<(), Fail
         "replacing should pin the new identity: {replaced}"
     );
     alpha.chat(&["sync", "beta"])?.exited(0)?;
+    Ok(())
+}
+
+/// Lets other users read `path`, as a file written with the wrong permissions would; Unix only.
+fn expose(path: &Path) -> Result<(), Failure> {
+    let status = std::process::Command::new("chmod")
+        .arg("644")
+        .arg(path)
+        .status()
+        .map_err(|error| Failure(format!("running chmod: {error}")))?;
+    ensure!(
+        status.success(),
+        "chmod failed on {}: {status}",
+        path.display()
+    );
     Ok(())
 }
 
