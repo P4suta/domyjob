@@ -11,7 +11,7 @@ State files are private and checked for owner and access permissions before use.
 Logs are bounded and terminal text is neutralized.
 Jobs receive an explicit environment allowlist, so SSH agent and connection variables are not passed to the command.
 
-The client builds and installs remote code from its local checkout over an authenticated SSH connection.
+The client builds and installs remote code from its embedded build source over an authenticated SSH connection.
 The same source fingerprint is checked after installation to prevent a stale node from handling a new wire request.
 The fingerprint detects changes; it does not certify the source or dependencies.
 The remote account and build environment are trusted to compile and execute that checkout.

@@ -13,7 +13,6 @@ use domyjob_core::wire::{self, Snapshot, WireError};
 use thiserror::Error;
 
 use crate::platform;
-use crate::source_fingerprint::{self, SourceKind};
 
 const METADATA: &[&str] = &[
     ".git", ".jj", ".hg", ".svn", ".pijul", "_darcs", ".bzr", "CVS",
@@ -121,20 +120,6 @@ impl Archive {
     fn finish(self) -> Result<Vec<u8>, SourceError> {
         Ok(self.builder.into_inner()?.0)
     }
-}
-
-pub(crate) fn checkout(root: &Path) -> Result<Vec<u8>, SourceError> {
-    let mut files = Vec::new();
-    source_fingerprint::from_checkout(root, |kind, path| {
-        if kind == SourceKind::File {
-            files.push(path.to_path_buf());
-        }
-    })?;
-    let mut archive = Archive::new();
-    for file in files {
-        archive.add(root, &file)?;
-    }
-    archive.finish()
 }
 
 fn walker(root: &Path) -> ignore::Walk {

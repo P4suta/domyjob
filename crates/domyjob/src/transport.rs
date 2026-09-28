@@ -24,6 +24,8 @@ use crate::identity;
 use crate::source::{self, SourceError};
 use crate::store::{Store, StoreError};
 
+const EMBEDDED_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/source.tar"));
+
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
     #[error(transparent)]
@@ -265,14 +267,14 @@ fn install_command(shell: RemoteShell) -> String {
 }
 
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
-    let archive = source::checkout(source_checkout()?)?;
-    if u64::try_from(archive.len()).map_err(|_size| WireError::Snapshot)? > wire::MAX_SNAPSHOT_BYTES
+    if u64::try_from(EMBEDDED_SOURCE.len()).map_err(|_size| WireError::Snapshot)?
+        > wire::MAX_SNAPSHOT_BYTES
     {
         return Err(WireError::Snapshot.into());
     }
     let command = install_command(remote_shell(machine)?);
     eprintln!(
-        "{}: updating remote binary from this checkout",
+        "{}: updating remote binary from this build",
         machine.as_str()
     );
     let mut child = SshChild::start_command(machine, &command, Stdio::inherit())?;
@@ -281,7 +283,7 @@ fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
         .stdin
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
-    input.write_all(&archive)?;
+    input.write_all(EMBEDDED_SOURCE)?;
     drop(input);
     let status = child.wait()?;
     if status.success() {
@@ -653,4 +655,23 @@ pub(crate) fn node() -> Result<(), TransportError> {
     output.write_all(&wire::frame(&reply)?)?;
     output.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use domyjob_core::wire::BuildId;
+
+    use super::{EMBEDDED_SOURCE, identity};
+    use crate::source_fingerprint;
+
+    #[test]
+    fn embedded_deployment_source_matches_the_compiled_build() {
+        let checkout = tempfile::tempdir().unwrap();
+        tar::Archive::new(EMBEDDED_SOURCE)
+            .unpack(checkout.path())
+            .unwrap();
+        let fingerprint =
+            source_fingerprint::from_checkout(checkout.path(), |_kind, _path| {}).unwrap();
+        assert_eq!(BuildId::from_fingerprint(fingerprint), identity::current());
+    }
 }

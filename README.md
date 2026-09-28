@@ -9,6 +9,7 @@ Rust 1.98 and `mise` are pinned in this repository.
 Build the client with `mise x -- cargo build --locked -p domyjob`, then run `target/debug/domyjob`.
 The client compares the complete source fingerprint with its compiled fingerprint and rebuilds itself when the checkout changes.
 Before each remote request, it compares the remote fingerprint and builds and installs the matching node over SSH when needed.
+The binary embeds its build source, so an installed copy can perform the first remote installation without its checkout.
 The remote machine needs `mise`, Rust, Cargo, and a working OpenSSH login.
 
 ```console
