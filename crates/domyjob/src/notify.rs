@@ -48,9 +48,19 @@ pub fn summary(machine: &MachineName, job: &Job) -> String {
         | Phase::Running { .. } => String::new(),
     };
     let state = job.state();
-    let code = match (state, job.exit_code()) {
-        (State::Failed, Some(code)) => format!(" (exit {code})"),
-        _ => String::new(),
+    let code = match state {
+        State::Failed => match job.exit_code() {
+            Some(code) => format!(" (exit {code})"),
+            None => String::new(),
+        },
+        State::Queued
+        | State::Preparing
+        | State::Running
+        | State::RestartPending
+        | State::Succeeded
+        | State::Killed
+        | State::Errored
+        | State::Lost => String::new(),
     };
     format!("{label} {}{code} on {machine}{took}", state.as_str())
 }
@@ -291,8 +301,9 @@ mod tests {
             &finished(Outcome::Succeeded),
         )
         .unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let written =
+            crate::ingress::foreign_json_envelope(std::str::from_utf8(&bytes).unwrap()).unwrap();
         assert_eq!(written.get("state"), Some(&serde_json::json!("succeeded")));
         assert_eq!(written.get("exit_code"), Some(&serde_json::json!(0)));
         assert!(matches!(

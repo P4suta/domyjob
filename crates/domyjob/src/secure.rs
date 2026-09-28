@@ -42,6 +42,25 @@ pub enum SecureError {
     PostQuantum(#[from] crate::pq::PqError),
 }
 
+impl SecureError {
+    #[must_use]
+    fn is_disconnected(&self) -> bool {
+        match self {
+            Self::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            Self::Handshake
+            | Self::Unknown
+            | Self::Frame(_)
+            | Self::Invalid(_)
+            | Self::PostQuantum(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Pair,
@@ -460,14 +479,7 @@ impl<S: Duplex> Reader<S> {
     fn fill(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         let frame = match receive_frame(&mut self.stream) {
             Ok(frame) => frame,
-            Err(SecureError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
+            Err(error) if error.is_disconnected() => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "the connection was cut before it was closed",
@@ -559,13 +571,7 @@ mod tests {
     use crate::paths::Dirs;
 
     fn identity(root: &std::path::Path, name: &str) -> Identity {
-        let dirs = Dirs {
-            home: root.into(),
-            state: root.join(name),
-            config: root.join("c"),
-            cache: root.join("k"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        };
+        let dirs = Dirs::for_test(root).with_test_state(root.join(name));
         Identity::load_or_create(&dirs).unwrap()
     }
 

@@ -29,7 +29,16 @@ avoid-breaking-exported-api = false
 pass-by-value-size-limit = 128
 
 disallowed-methods = [
+  { path = "domyjob::ingress::PeerRequest::into_request", reason = "only authz may release an inbound request after checking its principal and capability" },
   { path = "fail::cfg", reason = "test faults must be scoped by a guard and path through faults::inject" },
+  { path = "serde_json::from_slice", reason = "decode external JSON only through ingress::json" },
+  { path = "serde_json::from_str", reason = "decode external JSON only through ingress::json_text" },
+  { path = "serde_json::from_value", reason = "decode JSON values only through ingress::json_value" },
+  { path = "serde_json::from_reader", reason = "decode external JSON only through ingress" },
+  { path = "serde_json::de::Deserializer::from_slice", reason = "construct JSON decoders only in ingress" },
+  { path = "serde_json::de::Deserializer::from_str", reason = "construct JSON decoders only in ingress" },
+  { path = "serde_json::de::Deserializer::from_reader", reason = "construct JSON decoders only in ingress" },
+  { path = "toml::from_str", reason = "decode external TOML only through ingress::toml" },
   { path = "std::fs::write", reason = "write domyjob state through state_file, user files through user_files" },
   { path = "std::fs::create_dir", reason = "create directories through state_file::private_dir" },
   { path = "std::fs::create_dir_all", reason = "create directories through state_file::private_dir" },
@@ -83,6 +92,7 @@ disallowed-methods = [
 ]
 
 disallowed-types = [
+  { path = "toml_edit::DocumentMut", reason = "editable TOML parser values belong only in ingress::EditableToml" },
   { path = "once_cell::sync::Lazy", reason = "use std::sync::LazyLock" },
   { path = "once_cell::sync::OnceCell", reason = "use std::sync::OnceLock" },
   { path = "std::time::Instant", reason = "time decides nothing here; wait for the event itself" },

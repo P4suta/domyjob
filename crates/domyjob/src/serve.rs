@@ -172,14 +172,24 @@ fn addresses() -> Result<Vec<IpAddr>, ServeError> {
 }
 
 fn tailnet_address() -> Result<Option<IpAddr>, ServeError> {
-    Ok(addresses()?
-        .into_iter()
-        .find(|ip| matches!(address_scope(*ip), AddressScope::Tailnet) && ip.is_ipv4()))
+    Ok(addresses()?.into_iter().find(|ip| {
+        let tailnet = match address_scope(*ip) {
+            AddressScope::Tailnet => true,
+            AddressScope::Elsewhere => false,
+        };
+        ip.is_ipv4() && tailnet
+    }))
 }
 
 fn lan_address() -> Result<Option<IpAddr>, ServeError> {
     Ok(addresses()?.into_iter().find(|ip| match ip {
-        IpAddr::V4(v4) => v4.is_private() && matches!(address_scope(*ip), AddressScope::Elsewhere),
+        IpAddr::V4(v4) => {
+            let elsewhere = match address_scope(*ip) {
+                AddressScope::Tailnet => false,
+                AddressScope::Elsewhere => true,
+            };
+            v4.is_private() && elsewhere
+        }
         IpAddr::V6(_) => false,
     }))
 }
@@ -570,7 +580,10 @@ fn settle(shared: &Shared, consumed: bool) -> Result<(), ServeError> {
         }
         PairingState::Open(_) | PairingState::Closed => PairingState::Closed,
     };
-    let closed = matches!(next, PairingState::Closed);
+    let closed = match &next {
+        PairingState::Closed => true,
+        PairingState::Open(_) => false,
+    };
     *guard = next;
     drop(guard);
     if closed {
@@ -907,10 +920,8 @@ pub fn listing(dirs: &Dirs) -> Result<Listing, ServeError> {
 }
 
 pub fn revoke(dirs: &Dirs, who: &str) -> Result<usize, ServeError> {
-    let removed = Trust::remove(dirs, who)?;
-    if removed == 0 {
-        return Err(ServeError::Trust(TrustError::Unknown(who.to_owned())));
-    }
+    let selector = crate::trust::RevocationSelector::parse(who);
+    let removed = Trust::remove(dirs, &selector)?;
     let event = crate::audit::Event {
         principal: "owner",
         action: "revoke",
@@ -963,7 +974,14 @@ mod tests {
             trust.grant_for(&key).unwrap().capabilities(),
             &BTreeSet::from([Capability::Submit])
         );
-        assert_eq!(Trust::remove(&dirs, name.as_str()).unwrap(), 2);
+        assert_eq!(
+            Trust::remove(
+                &dirs,
+                &crate::trust::RevocationSelector::parse(name.as_str())
+            )
+            .unwrap(),
+            2
+        );
         let (servers, grants) = Trust::load(&dirs).unwrap().into_parts();
         assert!(servers.is_empty());
         assert!(grants.is_empty());

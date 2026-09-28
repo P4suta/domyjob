@@ -27,7 +27,7 @@ env = { RUST_LOG = "warn" }
 
 [tasks.clippy]
 description = "Lint every target with warnings denied"
-run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+run = "cargo clippy --locked --workspace --all-targets --features failpoints -- -D warnings"
 
 [tasks.gates]
 description = "Enforce the rules Clippy cannot express: no comments, no #[allow], exact input, typed errors, no owned trait objects"
@@ -36,11 +36,11 @@ run = "cargo xtask gates"
 [tasks.lint]
 description = "Formatting, Clippy, the repository gates, spelling, workflows, and duplication"
 depends = ["fmt:check", "clippy", "gates"]
-run = ["typos", "actionlint", "jscpd --config .jscpd.json --silent"]
+run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
 description = "Run every test"
-env = { CI_CANARY = "must-not-reach-a-job" }
+env = { CI_CANARY = "must-not-reach-a-job", CARGO_TARGET_DIR = "target/test" }
 run = [
   "cargo nextest run --locked --workspace --all-targets --features failpoints",
   "cargo test --locked --workspace --doc",
@@ -48,38 +48,60 @@ run = [
 
 [tasks.deny]
 description = "Check licenses, bans, and sources"
-run = "cargo deny --locked check licenses bans sources"
+run = "cargo xtask dependencies deny"
 
 [tasks.audit]
 description = "Check the dependency graph against the RustSec advisory database"
-run = "cargo audit --deny warnings"
+run = "cargo xtask dependencies audit"
+
+[tasks.vet]
+description = "Check pinned audit evidence and explicit exemptions for every dependency graph (requires cargo-vet 0.10.2)"
+run = "cargo xtask dependencies vet"
 
 [tasks.check]
-description = "Every gate a push waits for"
+description = "Run local lint, tests, license, and advisory checks"
 run = ["mise run lint", "mise run test", "mise run deny", "mise run audit"]
 
 [tasks."check:fleet"]
 description = "Lint and test the commit being pushed on every machine domyjob knows, the other operating systems included"
 run = [
-  "cargo run --quiet --package domyjob -- setup ${DOMYJOB_CHECK_ON:-@all} --build --rev @HEAD --if-missing",
-  "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --env CI_CANARY=must-not-reach-a-job --wait --grep 'Summary|FAIL|TIMEOUT|test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets --features failpoints -- -D warnings && cargo nextest run --locked --workspace --all-targets --features failpoints && cargo test --locked --workspace --doc'",
+  "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --wait --grep 'Summary|FAIL|TIMEOUT|test result|panicked|^error|^warning' -- 'mise run clippy && mise run test'",
 ]
 
 [tasks.fuzz]
 description = "Fuzz every input boundary for a fixed number of inputs"
 dir = "fuzz"
 run = [
-  "cargo +nightly fuzz run requests -- -runs=200000",
-  "cargo +nightly fuzz run orders -- -runs=200000",
-  "cargo +nightly fuzz run releases -- -runs=200000",
-  "cargo +nightly fuzz run terminal -- -runs=200000",
+  "cargo +nightly-2026-08-21 fetch --locked",
+  "mkdir -p corpus/requests",
+  "cp seeds/requests/*.json corpus/requests/",
+  "cargo +nightly-2026-08-21 fuzz run requests -- -runs=200000 -seed=1 -verbosity=0 -print_final_stats=1",
+  "cargo +nightly-2026-08-21 fuzz run orders -- -runs=200000 -seed=1 -verbosity=0 -print_final_stats=1",
+  "cargo +nightly-2026-08-21 fuzz run releases -- -runs=200000 -seed=1 -verbosity=0 -print_final_stats=1",
+  "cargo +nightly-2026-08-21 fuzz run terminal -- -runs=200000 -seed=1 -verbosity=0 -print_final_stats=1",
 ]
 
 [tasks.kani]
 description = "Prove the Kani harnesses"
 dir = "crates/domyjob"
-run = "cargo kani --lib"
+run = "cargo kani --lib --output-format terse"
 
 [tasks.proverif]
 description = "Prove the symbolic models and require every expected claim to hold (needs proverif on PATH)"
 run = "cargo xtask proverif"
+
+[tasks."mutations:authz"]
+description = "Require tests to detect every viable mutation in authorization"
+env = { TMPDIR = "/tmp", RUSTC_WRAPPER = "", CARGO_INCREMENTAL = "0" }
+run = [
+  "cargo fetch --locked",
+  "rust-mutants run --no-config --cargo \"$(rustup which cargo)\" --file crates/domyjob/src/authz.rs --locked --offline --coverage --no-doctests --jobs 1 --timeout 5m --ui plain -- --test-threads=1",
+]
+
+[tasks."mutations:trust"]
+description = "Require focused trust tests to detect every viable mutation in trust state"
+env = { TMPDIR = "/tmp", RUSTC_WRAPPER = "", CARGO_INCREMENTAL = "0" }
+run = [
+  "cargo fetch --locked",
+  "rust-mutants run --no-config --cargo \"$(rustup which cargo)\" --file crates/domyjob/src/trust.rs --locked --offline --coverage --no-doctests --jobs 1 --timeout 5m --ui plain -- trust --test-threads=1",
+]

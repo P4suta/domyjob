@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 use crate::client::ClientError;
+use crate::config::ConfigError;
 use crate::protocol::RefusalCode;
 use crate::remote::RemoteError;
 
@@ -107,6 +108,10 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
             Kind::Config,
             "use a shorter cache directory or a shorter SSH ControlPath in the transport configuration",
         ),
+        RemoteError::ControlPathToken { .. } => hinted(
+            Kind::Config,
+            "use a literal SSH ControlPath or %C so its maximum length can be checked before SSH starts",
+        ),
         RemoteError::Start { .. } | RemoteError::Pipe { .. } | RemoteError::Exited { .. } => {
             hinted(
                 Kind::Unreachable,
@@ -133,6 +138,7 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         },
         RemoteError::Garbled { .. }
         | RemoteError::Unexpected { .. }
+        | RemoteError::Unsendable { .. }
         | RemoteError::Protocol { .. } => hinted(
             Kind::Protocol,
             "the machine runs a different domyjob; `domyjob setup {machine}` installs the matching one",
@@ -142,6 +148,10 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         RemoteError::Newer { .. } => hinted(
             Kind::Protocol,
             "this machine has the older domyjob; `domyjob self update` here, or install the matching build, then try again",
+        ),
+        RemoteError::UncomparableVersion { .. } => hinted(
+            Kind::Protocol,
+            "check the remote domyjob binary before explicitly installing a matching build with `domyjob setup {machine} --build`",
         ),
         RemoteError::Unbuilt { .. } => hinted(
             Kind::Distribution,
@@ -158,7 +168,49 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
         | RemoteError::SshSession(_)
         | RemoteError::State(_)
         | RemoteError::Snapshot(_)
+        | RemoteError::LocalBuild { .. }
         | RemoteError::Io { .. } => plain(Kind::Local),
+    }
+}
+
+#[must_use]
+fn of_config(error: &ConfigError) -> Diagnosis {
+    match error {
+        ConfigError::Unknown { .. } => hinted(
+            Kind::Usage,
+            "add it with `domyjob machines add NAME`, or reach an ssh host directly as ssh:HOST",
+        ),
+        ConfigError::ThisMachine(_) => hinted(
+            Kind::Usage,
+            "`domyjob self uninstall` removes domyjob from this machine",
+        ),
+        ConfigError::Io(_)
+        | ConfigError::Parse { .. }
+        | ConfigError::TooLarge { .. }
+        | ConfigError::Template { .. }
+        | ConfigError::UnknownTransport { .. }
+        | ConfigError::NoMatch { .. }
+        | ConfigError::UnknownGroup(_)
+        | ConfigError::TooDeep(_)
+        | ConfigError::NoLabel(_)
+        | ConfigError::BadTerm(_)
+        | ConfigError::FactWorkerPanicked(_)
+        | ConfigError::Missing { .. }
+        | ConfigError::Edit { .. }
+        | ConfigError::Write(_)
+        | ConfigError::Exists(_)
+        | ConfigError::NotConfigured(_)
+        | ConfigError::ProjectRoot(_)
+        | ConfigError::EmptyProjectMachines(_)
+        | ConfigError::TooManyProjectMachines { .. }
+        | ConfigError::ProjectMachineUnknown { .. }
+        | ConfigError::DuplicateProjectRoot(_)
+        | ConfigError::ProjectNotApproved(_)
+        | ConfigError::ProjectMachineDenied { .. }
+        | ConfigError::ProjectSelector(_)
+        | ConfigError::TooManyMachines { .. }
+        | ConfigError::TooManyTargets { .. }
+        | ConfigError::SelectorTooComplex { .. } => plain(Kind::Config),
     }
 }
 
@@ -166,17 +218,8 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
 pub fn of_client(error: &ClientError) -> Diagnosis {
     match error {
         ClientError::Remote(remote) => of_remote(remote),
-        ClientError::Config(crate::config::ConfigError::Unknown { .. }) => hinted(
-            Kind::Usage,
-            "add it with `domyjob machines add NAME`, or reach an ssh host directly as ssh:HOST",
-        ),
-        ClientError::Config(crate::config::ConfigError::ThisMachine(_)) => hinted(
-            Kind::Usage,
-            "`domyjob self uninstall` removes domyjob from this machine",
-        ),
-        ClientError::Config(_) | ClientError::Project(_) | ClientError::Runner { .. } => {
-            plain(Kind::Config)
-        }
+        ClientError::Config(config) => of_config(config),
+        ClientError::Project(_) | ClientError::Runner { .. } => plain(Kind::Config),
         ClientError::Invalid(_) | ClientError::NoInput => plain(Kind::Usage),
         ClientError::Unknown(_) => hinted(
             Kind::NotFound,
@@ -251,7 +294,16 @@ mod tests {
         let unbuilt = RemoteError::Unbuilt {
             machine: "linux".to_owned(),
             was: String::new(),
+            cause: Box::new(RemoteError::Probe {
+                machine: "linux".to_owned(),
+                detail: "managed executable is missing".to_owned(),
+            }),
         };
+        assert!(
+            unbuilt
+                .to_string()
+                .contains("managed executable is missing")
+        );
         let hint = of_remote(&unbuilt).hint.unwrap();
         assert!(hint.contains("domyjob setup linux --build"), "{hint}");
         let unknown = of_refusal(RefusalCode::Paused).about(None).hint.unwrap();

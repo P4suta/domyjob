@@ -85,6 +85,30 @@ pub enum DistError {
     Io(#[from] crate::failure::IoFailure),
 }
 
+impl DistError {
+    #[must_use]
+    pub const fn permits_source_fallback(&self) -> bool {
+        match self {
+            Self::NoTrustRoot => true,
+            Self::Template { .. }
+            | Self::Start { .. }
+            | Self::Failed { .. }
+            | Self::TrustRoot
+            | Self::Signature
+            | Self::Manifest(_)
+            | Self::WrongVersion { .. }
+            | Self::Downgrade { .. }
+            | Self::NoTarget(_)
+            | Self::Digest { .. }
+            | Self::Version(_)
+            | Self::Invalid(_)
+            | Self::State(_)
+            | Self::Replace(_)
+            | Self::Io(_) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u64, u64, u64);
 
@@ -161,6 +185,11 @@ pub struct InsecureUnsigned(());
 impl InsecureUnsigned {
     #[must_use]
     pub const fn acknowledged_on_the_command_line() -> Self {
+        Self(())
+    }
+
+    #[must_use]
+    pub(crate) const fn from_local_checkout() -> Self {
         Self(())
     }
 }
@@ -352,6 +381,14 @@ fn render(
         .map_err(|source| DistError::Template { field, source })
 }
 
+pub(crate) struct DistributionPath<'a>(&'a Path);
+
+impl DistributionPath<'_> {
+    pub(crate) const fn path(&self) -> &Path {
+        self.0
+    }
+}
+
 fn fetch(
     distribution: &Distribution,
     url: crate::template::Rendered,
@@ -361,7 +398,7 @@ fn fetch(
         crate::durable::beside(output, "part").map_err(crate::state_file::StateError::from)?;
     let bindings = Bindings::new()
         .with("url", Arg::rendered(url))
-        .with("output", Arg::path(&partial));
+        .with("output", Arg::path(&DistributionPath(&partial)));
     let fetched = run(&distribution.fetch, &bindings, "fetch")?;
     if fetched {
         crate::state_file::replace_with(&partial, output)?;
@@ -412,8 +449,8 @@ fn fetch_archive(
         sha256_file(&archive)?,
     )?;
     let unpack = Bindings::new()
-        .with("archive", Arg::path(&archive))
-        .with("dir", Arg::path(dir));
+        .with("archive", Arg::path(&DistributionPath(&archive)))
+        .with("dir", Arg::path(&DistributionPath(dir)));
     if !run(&distribution.unpack, &unpack, "unpack")? {
         return Err(DistError::Failed {
             what: unpack_failure,
@@ -481,7 +518,11 @@ fn download(
     exe: &'static str,
 ) -> Result<Verified<Binary>, DistError> {
     let bindings = names(target, exe);
-    let dir = dirs.cache.join("dist").join(VERSION).join(target.as_str());
+    let dir = dirs
+        .cache()
+        .join("dist")
+        .join(VERSION)
+        .join(target.as_str());
     crate::state_file::private_dir(&dir).map_err(|e| {
         DistError::Io(crate::failure::IoFailure {
             action: "preparing",
@@ -585,6 +626,10 @@ pub enum Downgrade {
     Allow,
 }
 
+fn high_water_file(dirs: &Dirs) -> crate::state_file::StateFile<HighWater> {
+    crate::state_file::StateFile::at(&dirs.state().join("highest-release.json"))
+}
+
 pub fn self_update(
     config: &Config,
     dirs: &Dirs,
@@ -593,11 +638,10 @@ pub fn self_update(
     let Some(distribution) = &config.distribution else {
         return Ok(None);
     };
-    let high_water_path = dirs.state.join("highest-release.json");
-    let mut high_water = crate::state_file::StateFile::<HighWater>::at(&high_water_path).lock()?;
+    let mut high_water = high_water_file(dirs).lock()?;
     let target = TargetTriple::try_from(OWN_TARGET.to_owned())?;
     let exe = crate::platform::EXE_SUFFIX;
-    let dir = dirs.cache.join("update");
+    let dir = dirs.cache().join("update");
     let manifest = fetch_manifest(
         distribution,
         &dir,

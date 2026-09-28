@@ -34,8 +34,8 @@ impl Invocation {
     }
 
     #[must_use]
-    pub fn in_dir(mut self, dir: &Path) -> Self {
-        self.dir = Some(dir.to_path_buf());
+    pub fn in_dir(mut self, dir: &impl crate::template::SafePath) -> Self {
+        self.dir = Some(dir.safe_path().to_path_buf());
         self
     }
 

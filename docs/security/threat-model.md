@@ -31,6 +31,8 @@ Whoever controls a domyjob connection controls those machines, so every boundary
 6. **Another local user** on a shared machine reading or replacing state files.
 7. **The operator's own mistake**: exposing a listener, pairing the wrong machine, granting too much, forgetting a revoked device.
 
+Windows administrators and SYSTEM can bypass ordinary file ACLs and are outside the "another local user" boundary.
+
 ## Security properties required
 
 - **Mutual authentication with pinned keys** for every non-ssh connection, and authentication before any work is done.

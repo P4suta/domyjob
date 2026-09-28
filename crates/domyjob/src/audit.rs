@@ -159,7 +159,7 @@ impl AuditLog {
     #[must_use]
     pub fn at(dirs: &Dirs) -> Self {
         Self {
-            path: dirs.state.join("audit.jsonl"),
+            path: dirs.state().join("audit.jsonl"),
             active_limit: ACTIVE_LIMIT,
         }
     }
@@ -168,12 +168,24 @@ impl AuditLog {
         self.path.with_extension("head")
     }
 
+    fn head_file(&self) -> state_file::StateFile<Head> {
+        state_file::StateFile::at(&self.head_path())
+    }
+
     fn base_path(&self) -> PathBuf {
         self.path.with_extension("base")
     }
 
+    fn base_file(&self) -> state_file::StateFile<Head> {
+        state_file::StateFile::at(&self.base_path())
+    }
+
     fn rotation_path(&self) -> PathBuf {
         self.path.with_extension("rotation")
+    }
+
+    fn rotation_file(&self) -> state_file::StateFile<Rotation> {
+        state_file::StateFile::at(&self.rotation_path())
     }
 
     fn archive_path(&self, epoch: u64) -> PathBuf {
@@ -182,6 +194,10 @@ impl AuditLog {
 
     fn archive_base_path(&self, epoch: u64) -> PathBuf {
         self.path.with_file_name(format!("audit-{epoch}.base"))
+    }
+
+    fn archive_base_file(&self, epoch: u64) -> state_file::StateFile<Head> {
+        state_file::StateFile::at(&self.archive_base_path(epoch))
     }
 
     #[must_use]
@@ -210,10 +226,10 @@ impl AuditLog {
             self.finish_rotation()?;
             let mut head = match self.repair()? {
                 Some(advanced) => {
-                    state_file::write_json(&self.head_path(), &advanced)?;
+                    self.head_file().replace(&advanced)?;
                     advanced
                 }
-                None => match state_file::read_json::<Head>(&self.head_path())? {
+                None => match self.head_file().read()? {
                     Some(head) => head,
                     None => Head::genesis()?,
                 },
@@ -240,14 +256,11 @@ impl AuditLog {
             crate::faults::at("audit::sync", &self.path)
                 .and_then(|()| file.sync_all())
                 .map_err(io("syncing"))?;
-            state_file::write_json(
-                &self.head_path(),
-                &Head {
-                    epoch: entry.epoch,
-                    seq: entry.seq,
-                    hash: digest(&line)?,
-                },
-            )?;
+            self.head_file().replace(&Head {
+                epoch: entry.epoch,
+                seq: entry.seq,
+                hash: digest(&line)?,
+            })?;
             Ok(())
         })
     }
@@ -265,7 +278,7 @@ impl AuditLog {
     }
 
     fn base(&self) -> Result<Head, AuditError> {
-        Ok(state_file::read_json(&self.base_path())?.unwrap_or(Head::genesis()?))
+        Ok(self.base_file().read()?.unwrap_or(Head::genesis()?))
     }
 
     fn rotate(&self, from: &Head) -> Result<Head, AuditError> {
@@ -274,19 +287,16 @@ impl AuditLog {
             seq: from.seq,
             hash: from.hash.clone(),
         };
-        state_file::write_json(
-            &self.rotation_path(),
-            &Rotation {
-                from: from.clone(),
-                next: next.clone(),
-            },
-        )?;
+        self.rotation_file().replace(&Rotation {
+            from: from.clone(),
+            next: next.clone(),
+        })?;
         self.finish_rotation()?;
         Ok(next)
     }
 
     fn finish_rotation(&self) -> Result<(), AuditError> {
-        let Some(rotation) = state_file::read_json::<Rotation>(&self.rotation_path())? else {
+        let Some(rotation) = self.rotation_file().read()? else {
             return Ok(());
         };
         let archive = self.archive_path(rotation.from.epoch);
@@ -296,11 +306,12 @@ impl AuditLog {
         }
         let archive_base = self.archive_base_path(rotation.from.epoch);
         if state_file::read_bytes(&archive_base)?.is_none() {
-            state_file::write_json(&archive_base, &self.base()?)?;
+            self.archive_base_file(rotation.from.epoch)
+                .replace(&self.base()?)?;
         }
         state_file::write_bytes(&self.path, b"")?;
-        state_file::write_json(&self.base_path(), &rotation.next)?;
-        state_file::write_json(&self.head_path(), &rotation.next)?;
+        self.base_file().replace(&rotation.next)?;
+        self.head_file().replace(&rotation.next)?;
         Ok(state_file::remove_file(&self.rotation_path())?)
     }
 
@@ -348,7 +359,7 @@ impl AuditLog {
             state_file::cut_to(&self.path, crate::domain::len_u64(keep))?;
             bytes.truncate(keep);
         }
-        let head = match state_file::read_json::<Head>(&self.head_path()) {
+        let head = match self.head_file().read() {
             Ok(Some(head)) => head,
             Ok(None) => self.base()?,
             Err(_unreadable_head_is_for_walk_to_report) => return Ok(None),
@@ -392,12 +403,14 @@ impl AuditLog {
             let base = self.base()?;
             let mut expected = Head::genesis()?;
             for epoch in 0..base.epoch {
-                let archive_base: Head = state_file::read_json(&self.archive_base_path(epoch))?
-                    .ok_or_else(|| AuditError::Broken {
-                        path: self.archive_base_path(epoch),
-                        line: expected.seq,
-                        why: "an archive base is missing",
-                    })?;
+                let archive_base: Head =
+                    self.archive_base_file(epoch)
+                        .read()?
+                        .ok_or_else(|| AuditError::Broken {
+                            path: self.archive_base_path(epoch),
+                            line: expected.seq,
+                            why: "an archive base is missing",
+                        })?;
                 if archive_base != expected {
                     return Err(AuditError::Broken {
                         path: self.archive_base_path(epoch),
@@ -408,7 +421,8 @@ impl AuditLog {
                 let next = if epoch.saturating_add(1) == base.epoch {
                     base.clone()
                 } else {
-                    state_file::read_json(&self.archive_base_path(epoch.saturating_add(1)))?
+                    self.archive_base_file(epoch.saturating_add(1))
+                        .read()?
                         .ok_or_else(|| AuditError::Broken {
                             path: self.archive_base_path(epoch.saturating_add(1)),
                             line: expected.seq,
@@ -443,9 +457,7 @@ impl AuditLog {
                     let next = if epoch.saturating_add(1) == base.epoch {
                         base
                     } else {
-                        let Some(next) = state_file::read_json(
-                            &self.archive_base_path(epoch.saturating_add(1)),
-                        )?
+                        let Some(next) = self.archive_base_file(epoch.saturating_add(1)).read()?
                         else {
                             return Ok(None);
                         };
@@ -468,7 +480,7 @@ impl AuditLog {
 
     fn walk_locked(&self, stop_at: u64) -> Result<(Head, u64), AuditError> {
         let unrecorded = match self.repair()? {
-            Some(advanced) => match state_file::write_json(&self.head_path(), &advanced) {
+            Some(advanced) => match self.head_file().replace(&advanced) {
                 Ok(()) => None,
                 Err(_full_disk_still_lets_it_be_read) => Some(advanced),
             },
@@ -485,7 +497,7 @@ impl AuditLog {
         let base = self.base()?;
         let recorded = || match unrecorded {
             Some(head) => Ok(Some(head.clone())),
-            None => state_file::read_json::<Head>(&self.head_path()),
+            None => self.head_file().read(),
         };
         let Some(bytes) = state_file::read_audit_bytes(&self.path)? else {
             return match recorded()? {
@@ -525,13 +537,13 @@ impl AuditLog {
             why: "an archive is missing",
         })?;
         let base: Head =
-            state_file::read_json(&self.archive_base_path(epoch))?.ok_or_else(|| {
-                AuditError::Broken {
+            self.archive_base_file(epoch)
+                .read()?
+                .ok_or_else(|| AuditError::Broken {
                     path: self.archive_base_path(epoch),
                     line: expected.seq,
                     why: "an archive base is missing",
-                }
-            })?;
+                })?;
         Self::walk_bytes(WalkBytes {
             path: &path,
             bytes: &bytes,
@@ -745,15 +757,13 @@ mod tests {
         forged.extend_from_slice(&relinked);
         forged.push(b'\n');
         std::fs::write(log.path(), forged).unwrap();
-        state_file::write_json(
-            &log.head_path(),
-            &Head {
+        state_file::StateFile::<_>::at(&log.head_path())
+            .replace(&Head {
                 epoch: 0,
                 seq: 2,
                 hash: digest(&relinked).unwrap(),
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(matches!(
             log.verify(),
             Err(AuditError::Broken {

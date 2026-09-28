@@ -168,9 +168,11 @@ impl Rooted {
         removed: &Removed,
     ) -> Result<EntryMatch, TreeError> {
         Ok(match (self.found(rel, removed)?, expected) {
-            (Found::Nothing | Found::Directory, Some(_)) | (Found::Entry(_), None) => {
-                EntryMatch::Differs
-            }
+            (
+                Found::Nothing | Found::Directory,
+                Some(Entry::File { .. } | Entry::Symlink { .. }),
+            )
+            | (Found::Entry(_), None) => EntryMatch::Differs,
             (Found::Nothing | Found::Directory, None) => EntryMatch::Matches,
             (Found::Entry(meta), Some(Entry::File { blob, size, mode })) => EntryMatch::of(
                 meta.is_file()
@@ -204,11 +206,14 @@ impl Rooted {
         if !meta.is_file() {
             return Ok(None);
         }
-        if let Some(link @ Entry::Symlink { .. }) = sent {
-            match self.holds(rel, Some(link), &Removed::new())? {
-                EntryMatch::Matches => return Ok(Some(link.clone())),
-                EntryMatch::Differs => {}
+        match sent {
+            Some(link @ Entry::Symlink { .. }) => {
+                match self.holds(rel, Some(link), &Removed::new())? {
+                    EntryMatch::Matches => return Ok(Some(link.clone())),
+                    EntryMatch::Differs => {}
+                }
             }
+            Some(Entry::File { .. }) | None => {}
         }
         let mode = match sent {
             _ if self.family.modes() => meta.mode(),
@@ -317,7 +322,7 @@ impl Rooted {
                     self.remove_file(&ancestor)?;
                     self.create_dir(&ancestor)?;
                 }
-                (None, _) => self.create_dir(&ancestor)?,
+                (None, Blockers::Refuse | Blockers::Replace) => self.create_dir(&ancestor)?,
             }
         }
         Ok(())
@@ -341,12 +346,12 @@ impl Rooted {
     }
 
     pub fn clear_directory(&self, rel: &RelPath, contents: Contents) -> Result<(), TreeError> {
-        match (self.lstat(rel)?, contents) {
-            (Some(meta), Contents::Anything) if meta.is_dir() => self.remove_tree(rel),
-            (Some(meta), Contents::EmptyDirectoriesOnly) if meta.is_dir() => {
-                self.remove_empty_tree(rel)
-            }
-            (Some(_) | None, _) => Ok(()),
+        match self.lstat(rel)? {
+            Some(meta) if meta.is_dir() => match contents {
+                Contents::Anything => self.remove_tree(rel),
+                Contents::EmptyDirectoriesOnly => self.remove_empty_tree(rel),
+            },
+            Some(_) | None => Ok(()),
         }
     }
 

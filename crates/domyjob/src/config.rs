@@ -17,6 +17,7 @@ pub const TRANSPORT_VARS: &[&str] = &[
     "cache",
     "home",
     "session",
+    "control",
 ];
 pub const RESOLVE_VARS: &[&str] = &["root", "rev"];
 pub const LIST_VARS: &[&str] = &["root", "commit"];
@@ -456,6 +457,11 @@ impl TransportConf {
             crate::paths::Family::Unix => self.share.as_ref(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) const fn sharing_unix(&self) -> Option<&Argv> {
+        self.share.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -508,7 +514,7 @@ pub struct Machine {
 
 #[must_use]
 pub fn path(dirs: &crate::paths::Dirs) -> PathBuf {
-    dirs.config.join("config.toml")
+    dirs.config().join("config.toml")
 }
 
 fn parse(text: &str, origin: &str) -> Result<Config, ConfigError> {
@@ -974,19 +980,17 @@ pub struct NewMachine {
 
 fn edit(
     path: &Path,
-    change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), ConfigError>,
+    change: impl FnOnce(&mut crate::ingress::EditableToml) -> Result<(), ConfigError>,
 ) -> Result<(), ConfigError> {
     let text = match crate::bounded::text_file(path, crate::bounded::CONFIG_TEXT) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => return Err(crate::failure::io("reading", path)(source).into()),
     };
-    let mut doc = text
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|source| ConfigError::Edit {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+    let mut doc = crate::ingress::editable_toml(&text).map_err(|source| ConfigError::Edit {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
     change(&mut doc)?;
     let updated = doc.to_string();
     Config::layered(&updated, &path.display().to_string())?;

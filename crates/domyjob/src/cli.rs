@@ -658,7 +658,9 @@ enum TrustAction {
     Ls,
     #[command(about = "Remove a pairing, in either direction")]
     Revoke {
-        #[arg(help = "A machine name or a key fingerprint")]
+        #[arg(
+            help = "A machine name or key fingerprint; prefix with name: or fingerprint: if ambiguous"
+        )]
         who: String,
     },
 }
@@ -715,6 +717,14 @@ struct SelfArgs {
 
 #[derive(Debug, Subcommand)]
 enum SelfAction {
+    #[command(about = "Inspect and secure legacy Windows state ACLs without changing stored data")]
+    SecureState {
+        #[arg(
+            long,
+            help = "Show the state inventory and proposed ACL changes without applying them"
+        )]
+        dry_run: bool,
+    },
     #[command(about = "Replace this copy with the newest signed release")]
     Update {
         #[arg(long, help = "Install the release even if it is older than this copy")]
@@ -836,6 +846,8 @@ enum CliError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Node(#[from] crate::node::NodeError),
+    #[error(transparent)]
+    LegacyAcl(#[from] crate::platform::LegacyAclError),
     #[error("{0:?} is not KEY=VALUE with a valid variable name")]
     Env(String),
     #[error("{0:?} is not a revision; write it as @REV")]
@@ -850,6 +862,8 @@ enum CliError {
     NoHook(String),
     #[error("every machine refused the job")]
     NothingSubmitted,
+    #[error("watch accepts at most {limit} jobs at once (received {actual})")]
+    TooManyWatches { actual: usize, limit: usize },
     #[error("{0:?} is not a capability: use submit, observe, fetch, or kill")]
     Grant(String),
     #[error(transparent)]
@@ -862,6 +876,30 @@ enum CliError {
     Pattern(String),
     #[error(transparent)]
     Pull(#[from] crate::pull::PullError),
+}
+
+impl CliError {
+    fn is_output_broken_pipe(&self) -> bool {
+        match self {
+            Self::Output(error) => error.kind() == std::io::ErrorKind::BrokenPipe,
+            Self::Client(_)
+            | Self::Node(_)
+            | Self::LegacyAcl(_)
+            | Self::Env(_)
+            | Self::Rev(_)
+            | Self::Readiness
+            | Self::Mcp(_)
+            | Self::NoHook(_)
+            | Self::NothingSubmitted
+            | Self::TooManyWatches { .. }
+            | Self::Grant(_)
+            | Self::Serve(_)
+            | Self::Service(_)
+            | Self::Declined(_)
+            | Self::Pattern(_)
+            | Self::Pull(_) => false,
+        }
+    }
 }
 
 const FAILED_JOB: u8 = 1;
@@ -904,12 +942,23 @@ fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
     use crate::diagnosis::{Diagnosis, Kind};
     match error {
         CliError::Client(client) => crate::diagnosis::of_client(client),
-        CliError::Env(_)
+        CliError::LegacyAcl(
+            crate::platform::LegacyAclError::NotDirectory { .. }
+            | crate::platform::LegacyAclError::Foreign { .. }
+            | crate::platform::LegacyAclError::UnsafeEntry { .. }
+            | crate::platform::LegacyAclError::Remaining { .. },
+        ) => Diagnosis {
+            kind: Kind::Security,
+            hint: None,
+        },
+        CliError::LegacyAcl(crate::platform::LegacyAclError::Unsupported)
+        | CliError::Env(_)
         | CliError::Rev(_)
         | CliError::Readiness
         | CliError::Grant(_)
         | CliError::NoHook(_)
         | CliError::Pattern(_)
+        | CliError::TooManyWatches { .. }
         | CliError::Declined(_) => Diagnosis {
             kind: Kind::Usage,
             hint: None,
@@ -920,6 +969,10 @@ fn diagnose(error: &CliError) -> crate::diagnosis::Diagnosis {
         },
         CliError::Pull(error) => crate::diagnosis::of_pull(error),
         CliError::Node(_)
+        | CliError::LegacyAcl(
+            crate::platform::LegacyAclError::Io(_)
+            | crate::platform::LegacyAclError::InventoryLimit { .. },
+        )
         | CliError::Output(_)
         | CliError::Mcp(_)
         | CliError::Serve(_)
@@ -947,9 +1000,7 @@ pub fn main() -> ExitCode {
     };
     match outcome {
         Ok(code) => code,
-        Err(CliError::Output(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-            ExitCode::SUCCESS
-        }
+        Err(error) if error.is_output_broken_pipe() => ExitCode::SUCCESS,
         Err(error) => {
             let diagnosis = diagnose(&error);
             if json {
@@ -1037,6 +1088,9 @@ fn dispatch_machine(command: MachineCommand) -> Result<ExitCode, CliError> {
         MachineCommand::Setup(args) => setup(&args),
         MachineCommand::Doctor(args) => doctor(&args),
         MachineCommand::Myself(SelfArgs {
+            action: SelfAction::SecureState { dry_run },
+        }) => self_secure_state(dry_run),
+        MachineCommand::Myself(SelfArgs {
             action: SelfAction::Update { allow_downgrade },
         }) => self_update(allow_downgrade),
         MachineCommand::Myself(SelfArgs {
@@ -1046,6 +1100,23 @@ fn dispatch_machine(command: MachineCommand) -> Result<ExitCode, CliError> {
             kill_running,
         }),
     }
+}
+
+fn self_secure_state(dry_run: bool) -> Result<ExitCode, CliError> {
+    let dirs = Dirs::from_env();
+    let report = crate::platform::secure_legacy_state(dirs.state(), !dry_run)?;
+    if dry_run {
+        println!(
+            "inspected {} state entries; {} legacy ACLs can be secured",
+            report.scanned, report.candidates
+        );
+    } else {
+        println!(
+            "secured {} legacy ACLs across {} state entries",
+            report.candidates, report.scanned
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn dispatch_peer(command: PeerCommand) -> Result<ExitCode, CliError> {
@@ -1078,14 +1149,9 @@ fn node(args: &NodeArgs) -> Result<ExitCode, CliError> {
         crate::proc::reap(group);
         return Ok(ExitCode::SUCCESS);
     }
-    let mut dirs = Dirs::from_env();
+    let dirs = Dirs::from_env();
     if let Some(id) = &args.supervise {
-        if let Some(state) = &args.state_dir {
-            dirs.state.clone_from(state);
-        }
-        if let Some(home) = &args.home_dir {
-            dirs.home.clone_from(home);
-        }
+        let dirs = dirs.with_supervisor_paths(args.state_dir.as_ref(), args.home_dir.as_ref());
         crate::supervisor::supervise(dirs, id, readiness(args)?, crate::supervisor::Stops::Heard)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -1364,7 +1430,7 @@ fn announce(submitted: &[Submitted], json: bool) -> Result<(), CliError> {
 }
 
 fn spawn_watch(submitted: &[Submitted], notify: &[String]) -> Result<(), CliError> {
-    let exe = std::env::current_exe().map_err(CliError::Output)?;
+    let exe = crate::proc::Executable::current().map_err(CliError::Output)?;
     let mut args = vec![Arg::literal("watch")];
     if notify.is_empty() {
         args.push(Arg::literal("--config-defaults"));
@@ -1503,6 +1569,17 @@ enum Verdict {
     NotRun,
 }
 
+impl Verdict {
+    const fn failure_code(self) -> Option<i32> {
+        match self {
+            Self::Failed(Some(code)) => Some(code),
+            Self::Failed(None) | Self::Succeeded | Self::Pending | Self::Unknown | Self::NotRun => {
+                None
+            }
+        }
+    }
+}
+
 const fn verdict_of(job: &Job) -> Verdict {
     match job.state() {
         crate::protocol::State::Succeeded => Verdict::Succeeded,
@@ -1517,17 +1594,31 @@ const fn verdict_of(job: &Job) -> Verdict {
 }
 
 fn exit_for(verdicts: &[Verdict]) -> u8 {
-    let failed = |verdict: &Verdict| matches!(verdict, Verdict::Failed(_));
-    let unknown = |verdict: &Verdict| matches!(verdict, Verdict::Unknown | Verdict::NotRun);
-    match verdicts {
-        [] => UNKNOWN,
-        [Verdict::Failed(Some(code))] => match u8::try_from((*code).clamp(1, 255)) {
+    if verdicts.is_empty() {
+        return UNKNOWN;
+    }
+    if let [verdict] = verdicts
+        && let Some(code) = verdict.failure_code()
+    {
+        return match u8::try_from(code.clamp(1, 255)) {
             Ok(byte) => byte,
             Err(_out_of_range) => FAILED_JOB,
-        },
-        _ if verdicts.iter().any(failed) => FAILED_JOB,
-        _ if verdicts.iter().any(unknown) => UNKNOWN,
-        _ => 0,
+        };
+    }
+    let failed = |verdict: &Verdict| match verdict {
+        Verdict::Failed(_) => true,
+        Verdict::Succeeded | Verdict::Pending | Verdict::Unknown | Verdict::NotRun => false,
+    };
+    let unknown = |verdict: &Verdict| match verdict {
+        Verdict::Unknown | Verdict::NotRun => true,
+        Verdict::Succeeded | Verdict::Pending | Verdict::Failed(_) => false,
+    };
+    if verdicts.iter().any(failed) {
+        FAILED_JOB
+    } else if verdicts.iter().any(unknown) {
+        UNKNOWN
+    } else {
+        0
     }
 }
 
@@ -1612,27 +1703,23 @@ fn finish(
         common,
         board,
     };
-    std::thread::scope(|scope| -> Result<(), CliError> {
-        let (done, finished) = std::sync::mpsc::channel();
-        for (index, item) in submitted.iter().enumerate() {
-            let done = done.clone();
-            let watching = &watching;
-            scope.spawn(move || match done.send((index, watching.one(item))) {
-                Ok(()) | Err(_) => {}
-            });
-        }
-        drop(done);
-        let mut waiting: Vec<bool> = vec![true; submitted.len()];
-        for (index, outcome) in finished {
-            let Some(item) = submitted.get(index) else {
-                continue;
-            };
-            if let Some(slot) = waiting.get_mut(index) {
-                *slot = false;
-            }
-            if let Some(verdict) = verdicts.get_mut(index) {
-                *verdict = settle(&settling, item, outcome)?;
-            }
+    let indices: Vec<usize> = (0..submitted.len()).collect();
+    let mut waiting: Vec<bool> = vec![true; submitted.len()];
+    crate::fanout::try_arrivals(
+        &indices,
+        |index| {
+            submitted
+                .get(*index)
+                .ok_or(ClientError::Panicked)
+                .and_then(|item| watching.one(item))
+        },
+        |index, outcome| {
+            let outcome = outcome.map_err(|crate::fanout::Panicked| ClientError::Panicked)?;
+            let item = submitted.get(*index).ok_or(ClientError::Panicked)?;
+            let pending = waiting.get_mut(*index).ok_or(ClientError::Panicked)?;
+            *pending = false;
+            let verdict = verdicts.get_mut(*index).ok_or(ClientError::Panicked)?;
+            *verdict = settle(&settling, item, outcome)?;
             let still: Vec<String> = submitted
                 .iter()
                 .zip(&waiting)
@@ -1642,9 +1729,9 @@ fn finish(
             if !common.display.json && !board.is_live() && !board.is_quiet() && !still.is_empty() {
                 eprintln!("domyjob: still waiting for {}", still.join(", "));
             }
-        }
-        Ok(())
-    })?;
+            Ok::<(), CliError>(())
+        },
+    )?;
     verdicts.extend(std::iter::repeat_n(Verdict::NotRun, not_run));
     Ok(ExitCode::from(exit_for(&verdicts)))
 }
@@ -2105,41 +2192,26 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
     let machines = ctx.select(&args.targets)?;
     let mut all_ok = true;
     let mut answers = Vec::new();
-    std::thread::scope(|scope| -> Result<(), CliError> {
-        let handles: Vec<_> = machines
-            .iter()
-            .map(|machine| {
-                let ctx = &ctx;
-                (
-                    machine,
-                    scope.spawn(move || {
-                        client::clean(
-                            ctx,
-                            machine,
-                            (!args.dry_run, args.more.logs, args.more.all_idle),
-                        )
-                    }),
-                )
-            })
-            .collect();
-        for (machine, handle) in handles {
-            let result = match handle.join() {
-                Ok(result) => result,
-                Err(_panicked) => return Err(ClientError::Panicked.into()),
-            };
-            all_ok &= result.is_ok();
-            match result {
-                Ok(cleaned) if !args.json => show(crate::view::cleaned(&machine.name, &cleaned))?,
-                Err(error) if !args.json => crate::ui::report_error(
-                    &error.to_string(),
-                    None,
-                    crate::diagnosis::of_remote(&error).hint.as_deref(),
-                ),
-                answer @ (Ok(_) | Err(_)) => answers.push((&machine.name, answer)),
-            }
+    let results = crate::fanout::gathered(&machines, |machine| {
+        client::clean(
+            &ctx,
+            machine,
+            (!args.dry_run, args.more.logs, args.more.all_idle),
+        )
+    });
+    for (machine, result) in machines.iter().zip(results) {
+        let result = result.map_err(|crate::fanout::Panicked| ClientError::Panicked)?;
+        all_ok &= result.is_ok();
+        match result {
+            Ok(cleaned) if !args.json => show(crate::view::cleaned(&machine.name, &cleaned))?,
+            Err(error) if !args.json => crate::ui::report_error(
+                &error.to_string(),
+                None,
+                crate::diagnosis::of_remote(&error).hint.as_deref(),
+            ),
+            answer @ (Ok(_) | Err(_)) => answers.push((&machine.name, answer)),
         }
-        Ok(())
-    })?;
+    }
     if args.json {
         let cleaned = crate::output::Machines {
             machines: answers
@@ -2172,40 +2244,32 @@ fn overview(json: bool) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     let now = Timestamp::observe();
-    let (answers, answered) = std::sync::mpsc::channel();
     let mut reachable = true;
     let mut gathered = Vec::new();
-    std::thread::scope(|scope| -> Result<(), CliError> {
-        for machine in &machines {
-            let answers = answers.clone();
-            let ctx = &ctx;
-            scope.spawn(move || {
-                let survey = client::survey(ctx, machine);
-                match answers.send((machine.name.clone(), survey)) {
-                    Ok(()) | Err(_) => {}
-                }
-            });
-        }
-        drop(answers);
-        for (name, survey) in answered {
+    crate::fanout::try_arrivals(
+        &machines,
+        |machine| client::survey(&ctx, machine),
+        |machine, survey| {
+            let name = &machine.name;
+            let survey = survey.map_err(|crate::fanout::Panicked| ClientError::Panicked)?;
             reachable &= survey.is_ok();
             if json {
-                gathered.push((name, survey));
-                continue;
+                gathered.push((name.clone(), survey));
+                return Ok::<(), CliError>(());
             }
             match survey {
                 Ok((report, jobs)) => {
-                    show(crate::view::machine_card(&name, &report, &jobs, now))?;
+                    show(crate::view::machine_card(name, &report, &jobs, now))?;
                 }
                 Err(error) => show(crate::view::unreachable_card(
-                    &name,
-                    &crate::output::unprefixed(&name, &error),
+                    name,
+                    &crate::output::unprefixed(name, &error),
                     crate::diagnosis::of_remote(&error).hint.as_deref(),
                 ))?,
             }
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     if json {
         gathered.sort_by(|a, b| a.0.cmp(&b.0));
         let surveyed = crate::output::Machines {
@@ -2332,16 +2396,11 @@ type JobQuery = fn(&Context, &str) -> Result<(Machine, Job), ClientError>;
 fn jobs_command(args: &WaitArgs, ask: JobQuery) -> Result<ExitCode, CliError> {
     let ctx = Context::load()?;
     let mut verdicts = Vec::new();
-    std::thread::scope(|scope| -> Result<(), CliError> {
-        let (done, finished) = std::sync::mpsc::channel();
-        for reference in &args.jobs {
-            let (ctx, done) = (&ctx, done.clone());
-            scope.spawn(move || match done.send((reference, ask(ctx, reference))) {
-                Ok(()) | Err(_) => {}
-            });
-        }
-        drop(done);
-        for (reference, outcome) in finished {
+    crate::fanout::try_arrivals(
+        &args.jobs,
+        |reference| ask(&ctx, reference),
+        |reference, outcome| {
+            let outcome = outcome.map_err(|crate::fanout::Panicked| ClientError::Panicked)?;
             match outcome {
                 Ok((machine, job)) => {
                     print_job(&machine.name, &job, args.json)?;
@@ -2352,9 +2411,9 @@ fn jobs_command(args: &WaitArgs, ask: JobQuery) -> Result<ExitCode, CliError> {
                     eprintln!("domyjob: {reference}: {error}");
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok::<(), CliError>(())
+        },
+    )?;
     Ok(exit(&verdicts))
 }
 
@@ -2488,7 +2547,7 @@ fn show_pulled(
     let root = root.display();
     match (applied, pulling) {
         _ if steps.is_empty() => eprintln!("domyjob: {reference} changed no files"),
-        (None, _) => {}
+        (None, Pulling::Forward | Pulling::Back) => {}
         (Some(applied), Pulling::Forward) if applied.changed == 0 => {
             eprintln!("domyjob: {root} already matches {reference}");
         }
@@ -2620,8 +2679,8 @@ fn self_uninstall(
     if !confirmed {
         println!(
             "would remove the domyjob service if one is installed, this machine's domyjob key, {} (jobs, workspaces, audit log), and {} (cached binaries)",
-            dirs.state.display(),
-            dirs.cache.display()
+            dirs.state().display(),
+            dirs.cache().display()
         );
         println!("run `domyjob self uninstall --yes` to remove them");
         return Ok(ExitCode::SUCCESS);
@@ -2644,9 +2703,9 @@ fn self_uninstall(
         kept.push(format!("the service ({error})"));
     }
     dirs.keys
-        .forget(&dirs.state, "identity")
+        .forget(dirs.state(), "identity")
         .map_err(|e| CliError::Declined(e.to_string()))?;
-    for dir in [&dirs.state, &dirs.cache] {
+    for dir in [dirs.state(), dirs.cache()] {
         if let Err(error) = crate::state_file::remove_tree_forcibly(dir) {
             kept.push(format!("{} ({error})", dir.display()));
         }
@@ -2698,30 +2757,33 @@ fn machines_rewitness(args: &RewitnessArgs) -> Result<ExitCode, CliError> {
 
 fn serve(args: &ServeArgs) -> Result<ExitCode, CliError> {
     let dirs = Dirs::from_env();
-    if matches!(args.service, Some(ServiceAction::Install)) {
-        let exe = std::env::current_exe().map_err(CliError::Output)?;
-        let expose = args.expose.clone().unwrap_or_else(|| "tailnet".to_owned());
-        crate::serve::Exposure::parse(&expose).map_err(ClientError::from)?;
-        let serve_args = vec![
-            Arg::literal("--expose"),
-            Arg::user(&crate::input::UserText::from_cli(CliText(expose))),
-            Arg::literal("--port"),
-            Arg::number(u64::from(args.port)),
-        ];
-        let placed = crate::service::install(&dirs, &exe, &serve_args)?;
-        println!("domyjob serve now starts with your session ({placed})");
-        return Ok(ExitCode::SUCCESS);
-    }
-    if matches!(args.service, Some(ServiceAction::Uninstall)) {
-        match crate::service::uninstall(&dirs)? {
-            crate::service::Uninstalled::Service => {
-                println!("domyjob serve no longer starts with your session");
-            }
-            crate::service::Uninstalled::Nothing => {
-                println!("domyjob serve was not set to start with your session");
-            }
+    match &args.service {
+        Some(ServiceAction::Install) => {
+            let exe = crate::proc::Executable::current().map_err(CliError::Output)?;
+            let expose = args.expose.clone().unwrap_or_else(|| "tailnet".to_owned());
+            crate::serve::Exposure::parse(&expose).map_err(ClientError::from)?;
+            let serve_args = vec![
+                Arg::literal("--expose"),
+                Arg::user(&crate::input::UserText::from_cli(CliText(expose))),
+                Arg::literal("--port"),
+                Arg::number(u64::from(args.port)),
+            ];
+            let placed = crate::service::install(&dirs, &exe, &serve_args)?;
+            println!("domyjob serve now starts with your session ({placed})");
+            return Ok(ExitCode::SUCCESS);
         }
-        return Ok(ExitCode::SUCCESS);
+        Some(ServiceAction::Uninstall) => {
+            match crate::service::uninstall(&dirs)? {
+                crate::service::Uninstalled::Service => {
+                    println!("domyjob serve no longer starts with your session");
+                }
+                crate::service::Uninstalled::Nothing => {
+                    println!("domyjob serve was not set to start with your session");
+                }
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        None => {}
     }
     let exposure = match &args.expose {
         Some(text) => crate::serve::Exposure::parse(text).map_err(ClientError::from)?,
@@ -2974,25 +3036,19 @@ fn setup(args: &SetupArgs) -> Result<ExitCode, CliError> {
         )
     };
     let mut all_ok = true;
-    std::thread::scope(|scope| {
-        let (done, finished) = std::sync::mpsc::channel();
-        for machine in &machines {
-            let (install, done) = (&install, done.clone());
-            scope.spawn(move || match done.send((machine, install(machine))) {
-                Ok(()) | Err(_) => {}
-            });
-        }
-        drop(done);
-        for (machine, outcome) in finished {
-            match outcome {
-                Ok(hello) => println!(
-                    "{}\t{}/{}\t{}",
-                    machine.name, hello.os, hello.arch, hello.version
-                ),
-                Err(error) => {
-                    all_ok = false;
-                    eprintln!("domyjob: {}: {error}", machine.name);
-                }
+    crate::fanout::arrivals(&machines, install, |machine, outcome| {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(crate::fanout::Panicked) => Err(ClientError::Panicked),
+        };
+        match outcome {
+            Ok(hello) => println!(
+                "{}\t{}/{}\t{}",
+                machine.name, hello.os, hello.arch, hello.version
+            ),
+            Err(error) => {
+                all_ok = false;
+                eprintln!("domyjob: {}: {error}", machine.name);
             }
         }
     });
@@ -3070,7 +3126,7 @@ fn doctor_live(
     show(crate::view::doctor_local(
         protection,
         fits,
-        &ctx.dirs.state.display().to_string(),
+        &ctx.dirs.state().display().to_string(),
     ))?;
     if machines.is_empty() {
         show(crate::view::first_run())?;
@@ -3082,18 +3138,11 @@ fn doctor_live(
         .max()
         .unwrap_or(0);
     let mut problems = usize::from(!fits);
-    std::thread::scope(|scope| -> Result<(), CliError> {
-        let (done, finished) = std::sync::mpsc::channel();
-        for machine in machines {
-            let done = done.clone();
-            scope.spawn(
-                move || match done.send((machine, client::examine_one(ctx, machine))) {
-                    Ok(()) | Err(_) => {}
-                },
-            );
-        }
-        drop(done);
-        for (machine, outcome) in finished {
+    crate::fanout::try_arrivals(
+        machines,
+        |machine| client::examine_one(ctx, machine),
+        |machine, outcome| {
+            let outcome = outcome.map_err(|crate::fanout::Panicked| ClientError::Panicked)?;
             match outcome {
                 Ok(facts) => show(crate::view::doctor_reached(&machine.name, &facts, widest))?,
                 Err(error) => {
@@ -3107,9 +3156,9 @@ fn doctor_live(
                     ))?;
                 }
             }
-        }
-        Ok(())
-    })?;
+            Ok::<(), CliError>(())
+        },
+    )?;
     let verdict = match problems {
         0 => crate::ui::paint(crate::ui::Tone::Good, "everything answers"),
         1 => crate::ui::paint(crate::ui::Tone::Bad, "1 problem"),
@@ -3132,7 +3181,7 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
     let protection = crate::trust::Identity::protection(&ctx.dirs).describe();
     let socket = ctx
         .dirs
-        .state
+        .state()
         .join("v3")
         .join("live")
         .join("0000000000000000.sock");
@@ -3145,7 +3194,11 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
         .iter()
         .map(|(name, result)| checked(name, result))
         .collect();
-    let all_ok = socket_fits && rows.iter().all(|row| matches!(row, Checked::Answer(_)));
+    let all_ok = socket_fits
+        && rows.iter().all(|row| match row {
+            Checked::Answer(_) => true,
+            Checked::Unreachable(_) => false,
+        });
     let mut out = std::io::stdout().lock();
     if args.json {
         let checkup = crate::output::Checkup {
@@ -3163,7 +3216,7 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
             writeln!(
                 out,
                 "this machine: {} is too long for local sockets; set DOMYJOB_STATE to a shorter directory",
-                ctx.dirs.state.display()
+                ctx.dirs.state().display()
             )
             .map_err(CliError::Output)?;
         }
@@ -3180,11 +3233,14 @@ fn doctor(args: &DoctorArgs) -> Result<ExitCode, CliError> {
 }
 
 fn skill(args: &SkillArgs) -> Result<ExitCode, CliError> {
-    let Some(SkillAction::Install { to }) = &args.action else {
-        std::io::stdout()
-            .write_all(SKILL.as_bytes())
-            .map_err(CliError::Output)?;
-        return Ok(ExitCode::SUCCESS);
+    let to = match &args.action {
+        Some(SkillAction::Install { to }) => to,
+        None => {
+            std::io::stdout()
+                .write_all(SKILL.as_bytes())
+                .map_err(CliError::Output)?;
+            return Ok(ExitCode::SUCCESS);
+        }
     };
     for directory in to {
         let path = directory.join("SKILL.md");
@@ -3211,13 +3267,29 @@ fn watch(args: &WatchArgs) -> Result<ExitCode, CliError> {
     } else {
         notify_targets(&ctx, &args.notify)
     };
+    let jobs = crate::fanout::ConcurrentBatch::<String, MAX_WATCHES>::new(&args.jobs).map_err(
+        |too_many| CliError::TooManyWatches {
+            actual: too_many.actual,
+            limit: too_many.limit,
+        },
+    )?;
+    run_watches(&ctx, &targets, &jobs);
+    Ok(ExitCode::SUCCESS)
+}
+
+const MAX_WATCHES: usize = 64;
+
+fn run_watches(
+    ctx: &Context,
+    targets: &[NotifyTarget],
+    jobs: &crate::fanout::ConcurrentBatch<'_, String, MAX_WATCHES>,
+) {
     std::thread::scope(|scope| {
-        for reference in &args.jobs {
-            let (ctx, targets) = (&ctx, &targets);
+        for reference in jobs.items() {
+            let (ctx, targets) = (ctx, targets);
             scope.spawn(move || watch_one(ctx, reference, targets));
         }
     });
-    Ok(ExitCode::SUCCESS)
 }
 
 const WATCH_ATTEMPTS: u32 = 5;
@@ -3237,7 +3309,10 @@ fn watch_one(ctx: &Context, reference: &str, targets: &[NotifyTarget]) {
                 }
                 return;
             }
-            Err(error) if attempts_left > 0 && !matches!(error, ClientError::Unknown(_)) => {
+            Err(error)
+                if attempts_left > 0
+                    && error.watch_retryability() == client::Retryability::Retryable =>
+            {
                 note_watch(
                     ctx,
                     &format!("waiting for {reference}: {error}; trying again"),
@@ -3265,7 +3340,7 @@ fn watch_one(ctx: &Context, reference: &str, targets: &[NotifyTarget]) {
 }
 
 fn note_watch(ctx: &Context, line: &str) {
-    let path = ctx.dirs.state.join("watch.log");
+    let path = ctx.dirs.state().join("watch.log");
     if let Ok(mut file) = crate::state_file::open_append(&path) {
         match writeln!(file, "{} {line}", Timestamp::observe()) {
             Ok(()) | Err(_) => {}

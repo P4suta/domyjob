@@ -4,12 +4,17 @@ use domyjob::lock::OsLock;
 fn locks_exclude_each_other_and_free_on_release() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("slots");
-    let (first, held) = OsLock::first_free(&dir, 2).unwrap().unwrap();
-    let (second, other) = OsLock::first_free(&dir, 2).unwrap().unwrap();
-    assert_eq!((first, second), (0, 1));
-    assert!(OsLock::first_free(&dir, 2).unwrap().is_none());
+    let (first, held) = OsLock::first_free(&dir).unwrap().unwrap();
+    let (second, other) = OsLock::first_free(&dir).unwrap().unwrap();
+    assert_eq!(first.to_string(), "0");
+    assert_eq!(second.to_string(), "1");
+    let (third, next) = OsLock::first_free(&dir).unwrap().unwrap();
+    assert_eq!(third.to_string(), "2");
     held.release().unwrap();
-    assert_eq!(OsLock::first_free(&dir, 2).unwrap().unwrap().0, 0);
+    let (reused, released) = OsLock::first_free(&dir).unwrap().unwrap();
+    assert_eq!(reused, first);
+    released.release().unwrap();
+    drop(next);
     drop(other);
     assert!(
         OsLock::try_exclusive(&dir.join("1.lock"))

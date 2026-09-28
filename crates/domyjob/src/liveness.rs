@@ -15,6 +15,7 @@ pub const FIRST_WORD: Duration = Duration::from_secs(120);
 
 pub const STREAM_BEAT: u32 = u32::MAX;
 const STREAM_REPLY: &[u8] = br#"{"reply":"stream"}"#;
+const NEED_BLOBS_REPLY: &[u8] = br#"{"reply":"need_blobs""#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -49,6 +50,8 @@ impl Write for Pulsed<'_> {
         if beating.stage == Stage::Answering {
             beating.stage = if bytes.starts_with(STREAM_REPLY) {
                 Stage::Streaming
+            } else if bytes.starts_with(NEED_BLOBS_REPLY) {
+                Stage::Answering
             } else {
                 Stage::Answered
             };
@@ -394,6 +397,21 @@ mod tests {
         assert_eq!(answered, 7);
         assert_eq!(out, b"{\"reply\":\"job\"}\n");
         assert!(started.elapsed() < BEAT);
+    }
+
+    #[test]
+    fn a_snapshot_request_keeps_beating_after_the_blob_list() {
+        let (told, heard) = std::sync::mpsc::channel();
+        let mut seen = Vec::new();
+        with_pulse_every(&mut crate::faults::Told(told), QUICK, |pulsed| {
+            pulsed
+                .write_all(b"{\"reply\":\"need_blobs\",\"blobs\":[]}\n")
+                .unwrap();
+            until_written(&heard, b"\n", &mut seen);
+            pulsed.write_all(b"{\"reply\":\"job\"}\n").unwrap();
+            pause(QUICK * 4);
+        });
+        assert_eq!(seen, b"{\"reply\":\"need_blobs\",\"blobs\":[]}\n\n");
     }
 
     struct Hungup;

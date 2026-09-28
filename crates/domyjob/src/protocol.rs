@@ -9,7 +9,7 @@ use crate::domain::{
 };
 use crate::terminal::RemoteText;
 
-const FRAMING: &str = "json lines; a stream is u32 big-endian lengths, 0 to end, u32::MAX to beat, then an ending line; changes stream a changed line, the sent manifest, then each file left";
+const FRAMING: &str = "json lines; a snapshot submission sends its manifest frame, receives need_blobs, sends exactly those blob frames, then receives the job; a stream is u32 big-endian lengths, 0 to end, u32::MAX to beat, then an ending line; changes stream a changed line, the sent manifest, then each file left";
 
 #[must_use]
 pub fn wire() -> &'static str {
@@ -35,14 +35,22 @@ pub fn build_key() -> &'static str {
     KEY.get_or_init(|| format!("{VERSION}-{}-{BUILD_STAMP}", wire()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionRelation {
+    Newer,
+    OlderOrEqual,
+    Unparsable,
+}
+
 #[must_use]
-pub fn is_newer(theirs: &str) -> bool {
+pub fn version_relation(theirs: &str) -> VersionRelation {
     match (
         semver::Version::parse(theirs),
         semver::Version::parse(VERSION),
     ) {
-        (Ok(theirs), Ok(ours)) => theirs > ours,
-        (Ok(_) | Err(_), Ok(_) | Err(_)) => false,
+        (Ok(theirs), Ok(ours)) if theirs > ours => VersionRelation::Newer,
+        (Ok(_), Ok(_)) => VersionRelation::OlderOrEqual,
+        (Err(_), _) | (Ok(_), Err(_)) => VersionRelation::Unparsable,
     }
 }
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -53,12 +61,6 @@ pub const BUILD_STAMP: &str = env!("DOMYJOB_BUILD_STAMP");
 pub enum Request {
     Hello,
     Hold,
-    Missing {
-        blobs: Vec<BlobId>,
-    },
-    Upload {
-        count: u64,
-    },
     Submit {
         submission: Box<Submission>,
     },
@@ -131,11 +133,8 @@ pub enum Follow {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reply")]
 pub enum Reply {
     Hello(Hello),
-    Missing {
+    NeedBlobs {
         blobs: Vec<BlobId>,
-    },
-    Stored {
-        count: u64,
     },
     Job(Box<Job>),
     Jobs {
@@ -166,11 +165,49 @@ macro_rules! into_variant {
 }
 
 impl Reply {
+    #[must_use]
+    pub(crate) const fn refusal(&self) -> Option<&Refusal> {
+        match self {
+            Self::Refused(refusal) => Some(refusal),
+            Self::Hello(_)
+            | Self::NeedBlobs { .. }
+            | Self::Job(_)
+            | Self::Jobs { .. }
+            | Self::Stream
+            | Self::AuditAt { .. }
+            | Self::AuditHead(_)
+            | Self::Digest(_)
+            | Self::Found(_)
+            | Self::Report(_)
+            | Self::Cleaned(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn needs_content_retry(&self) -> bool {
+        match self.refusal() {
+            Some(refusal) => match refusal.code {
+                RefusalCode::MissingContent => true,
+                RefusalCode::BadRequest
+                | RefusalCode::NoSuchJob
+                | RefusalCode::AmbiguousJob
+                | RefusalCode::NoWorkspace
+                | RefusalCode::Forbidden
+                | RefusalCode::Storage
+                | RefusalCode::Spawn
+                | RefusalCode::NoSuchPath
+                | RefusalCode::NotAFile
+                | RefusalCode::DiskFull
+                | RefusalCode::Paused => false,
+            },
+            None => false,
+        }
+    }
+
     into_variant!(into_report, Report, Self::Report(report) => *report);
     into_variant!(into_cleaned, Cleaned, Self::Cleaned(cleaned) => *cleaned);
     into_variant!(into_hello, Hello, Self::Hello(hello) => hello);
-    into_variant!(into_missing, Vec<BlobId>, Self::Missing { blobs } => blobs);
-    into_variant!(into_stored, u64, Self::Stored { count } => count);
+    into_variant!(into_need_blobs, Vec<BlobId>, Self::NeedBlobs { blobs } => blobs);
     into_variant!(into_job, Job, Self::Job(job) => *job);
     into_variant!(into_jobs, (Vec<Job>, Vec<Unreadable>), Self::Jobs { jobs, unreadable } => (jobs, unreadable));
     into_variant!(into_stream, (), Self::Stream => ());
@@ -249,7 +286,82 @@ impl crate::ingress::Ingress for Survey {}
 #[serde(deny_unknown_fields)]
 pub struct Cleaned {
     pub applied: bool,
-    pub items: Vec<Freeable>,
+    pub items: CleanReportItems,
+}
+
+pub(crate) const CLEAN_DETAIL_LIMIT: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct CleanReportItems(
+    #[serde(deserialize_with = "bounded_clean_items")]
+    #[schemars(length(max = CLEAN_DETAIL_LIMIT + 1))]
+    Vec<Freeable>,
+);
+
+impl CleanReportItems {
+    pub(crate) fn from_parts(
+        details: [Option<Freeable>; CLEAN_DETAIL_LIMIT],
+        summary: Option<Freeable>,
+    ) -> Self {
+        let mut items: Vec<_> = details.into_iter().flatten().collect();
+        items.extend(summary);
+        Self(items)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn one(item: Freeable) -> Self {
+        let mut details = std::array::from_fn(|_| None);
+        details[0] = Some(item);
+        Self::from_parts(details, None)
+    }
+}
+
+impl std::ops::Deref for CleanReportItems {
+    type Target = [Freeable];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn bounded_clean_items<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Freeable>, D::Error> {
+    struct Bounded;
+
+    impl<'de> serde::de::Visitor<'de> for Bounded {
+        type Value = Vec<Freeable>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {} cleanable items",
+                CLEAN_DETAIL_LIMIT + 1
+            )
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut items = Vec::with_capacity(CLEAN_DETAIL_LIMIT + 1);
+            while items.len() < CLEAN_DETAIL_LIMIT + 1 {
+                match sequence.next_element()? {
+                    Some(item) => items.push(item),
+                    None => return Ok(items),
+                }
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "too many cleanable items",
+                ));
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -467,6 +579,16 @@ pub enum Location {
     Home,
 }
 
+impl Location {
+    #[must_use]
+    pub const fn source(&self) -> Option<&Source> {
+        match self {
+            Self::Snapshot { source, .. } => Some(source),
+            Self::Home => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Submission {
@@ -504,10 +626,7 @@ pub struct Spec {
 impl Spec {
     #[must_use]
     pub const fn source(&self) -> Option<&Source> {
-        match &self.location {
-            Location::Snapshot { source, .. } => Some(source),
-            Location::Home => None,
-        }
+        self.location.source()
     }
 }
 
@@ -532,6 +651,28 @@ pub enum Phase {
         finished_at: Timestamp,
         outcome: Outcome,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhaseKind {
+    Queued,
+    Preparing,
+    Starting,
+    Running,
+    Finished,
+}
+
+impl Phase {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> PhaseKind {
+        match self {
+            Self::Queued => PhaseKind::Queued,
+            Self::Preparing { .. } => PhaseKind::Preparing,
+            Self::Starting { .. } => PhaseKind::Starting,
+            Self::Running { .. } => PhaseKind::Running,
+            Self::Finished { .. } => PhaseKind::Finished,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -589,6 +730,34 @@ impl State {
             Self::Lost => "lost",
         }
     }
+
+    #[must_use]
+    pub const fn counts_as_running(self) -> bool {
+        match self {
+            Self::Preparing | Self::Running => true,
+            Self::Queued
+            | Self::RestartPending
+            | Self::Succeeded
+            | Self::Failed
+            | Self::Killed
+            | Self::Errored
+            | Self::Lost => false,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_timing_sample(self) -> bool {
+        match self {
+            Self::Succeeded | Self::Failed => true,
+            Self::Queued
+            | Self::Preparing
+            | Self::Running
+            | Self::RestartPending
+            | Self::Killed
+            | Self::Errored
+            | Self::Lost => false,
+        }
+    }
 }
 
 impl Job {
@@ -605,12 +774,14 @@ impl Job {
     #[must_use]
     pub const fn state(&self) -> State {
         match (&self.phase, self.supervisor) {
-            (Phase::Finished { outcome, .. }, _) => match outcome {
-                Outcome::Succeeded => State::Succeeded,
-                Outcome::Failed { .. } => State::Failed,
-                Outcome::Killed => State::Killed,
-                Outcome::Errored { .. } => State::Errored,
-            },
+            (Phase::Finished { outcome, .. }, Supervisor::Alive | Supervisor::Gone) => {
+                match outcome {
+                    Outcome::Succeeded => State::Succeeded,
+                    Outcome::Failed { .. } => State::Failed,
+                    Outcome::Killed => State::Killed,
+                    Outcome::Errored { .. } => State::Errored,
+                }
+            }
             (Phase::Queued | Phase::Preparing { .. }, Supervisor::Gone) => State::RestartPending,
             (Phase::Starting { .. } | Phase::Running { .. }, Supervisor::Gone) => State::Lost,
             (Phase::Queued, Supervisor::Alive) => State::Queued,
@@ -621,14 +792,12 @@ impl Job {
 
     #[must_use]
     pub const fn is_settled(&self) -> bool {
-        matches!(
-            (&self.phase, self.supervisor),
-            (Phase::Finished { .. }, _)
-                | (
-                    Phase::Starting { .. } | Phase::Running { .. },
-                    Supervisor::Gone
-                )
-        )
+        match (&self.phase, self.supervisor) {
+            (Phase::Finished { .. }, Supervisor::Alive | Supervisor::Gone)
+            | (Phase::Starting { .. } | Phase::Running { .. }, Supervisor::Gone) => true,
+            (Phase::Queued | Phase::Preparing { .. }, Supervisor::Alive | Supervisor::Gone)
+            | (Phase::Starting { .. } | Phase::Running { .. }, Supervisor::Alive) => false,
+        }
     }
 
     #[must_use]
@@ -668,17 +837,15 @@ impl Job {
 
     #[must_use]
     pub const fn succeeded(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::Finished {
-                outcome: Outcome::Succeeded,
-                ..
+        match self.outcome() {
+            Some(Outcome::Succeeded) => true,
+            Some(Outcome::Failed { .. } | Outcome::Killed | Outcome::Errored { .. }) | None => {
+                false
             }
-        )
+        }
     }
 }
 
-impl crate::ingress::Ingress for Request {}
 impl crate::ingress::Ingress for Reply {}
 impl crate::ingress::Ingress for Frame {}
 impl crate::ingress::Ingress for Phase {}
@@ -688,7 +855,7 @@ impl crate::ingress::Ingress for Job {}
 impl crate::ingress::Ingress for Hello {}
 impl crate::ingress::Ingress for Digest {}
 impl crate::ingress::Ingress for Found {}
-impl crate::ingress::Ingress for Submission {}
+impl crate::ingress::Ingress for CleanReportItems {}
 
 #[cfg(test)]
 mod tests {
@@ -696,13 +863,73 @@ mod tests {
 
     #[test]
     fn requests_are_exact() {
-        let hello: Request = serde_json::from_str(r#"{"op":"hello"}"#).unwrap();
-        assert_eq!(hello, Request::Hello);
-        let kill: Request = serde_json::from_str(r#"{"op":"kill","job":"01ABC"}"#).unwrap();
-        assert!(matches!(kill, Request::Kill { .. }));
-        serde_json::from_str::<Request>(r#"{"op":"kill","job":"01ABC","x":1}"#).unwrap_err();
-        serde_json::from_str::<Request>(r#"{"op":"kill","job":"not-an-id"}"#).unwrap_err();
-        serde_json::from_str::<Request>(r#"{"op":"reboot"}"#).unwrap_err();
+        let hello: crate::ingress::PeerRequest =
+            crate::ingress::json_text(r#"{"op":"hello"}"#).unwrap();
+        assert_eq!(hello.audit().0.name, "hello");
+        let kill: crate::ingress::PeerRequest =
+            crate::ingress::json_text(r#"{"op":"kill","job":"01ABC"}"#).unwrap();
+        assert_eq!(kill.audit().0.name, "kill");
+        crate::ingress::json_text::<crate::ingress::PeerRequest>(
+            r#"{"op":"kill","job":"01ABC","x":1}"#,
+        )
+        .unwrap_err();
+        crate::ingress::json_text::<crate::ingress::PeerRequest>(
+            r#"{"op":"kill","job":"not-an-id"}"#,
+        )
+        .unwrap_err();
+        crate::ingress::json_text::<crate::ingress::PeerRequest>(r#"{"op":"reboot"}"#).unwrap_err();
+    }
+
+    #[test]
+    fn request_fuzz_seeds_cross_the_peer_boundary() {
+        for (name, bytes) in [
+            (
+                "hello",
+                &include_bytes!("../../../fuzz/seeds/requests/hello.json")[..],
+            ),
+            (
+                "list",
+                &include_bytes!("../../../fuzz/seeds/requests/list.json")[..],
+            ),
+            (
+                "search",
+                &include_bytes!("../../../fuzz/seeds/requests/search.json")[..],
+            ),
+            (
+                "clean",
+                &include_bytes!("../../../fuzz/seeds/requests/clean.json")[..],
+            ),
+            (
+                "configure",
+                &include_bytes!("../../../fuzz/seeds/requests/configure.json")[..],
+            ),
+            (
+                "submit",
+                &include_bytes!("../../../fuzz/seeds/requests/submit.json")[..],
+            ),
+        ] {
+            let peer: crate::ingress::PeerRequest = crate::ingress::json(bytes).unwrap();
+            assert_eq!(peer.audit().0.name, name);
+            crate::authz::authorize(crate::authz::Principal::Owner, peer).unwrap();
+        }
+    }
+
+    #[test]
+    fn clean_reports_refuse_more_than_the_bounded_detail_and_summary_slots() {
+        let one = Freeable {
+            what: RemoteText::new("workspace".to_owned()),
+            bytes: 1,
+        };
+        let within = serde_json::to_string(&vec![one.clone(); CLEAN_DETAIL_LIMIT + 1]).unwrap();
+        let parsed: CleanReportItems = crate::ingress::json_text(&within).unwrap();
+        assert_eq!(parsed.len(), CLEAN_DETAIL_LIMIT + 1);
+        let excess = serde_json::to_string(&vec![one; CLEAN_DETAIL_LIMIT + 2]).unwrap();
+        crate::ingress::json_text::<CleanReportItems>(&excess).unwrap_err();
+        let schema = serde_json::to_value(schemars::schema_for!(CleanReportItems)).unwrap();
+        assert_eq!(
+            schema.get("maxItems").and_then(serde_json::Value::as_u64),
+            Some(crate::domain::len_u64(CLEAN_DETAIL_LIMIT + 1))
+        );
     }
 
     #[test]
@@ -751,11 +978,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_release_above_this_one_counts_as_newer() {
-        assert!(is_newer("999.0.0"));
-        assert!(!is_newer(VERSION));
-        assert!(!is_newer("0.0.0-alpha"));
-        assert!(!is_newer("not a version"));
+    fn version_relation_distinguishes_newer_older_and_invalid_versions() {
+        assert_eq!(version_relation("999.0.0"), VersionRelation::Newer);
+        assert_eq!(version_relation(VERSION), VersionRelation::OlderOrEqual);
+        assert_eq!(
+            version_relation("0.0.0-alpha"),
+            VersionRelation::OlderOrEqual
+        );
+        assert_eq!(
+            version_relation("not a version"),
+            VersionRelation::Unparsable
+        );
     }
 
     #[test]
@@ -796,8 +1029,144 @@ mod tests {
             outcome: Outcome::Failed { exit_code: 3 },
         };
         let text = serde_json::to_string(&phase).unwrap();
-        assert_eq!(serde_json::from_str::<Phase>(&text).unwrap(), phase);
+        assert_eq!(crate::ingress::json_text::<Phase>(&text).unwrap(), phase);
         assert!(text.contains(r#""outcome":"failed""#));
+    }
+
+    #[test]
+    fn only_missing_content_refusals_request_a_submission_retry() {
+        let refused = |code| {
+            Reply::Refused(Refusal {
+                code,
+                detail: RemoteText::new("refused".into()),
+            })
+        };
+        assert!(refused(RefusalCode::MissingContent).needs_content_retry());
+        assert!(!refused(RefusalCode::BadRequest).needs_content_retry());
+        assert!(!Reply::Stream.needs_content_retry());
+    }
+
+    fn assert_phase_decision(
+        phase: Phase,
+        supervisor: Supervisor,
+        expected: (PhaseKind, State, bool, bool),
+    ) {
+        let job = Job {
+            spec: Spec {
+                id: "0CCCCCCCCCCCCCCC".parse().unwrap(),
+                name: None,
+                command: Command::Script("true".into()),
+                location: Location::Home,
+                env_names: BTreeSet::new(),
+                shell: None,
+                concurrency: Concurrency::DEFAULT,
+                sequence: 0,
+                submitted_by: Submitter::Owner,
+                submitted_at: Timestamp::at_millis(1),
+            },
+            phase,
+            supervisor,
+            behind: Vec::new(),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            (
+                job.phase.kind(),
+                job.state(),
+                job.is_settled(),
+                job.succeeded()
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn active_phase_classification_preserves_job_decisions() {
+        let started = Timestamp::at_millis(1);
+        let starting = Phase::Starting {
+            started_at: started,
+            workspace: String::new(),
+        };
+        let running = Phase::Running {
+            started_at: started,
+            pid: 1,
+            workspace: String::new(),
+        };
+        for (phase, supervisor, expected) in [
+            (
+                Phase::Queued,
+                Supervisor::Alive,
+                (PhaseKind::Queued, State::Queued, false, false),
+            ),
+            (
+                Phase::Queued,
+                Supervisor::Gone,
+                (PhaseKind::Queued, State::RestartPending, false, false),
+            ),
+            (
+                Phase::Preparing {
+                    started_at: started,
+                },
+                Supervisor::Gone,
+                (PhaseKind::Preparing, State::RestartPending, false, false),
+            ),
+            (
+                starting.clone(),
+                Supervisor::Alive,
+                (PhaseKind::Starting, State::Running, false, false),
+            ),
+            (
+                starting,
+                Supervisor::Gone,
+                (PhaseKind::Starting, State::Lost, true, false),
+            ),
+            (
+                running.clone(),
+                Supervisor::Alive,
+                (PhaseKind::Running, State::Running, false, false),
+            ),
+            (
+                running,
+                Supervisor::Gone,
+                (PhaseKind::Running, State::Lost, true, false),
+            ),
+        ] {
+            assert_phase_decision(phase, supervisor, expected);
+        }
+    }
+
+    #[test]
+    fn finished_phase_classification_preserves_job_decisions() {
+        let started = Timestamp::at_millis(1);
+        let finished_at = Timestamp::at_millis(2);
+        for (outcome, supervisor, state, succeeded) in [
+            (Outcome::Succeeded, Supervisor::Gone, State::Succeeded, true),
+            (
+                Outcome::Failed { exit_code: 3 },
+                Supervisor::Alive,
+                State::Failed,
+                false,
+            ),
+            (Outcome::Killed, Supervisor::Gone, State::Killed, false),
+            (
+                Outcome::Errored {
+                    reason: RemoteText::new("error".into()),
+                },
+                Supervisor::Gone,
+                State::Errored,
+                false,
+            ),
+        ] {
+            assert_phase_decision(
+                Phase::Finished {
+                    started_at: Some(started),
+                    finished_at,
+                    outcome,
+                },
+                supervisor,
+                (PhaseKind::Finished, state, true, succeeded),
+            );
+        }
     }
 
     proptest::proptest! {

@@ -1,5 +1,5 @@
 use std::io::{PipeReader, PipeWriter, Read};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Mutex;
 
 #[derive(Debug)]
@@ -34,10 +34,35 @@ pub enum ProcError {
 
 pub use platform::Readiness;
 
-pub fn own_executable() -> std::io::Result<std::path::PathBuf> {
+#[derive(Debug, Clone)]
+pub struct Executable(std::path::PathBuf);
+
+impl Executable {
+    pub fn current() -> std::io::Result<Self> {
+        std::env::current_exe().map(Self)
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn fallback() -> Self {
+        Self(std::path::PathBuf::from("domyjob"))
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(path: &std::path::Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+pub fn own_executable() -> std::io::Result<Executable> {
     match crate::platform::RUNNING_EXECUTABLE {
-        Some(running) => Ok(std::path::PathBuf::from(running)),
-        None => std::env::current_exe(),
+        Some(running) => Ok(Executable(std::path::PathBuf::from(running))),
+        None => Executable::current(),
     }
 }
 
@@ -79,7 +104,11 @@ pub fn terminate(pid: u32) {
 }
 
 impl Group {
-    pub fn spawn(mut command: Command, output: PipeWriter) -> Result<Self, ProcError> {
+    pub(crate) fn spawn(
+        prepared: crate::store::PreparedJobCommand,
+        output: PipeWriter,
+    ) -> Result<Self, ProcError> {
+        let mut command = prepared.into_command();
         let spawn_error = |source| ProcError::Spawn {
             what: "the command",
             source,
@@ -122,10 +151,13 @@ impl Group {
         self.tree.await_leader(self.id)?;
         let mut guard = self.child.lock().map_err(|_poisoned| ProcError::Poisoned)?;
         let state = std::mem::replace(&mut *guard, Child::Reaped);
-        let Child::Running(mut child) = state else {
-            return Err(ProcError::Wait(std::io::Error::other(
-                "the command was already reaped",
-            )));
+        let mut child = match state {
+            Child::Running(child) => child,
+            Child::Reaped => {
+                return Err(ProcError::Wait(std::io::Error::other(
+                    "the command was already reaped",
+                )));
+            }
         };
         self.tree.kill_all()?;
         let status = child.wait().map_err(ProcError::Wait);

@@ -145,9 +145,11 @@ fn parse_pieces(text: &str) -> Result<Vec<Piece>, TemplateError> {
 fn parse_word(text: &str) -> Result<Word, TemplateError> {
     let pieces = parse_pieces(text)?;
     for piece in &pieces {
-        if let Piece::Var { name, .. } = piece
-            && let Some(list) = name.strip_suffix("...")
-        {
+        let list = match piece {
+            Piece::Var { name, .. } => name.strip_suffix("..."),
+            Piece::Text(_) => None,
+        };
+        if let Some(list) = list {
             return match pieces.as_slice() {
                 [
                     Piece::Var {
@@ -155,7 +157,20 @@ fn parse_word(text: &str) -> Result<Word, TemplateError> {
                         ..
                     },
                 ] => Ok(Word::Splice(list.to_owned())),
-                _ => Err(TemplateError::Splice {
+                []
+                | [
+                    Piece::Text(_)
+                    | Piece::Var {
+                        filter:
+                            Filter::Posix
+                            | Filter::PowerShell
+                            | Filter::Json
+                            | Filter::AppleScript
+                            | Filter::Fileset,
+                        ..
+                    },
+                ]
+                | [_, _, ..] => Err(TemplateError::Splice {
                     text: text.to_owned(),
                     name: list.to_owned(),
                 }),
@@ -208,12 +223,66 @@ mod approved_word {
     pub(super) trait Sealed {}
 }
 
+mod approved_path {
+    pub(super) trait Sealed {}
+}
+
 #[expect(
     private_bounds,
     reason = "only the listed domain types can become process words"
 )]
 pub trait SafeWord: approved_word::Sealed {
     fn safe_word(&self) -> &str;
+}
+
+#[expect(
+    private_bounds,
+    reason = "only paths with a named local source can become process arguments"
+)]
+pub trait SafePath: approved_path::Sealed {
+    fn safe_path(&self) -> &std::path::Path;
+}
+
+impl approved_path::Sealed for crate::proc::Executable {}
+impl SafePath for crate::proc::Executable {
+    fn safe_path(&self) -> &std::path::Path {
+        self.path()
+    }
+}
+
+impl approved_path::Sealed for crate::paths::LocalDirectory<'_> {}
+impl SafePath for crate::paths::LocalDirectory<'_> {
+    fn safe_path(&self) -> &std::path::Path {
+        self.path()
+    }
+}
+
+impl approved_path::Sealed for crate::paths::ServiceLog {}
+impl SafePath for crate::paths::ServiceLog {
+    fn safe_path(&self) -> &std::path::Path {
+        self.path()
+    }
+}
+
+impl approved_path::Sealed for crate::snapshot::Detected<'_> {}
+impl SafePath for crate::snapshot::Detected<'_> {
+    fn safe_path(&self) -> &std::path::Path {
+        self.root()
+    }
+}
+
+impl approved_path::Sealed for crate::dist::DistributionPath<'_> {}
+impl SafePath for crate::dist::DistributionPath<'_> {
+    fn safe_path(&self) -> &std::path::Path {
+        self.path()
+    }
+}
+
+impl approved_path::Sealed for crate::supervisor::WorkingDirectory {}
+impl SafePath for crate::supervisor::WorkingDirectory {
+    fn safe_path(&self) -> &std::path::Path {
+        self.path()
+    }
 }
 
 macro_rules! approved_word {
@@ -252,6 +321,14 @@ impl SafeWord for crate::remote::TransferId {
     }
 }
 
+impl approved_word::Sealed for crate::remote::SshControlId {}
+
+impl SafeWord for crate::remote::SshControlId {
+    fn safe_word(&self) -> &str {
+        self.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg(String);
 
@@ -273,8 +350,8 @@ impl Arg {
     }
 
     #[must_use]
-    pub fn path(path: &std::path::Path) -> Self {
-        Self(path.display().to_string())
+    pub fn path(path: &impl SafePath) -> Self {
+        Self(path.safe_path().display().to_string())
     }
 
     #[must_use]

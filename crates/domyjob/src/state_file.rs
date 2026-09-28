@@ -23,6 +23,10 @@ pub enum StateError {
         "{path} can be read or changed by other users (mode {mode:o}); run `chmod go-rwx {path}` and retry"
     )]
     Exposed { path: PathBuf, mode: u32 },
+    #[error(
+        "{path} has an untrusted Windows ACL; restrict access to the current user and SYSTEM and retry"
+    )]
+    ExposedAcl { path: PathBuf },
     #[error("{path} belongs to another user; refusing to trust it")]
     Foreign { path: PathBuf },
     #[error("{path} is not a regular state file")]
@@ -48,8 +52,8 @@ impl ReadBudget {
     }
 }
 
-fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateError> {
-    match crate::platform::ownership(meta) {
+fn check_owner_only(path: &Path, file: &std::fs::File) -> Result<(), StateError> {
+    match crate::platform::ownership(file).map_err(io("checking", path))? {
         crate::platform::Ownership::Private => Ok(()),
         crate::platform::Ownership::OtherOwner => Err(StateError::Foreign {
             path: path.to_path_buf(),
@@ -58,17 +62,22 @@ fn check_owner_only(path: &Path, meta: &std::fs::Metadata) -> Result<(), StateEr
             path: path.to_path_buf(),
             mode,
         }),
+        crate::platform::Ownership::LegacyAcl | crate::platform::Ownership::ExposedAcl => {
+            Err(StateError::ExposedAcl {
+                path: path.to_path_buf(),
+            })
+        }
     }
 }
 
 fn check_private_file(path: &Path, file: &std::fs::File) -> Result<std::fs::Metadata, StateError> {
     let meta = file.metadata().map_err(io("checking", path))?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    if !meta.is_file() || crate::platform::is_reparse_point(&meta) {
         return Err(StateError::NotFile {
             path: path.to_path_buf(),
         });
     }
-    check_owner_only(path, &meta)?;
+    check_owner_only(path, file)?;
     Ok(meta)
 }
 
@@ -88,16 +97,34 @@ fn create_private_dir(path: &Path) -> Result<(), StateError> {
         .map_err(Into::into)
 }
 
+fn not_directory(path: &Path) -> StateError {
+    StateError::Io(crate::failure::IoFailure {
+        action: "using",
+        path: path.to_path_buf(),
+        source: std::io::Error::other("it exists and is not a directory"),
+    })
+}
+
+fn check_private_dir(path: &Path) -> Result<(), StateError> {
+    let dir = crate::platform::open_dir_for_ownership(path).map_err(io("opening", path))?;
+    let meta = dir.metadata().map_err(io("checking", path))?;
+    if !meta.is_dir() || crate::platform::is_reparse_point(&meta) {
+        return Err(not_directory(path));
+    }
+    check_owner_only(path, &dir)
+}
+
 pub fn private_dir(path: &Path) -> Result<(), StateError> {
     crate::faults::at("state_file::dir", path).map_err(io("preparing", path))?;
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => check_owner_only(path, &meta),
-        Ok(_) => Err(StateError::Io(crate::failure::IoFailure {
-            action: "using",
-            path: path.to_path_buf(),
-            source: std::io::Error::other("it exists and is not a directory"),
-        })),
-        Err(e) if e.kind() == ErrorKind::NotFound => create_private_dir(path),
+        Ok(meta) if meta.is_dir() && !crate::platform::is_reparse_point(&meta) => {
+            check_private_dir(path)
+        }
+        Ok(_) => Err(not_directory(path)),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            create_private_dir(path)?;
+            check_private_dir(path)
+        }
         Err(e) => Err(io("checking", path)(e).into()),
     }
 }
@@ -144,7 +171,7 @@ pub fn read_history_bytes(path: &Path) -> Result<Option<Vec<u8>>, StateError> {
     read_limited(path, ReadBudget::History)
 }
 
-pub fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, StateError> {
+pub(crate) fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<Option<T>, StateError> {
     match read_bytes(path)? {
         Some(bytes) => crate::ingress::json(&bytes)
             .map(Some)
@@ -198,27 +225,26 @@ pub fn open_append(path: &Path) -> Result<std::fs::File, StateError> {
 }
 
 pub fn overwrite_in_place(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    use std::io::Write as _;
     crate::faults::at("state_file::overwrite", path).map_err(io("writing", path))?;
+    mutate_existing(path, "writing", |file| file.write_all(bytes))
+}
+
+pub fn cut_to(path: &Path, len: u64) -> Result<(), StateError> {
+    crate::faults::at("state_file::cut", path).map_err(io("cutting", path))?;
+    mutate_existing(path, "cutting", |file| file.set_len(len))
+}
+
+fn mutate_existing(
+    path: &Path,
+    action: &'static str,
+    change: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), StateError> {
     let mut file = private_options()
         .write(true)
         .open(path)
         .map_err(|error| classify_open_error(path, error))?;
     check_private_file(path, &file)?;
-    file.write_all(bytes).map_err(io("writing", path))?;
-    file.sync_all()
-        .map_err(io("syncing", path))
-        .map_err(Into::into)
-}
-
-pub fn cut_to(path: &Path, len: u64) -> Result<(), StateError> {
-    crate::faults::at("state_file::cut", path).map_err(io("cutting", path))?;
-    let file = private_options()
-        .write(true)
-        .open(path)
-        .map_err(|error| classify_open_error(path, error))?;
-    check_private_file(path, &file)?;
-    file.set_len(len).map_err(io("cutting", path))?;
+    change(&mut file).map_err(io(action, path))?;
     file.sync_all()
         .map_err(io("syncing", path))
         .map_err(Into::into)
@@ -294,12 +320,7 @@ impl Staged {
 }
 
 pub fn remove_file(path: &Path) -> Result<(), StateError> {
-    crate::faults::at("state_file::remove", path).map_err(io("removing", path))?;
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io("removing", path)(e).into()),
-    }
+    remove_missing_ok(path, |path| std::fs::remove_file(path))
 }
 
 pub fn publish_dir(staged: &Path, target: &Path) -> Result<(), StateError> {
@@ -321,8 +342,15 @@ pub fn publish_dir(staged: &Path, target: &Path) -> Result<(), StateError> {
 }
 
 pub fn remove_dir_all(path: &Path) -> Result<(), StateError> {
+    remove_missing_ok(path, |path| std::fs::remove_dir_all(path))
+}
+
+fn remove_missing_ok(
+    path: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), StateError> {
     crate::faults::at("state_file::remove", path).map_err(io("removing", path))?;
-    match std::fs::remove_dir_all(path) {
+    match remove(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(io("removing", path)(e).into()),
@@ -371,7 +399,7 @@ fn make_removable(path: &Path) {
     }
 }
 
-pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StateError> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StateError> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|source| StateError::Json {
         path: path.to_path_buf(),
         source,
@@ -393,11 +421,16 @@ pub struct LockedStateFile<T> {
 
 impl<T> StateFile<T> {
     #[must_use]
-    pub fn at(path: &Path) -> Self {
+    pub(crate) fn at(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
             value: PhantomData,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn lock(self) -> Result<LockedStateFile<T>, StateError> {
@@ -411,6 +444,48 @@ impl<T> StateFile<T> {
             })
         })?;
         Ok(LockedStateFile { file: self, lock })
+    }
+
+    pub fn read(&self) -> Result<Option<T>, StateError>
+    where
+        T: crate::ingress::Ingress,
+    {
+        read_json(&self.path)
+    }
+
+    pub fn replace(&self, value: &T) -> Result<(), StateError>
+    where
+        T: Serialize,
+    {
+        write_json(&self.path, value)
+    }
+
+    pub fn update<R>(
+        self,
+        empty: impl FnOnce() -> T,
+        change: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, StateError>
+    where
+        T: Serialize + crate::ingress::Ingress,
+    {
+        self.try_update(empty, |value| Ok::<R, StateError>(change(value)))
+    }
+
+    pub fn try_update<R, E>(
+        self,
+        empty: impl FnOnce() -> T,
+        change: impl FnOnce(&mut T) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        T: Serialize + crate::ingress::Ingress,
+        E: From<StateError>,
+    {
+        let mut file = self.lock()?;
+        let mut value = file.read()?.unwrap_or_else(empty);
+        let result = change(&mut value)?;
+        file.write(&value)?;
+        file.release()?;
+        Ok(result)
     }
 }
 
@@ -469,25 +544,15 @@ impl<T> LockedStateFile<T> {
     }
 }
 
-pub fn update_json<T, R>(
-    path: &Path,
-    empty: impl FnOnce() -> T,
-    change: impl FnOnce(&mut T) -> R,
-) -> Result<R, StateError>
-where
-    T: Serialize + crate::ingress::Ingress,
-{
-    let mut file = StateFile::<T>::at(path).lock()?;
-    let mut value = file.read()?.unwrap_or_else(empty);
-    let result = change(&mut value);
-    file.write(&value)?;
-    file.release()?;
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+    #[serde(transparent)]
+    struct TestBytes(Vec<u8>);
+
+    impl crate::ingress::Ingress for TestBytes {}
 
     #[test]
     #[expect(
@@ -511,23 +576,27 @@ mod tests {
     fn state_is_private_atomic_and_refused_when_exposed() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state").join("trust.json");
-        write_json(&path, &vec![1, 2, 3]).unwrap();
-        assert_eq!(read_json::<Vec<u8>>(&path).unwrap(), Some(vec![1, 2, 3]));
-        let total = update_json(&path, Vec::new, |values: &mut Vec<u8>| {
-            values.push(4);
-            values.len()
-        })
-        .unwrap();
-        assert_eq!(total, 4);
-        let meta = std::fs::metadata(&path).unwrap();
+        write_json(&path, &TestBytes(vec![1, 2, 3])).unwrap();
         assert_eq!(
-            crate::platform::ownership(&meta),
+            read_json::<TestBytes>(&path).unwrap(),
+            Some(TestBytes(vec![1, 2, 3]))
+        );
+        let total = StateFile::<TestBytes>::at(&path)
+            .update(TestBytes::default, |values| {
+                values.0.push(4);
+                values.0.len()
+            })
+            .unwrap();
+        assert_eq!(total, 4);
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            crate::platform::ownership(&file).unwrap(),
             crate::platform::Ownership::Private
         );
         if crate::platform::expose(&path).unwrap() {
             assert!(matches!(
-                read_json::<Vec<u8>>(&path),
-                Err(StateError::Exposed { .. })
+                read_json::<TestBytes>(&path),
+                Err(StateError::Exposed { .. } | StateError::ExposedAcl { .. })
             ));
         }
     }
@@ -541,16 +610,16 @@ mod tests {
                 let path = &path;
                 scope.spawn(move || {
                     for _ in 0..8 {
-                        let mut file = StateFile::<Vec<u8>>::at(path).lock().unwrap();
+                        let mut file = StateFile::<TestBytes>::at(path).lock().unwrap();
                         let mut values = file.read().unwrap().unwrap_or_default();
-                        values.push(1);
+                        values.0.push(1);
                         file.write(&values).unwrap();
                         file.release().unwrap();
                     }
                 });
             }
         });
-        assert_eq!(read_json::<Vec<u8>>(&path).unwrap().unwrap().len(), 64);
+        assert_eq!(read_json::<TestBytes>(&path).unwrap().unwrap().0.len(), 64);
     }
 
     #[test]

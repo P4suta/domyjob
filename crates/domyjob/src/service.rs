@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::paths::Dirs;
 use crate::template::{Arg, Argv, Bindings, Text};
@@ -48,7 +48,7 @@ fn definition_for(os: &'static str) -> Result<crate::config::ServiceConf, Servic
         .ok_or(ServiceError::Unsupported(os))
 }
 
-fn bindings(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Bindings {
+fn bindings(dirs: &Dirs, exe: &crate::proc::Executable, args: &[Arg]) -> Bindings {
     let action = Arg::concat(&[
         Arg::literal("\""),
         Arg::path(exe),
@@ -61,14 +61,14 @@ fn bindings(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Bindings {
         plist_arguments.push_str(&xml(arg.as_arg_str()));
         plist_arguments.push_str("</string>");
     }
-    let log = dirs.state.join("serve.log");
+    let log = dirs.service_log();
     Bindings::new()
-        .with("home", Arg::path(&dirs.home))
-        .with("state", Arg::path(&dirs.state))
+        .with("home", Arg::path(&dirs.home_path()))
+        .with("state", Arg::path(&dirs.state_path()))
         .with("exe", Arg::path(exe))
         .with(
             "exe_xml",
-            Arg::service_text(ServiceArg(xml(&exe.display().to_string()))),
+            Arg::service_text(ServiceArg(xml(&exe.path().display().to_string()))),
         )
         .with("arguments", Arg::spaced(args))
         .with(
@@ -78,7 +78,7 @@ fn bindings(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Bindings {
         .with("log", Arg::path(&log))
         .with(
             "log_xml",
-            Arg::service_text(ServiceArg(xml(&log.display().to_string()))),
+            Arg::service_text(ServiceArg(xml(&log.path().display().to_string()))),
         )
         .with(
             "uid",
@@ -134,7 +134,11 @@ fn execute(
     Ok(())
 }
 
-pub fn install(dirs: &Dirs, exe: &Path, args: &[Arg]) -> Result<String, ServiceError> {
+pub fn install(
+    dirs: &Dirs,
+    exe: &crate::proc::Executable,
+    args: &[Arg],
+) -> Result<String, ServiceError> {
     let definition = definition_for(crate::platform::OS)?;
     let bindings = bindings(dirs, exe, args);
     if let (Some(path), Some(contents)) = (&definition.file, &definition.contents) {
@@ -168,7 +172,7 @@ fn is_installed(
 
 pub fn uninstall(dirs: &Dirs) -> Result<Uninstalled, ServiceError> {
     let definition = definition_for(crate::platform::OS)?;
-    let exe = crate::proc::own_executable().unwrap_or_else(|_| PathBuf::from("domyjob"));
+    let exe = crate::proc::own_executable().unwrap_or_else(|_| crate::proc::Executable::fallback());
     let bindings = bindings(dirs, &exe, &[]);
     if !is_installed(&definition, &bindings)? {
         return Ok(Uninstalled::Nothing);
@@ -185,19 +189,17 @@ mod tests {
     use super::*;
 
     fn dirs() -> Dirs {
-        Dirs {
-            home: PathBuf::from("/home/me"),
-            state: PathBuf::from("/home/me/.local/state/domyjob"),
-            config: PathBuf::from("/home/me/.config/domyjob"),
-            cache: PathBuf::from("/home/me/.cache/domyjob"),
-            keys: crate::keystore::KeyStore::OwnerOnlyFile,
-        }
+        Dirs::for_test(std::path::Path::new("/home/me"))
     }
 
     #[test]
     fn service_definitions_name_the_binary_and_address() {
         let args = vec![Arg::literal("--expose"), Arg::literal("tailnet")];
-        let bindings = bindings(&dirs(), Path::new("/opt/a&b/domyjob"), &args);
+        let bindings = bindings(
+            &dirs(),
+            &crate::proc::Executable::for_test(std::path::Path::new("/opt/a&b/domyjob")),
+            &args,
+        );
         let definitions = crate::config::Config::builtin().unwrap();
 
         let linux = definitions.services.get("linux").unwrap();

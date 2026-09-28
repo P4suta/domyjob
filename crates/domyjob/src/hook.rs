@@ -104,11 +104,7 @@ fn fire(ctx: &Context, firing: &Firing<'_>) -> Result<(), ClientError> {
             kind: "source",
             name: rule.source.clone(),
         })?;
-    let detected = Detected {
-        name: &rule.source,
-        source: conf,
-        root: root.clone(),
-    };
+    let detected = Detected::from_hook_root(&rule.source, conf, root.clone());
     let snapshot = snapshot::from_revision(&detected, &fired.rev)?;
     let prepared = client::prepared(ctx, &root, snapshot, None)?;
     let order = Order {
@@ -175,7 +171,13 @@ pub fn trigger(fired: &Event) -> Result<ExitCode, ClientError> {
         .config
         .triggers
         .iter()
-        .filter(|(_, rule)| matches!(consider(rule, fired, &root), Consideration::Accepts))
+        .filter(|(_, rule)| match consider(rule, fired, &root) {
+            Consideration::Accepts => true,
+            Consideration::OtherSource
+            | Consideration::OtherEvent
+            | Consideration::OtherRepository
+            | Consideration::OtherRef => false,
+        })
         .collect();
     if matching.is_empty() {
         eprintln!(

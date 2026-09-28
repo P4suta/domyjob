@@ -73,6 +73,32 @@ pub enum ClientError {
     OutsideRoot { start: PathBuf, root: PathBuf },
 }
 
+impl ClientError {
+    #[must_use]
+    pub(crate) const fn watch_retryability(&self) -> Retryability {
+        match self {
+            Self::Remote(error) => retryability(error),
+            Self::Config(_)
+            | Self::Snapshot(_)
+            | Self::Project(_)
+            | Self::Invalid(_)
+            | Self::Runner { .. }
+            | Self::NoInput
+            | Self::Io(_)
+            | Self::Index { .. }
+            | Self::Unknown(_)
+            | Self::State(_)
+            | Self::Panicked
+            | Self::Ambiguous { .. }
+            | Self::Unpacked { .. }
+            | Self::NotSent { .. }
+            | Self::Elsewhere { .. }
+            | Self::NoFacts(_)
+            | Self::OutsideRoot { .. } => Retryability::Final,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub config: Config,
@@ -101,12 +127,15 @@ impl Context {
     }
 
     fn index_path(&self) -> PathBuf {
-        self.dirs.state.join("client").join("index.jsonl")
+        self.dirs.state().join("client").join("index.jsonl")
+    }
+
+    fn origin_file(&self) -> crate::state_file::StateFile<ClientOriginId> {
+        crate::state_file::StateFile::at(&self.dirs.state().join("client").join("origin"))
     }
 
     fn origin(&self) -> Result<ClientOriginId, ClientError> {
-        let path = self.dirs.state.join("client").join("origin");
-        let mut file = crate::state_file::StateFile::<ClientOriginId>::at(&path).lock()?;
+        let mut file = self.origin_file().lock()?;
         let origin = file.load_or_create::<ClientError>(
             |bytes| Ok(String::from_utf8_lossy(bytes).trim().parse()?),
             || Ok(ClientOriginId::generate()?),
@@ -468,7 +497,8 @@ fn root_of(start: &Path, given: Option<&Path>, config: &Config) -> Result<PathBu
     if let Some(found) = project::find_root(start)? {
         return Ok(found);
     }
-    Ok(snapshot::detect(config, start)?.map_or_else(|| start.to_path_buf(), |found| found.root))
+    Ok(snapshot::detect(config, start)?
+        .map_or_else(|| start.to_path_buf(), |found| found.root().to_path_buf()))
 }
 
 fn snapshot_at(
@@ -560,7 +590,7 @@ fn repository_place(
         return Ok(plain());
     };
     let named = repository_name(&shared).unwrap_or_else(|| root.as_os_str().to_owned());
-    let place = match root.strip_prefix(&detected.root) {
+    let place = match root.strip_prefix(detected.root()) {
         Ok(inner) if !inner.as_os_str().is_empty() => shared.join(inner),
         Ok(_) | Err(_) => shared,
     };
@@ -626,63 +656,19 @@ pub fn prepare(ctx: &Context, order: &Order) -> Result<Option<Prepared>, ClientE
     prepared(ctx, &root, snapshot, subdir).map(Some)
 }
 
-fn deliver(
-    link: &Link<'_>,
-    prepared: &Prepared,
-    report: &dyn Fn(Stage<'_>),
-) -> Result<(), RemoteError> {
-    let mut wanted = prepared.snapshot.manifest.blobs();
-    wanted.push(prepared.manifest.0.clone());
-    let missing = link
-        .call(&Request::Missing { blobs: wanted }, &[])?
-        .into_missing()
-        .map_err(|other| link.unexpected("missing", *other))?;
-    if missing.is_empty() {
+fn report_missing(payload: &[(&BlobId, &Origin)], report: &dyn Fn(Stage<'_>)) {
+    if payload.is_empty() {
         report(Stage::UpToDate);
-        return Ok(());
+        return;
     }
-    let manifest_origin = Origin::Memory(prepared.manifest.1.clone());
-    let payload: Vec<(&BlobId, &Origin)> = missing
-        .iter()
-        .filter_map(|blob| {
-            if *blob == prepared.manifest.0 {
-                Some((blob, &manifest_origin))
-            } else {
-                prepared
-                    .snapshot
-                    .origins
-                    .get(blob)
-                    .map(|origin| (blob, origin))
-            }
-        })
-        .collect();
     let count = crate::domain::len_u64(payload.len());
-    let bytes = payload.iter().fold(0u64, |sum, (blob, origin)| {
-        let size = match origin {
-            Origin::Memory(bytes) => crate::domain::len_u64(bytes.len()),
-            Origin::Disk(_) => prepared
-                .snapshot
-                .manifest
-                .entries
-                .values()
-                .find_map(|entry| match entry {
-                    Entry::File {
-                        blob: known, size, ..
-                    } if known == *blob => Some(*size),
-                    Entry::File { .. } | Entry::Symlink { .. } => None,
-                })
-                .unwrap_or(0),
-        };
-        sum.saturating_add(size)
-    });
+    let bytes = payload
+        .iter()
+        .fold(0u64, |sum, (_, origin)| sum.saturating_add(origin.size()));
     report(Stage::Sending {
         files: count,
         bytes,
     });
-    link.call(&Request::Upload { count }, &payload)?
-        .into_stored()
-        .map(drop)
-        .map_err(|other| link.unexpected("stored", *other))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,32 +728,32 @@ impl Plan<'_> {
         let mut attempts_left = SUBMIT_ATTEMPTS;
         let job = loop {
             attempts_left = attempts_left.saturating_sub(1);
-            let sent = self
-                .prepared
-                .as_ref()
-                .map_or(Ok(()), |prepared| deliver(&link, prepared, &report))
-                .and_then(|()| {
-                    link.call(
-                        &Request::Submit {
-                            submission: Box::new(self.submission(machine, &nonce)),
-                        },
-                        &[],
-                    )
-                });
+            let submission = self.submission(machine, &nonce);
+            let sent = match &self.prepared {
+                Some(prepared) => link.submit_snapshot(
+                    submission,
+                    (&prepared.manifest, &prepared.snapshot.origins),
+                    |payload| report_missing(payload, &report),
+                ),
+                None => link.call(
+                    &Request::Submit {
+                        submission: Box::new(submission),
+                    },
+                    &[],
+                ),
+            };
             let reply = match sent {
                 Ok(reply) => reply,
-                Err(error) if transient(&error) && attempts_left > 0 => {
+                Err(error)
+                    if retryability(&error) == Retryability::Retryable && attempts_left > 0 =>
+                {
                     eprintln!("domyjob: {error}; submitting again, which cannot start it twice");
                     link = Link::open(&self.ctx.config, &self.ctx.dirs, machine)?;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            let missing = matches!(
-                &reply,
-                Reply::Refused(refusal)
-                    if refusal.code == crate::protocol::RefusalCode::MissingContent
-            );
+            let missing = reply.needs_content_retry();
             if !missing || attempts_left == 0 {
                 break reply
                     .into_job()
@@ -1086,17 +1072,58 @@ type Take<T> = (&'static str, fn(Reply) -> Result<T, Box<Reply>>);
 
 const TRANSPORT_ATTEMPTS: u32 = 2;
 
-const fn transient(error: &RemoteError) -> bool {
-    matches!(
-        error,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Retryability {
+    Retryable,
+    Final,
+}
+
+const fn retryability(error: &RemoteError) -> Retryability {
+    match error {
         RemoteError::Silent { .. }
-            | RemoteError::Pipe { .. }
-            | RemoteError::Exited { .. }
-            | RemoteError::Stream {
-                problem: crate::framed::Unframed::Truncated | crate::framed::Unframed::Reading(_),
-                ..
-            }
-    )
+        | RemoteError::Pipe { .. }
+        | RemoteError::Exited { .. }
+        | RemoteError::Stream {
+            problem: crate::framed::Unframed::Truncated | crate::framed::Unframed::Reading(_),
+            ..
+        } => Retryability::Retryable,
+        RemoteError::Stream {
+            problem:
+                crate::framed::Unframed::Malformed(_)
+                | crate::framed::Unframed::Damaged(_)
+                | crate::framed::Unframed::Writing(_)
+                | crate::framed::Unframed::Failed(_),
+            ..
+        }
+        | RemoteError::SshSession(_)
+        | RemoteError::ControlPath { .. }
+        | RemoteError::ControlPathToken { .. }
+        | RemoteError::TransferId(_)
+        | RemoteError::Config(_)
+        | RemoteError::Template { .. }
+        | RemoteError::Empty { .. }
+        | RemoteError::Start { .. }
+        | RemoteError::Garbled { .. }
+        | RemoteError::Refused { .. }
+        | RemoteError::Unreadable { .. }
+        | RemoteError::Unexpected { .. }
+        | RemoteError::Unsendable { .. }
+        | RemoteError::Protocol { .. }
+        | RemoteError::Newer { .. }
+        | RemoteError::UncomparableVersion { .. }
+        | RemoteError::Probe { .. }
+        | RemoteError::Dist(_)
+        | RemoteError::State(_)
+        | RemoteError::Tampered { .. }
+        | RemoteError::BuildMismatch { .. }
+        | RemoteError::AuditRolledBack { .. }
+        | RemoteError::AuditRewritten { .. }
+        | RemoteError::Outdated { .. }
+        | RemoteError::Unbuilt { .. }
+        | RemoteError::Snapshot(_)
+        | RemoteError::LocalBuild { .. }
+        | RemoteError::Io(_) => Retryability::Final,
+    }
 }
 
 fn ask<T>(
@@ -1115,7 +1142,7 @@ fn ask<T>(
                 let answer = take(reply).map_err(|other| link.unexpected(expected, *other))?;
                 return Ok((machine, answer));
             }
-            Err(error) if transient(&error) && attempts_left > 0 => {
+            Err(error) if retryability(&error) == Retryability::Retryable && attempts_left > 0 => {
                 eprintln!("domyjob: {error}; asking again");
             }
             Err(error) => return Err(error.into()),
@@ -1226,7 +1253,10 @@ pub fn logs(
                 lines,
             },
         };
-        let resumable = !matches!(output, Output::Tail(_)) || delivered.bytes == 0;
+        let resumable = match output {
+            Output::Follow | Output::Snapshot => true,
+            Output::Tail(_) => delivered.bytes == 0,
+        };
         let link = Link::open(&ctx.config, &ctx.dirs, &machine)?;
         match link.stream(&request, &mut delivered) {
             Ok(reply) => {
@@ -1235,7 +1265,11 @@ pub fn logs(
                     .map_err(|other| link.unexpected("a log stream", *other))?;
                 return Ok(machine);
             }
-            Err(error) if transient(&error) && resumable && attempts_left > 0 => {
+            Err(error)
+                if retryability(&error) == Retryability::Retryable
+                    && resumable
+                    && attempts_left > 0 =>
+            {
                 eprintln!("domyjob: {error}; picking up where it stopped");
             }
             Err(error) => return Err(error.into()),
@@ -1306,7 +1340,7 @@ pub fn recorded(ctx: &Context, text: &str) -> Result<(MachineName, JobId), Clien
 
 #[must_use]
 pub fn pulls(ctx: &Context) -> PathBuf {
-    ctx.dirs.state.join("client").join("pulls")
+    ctx.dirs.state().join("client").join("pulls")
 }
 
 fn sent_from(ctx: &Context, machine: &MachineName, job: &JobId) -> Result<SentFrom, ClientError> {
@@ -1355,8 +1389,8 @@ fn unpack(
     let sent = crate::pull::SentManifest::verified(raw, recorded)?;
     let mut contents = BTreeMap::new();
     for left in &header.left {
-        if let Some(Entry::File { size, .. }) = &left.now {
-            let wanted = usize::try_from(*size)
+        if let Some(file) = left.now.as_ref().and_then(Entry::file) {
+            let wanted = usize::try_from(file.size)
                 .map_err(|_too_large| Unpacking::TooLarge(left.path.clone()))?;
             let (bytes, next) = rest
                 .split_at_checked(wanted)
@@ -1378,16 +1412,78 @@ impl crate::ingress::Ingress for EarlierEntry {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn watch_retries_transport_interruption_but_stops_on_local_or_invalid_input() {
+        let transient = ClientError::Remote(RemoteError::Silent {
+            machine: "peer".to_owned(),
+            doing: "reading",
+        });
+        let damaged = ClientError::Remote(RemoteError::Stream {
+            machine: "peer".to_owned(),
+            doing: "reading",
+            problem: crate::framed::Unframed::Damaged("digest"),
+        });
+        assert_eq!(transient.watch_retryability(), Retryability::Retryable);
+        for error in [
+            damaged,
+            ClientError::Unknown("job".to_owned()),
+            ClientError::NoInput,
+        ] {
+            assert_eq!(error.watch_retryability(), Retryability::Final);
+        }
+    }
+
+    #[test]
+    fn retryability_separates_transport_interruption_from_bad_or_local_streams() {
+        let stream = |problem| RemoteError::Stream {
+            machine: "peer".to_owned(),
+            doing: "reading",
+            problem,
+        };
+        for (error, expected) in [
+            (
+                RemoteError::Silent {
+                    machine: "peer".to_owned(),
+                    doing: "reading",
+                },
+                Retryability::Retryable,
+            ),
+            (
+                stream(crate::framed::Unframed::Truncated),
+                Retryability::Retryable,
+            ),
+            (
+                stream(crate::framed::Unframed::Reading(
+                    std::io::ErrorKind::BrokenPipe.into(),
+                )),
+                Retryability::Retryable,
+            ),
+            (
+                stream(crate::framed::Unframed::Damaged("digest")),
+                Retryability::Final,
+            ),
+            (
+                stream(crate::framed::Unframed::Writing(
+                    std::io::ErrorKind::BrokenPipe.into(),
+                )),
+                Retryability::Final,
+            ),
+            (
+                RemoteError::UncomparableVersion {
+                    machine: "peer".to_owned(),
+                    version: crate::terminal::RemoteText::new("bad".to_owned()),
+                },
+                Retryability::Final,
+            ),
+        ] {
+            assert_eq!(retryability(&error), expected, "{error}");
+        }
+    }
+
     fn context(tmp: &tempfile::TempDir) -> Context {
         Context {
             config: Config::layered("[machines.linux]", "test").unwrap(),
-            dirs: Dirs {
-                home: tmp.path().to_path_buf(),
-                state: tmp.path().join("state"),
-                config: tmp.path().join("config"),
-                cache: tmp.path().join("cache"),
-                keys: crate::keystore::KeyStore::OwnerOnlyFile,
-            },
+            dirs: Dirs::for_test(tmp.path()),
         }
     }
 
@@ -1450,7 +1546,7 @@ mod tests {
         let machine = ctx.config.machine(&"linux".parse().unwrap()).unwrap();
         let tag = ctx
             .dirs
-            .cache
+            .cache()
             .join("machines")
             .join("linux.json")
             .display()
@@ -1468,7 +1564,7 @@ mod tests {
         let ctx = context(&tmp);
         let origin = ctx.origin().unwrap();
         assert_eq!(ctx.origin().unwrap(), origin);
-        let path = ctx.dirs.state.join("client").join("origin");
+        let path = ctx.dirs.state().join("client").join("origin");
         crate::state_file::write_bytes(&path, b"../corrupt").unwrap();
         assert!(matches!(
             ctx.origin(),

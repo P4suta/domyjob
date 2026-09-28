@@ -3,7 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::Path;
-use std::process::{Output, Stdio};
+use std::process::Output;
+
+#[cfg(not(windows))]
+use std::process::{Command as TestCommand, Stdio};
+#[cfg(windows)]
+use windows_spawn::{Command as TestCommand, Stdio};
 
 use domyjob::authz::Submitter;
 use domyjob::clock::Timestamp;
@@ -19,14 +24,17 @@ fn dirs(root: &Path) -> Dirs {
     Dirs::isolated_for_test(root)
 }
 
-fn command(dirs: &Dirs, args: Vec<Arg>) -> std::process::Command {
-    let executable = Path::new(env!("CARGO_BIN_EXE_domyjob"));
-    let mut command = Invocation::new(Arg::path(executable), args).command();
+fn command(dirs: &Dirs, args: Vec<Arg>) -> TestCommand {
+    let invocation = Invocation::new(Arg::literal(env!("CARGO_BIN_EXE_domyjob")), args);
+    #[cfg(not(windows))]
+    let mut command = invocation.command();
+    #[cfg(windows)]
+    let mut command = invocation.windows_command();
     command
-        .env("HOME", &dirs.home)
-        .env("DOMYJOB_STATE", &dirs.state)
-        .env("DOMYJOB_CONFIG", &dirs.config)
-        .env("DOMYJOB_CACHE", &dirs.cache);
+        .env("HOME", dirs.home())
+        .env("DOMYJOB_STATE", dirs.state())
+        .env("DOMYJOB_CONFIG", dirs.config())
+        .env("DOMYJOB_CACHE", dirs.cache());
     command
 }
 
@@ -84,7 +92,12 @@ fn a_real_node_recovers_after_aborting_at_each_atomic_write_step() {
             },
             Some(site),
         );
-        assert!(!interrupted.status.success(), "{site} did not abort");
+        assert!(
+            !interrupted.status.success(),
+            "{site} did not abort: stdout={} stderr={}",
+            String::from_utf8_lossy(&interrupted.stdout),
+            String::from_utf8_lossy(&interrupted.stderr)
+        );
         let recovered = recover(&dirs);
         assert!(
             recovered.status.success(),
@@ -103,11 +116,12 @@ fn a_real_node_recovers_after_aborting_at_each_atomic_write_step() {
 fn a_real_supervisor_killed_after_starting_is_recovered_without_rerunning() {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = dirs(tmp.path());
+    domyjob::state_file::private_dir(dirs.home()).unwrap();
     let store = Store::open(&dirs).unwrap();
     let id: JobId = "0BBBBBBBBBBBBBBB".parse().unwrap();
     let script = match domyjob::platform::FAMILY {
-        Family::Unix => "yes",
-        Family::Windows => "while ($true) { Write-Output x }",
+        Family::Unix => "while :; do printf 'x\\n'; /bin/sleep 1; done",
+        Family::Windows => "while ($true) { Write-Output x; Start-Sleep -Seconds 1 }",
     };
     let spec = Spec {
         id: id.clone(),
@@ -122,7 +136,7 @@ fn a_real_supervisor_killed_after_starting_is_recovered_without_rerunning() {
         submitted_at: Timestamp::observe(),
     };
     store
-        .stage(&spec, (&BTreeMap::new(), &LaunchEnv::default()))
+        .stage(&spec, (&BTreeMap::new(), &LaunchEnv::of_this_process()))
         .unwrap();
     let (change_tx, change_rx) = std::sync::mpsc::channel();
     let mut watcher =
@@ -135,9 +149,9 @@ fn a_real_supervisor_killed_after_starting_is_recovered_without_rerunning() {
         Arg::literal("--supervise"),
         Arg::word(&id),
         Arg::literal("--state-dir"),
-        Arg::path(&dirs.state),
+        Arg::path(&dirs.state_path()),
         Arg::literal("--home-dir"),
-        Arg::path(&dirs.home),
+        Arg::path(&dirs.home_path()),
     ];
     if domyjob::platform::FAMILY == Family::Windows {
         args.push(Arg::literal("--ready-event"));
@@ -146,22 +160,22 @@ fn a_real_supervisor_killed_after_starting_is_recovered_without_rerunning() {
     let mut supervisor = command(&dirs, args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     loop {
         change_rx.recv().unwrap();
         match store.phase(&id) {
             Ok(Phase::Starting { .. } | Phase::Running { .. }) => break,
-            Ok(Phase::Finished { .. }) => {
-                panic!("the job finished before the supervisor was killed")
+            Ok(phase @ Phase::Finished { .. }) => {
+                panic!("the job finished before the supervisor was killed: {phase:?}")
             }
             Ok(Phase::Queued | Phase::Preparing { .. }) | Err(_) => {}
         }
     }
     supervisor.kill().unwrap();
-    let stopped = supervisor.wait_with_output().unwrap();
-    assert!(!stopped.status.success());
+    let stopped = supervisor.wait().unwrap();
+    assert!(!stopped.success());
     let recovered = recover(&dirs);
     assert!(
         recovered.status.success(),

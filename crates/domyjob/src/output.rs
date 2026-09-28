@@ -238,12 +238,7 @@ impl<'a> Overview<'a> {
         Self {
             machine,
             report,
-            running: summaries(&|job| {
-                matches!(
-                    job.state(),
-                    crate::protocol::State::Running | crate::protocol::State::Preparing
-                )
-            }),
+            running: summaries(&|job| job.state().counts_as_running()),
             queued: summaries(&|job| job.state() == crate::protocol::State::Queued),
             recent: jobs
                 .iter()

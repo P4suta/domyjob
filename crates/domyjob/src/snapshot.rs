@@ -146,6 +146,22 @@ pub enum Entry {
     Symlink { target: String },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FileContent<'a> {
+    pub blob: &'a BlobId,
+    pub size: u64,
+}
+
+impl Entry {
+    #[must_use]
+    pub(crate) const fn file(&self) -> Option<FileContent<'_>> {
+        match self {
+            Self::File { blob, size, .. } => Some(FileContent { blob, size: *size }),
+            Self::Symlink { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Left {
@@ -161,7 +177,6 @@ pub struct Changed {
 }
 
 impl crate::ingress::Ingress for Changed {}
-impl crate::ingress::Ingress for Left {}
 
 fn metadata(name: &str) -> bool {
     METADATA_DIRS.contains(&name)
@@ -174,8 +189,6 @@ pub struct Change {
     pub before: Option<Entry>,
     pub after: Option<Entry>,
 }
-
-impl crate::ingress::Ingress for Vec<Change> {}
 
 #[must_use]
 pub fn changes(before: &Manifest, after: &Manifest) -> Vec<Change> {
@@ -232,11 +245,11 @@ impl Manifest {
         let mut budget = SourceBudget::default();
         for (path, entry) in &self.entries {
             budget.path(path)?;
-            if let Entry::File { size, .. } = entry
-                && *size > crate::bounded::BLOB
+            if let Some(file) = entry.file()
+                && file.size > crate::bounded::BLOB
             {
                 return Err(SnapshotError::TooLarge {
-                    size: *size,
+                    size: file.size,
                     limit: crate::bounded::BLOB,
                 });
             }
@@ -283,9 +296,18 @@ pub struct DiskOrigin {
     root: Arc<cap_std::fs::Dir>,
     relative: RelPath,
     shown: PathBuf,
+    size: u64,
 }
 
 impl Origin {
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::Disk(disk) => disk.size,
+            Self::Memory(bytes) => crate::domain::len_u64(bytes.len()),
+        }
+    }
+
     pub fn open(&self) -> Result<OriginInput<'_>, SnapshotError> {
         let (reader, size) = match self {
             Self::Disk(disk) => {
@@ -312,6 +334,12 @@ impl Origin {
                     .map_err(crate::failure::io("checking", &disk.shown))?;
                 if !metadata.is_file() {
                     return Err(SnapshotError::NotFile(disk.shown.clone()));
+                }
+                if metadata.len() != disk.size {
+                    return Err(SnapshotError::SizeChanged {
+                        expected: disk.size,
+                        actual: metadata.len(),
+                    });
                 }
                 (OriginReader::Disk(file), metadata.len())
             }
@@ -510,14 +538,15 @@ fn disk_origins(
 ) -> BTreeMap<BlobId, Origin> {
     let mut origins = BTreeMap::new();
     for (rel, entry) in &manifest.entries {
-        if let Entry::File { blob, .. } = entry {
-            origins.entry(blob.clone()).or_insert_with(|| {
+        if let Some(file) = entry.file() {
+            origins.entry(file.blob.clone()).or_insert_with(|| {
                 Origin::Disk(DiskOrigin {
                     root: Arc::clone(root),
                     relative: rel.clone(),
                     shown: rel
                         .parts()
                         .fold(shown.to_path_buf(), |p, part| p.join(part)),
+                    size: file.size,
                 })
             });
         }
@@ -640,7 +669,23 @@ fn hash_all(pending: &[Pending]) -> Result<Vec<Hashed<'_>>, SnapshotError> {
 pub struct Detected<'a> {
     pub name: &'a str,
     pub source: &'a SourceConf,
-    pub root: PathBuf,
+    root: PathBuf,
+}
+
+impl<'a> Detected<'a> {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub(crate) const fn from_hook_root(
+        name: &'a str,
+        source: &'a SourceConf,
+        root: PathBuf,
+    ) -> Self {
+        Self { name, source, root }
+    }
 }
 
 pub fn detect<'a>(config: &'a Config, start: &Path) -> Result<Option<Detected<'a>>, SnapshotError> {
@@ -774,7 +819,7 @@ pub fn identity(detected: &Detected<'_>) -> Result<Option<PathBuf>, SnapshotErro
         return Ok(None);
     };
     let argv = identity
-        .render(&Bindings::new().with("root", Arg::path(&detected.root)))
+        .render(&Bindings::new().with("root", Arg::path(detected)))
         .map_err(|source| SnapshotError::Template {
             source_name: detected.name.to_owned(),
             source,
@@ -800,7 +845,7 @@ pub fn from_revision(
         source_name: name.to_owned(),
         source: source_error,
     };
-    let root = Arg::path(&detected.root);
+    let root = Arg::path(detected);
     let resolved = run_template(
         (name, source),
         &source

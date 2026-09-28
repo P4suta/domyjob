@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::config::{Config, ConfigError, MAX_SELECTOR_TERMS, Machine};
 use crate::domain::{EnvName, JobName, MachineName, RelPath};
 use crate::protocol::Workspace;
+use crate::provenance::{ApprovedRepository, Labeled, Repository};
 
 pub const FILE: &str = "domyjob.toml";
 
@@ -38,12 +39,15 @@ struct File {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryRequest {
     on: ProjectSelector,
-    run: Vec<String>,
-    runner: Option<String>,
+    run: Vec<RepositoryText>,
+    runner: Option<RepositoryText>,
     workspace: Option<Workspace>,
     dir: Option<RelPath>,
-    env: Option<BTreeMap<EnvName, String>>,
+    env: Option<BTreeMap<EnvName, RepositoryText>>,
 }
+
+type RepositoryText = Labeled<String, Repository>;
+pub type ApprovedProjectWord = Labeled<String, ApprovedRepository>;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "String")]
@@ -99,16 +103,6 @@ impl ApprovedProjectTargets {
     #[must_use]
     pub(crate) fn into_machines(self) -> Vec<Machine> {
         self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ApprovedProjectWord(String);
-
-impl ApprovedProjectWord {
-    #[must_use]
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -202,15 +196,40 @@ impl RepositoryRequest {
                 machines.push(config.machine(&machine_name)?);
             }
         }
+        let targets = ApprovedProjectTargets(machines);
         Ok(ApprovedProjectJob {
             parts: ProjectOrderParts {
                 root,
-                targets: ApprovedProjectTargets(machines),
-                words: self.run.iter().cloned().map(ApprovedProjectWord).collect(),
-                runner: self.runner.clone(),
+                words: self
+                    .run
+                    .iter()
+                    .map(|word| word.after_project_approval(&targets))
+                    .collect(),
+                runner: self.runner.as_ref().map(|runner| {
+                    runner
+                        .after_project_approval(&targets)
+                        .into_approved_string()
+                }),
                 workspace: self.workspace.unwrap_or(Workspace::Warm),
                 dir: self.dir.clone(),
-                env: self.env.clone().unwrap_or_default(),
+                env: self
+                    .env
+                    .as_ref()
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.clone(),
+                                    value
+                                        .after_project_approval(&targets)
+                                        .into_approved_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                targets,
             },
         })
     }
@@ -251,7 +270,10 @@ workspace = "fresh"
     fn projects_declare_jobs_and_nothing_else() {
         let project = Project::parse(SAMPLE, "sample").unwrap();
         let test: JobName = "test".parse().unwrap();
-        assert_eq!(project.job(&test).unwrap().run, ["cargo", "test"]);
+        assert_eq!(
+            serde_json::to_value(&project.job(&test).unwrap().run).unwrap(),
+            serde_json::json!(["cargo", "test"])
+        );
         let with_trigger = "[triggers.x]\nevent = \"push\"\n";
         assert!(matches!(
             Project::parse(with_trigger, "x"),
@@ -360,6 +382,44 @@ workspace = "fresh"
             too_many.parse::<ProjectSelector>(),
             Err(ConfigError::SelectorTooComplex { .. })
         ));
+    }
+
+    #[test]
+    fn repository_values_leave_their_origin_only_after_local_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let local = format!(
+            "[[project_jobs]]\nroot = '{}'\nmachines = ['local']\n",
+            root.path().display()
+        );
+        let config = Config::layered(&local, "local config").unwrap();
+        let project = Project::parse(
+            "[jobs.complete]\non = '@all'\nrun = ['echo', 'ok']\nrunner = 'shell'\n[jobs.complete.env]\nMESSAGE = 'hello'\n",
+            "sample",
+        )
+        .unwrap();
+        let name: JobName = "complete".parse().unwrap();
+        let approved = project
+            .job(&name)
+            .unwrap()
+            .approve(&config, root.path(), None)
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            approved
+                .words
+                .iter()
+                .map(ApprovedProjectWord::as_str)
+                .collect::<Vec<_>>(),
+            ["echo", "ok"]
+        );
+        assert_eq!(approved.runner.as_deref(), Some("shell"));
+        assert_eq!(
+            approved
+                .env
+                .get(&"MESSAGE".parse().unwrap())
+                .map(String::as_str),
+            Some("hello")
+        );
     }
 
     #[test]

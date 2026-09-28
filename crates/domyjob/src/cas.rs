@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{BlobId, RelPath};
 use crate::snapshot::Manifest;
 
+#[cfg(test)]
+const STORED_SCAN_BATCH: usize = crate::bounded::DIRECTORY_BATCH.get();
+
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
     #[error(transparent)]
@@ -173,16 +176,33 @@ impl Cas {
         Ok(size)
     }
 
-    pub fn stored(&self) -> Result<Vec<BlobId>, CasError> {
-        crate::faults::at("cas::list", &self.root).map_err(io("listing", &self.root))?;
-        let mut out = Vec::new();
+    pub fn for_each_stored<E>(&self, visit: impl FnMut(BlobId) -> Result<(), E>) -> Result<(), E>
+    where
+        E: From<CasError>,
+    {
+        self.for_each_stored_matching("", visit)
+    }
+
+    pub(crate) fn for_each_stored_matching<E>(
+        &self,
+        wanted: &str,
+        mut visit: impl FnMut(BlobId) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: From<CasError>,
+    {
+        crate::faults::at("cas::list", &self.root)
+            .map_err(io("listing", &self.root))
+            .map_err(CasError::from)?;
         let fans = match std::fs::read_dir(&self.root) {
             Ok(fans) => fans,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(io("listing", &self.root)(e).into()),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(CasError::from(io("listing", &self.root)(e)).into()),
         };
         for fan in fans {
-            let fan = fan.map_err(io("listing", &self.root))?;
+            let fan = fan
+                .map_err(io("listing", &self.root))
+                .map_err(CasError::from)?;
             let fan_name = fan.file_name();
             let Some(prefix) = fan_name.to_str().filter(|name| {
                 name.len() == 2
@@ -192,18 +212,46 @@ impl Cas {
             }) else {
                 continue;
             };
-            let path = fan.path();
-            crate::faults::at("cas::list", &path).map_err(io("listing", &path))?;
-            let inner = std::fs::read_dir(&path).map_err(io("listing", &path))?;
-            for blob in inner {
-                let blob = blob.map_err(io("listing", &path))?;
-                let name = format!("{}{}", prefix, blob.file_name().to_string_lossy());
-                match name.parse::<BlobId>() {
-                    Ok(id) => out.push(id),
-                    Err(_staging_or_foreign) => {}
-                }
+            if !prefix.starts_with(wanted) && !wanted.starts_with(prefix) {
+                continue;
             }
+            let path = fan.path();
+            crate::bounded::SortedScan::<BlobId>::new().walk(
+                |offer| {
+                    crate::faults::at("cas::list", &path)
+                        .map_err(io("listing", &path))
+                        .map_err(CasError::from)?;
+                    let inner = std::fs::read_dir(&path)
+                        .map_err(io("listing", &path))
+                        .map_err(CasError::from)?;
+                    for blob in inner {
+                        let blob = blob.map_err(io("listing", &path)).map_err(CasError::from)?;
+                        let name = format!("{}{}", prefix, blob.file_name().to_string_lossy());
+                        let Ok(id) = name.parse::<BlobId>() else {
+                            continue;
+                        };
+                        if id.as_str().starts_with(wanted) {
+                            offer(id);
+                        }
+                    }
+                    Ok::<(), E>(())
+                },
+                |id| {
+                    visit(id)?;
+                    Ok(crate::bounded::ScanFlow::Continue)
+                },
+            )?;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn stored(&self) -> Result<Vec<BlobId>, CasError> {
+        let mut out = Vec::new();
+        self.for_each_stored::<CasError>(|blob| {
+            out.push(blob);
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -299,6 +347,25 @@ mod tests {
         let tag = cas.root.join(blob.split().0).display().to_string();
         let _faults = crate::faults::inject(&[("cas::list", &tag)]);
         assert!(matches!(cas.stored(), Err(CasError::Io { .. })));
+    }
+
+    #[test]
+    fn deleting_stored_blobs_crosses_batches_without_skipping_a_fan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas = Cas::open(tmp.path().join("objects")).unwrap();
+        for index in 0..=STORED_SCAN_BATCH {
+            let id: BlobId = format!("aa{index:062x}").parse().unwrap();
+            crate::state_file::write_bytes(&cas.path(&id), b"fixture").unwrap();
+        }
+        let mut removed = 0;
+        cas.for_each_stored::<CasError>(|id| {
+            cas.remove(&id)?;
+            removed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(removed, STORED_SCAN_BATCH + 1);
+        assert!(cas.stored().unwrap().is_empty());
     }
 
     #[test]

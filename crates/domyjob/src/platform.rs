@@ -54,7 +54,7 @@ pub const fn boot_identity() -> Option<String> {
 #[cfg(target_os = "linux")]
 fn boot_identity_on_this_system() -> Option<String> {
     let Ok(identity) = crate::bounded::text_file(
-        std::path::Path::new("/proc/sys/kernel/random/boot_id"),
+        Path::new("/proc/sys/kernel/random/boot_id"),
         crate::bounded::BOOT_ID,
     ) else {
         return None;
@@ -241,28 +241,427 @@ pub enum Ownership {
     Private,
     OtherOwner,
     Exposed(u32),
+    LegacyAcl,
+    ExposedAcl,
+}
+
+#[cfg(unix)]
+pub fn ownership(file: &std::fs::File) -> std::io::Result<Ownership> {
+    use std::os::unix::fs::MetadataExt;
+    const GROUP_AND_OTHER_BITS: u32 = 6;
+    let meta = file.metadata()?;
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Ok(Ownership::OtherOwner);
+    }
+    let mode = MetadataExt::mode(&meta) & 0o777;
+    if mode.trailing_zeros() >= GROUP_AND_OTHER_BITS {
+        Ok(Ownership::Private)
+    } else {
+        Ok(Ownership::Exposed(mode))
+    }
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "the ACL must be read from the open handle and each allowed SID inspected"
+)]
+pub fn ownership(file: &std::fs::File) -> std::io::Result<Ownership> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, OWNER_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    const SYSTEM: &str = "S-1-5-18";
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const MAX_PRIVATE_ACES: u32 = 32;
+    let read_only = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
+
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            std::ptr::null_mut(),
+            &raw mut dacl,
+            std::ptr::null_mut(),
+            &raw mut raw,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    let _descriptor = LocalSecurityDescriptor(raw);
+    let user = current_user_sid()?;
+    let owner = sid_text(owner)?;
+    if owner != user && owner.as_str() != ADMINISTRATORS {
+        return Ok(Ownership::OtherOwner);
+    }
+    if dacl.is_null() {
+        return Ok(Ownership::ExposedAcl);
+    }
+    let mut size = ACL_SIZE_INFORMATION::default();
+    let size_bytes =
+        u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).map_err(std::io::Error::other)?;
+    if unsafe { GetAclInformation(dacl, (&raw mut size).cast(), size_bytes, AclSizeInformation) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if size.AceCount > MAX_PRIVATE_ACES {
+        return Ok(Ownership::ExposedAcl);
+    }
+    let mut legacy_acl = false;
+    for index in 0..size.AceCount {
+        let mut entry = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &raw mut entry) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let header: &ACE_HEADER = unsafe { &*entry.cast() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+            || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            return Ok(Ownership::ExposedAcl);
+        }
+        let ace: &ACCESS_ALLOWED_ACE = unsafe { &*entry.cast() };
+        let sid = sid_text((&raw const ace.SidStart).cast_mut().cast())?;
+        if sid != user && sid.as_str() != SYSTEM {
+            if sid.as_str() != ADMINISTRATORS && ace.Mask & !read_only != 0 {
+                return Ok(Ownership::ExposedAcl);
+            }
+            legacy_acl = true;
+        }
+    }
+    Ok(if legacy_acl {
+        Ownership::LegacyAcl
+    } else {
+        Ownership::Private
+    })
+}
+
+#[cfg(windows)]
+pub fn open_dir_for_ownership(path: &Path) -> std::io::Result<std::fs::File> {
+    open_for_acl_inspection(path)
+}
+
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "ACL inspection and repair open the named object without following a reparse point"
+)]
+fn open_acl_handle(path: &Path, access: u32) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.access_mode(access);
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(path)
+}
+
+#[cfg(windows)]
+pub fn open_for_acl_inspection(path: &Path) -> std::io::Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+
+    open_acl_handle(path, READ_CONTROL)
+}
+
+#[cfg(windows)]
+pub fn open_for_acl_repair(path: &Path) -> std::io::Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+
+    open_acl_handle(path, READ_CONTROL | WRITE_DAC)
+}
+
+#[cfg(windows)]
+#[expect(
+    unsafe_code,
+    reason = "the same open handle receives a protected owner-and-SYSTEM DACL after its current ACL was classified"
+)]
+pub fn tighten_legacy_acl(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    match ownership(file)? {
+        Ownership::Private => return Ok(()),
+        Ownership::LegacyAcl => {}
+        Ownership::OtherOwner | Ownership::Exposed(_) | Ownership::ExposedAcl => {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+    }
+    let descriptor = LocalSecurityDescriptor::for_current_user()?;
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.0,
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    } == 0
+        || present == 0
+        || dacl.is_null()
+    {
+        return Err(std::io::Error::other("the private DACL is unavailable"));
+    }
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status.cast_signed()));
+    }
+    match ownership(file)? {
+        Ownership::Private => Ok(()),
+        Ownership::OtherOwner
+        | Ownership::Exposed(_)
+        | Ownership::LegacyAcl
+        | Ownership::ExposedAcl => Err(std::io::Error::other("the ACL remained exposed")),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LegacyAclError {
+    #[error(transparent)]
+    Io(#[from] crate::failure::IoFailure),
+    #[error("{path} is not a regular state directory")]
+    NotDirectory { path: std::path::PathBuf },
+    #[error("{path} belongs to another user; refusing to migrate it")]
+    Foreign { path: std::path::PathBuf },
+    #[error("{path} cannot be retained during Windows state ACL migration")]
+    UnsafeEntry { path: std::path::PathBuf },
+    #[error(
+        "the Windows state inventory exceeds its {entries}-entry or {path_bytes}-byte path budget at {path}"
+    )]
+    InventoryLimit {
+        path: std::path::PathBuf,
+        entries: usize,
+        path_bytes: usize,
+    },
+    #[error(
+        "{path} still has {remaining} legacy ACLs after migration; rerun `domyjob self secure-state`"
+    )]
+    Remaining {
+        path: std::path::PathBuf,
+        remaining: usize,
+    },
+    #[error("state ACL migration is available only on Windows")]
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyAclReport {
+    pub scanned: usize,
+    pub candidates: usize,
+}
+
+#[cfg(not(windows))]
+pub const fn secure_legacy_state(
+    _root: &Path,
+    _apply: bool,
+) -> Result<LegacyAclReport, LegacyAclError> {
+    Err(LegacyAclError::Unsupported)
+}
+
+#[cfg(windows)]
+pub fn secure_legacy_state(root: &Path, apply: bool) -> Result<LegacyAclReport, LegacyAclError> {
+    let plan = plan_legacy_acl(root)?;
+    let report = LegacyAclReport {
+        scanned: plan.scanned(),
+        candidates: plan.candidates(),
+    };
+    if apply {
+        plan.apply()?;
+    }
+    Ok(report)
+}
+
+#[cfg(windows)]
+const LEGACY_INVENTORY_ENTRIES: usize = 150_000;
+#[cfg(windows)]
+const LEGACY_INVENTORY_PATH_BYTES: usize = 32 << 20;
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct LegacyAclPlan {
+    root: std::path::PathBuf,
+    candidates: Vec<std::path::PathBuf>,
+    scanned: usize,
+}
+
+#[cfg(windows)]
+impl LegacyAclPlan {
+    #[must_use]
+    pub const fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    #[must_use]
+    pub const fn candidates(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub fn apply(self) -> Result<(), LegacyAclError> {
+        for path in &self.candidates {
+            let file = open_for_acl_repair(path).map_err(crate::failure::io("opening", path))?;
+            let meta = file
+                .metadata()
+                .map_err(crate::failure::io("checking", path))?;
+            if is_reparse_point(&meta) || !(meta.is_dir() || meta.is_file()) {
+                return Err(LegacyAclError::UnsafeEntry { path: path.clone() });
+            }
+            tighten_legacy_acl(&file).map_err(crate::failure::io("securing", path))?;
+        }
+        if self.scanned == 0 {
+            create_private_dir(&self.root).map_err(crate::failure::io("creating", &self.root))?;
+        }
+        let remaining = plan_legacy_acl(&self.root)?.candidates();
+        if remaining != 0 {
+            return Err(LegacyAclError::Remaining {
+                path: self.root,
+                remaining,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn legacy_inventory_limit(path: &Path) -> LegacyAclError {
+    LegacyAclError::InventoryLimit {
+        path: path.to_path_buf(),
+        entries: LEGACY_INVENTORY_ENTRIES,
+        path_bytes: LEGACY_INVENTORY_PATH_BYTES,
+    }
+}
+
+#[cfg(windows)]
+pub fn plan_legacy_acl(root: &Path) -> Result<LegacyAclPlan, LegacyAclError> {
+    if let Err(error) = std::fs::symlink_metadata(root) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(LegacyAclPlan {
+                root: root.to_path_buf(),
+                candidates: Vec::new(),
+                scanned: 0,
+            });
+        }
+        return Err(crate::failure::io("checking", root)(error).into());
+    }
+    let mut pending = vec![(root.to_path_buf(), false)];
+    let mut entries = 1usize;
+    let mut path_bytes = root.as_os_str().as_encoded_bytes().len();
+    let mut candidates = Vec::new();
+    let mut scanned = 0usize;
+    while let Some((path, exposed_parent)) = pending.pop() {
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(crate::failure::io("checking", &path))?;
+        let reparse = is_reparse_point(&meta);
+        if path == root && (!meta.is_dir() || reparse) {
+            return Err(LegacyAclError::NotDirectory { path });
+        }
+        let file = open_for_acl_inspection(&path).map_err(crate::failure::io("opening", &path))?;
+        let opened = file
+            .metadata()
+            .map_err(crate::failure::io("checking", &path))?;
+        if reparse != is_reparse_point(&opened)
+            || (!reparse
+                && (meta.is_dir() != opened.is_dir() || meta.is_file() != opened.is_file()))
+            || !(meta.is_dir() || meta.is_file() || reparse)
+        {
+            return Err(LegacyAclError::UnsafeEntry { path });
+        }
+        let owner = ownership(&file).map_err(crate::failure::io("checking", &path))?;
+        let exposed = match owner {
+            Ownership::Private => false,
+            Ownership::LegacyAcl if !reparse => {
+                candidates.push(path.clone());
+                true
+            }
+            Ownership::OtherOwner => return Err(LegacyAclError::Foreign { path }),
+            Ownership::LegacyAcl | Ownership::ExposedAcl | Ownership::Exposed(_) => {
+                return Err(LegacyAclError::UnsafeEntry { path });
+            }
+        };
+        scanned = scanned
+            .checked_add(1)
+            .ok_or_else(|| legacy_inventory_limit(&path))?;
+        if reparse {
+            if exposed_parent {
+                return Err(LegacyAclError::UnsafeEntry { path });
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(crate::failure::io("reading", &path))? {
+                let entry = entry.map_err(crate::failure::io("reading", &path))?;
+                let child = entry.path();
+                entries = entries
+                    .checked_add(1)
+                    .ok_or_else(|| legacy_inventory_limit(&child))?;
+                path_bytes = path_bytes
+                    .checked_add(child.as_os_str().as_encoded_bytes().len())
+                    .ok_or_else(|| legacy_inventory_limit(&child))?;
+                if entries > LEGACY_INVENTORY_ENTRIES || path_bytes > LEGACY_INVENTORY_PATH_BYTES {
+                    return Err(legacy_inventory_limit(&child));
+                }
+                pending.push((child, exposed));
+            }
+        }
+    }
+    Ok(LegacyAclPlan {
+        root: root.to_path_buf(),
+        candidates,
+        scanned,
+    })
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the ownership check opens a directory handle without following a symlink"
+)]
+pub fn open_dir_for_ownership(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options);
+    options.open(path)
 }
 
 #[cfg(unix)]
 #[must_use]
-pub fn ownership(meta: &std::fs::Metadata) -> Ownership {
-    use std::os::unix::fs::MetadataExt;
-    const GROUP_AND_OTHER_BITS: u32 = 6;
-    if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Ownership::OtherOwner;
-    }
-    let mode = MetadataExt::mode(meta) & 0o777;
-    if mode.trailing_zeros() >= GROUP_AND_OTHER_BITS {
-        Ownership::Private
-    } else {
-        Ownership::Exposed(mode)
-    }
+pub fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[must_use]
-pub const fn ownership(_meta: &std::fs::Metadata) -> Ownership {
-    Ownership::Private
+pub fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
@@ -281,40 +680,17 @@ fn create_private_dir_in(path: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 #[expect(
     unsafe_code,
-    reason = "reading the current user's SID from the process token needs the token API"
+    reason = "Windows renders a binary SID from the ACL or process token"
 )]
-fn current_user_sid() -> std::io::Result<crate::domain::WindowsSid> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+fn sid_text(sid: windows_sys::Win32::Security::PSID) -> std::io::Result<crate::domain::WindowsSid> {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     let refuse = |detail: &str| std::io::Error::other(detail.to_owned());
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(refuse("the process token cannot be opened"));
+    if sid.is_null() {
+        return Err(refuse("the SID is missing"));
     }
-    let mut needed = 0u32;
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed) };
-    let Ok(capacity) = usize::try_from(needed) else {
-        return Err(refuse("the token is too large"));
-    };
-    let mut buffer = vec![0u8; capacity];
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    if asked == 0 || buffer.len() < size_of::<TOKEN_USER>() {
-        return Err(refuse("the token has no user"));
-    }
-    let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
     let mut wide: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut wide) } == 0 || wide.is_null() {
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut wide) } == 0 || wide.is_null() {
         return Err(refuse("the SID cannot be rendered"));
     }
     let mut len = 0usize;
@@ -328,37 +704,152 @@ fn current_user_sid() -> std::io::Result<crate::domain::WindowsSid> {
 
 #[cfg(windows)]
 #[expect(
-    clippy::disallowed_methods,
-    reason = "the one place that creates a private directory, then confines it with an ACL"
+    unsafe_code,
+    reason = "reading the current user's SID from the process token needs the token API"
 )]
-fn create_private_dir_in(path: &Path) -> std::io::Result<()> {
-    use crate::template::Arg;
-    std::fs::create_dir_all(path)?;
-    let sid = current_user_sid()?;
-    let args = vec![
-        Arg::path(path),
-        Arg::literal("/inheritance:r"),
-        Arg::literal("/grant:r"),
-        Arg::concat(&[
-            Arg::literal("*"),
-            Arg::word(&sid),
-            Arg::literal(":(OI)(CI)F"),
-        ]),
-        Arg::literal("/grant:r"),
-        Arg::literal("*S-1-5-18:(OI)(CI)F"),
-        Arg::literal("/Q"),
-    ];
-    let status = crate::spawn::Invocation::new(Arg::literal("icacls"), args)
-        .command()
-        .stdout(std::process::Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "icacls exited with {status}"
-        )))
+fn current_user_sid() -> std::io::Result<crate::domain::WindowsSid> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let refuse = |detail: &str| std::io::Error::other(detail.to_owned());
+    let mut token: HANDLE = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(refuse("the process token cannot be opened"));
     }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    let Ok(capacity) = usize::try_from(needed) else {
+        return Err(refuse("the token is too large"));
+    };
+    let mut buffer = vec![0u8; capacity];
+    let asked = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &raw mut needed,
+        )
+    };
+    if asked == 0 || buffer.len() < size_of::<TOKEN_USER>() {
+        return Err(refuse("the token has no user"));
+    }
+    let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
+    sid_text(user.User.Sid)
+}
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl LocalSecurityDescriptor {
+    fn for_current_user() -> std::io::Result<Self> {
+        let sid = current_user_sid()?;
+        Self::from_sddl(&format!(
+            "O:{}D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",
+            sid.as_str(),
+            sid.as_str()
+        ))
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "Windows converts SDDL into a security descriptor owned by LocalFree"
+    )]
+    fn from_sddl(sddl: &str) -> std::io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "CreateDirectoryW applies the owner-only ACL as the directory is created"
+    )]
+    fn create(&self, path: &Path) -> std::io::Result<()> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        wide.push(0);
+        let size =
+            u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).map_err(std::io::Error::other)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: 0,
+        };
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &raw const attributes) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    #[expect(
+        unsafe_code,
+        reason = "LocalFree releases the descriptor returned by the SDDL conversion API"
+    )]
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn create_private_dir_in(path: &Path) -> std::io::Result<()> {
+    let descriptor = LocalSecurityDescriptor::for_current_user()?;
+    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.is_dir() => continue,
+            Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match descriptor.create(ancestor) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(ancestor)?.is_dir() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[expect(
@@ -448,13 +939,65 @@ pub fn expose(path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, windows))]
+pub fn expose(path: &Path) -> std::io::Result<bool> {
+    expose_with_rights(path, "GR")
+}
+
+#[cfg(all(test, windows))]
 #[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the signature of systems where group and other bits exist"
+    unsafe_code,
+    reason = "the test creates a file with an Everyone ACE to verify the production ACL rejection"
 )]
-pub const fn expose(_path: &Path) -> std::io::Result<bool> {
-    Ok(false)
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test replaces its private fixture file with one created under an exposed ACL"
+)]
+fn expose_with_rights(path: &Path, rights: &str) -> std::io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let sid = current_user_sid()?;
+    let descriptor = LocalSecurityDescriptor::from_sddl(&format!(
+        "O:{}D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)(A;OICI;{rights};;;WD)",
+        sid.as_str(),
+        sid.as_str()
+    ))?;
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir(path)?;
+        descriptor.create(path)?;
+        return Ok(true);
+    }
+    std::fs::remove_file(path)?;
+    let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
+    name.push(0);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).map_err(std::io::Error::other)?,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &raw const attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(unsafe { std::fs::File::from_raw_handle(handle) });
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -547,12 +1090,276 @@ pub fn push_arg(command: &mut std::process::Command, word: &str, _cmd: bool) {
 }
 
 #[cfg(all(test, windows))]
+mod windows_private_dir_tests {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use super::*;
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the shared fixture must fail its boundary test if legacy ACL setup fails"
+    )]
+    fn legacy_state(root: &Path) {
+        crate::state_file::private_dir(root).unwrap();
+        assert!(expose(root).unwrap());
+    }
+
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the boundary test reads the ACL Windows assigned to a newly created directory"
+    )]
+    fn nested_private_directories_have_only_the_owner_and_system_in_their_acl() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("first path").join("実行").join("private");
+        create_private_dir(&path).unwrap();
+        crate::state_file::write_bytes(&path.join("file"), b"kept").unwrap();
+        let information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let sid = current_user_sid().unwrap();
+        for directory in path.ancestors().take(3) {
+            let mut name: Vec<u16> = directory.as_os_str().encode_wide().collect();
+            name.push(0);
+            let mut raw = std::ptr::null_mut();
+            let status = unsafe {
+                GetNamedSecurityInfoW(
+                    name.as_ptr(),
+                    SE_FILE_OBJECT,
+                    information,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut raw,
+                )
+            };
+            assert_eq!(status, 0);
+            let descriptor = LocalSecurityDescriptor(raw);
+            let mut shown = std::ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                        descriptor.0,
+                        SDDL_REVISION_1,
+                        information,
+                        &raw mut shown,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            let mut length = 0usize;
+            while unsafe { *shown.add(length) } != 0 {
+                length = length.saturating_add(1);
+            }
+            let acl =
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(shown, length) });
+            unsafe { LocalFree(shown.cast()) };
+            assert!(acl.contains(&format!("O:{}", sid.as_str())), "{acl}");
+            assert!(acl.contains("D:P"), "{acl}");
+            assert_eq!(acl.matches("(A;").count(), 2, "{acl}");
+            assert!(acl.contains(sid.as_str()) && acl.contains(";;;SY"), "{acl}");
+        }
+    }
+
+    #[test]
+    fn existing_directory_with_everyone_acl_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        legacy_state(&dir);
+        let handle = open_dir_for_ownership(&dir).unwrap();
+        assert_eq!(ownership(&handle).unwrap(), Ownership::LegacyAcl);
+        assert!(matches!(
+            crate::state_file::private_dir(&dir),
+            Err(crate::state_file::StateError::ExposedAcl { .. })
+        ));
+    }
+
+    #[test]
+    fn writable_everyone_acl_is_not_a_legacy_migration_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state");
+        crate::state_file::private_dir(&dir).unwrap();
+        assert!(expose_with_rights(&dir, "GW").unwrap());
+        let handle = open_dir_for_ownership(&dir).unwrap();
+        assert_eq!(ownership(&handle).unwrap(), Ownership::ExposedAcl);
+        let repair = open_for_acl_repair(&dir).unwrap();
+        assert_eq!(
+            tighten_legacy_acl(&repair).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture must create legacy children that inherit the exposed ACL"
+    )]
+    fn readonly_legacy_acl_is_tightened_on_the_same_handle_and_propagates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        legacy_state(&root);
+        let child = root.join("jobs");
+        std::fs::create_dir_all(&child).unwrap();
+        let record = child.join("record");
+        std::fs::write(&record, b"kept").unwrap();
+        let root_handle = open_for_acl_repair(&root).unwrap();
+        assert_eq!(ownership(&root_handle).unwrap(), Ownership::LegacyAcl);
+        tighten_legacy_acl(&root_handle).unwrap();
+        for path in [&root, &child, &record] {
+            let handle = if path.is_dir() {
+                open_dir_for_ownership(path).unwrap()
+            } else {
+                std::fs::File::open(path).unwrap()
+            };
+            assert_eq!(ownership(&handle).unwrap(), Ownership::Private);
+        }
+        assert_eq!(std::fs::read(record).unwrap(), b"kept");
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture creates preexisting state files under an inherited legacy ACL"
+    )]
+    fn legacy_state_is_preflighted_and_secured_without_changing_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        legacy_state(&root);
+        let jobs = root.join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        let record = jobs.join("record");
+        std::fs::write(&record, b"kept").unwrap();
+        let private = root.join("v3");
+        create_private_dir(&private).unwrap();
+        crate::state_file::write_bytes(&private.join("private"), b"protected").unwrap();
+
+        let plan = plan_legacy_acl(&root).unwrap();
+        assert_eq!(plan.scanned(), 5);
+        assert_eq!(plan.candidates(), 3);
+        assert_eq!(
+            ownership(&open_dir_for_ownership(&root).unwrap()).unwrap(),
+            Ownership::LegacyAcl
+        );
+        plan.apply().unwrap();
+        assert_eq!(plan_legacy_acl(&root).unwrap().candidates(), 0);
+        assert_eq!(std::fs::read(record).unwrap(), b"kept");
+        assert_eq!(
+            std::fs::read(private.join("private")).unwrap(),
+            b"protected"
+        );
+        crate::state_file::private_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn legacy_acl_repair_resumes_after_the_root_was_secured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        legacy_state(&root);
+        let root_handle = open_for_acl_repair(&root).unwrap();
+        tighten_legacy_acl(&root_handle).unwrap();
+        let child = root.join("jobs");
+        crate::state_file::private_dir(&child).unwrap();
+        assert!(expose(&child).unwrap());
+        assert_eq!(
+            ownership(&open_dir_for_ownership(&root).unwrap()).unwrap(),
+            Ownership::Private
+        );
+        assert_eq!(
+            ownership(&open_dir_for_ownership(&child).unwrap()).unwrap(),
+            Ownership::LegacyAcl
+        );
+        let plan = plan_legacy_acl(&root).unwrap();
+        assert_eq!(plan.candidates(), 1);
+        plan.apply().unwrap();
+        assert_eq!(plan_legacy_acl(&root).unwrap().candidates(), 0);
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture creates a writable foreign ACE in preexisting state"
+    )]
+    fn legacy_state_preflight_rejects_writable_aces_before_any_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        legacy_state(&root);
+        let record = root.join("record");
+        std::fs::write(&record, b"kept").unwrap();
+        assert!(expose_with_rights(&record, "GW").unwrap());
+        std::fs::write(&record, b"kept").unwrap();
+        assert!(matches!(
+            plan_legacy_acl(&root),
+            Err(LegacyAclError::UnsafeEntry { .. })
+        ));
+        assert_eq!(
+            ownership(&open_dir_for_ownership(&root).unwrap()).unwrap(),
+            Ownership::LegacyAcl
+        );
+        assert_eq!(std::fs::read(record).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn legacy_state_preflight_rejects_a_reparse_point_under_exposed_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        legacy_state(&root);
+        let outside = tmp.path().join("outside");
+        crate::state_file::private_dir(&outside).unwrap();
+        if make_dir_link(&outside, &root.join("link")).is_err() {
+            return;
+        }
+        assert!(matches!(
+            plan_legacy_acl(&root),
+            Err(LegacyAclError::UnsafeEntry { .. })
+        ));
+        assert_eq!(
+            ownership(&open_dir_for_ownership(&root).unwrap()).unwrap(),
+            Ownership::LegacyAcl
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_source_stamp_tests {
+    #[test]
+    fn source_stamp_rejects_product_links_but_ignores_build_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("crates/domyjob/src/source.rs");
+        crate::user_files::write(&source, b"fn main() {}\n").unwrap();
+        let link = tmp.path().join("crates/domyjob/src/link.rs");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let error = crate::build_stamp::digest(tmp.path()).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+
+        crate::user_files::remove(&link).unwrap();
+        std::os::unix::fs::symlink(&source, tmp.path().join("target")).unwrap();
+        crate::build_stamp::digest(tmp.path()).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
 mod windows_source_build_tests {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::{Output, Stdio};
 
     use crate::template::Arg;
+
+    fn describe(output: &Output) -> String {
+        format!(
+            "status: {}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
 
     fn absent(path: &Path) -> bool {
         matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
@@ -563,13 +1370,14 @@ mod windows_source_build_tests {
         reason = "unreadable fixture directories fail the test"
     )]
     fn source_is_clean(cache: &Path) -> bool {
-        std::fs::read_dir(cache).unwrap().all(|entry| {
+        let transient_sources_absent = std::fs::read_dir(cache).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
                 .starts_with("source-")
-        })
+        });
+        transient_sources_absent && absent(&cache.join("build").join("source"))
     }
 
     #[expect(
@@ -599,7 +1407,7 @@ mod windows_source_build_tests {
         for (name, contents) in [
             (
                 "Cargo.toml",
-                "[package]\nname = \"domyjob\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+                "[package]\nname = \"domyjob\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[profile.remote]\ninherits = \"dev\"\n",
             ),
             (
                 "Cargo.lock",
@@ -616,25 +1424,19 @@ mod windows_source_build_tests {
                 .unwrap();
         }
         let archive = archive.into_inner().unwrap();
-        let digest = crate::domain::BlobId::of(&archive);
-        let (script, transfer) = crate::remote::windows_source_build_for_test(cache, &digest);
+        let (script, transfer, payload) =
+            crate::remote::windows_source_build_for_test(cache, &archive);
         let artifact = cache
             .join("build")
-            .join(crate::protocol::build_key())
-            .join(digest.as_str())
-            .join("release/domyjob.exe");
+            .join("shared")
+            .join("remote/domyjob.exe");
         crate::state_file::private_dir(artifact.parent().unwrap()).unwrap();
         crate::state_file::write_bytes(
-            &cache
-                .join("build")
-                .join(crate::protocol::build_key())
-                .join(digest.as_str())
-                .join("CACHEDIR.TAG"),
+            &cache.join("build").join("shared").join("CACHEDIR.TAG"),
             b"Signature: 8a477f597d28d172789f06886806bc55\n",
         )
         .unwrap();
         crate::state_file::write_bytes(&artifact, b"stale executable").unwrap();
-        let source = crate::remote::base64_lines(&archive);
         let mut child =
             crate::spawn::Invocation::new(Arg::literal("cmd"), vec![Arg::literal("/c"), script])
                 .command()
@@ -643,12 +1445,7 @@ mod windows_source_build_tests {
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
+        child.stdin.take().unwrap().write_all(&payload).unwrap();
         let output = child.wait_with_output().unwrap();
         (transfer, output)
     }
@@ -677,11 +1474,7 @@ mod windows_source_build_tests {
                 .command();
         discard.env("USERPROFILE", profile).env("TEMP", profile);
         let discarded = discard.output().unwrap();
-        assert!(
-            discarded.status.success(),
-            "{}",
-            String::from_utf8_lossy(&discarded.stderr)
-        );
+        assert!(discarded.status.success(), "{}", describe(&discarded));
         assert!(absent(staged) && absent(&upload) && absent(&source));
     }
 
@@ -691,12 +1484,11 @@ mod windows_source_build_tests {
         let errors = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{errors}");
         assert!(errors.contains("build must fail"), "{errors}");
-        assert!(absent(
-            &cache
-                .join("bin")
-                .join(crate::protocol::build_key())
-                .join(format!("domyjob.incoming-{}.exe", transfer.as_str()))
-        ));
+        assert!(absent(&cache.join("bin").join(format!(
+            "domyjob-{}.incoming-{}.exe",
+            crate::protocol::build_key(),
+            transfer.as_str()
+        ))));
         assert!(source_is_clean(&cache));
     }
 
@@ -708,10 +1500,11 @@ mod windows_source_build_tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let staged = cache
-            .join("bin")
-            .join(crate::protocol::build_key())
-            .join(format!("domyjob.incoming-{}.exe", transfer.as_str()));
+        let staged = cache.join("bin").join(format!(
+            "domyjob-{}.incoming-{}.exe",
+            crate::protocol::build_key(),
+            transfer.as_str()
+        ));
         assert!(std::fs::metadata(staged).unwrap().len() > 1000);
         assert!(source_is_clean(&cache));
     }
@@ -719,7 +1512,9 @@ mod windows_source_build_tests {
     #[test]
     fn concurrent_source_builds_in_one_cache_stage_their_own_executables() {
         let temp = tempfile::tempdir().unwrap();
-        let cache = temp.path().join(".cache").join("domyjob");
+        let profile = temp.path().join("profile");
+        crate::state_file::private_dir(&profile).unwrap();
+        let cache = profile.join(".cache").join("domyjob");
         let ((first, first_output), (second, second_output)) = std::thread::scope(|scope| {
             let first =
                 scope.spawn(|| run_build_in_cache(&cache, "fn main() { println!(\"first\"); }\n"));
@@ -727,30 +1522,28 @@ mod windows_source_build_tests {
                 scope.spawn(|| run_build_in_cache(&cache, "fn main() { println!(\"second\"); }\n"));
             (first.join().unwrap(), second.join().unwrap())
         });
-        assert!(
-            first_output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&first_output.stderr)
-        );
+        assert!(first_output.status.success(), "{}", describe(&first_output));
         assert!(
             second_output.status.success(),
             "{}",
-            String::from_utf8_lossy(&second_output.stderr)
+            describe(&second_output)
         );
         assert_ne!(first, second);
         let run = |path: &Path| {
-            let output = crate::spawn::Invocation::new(Arg::path(path), vec![])
-                .command()
-                .output()
-                .unwrap();
+            let output =
+                crate::spawn::Invocation::new(Arg::for_test(path.display().to_string()), vec![])
+                    .command()
+                    .output()
+                    .unwrap();
             assert!(output.status.success());
             String::from_utf8(output.stdout).unwrap()
         };
         for (transfer, expected) in [(first, "first\n"), (second, "second\n")] {
-            let staged = cache
-                .join("bin")
-                .join(crate::protocol::build_key())
-                .join(format!("domyjob.incoming-{}.exe", transfer.as_str()));
+            let staged = cache.join("bin").join(format!(
+                "domyjob-{}.incoming-{}.exe",
+                crate::protocol::build_key(),
+                transfer.as_str()
+            ));
             assert_eq!(run(&staged), expected);
             let mut promote = crate::spawn::Invocation::new(
                 Arg::literal("cmd"),
@@ -760,7 +1553,7 @@ mod windows_source_build_tests {
                 ],
             )
             .command();
-            promote.env("USERPROFILE", temp.path());
+            promote.env("USERPROFILE", &profile);
             let result = promote.output().unwrap();
             assert!(
                 result.status.success(),
@@ -770,10 +1563,9 @@ mod windows_source_build_tests {
             assert!(absent(&staged));
             let current = cache
                 .join("bin")
-                .join(crate::protocol::build_key())
-                .join("domyjob.exe");
+                .join(format!("domyjob-{}.exe", crate::protocol::build_key()));
             assert_eq!(run(&current), expected);
-            discard_staged_for_test(temp.path(), &staged, &transfer);
+            discard_staged_for_test(&profile, &staged, &transfer);
             assert_eq!(run(&current), expected);
         }
     }

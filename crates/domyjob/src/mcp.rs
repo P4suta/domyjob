@@ -981,7 +981,8 @@ mod tests {
         )
         .unwrap();
         let locked = out.lock().unwrap();
-        let reply = serde_json::from_slice::<Value>(&locked).unwrap();
+        let reply =
+            crate::ingress::foreign_json_envelope(std::str::from_utf8(&locked).unwrap()).unwrap();
         assert_eq!(reply.pointer("/result"), Some(&json!({})));
         drop(locked);
 

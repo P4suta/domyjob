@@ -39,6 +39,19 @@ jobs:
       - run: mise run deny
       - run: mise run audit
 
+  vet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install_args: rust
+      - run: cargo install --locked cargo-vet --version 0.10.2
+      - run: mise run vet
+
   test:
     strategy:
       fail-fast: false
@@ -56,10 +69,78 @@ jobs:
       - run: mise run clippy
       - run: mise run test
 
+  kani:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install_args: rust
+      - run: cargo install --locked kani-verifier --version 0.68.0
+      - run: cargo kani setup
+      - run: mise run kani
+
+  proverif:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install_args: rust
+      - name: Build ProVerif 2.05
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocaml
+          curl --fail --location --retry 3 --output /tmp/proverif2.05.tar.gz https://proverif.inria.fr/proverif2.05.tar.gz
+          echo '4871f53c32ab4a04669a060c4886ba5d9080496963fb980a9a62d2c429ceabc4  /tmp/proverif2.05.tar.gz' | sha256sum --check
+          tar -xzf /tmp/proverif2.05.tar.gz -C /tmp
+          cd /tmp/proverif2.05
+          ./build -nointeract native
+          echo "$PWD" >> "$GITHUB_PATH"
+      - run: mise run proverif
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install_args: rust
+      - run: rustup toolchain install nightly-2026-08-21 --component rust-src
+      - run: cargo install --locked cargo-fuzz --version 0.13.2
+      - run: mise run fuzz
+
+  mutations:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [authz, trust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+        with:
+          install_args: rust
+      - run: rustup component add llvm-tools-preview --toolchain 1.98.0
+      - run: cargo install --locked --git https://github.com/P4suta/njutest --rev f0084f1254dcfb1d0f6357a3a181a365609c7415 rust-mutants-cli
+      - run: mise run mutations:${{ matrix.scope }}
+
   ci-success:
     name: ci-success
     if: always()
-    needs: [lint, deny, test]
+    needs: [lint, deny, vet, test, kani, proverif, fuzz, mutations]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

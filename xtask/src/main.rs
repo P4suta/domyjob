@@ -62,12 +62,36 @@ fn proverif(root: &Path) -> ExitCode {
     }
 }
 
+fn dependencies(root: &Path, check: xtask::dependencies::Check) -> ExitCode {
+    match xtask::dependencies::run(root, check) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("dependencies: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn workflows(root: &Path) -> ExitCode {
+    match xtask::workflows::check(root) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("workflows: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     match words.as_slice() {
         ["gates"] => gates(&root),
+        ["workflows"] => workflows(&root),
+        ["dependencies", "deny"] => dependencies(&root, xtask::dependencies::Check::Deny),
+        ["dependencies", "audit"] => dependencies(&root, xtask::dependencies::Check::Audit),
+        ["dependencies", "vet"] => dependencies(&root, xtask::dependencies::Check::Vet),
         ["proverif"] => proverif(&root),
         ["release-keygen", path] => keygen(Path::new(path)),
         ["release-sign", secret, manifest, trusted] => {
@@ -75,7 +99,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: cargo xtask gates | proverif | release-keygen SECRET-PATH | release-sign SECRET-PATH MANIFEST TRUSTED-COMMENT"
+                "usage: cargo xtask gates | workflows | dependencies deny|audit|vet | proverif | release-keygen SECRET-PATH | release-sign SECRET-PATH MANIFEST TRUSTED-COMMENT"
             );
             ExitCode::from(2)
         }

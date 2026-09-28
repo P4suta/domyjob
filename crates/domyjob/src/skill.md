@@ -124,5 +124,8 @@ Wherever machines are listed, one that could not answer is `{"machine": ..., "er
 - Add `--json` to `run`, `digest`, `status`, `wait`, `ls`, and `logs --grep` for machine-readable output.
 - `domyjob mcp` serves the same operations as MCP tools, if you prefer tools to commands.
 - `domyjob doctor` checks that every machine answers and runs a matching domyjob, and `domyjob setup MACHINES` installs the matching one where it does not; `domyjob run --dry-run ...` shows what would be sent where without sending it.
+- When a machine needs a matching build and no signed release is available, a domyjob built from an available local source checkout builds and installs that checkout automatically.
+  The checkout must still match the running client's source stamp; rebuild the local client first if it has changed.
+- On Windows, `domyjob self secure-state --dry-run` inventories existing state ACLs without changing them; `domyjob self secure-state` restricts eligible legacy ACLs to the current user and SYSTEM and verifies the result.
 - `domyjob machines remove NAME --wipe` removes everything domyjob placed on a machine (its jobs, workspaces, key, service, and copy of domyjob) and then forgets it; it refuses while jobs still run there unless `--kill-running` is given.
   `domyjob self uninstall` does the same for the machine you are on.

@@ -3,14 +3,42 @@ pub struct Panicked;
 
 const MAX_WORKERS: usize = 16;
 
-pub fn arrivals<T: Sync, R: Send>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooMany {
+    pub actual: usize,
+    pub limit: usize,
+}
+
+#[derive(Debug)]
+pub struct ConcurrentBatch<'a, T, const MAX: usize> {
+    items: &'a [T],
+}
+
+impl<'a, T, const MAX: usize> ConcurrentBatch<'a, T, MAX> {
+    pub const fn new(items: &'a [T]) -> Result<Self, TooMany> {
+        if items.len() > MAX {
+            return Err(TooMany {
+                actual: items.len(),
+                limit: MAX,
+            });
+        }
+        Ok(Self { items })
+    }
+
+    #[must_use]
+    pub const fn items(&self) -> &'a [T] {
+        self.items
+    }
+}
+
+pub fn try_arrivals<T: Sync, R: Send, E>(
     items: &[T],
     work: impl Fn(&T) -> R + Sync,
-    mut each: impl FnMut(&T, Result<R, Panicked>),
-) {
+    mut each: impl FnMut(&T, Result<R, Panicked>) -> Result<(), E>,
+) -> Result<(), E> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        let (done, arrived) = std::sync::mpsc::channel();
+        let (done, arrived) = std::sync::mpsc::sync_channel(MAX_WORKERS);
         for _ in 0..items.len().min(MAX_WORKERS) {
             let (work, done) = (&work, done.clone());
             let next = &next;
@@ -43,11 +71,30 @@ pub fn arrivals<T: Sync, R: Send>(
         }
         drop(done);
         for (index, result) in arrived {
-            if let Some(item) = items.get(index) {
-                each(item, result);
+            if let Some(item) = items.get(index)
+                && let Err(error) = each(item, result)
+            {
+                next.store(items.len(), std::sync::atomic::Ordering::Relaxed);
+                return Err(error);
             }
         }
+        Ok(())
+    })
+}
+
+pub fn arrivals<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+    mut each: impl FnMut(&T, Result<R, Panicked>),
+) {
+    let result: Result<(), std::convert::Infallible> = try_arrivals(items, work, |item, result| {
+        each(item, result);
+        Ok(())
     });
+    match result {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
 }
 
 pub fn gathered<T: Sync, R: Send>(
@@ -100,5 +147,34 @@ mod tests {
         let workers: std::collections::HashSet<_> =
             answers.into_iter().map(Result::unwrap).collect();
         assert!(workers.len() <= MAX_WORKERS);
+    }
+
+    #[test]
+    fn a_fallible_consumer_stops_receiving_after_its_first_error() {
+        let items = [1, 2, 3];
+        let mut received = 0;
+        let outcome = try_arrivals(
+            &items,
+            |item| item * 2,
+            |_item, _result| {
+                received += 1;
+                Err("stop")
+            },
+        );
+        assert_eq!(outcome, Err("stop"));
+        assert_eq!(received, 1);
+    }
+
+    #[test]
+    fn a_concurrent_batch_requires_its_worker_limit_before_spawning() {
+        let items = [1, 2, 3];
+        assert_eq!(
+            ConcurrentBatch::<_, 2>::new(&items).err(),
+            Some(TooMany {
+                actual: 3,
+                limit: 2,
+            })
+        );
+        assert_eq!(ConcurrentBatch::<_, 3>::new(&items).unwrap().items(), items);
     }
 }

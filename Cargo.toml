@@ -169,6 +169,8 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
   "Win32_System_JobObjects",
   "Win32_System_Console",
   "Win32_System_Threading",
@@ -176,6 +178,16 @@ windows-sys = { version = "0.61", features = [
   "Win32_Networking_WinSock",
   "Win32_System_Pipes",
 ] }
+
+[profile.test]
+debug = 0
+
+[profile.remote]
+inherits = "dev"
+debug = 0
+incremental = true
+opt-level = 1
+strip = true
 
 [profile.release]
 strip = true

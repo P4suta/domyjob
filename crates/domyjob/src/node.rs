@@ -3,18 +3,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::audit::{AuditLog, Verdict};
-use crate::authz::{self, Authorized, Principal, Relation};
+use crate::authz::{
+    self, Authorized, AuthorizedClean, AuthorizedConfigure, AuthorizedKill, AuthorizedRetry,
+    AuthorizedSubmission, CommandAction, CommandAuthority, Commanded, Principal, Queried, Relation,
+    Routed,
+};
+use crate::bounded::ScanFlow;
 use crate::cas::{Cas, CasError};
 use crate::clock::Timestamp;
 use crate::control::{Order, Session};
 use crate::domain::{BlobId, Invalid, JobId, JobRef};
-use crate::local_socket::Reach;
-use crate::lock::LockError;
+use crate::lock::{LockError, SlotIndex};
 use crate::paths::Dirs;
 use crate::proc::{self, ProcError};
 use crate::protocol::{
-    Change, Follow, Frame, Hello, Job, Location, Phase, Refusal, RefusalCode, Reply, Request, Spec,
-    Submission, VERSION,
+    Follow, Frame, Hello, Job, Location, Phase, PhaseKind, Refusal, RefusalCode, Reply, Request,
+    Source, Spec, VERSION,
 };
 use crate::store::{Publication, Store, StoreError};
 use crate::terminal::RemoteText;
@@ -53,16 +57,22 @@ pub enum NodeError {
     Output(std::io::Error),
     #[error("the request is not valid: {0}")]
     Request(serde_json::Error),
-    #[error("{0} is not stored here yet; upload it first")]
+    #[error("{0} is missing from the submitted snapshot")]
     Incomplete(String),
-    #[error("an upload of {0} items is more than one request may carry")]
-    TooMany(u64),
+    #[error("the snapshot sent blob {got}, expected {expected}")]
+    UnexpectedBlob { expected: BlobId, got: BlobId },
     #[error("a list request may return at most {0} jobs")]
     ListLimit(u32),
     #[error("more than {0} unreadable jobs prevent a complete list")]
     TooManyUnreadable(usize),
+    #[error("CAS collection cannot partition its {0}-entry reachability budget any further")]
+    CollectionBudget(usize),
+    #[error("measuring {path}: a directory tree exceeds the {limit}-level depth budget")]
+    MeasureDepth { path: PathBuf, limit: usize },
     #[error("job {0} has no workspace to fetch from")]
     NoWorkspace(JobId),
+    #[error("all {0} warm workspace slots are locked")]
+    WorkspaceSlotsFull(usize),
     #[error(
         "job {job}'s workspace has since been filled by job {by}, so only what {job} changed is kept; `domyjob pull` still brings that back"
     )]
@@ -71,6 +81,10 @@ pub enum NodeError {
     Unfinished(JobId),
     #[error("this machine is paused and takes no new jobs until it is resumed")]
     Paused,
+    #[error(
+        "this machine already has {0} unfinished jobs; wait for one to finish before submitting another"
+    )]
+    JobCapacity(usize),
     #[error(transparent)]
     Workspace(#[from] crate::workspace::WorkspaceError),
     #[error(transparent)]
@@ -97,6 +111,71 @@ pub enum NodeError {
     Control(std::io::Error),
 }
 
+const fn store_refusal(error: &StoreError) -> RefusalCode {
+    match error {
+        StoreError::NoSuchJob(_) => RefusalCode::NoSuchJob,
+        StoreError::Ambiguous { .. } => RefusalCode::AmbiguousJob,
+        StoreError::Io(_)
+        | StoreError::Json { .. }
+        | StoreError::State(_)
+        | StoreError::Lock(_)
+        | StoreError::Exists(_)
+        | StoreError::InvalidHolder { .. }
+        | StoreError::InvalidOutcome { .. }
+        | StoreError::InvalidPhaseTransition { .. }
+        | StoreError::Invalid(_) => RefusalCode::Storage,
+    }
+}
+
+const fn cas_refusal(error: &CasError) -> RefusalCode {
+    match error {
+        CasError::Missing(_) => RefusalCode::MissingContent,
+        CasError::Io(_)
+        | CasError::Corrupt { .. }
+        | CasError::TooLarge { .. }
+        | CasError::InMemoryLimit { .. }
+        | CasError::State(_)
+        | CasError::Unportable(_)
+        | CasError::Damaged(_)
+        | CasError::Manifest { .. }
+        | CasError::Encode(_) => RefusalCode::Storage,
+    }
+}
+
+fn tree_refusal(error: &crate::tree::TreeError) -> RefusalCode {
+    match error {
+        crate::tree::TreeError::Io(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            RefusalCode::NoSuchPath
+        }
+        crate::tree::TreeError::Io(_)
+        | crate::tree::TreeError::Blocked(_)
+        | crate::tree::TreeError::Occupied(_)
+        | crate::tree::TreeError::Unportable(_) => RefusalCode::Storage,
+    }
+}
+
+fn workspace_refusal(error: &crate::workspace::WorkspaceError) -> RefusalCode {
+    match error {
+        crate::workspace::WorkspaceError::NotAFile(_) => RefusalCode::NotAFile,
+        crate::workspace::WorkspaceError::Tree(error) => tree_refusal(error),
+        crate::workspace::WorkspaceError::Cas(_)
+        | crate::workspace::WorkspaceError::State(_)
+        | crate::workspace::WorkspaceError::Stopped
+        | crate::workspace::WorkspaceError::Gone(_)
+        | crate::workspace::WorkspaceError::SizeMismatch { .. }
+        | crate::workspace::WorkspaceError::Snapshot(_) => RefusalCode::Storage,
+    }
+}
+
+const fn scan_refusal(error: &crate::logscan::ScanError) -> RefusalCode {
+    match error {
+        crate::logscan::ScanError::Pattern(..) | crate::logscan::ScanError::PatternTooLong => {
+            RefusalCode::BadRequest
+        }
+        crate::logscan::ScanError::Io(_) => RefusalCode::Storage,
+    }
+}
+
 impl NodeError {
     fn code(&self) -> RefusalCode {
         match out_of_space(self) {
@@ -104,41 +183,38 @@ impl NodeError {
             ErrorCause::Other => {}
         }
         match self {
-            Self::Store(StoreError::NoSuchJob(_)) => RefusalCode::NoSuchJob,
-            Self::Store(StoreError::Ambiguous { .. }) => RefusalCode::AmbiguousJob,
-            Self::Cas(CasError::Missing(_)) | Self::Incomplete(_) => RefusalCode::MissingContent,
+            Self::Store(error) => store_refusal(error),
+            Self::Cas(error) => cas_refusal(error),
+            Self::Workspace(error) => workspace_refusal(error),
+            Self::Scan(error) => scan_refusal(error),
+            Self::Incomplete(_) => RefusalCode::MissingContent,
             Self::Denied(_) => RefusalCode::Forbidden,
-            Self::Workspace(crate::workspace::WorkspaceError::NotAFile(_)) => RefusalCode::NotAFile,
-            Self::Workspace(crate::workspace::WorkspaceError::Tree(
-                crate::tree::TreeError::Io(crate::failure::IoFailure { source, .. }),
-            )) if source.kind() == std::io::ErrorKind::NotFound => RefusalCode::NoSuchPath,
             Self::NoWorkspace(_) | Self::Reused { .. } => RefusalCode::NoWorkspace,
             Self::Paused => RefusalCode::Paused,
             Self::Unfinished(_)
             | Self::Request(_)
             | Self::Invalid(_)
             | Self::Input(_)
-            | Self::TooMany(_)
+            | Self::UnexpectedBlob { .. }
             | Self::ListLimit(_)
-            | Self::Scan(
-                crate::logscan::ScanError::Pattern(..) | crate::logscan::ScanError::PatternTooLong,
-            )
             | Self::Misrouted(_)
             | Self::UnsafeRetry(_) => RefusalCode::BadRequest,
-            Self::Proc(_) | Self::AlreadySupervised(_) | Self::NotStarted(_) => RefusalCode::Spawn,
-            Self::Store(_)
-            | Self::Workspace(_)
-            | Self::Snapshot(_)
+            Self::Proc(_)
+            | Self::AlreadySupervised(_)
+            | Self::NotStarted(_)
+            | Self::JobCapacity(_) => RefusalCode::Spawn,
+            Self::Snapshot(_)
             | Self::QueueClosed
             | Self::Panicked(_)
             | Self::Control(_)
-            | Self::Cas(_)
             | Self::Output(_)
             | Self::Io(_)
             | Self::Audit(_)
             | Self::State(_)
-            | Self::Scan(crate::logscan::ScanError::Io(_))
             | Self::TooManyUnreadable(_)
+            | Self::CollectionBudget(_)
+            | Self::MeasureDepth { .. }
+            | Self::WorkspaceSlotsFull(_)
             | Self::Lock(_) => RefusalCode::Storage,
         }
     }
@@ -197,27 +273,66 @@ fn entries(path: &Path) -> Result<Option<std::fs::ReadDir>, NodeError> {
     }
 }
 
-fn size_of(path: &Path) -> Result<u64, NodeError> {
-    let mut total = 0u64;
-    let mut pending = vec![path.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        crate::faults::at("node::measure", &next).map_err(io("checking", &next))?;
-        let meta = match std::fs::symlink_metadata(&next) {
-            Ok(meta) => meta,
+fn visit_project_workspaces(
+    project: &Path,
+    visit: &mut impl FnMut(&Path, &Path) -> Result<ScanFlow, NodeError>,
+) -> Result<ScanFlow, NodeError> {
+    crate::faults::at("node::list", project).map_err(io("listing", project))?;
+    let locks = project.join("locks");
+    for index in SlotIndex::all() {
+        let workspace = project.join(index.to_string());
+        match std::fs::symlink_metadata(&workspace) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(io("checking", &next)(error)),
-        };
-        if meta.is_dir() {
-            if let Some(entries) = entries(&next)? {
-                for entry in entries {
-                    pending.push(entry.map_err(io("listing", &next))?.path());
-                }
-            }
-        } else {
-            total = total.saturating_add(meta.len());
+            Err(error) => return Err(io("checking", &workspace)(error)),
+        }
+        if visit(&workspace, &index.lock_path(&locks))? == ScanFlow::Stop {
+            return Ok(ScanFlow::Stop);
         }
     }
-    Ok(total)
+    Ok(ScanFlow::Continue)
+}
+
+fn size_of(path: &Path) -> Result<u64, NodeError> {
+    let mut total = 0u64;
+    let mut directories = Vec::new();
+    let mut next = Some(path.to_path_buf());
+    loop {
+        if let Some(current) = next.take() {
+            crate::faults::at("node::measure", &current).map_err(io("checking", &current))?;
+            let meta = match std::fs::symlink_metadata(&current) {
+                Ok(meta) => Some(meta),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io("checking", &current)(error)),
+            };
+            if let Some(meta) = meta {
+                if meta.is_dir() {
+                    if directories.len() == MAX_MEASURE_DIRS {
+                        return Err(NodeError::MeasureDepth {
+                            path: current,
+                            limit: MAX_MEASURE_DIRS,
+                        });
+                    }
+                    if let Some(entries) = entries(&current)? {
+                        directories.push((current, entries));
+                    }
+                } else {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+        let Some((parent, entries)) = directories.last_mut() else {
+            return Ok(total);
+        };
+        match entries.next() {
+            Some(Ok(entry)) => next = Some(entry.path()),
+            Some(Err(error)) => return Err(io("listing", parent)(error)),
+            None => {
+                directories.pop();
+            }
+        }
+    }
 }
 
 fn disk_pressure(area: &Path) -> Result<DiskPressure, NodeError> {
@@ -273,6 +388,21 @@ enum Reclamation {
     Done,
 }
 
+impl Reclamation {
+    fn visit(
+        self,
+        pressure: &impl Fn() -> Result<DiskPressure, NodeError>,
+    ) -> Result<ScanFlow, NodeError> {
+        match self {
+            Self::Busy => Ok(ScanFlow::Continue),
+            Self::Done => match pressure()? {
+                DiskPressure::Enough => Ok(ScanFlow::Stop),
+                DiskPressure::Short => Ok(ScanFlow::Continue),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WorkspaceFreshness {
     Current,
@@ -283,6 +413,141 @@ enum WorkspaceFreshness {
 enum Keep {
     Every,
     Unfinished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobUse {
+    Needed,
+    Spent,
+}
+
+struct Marks {
+    prefix: String,
+    limit: usize,
+    ids: std::collections::BTreeMap<BlobId, BlobUse>,
+    children: std::collections::BTreeSet<char>,
+    overflow: bool,
+}
+
+impl Marks {
+    fn new(prefix: &str, limit: usize) -> Self {
+        Self {
+            prefix: prefix.to_owned(),
+            limit,
+            ids: std::collections::BTreeMap::new(),
+            children: std::collections::BTreeSet::new(),
+            overflow: false,
+        }
+    }
+
+    fn record(&mut self, blob: &BlobId, use_kind: BlobUse) {
+        if !blob.as_str().starts_with(&self.prefix) {
+            return;
+        }
+        if let Some(child) = blob.as_str().chars().nth(self.prefix.len()) {
+            self.children.insert(child);
+        }
+        if let Some(current) = self.ids.get_mut(blob) {
+            if use_kind == BlobUse::Needed {
+                *current = BlobUse::Needed;
+            }
+            return;
+        }
+        if self.ids.len() == self.limit {
+            self.overflow = true;
+            return;
+        }
+        self.ids.insert(blob.clone(), use_kind);
+    }
+}
+
+enum MarkScan {
+    Ready(Marks),
+    Split(Vec<char>),
+}
+
+#[derive(Clone, Copy)]
+enum MissingManifest {
+    Refuse,
+    Ignore,
+}
+
+#[derive(Clone, Copy)]
+struct CollectionPlan<'a> {
+    keep: Keep,
+    incoming: Option<&'a Source>,
+    limit: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MarkInput<'a> {
+    source: &'a Source,
+    job: Option<&'a JobId>,
+    use_kind: BlobUse,
+    missing: MissingManifest,
+}
+
+const CAS_MARK_LIMIT: usize = 65_536;
+
+#[cfg(test)]
+const WORKSPACE_SCAN_BATCH: usize = crate::bounded::DIRECTORY_BATCH.get();
+const MAX_MEASURE_DIRS: usize = 64;
+
+struct CleanItems {
+    details: Vec<crate::protocol::Freeable>,
+    other_count: u64,
+    other_bytes: u64,
+}
+
+impl CleanItems {
+    fn new() -> Self {
+        Self {
+            details: Vec::with_capacity(crate::protocol::CLEAN_DETAIL_LIMIT),
+            other_count: 0,
+            other_bytes: 0,
+        }
+    }
+
+    fn add(&mut self, item: crate::protocol::Freeable) {
+        if self.details.len() < crate::protocol::CLEAN_DETAIL_LIMIT {
+            self.details.push(item);
+            return;
+        }
+        let omitted = match self.details.iter_mut().min_by(|left, right| {
+            (left.bytes, left.what.as_raw_str()).cmp(&(right.bytes, right.what.as_raw_str()))
+        }) {
+            Some(least)
+                if (item.bytes, item.what.as_raw_str())
+                    > (least.bytes, least.what.as_raw_str()) =>
+            {
+                std::mem::replace(least, item)
+            }
+            Some(_) => item,
+            None => {
+                self.details.push(item);
+                return;
+            }
+        };
+        self.other_count = self.other_count.saturating_add(1);
+        self.other_bytes = self.other_bytes.saturating_add(omitted.bytes);
+    }
+
+    fn finish(self) -> crate::protocol::CleanReportItems {
+        let summary = (self.other_count > 0).then(|| crate::protocol::Freeable {
+            what: RemoteText::new(format!("the other {} cleanable items", self.other_count)),
+            bytes: self.other_bytes,
+        });
+        let mut details = self.details.into_iter();
+        crate::protocol::CleanReportItems::from_parts(
+            std::array::from_fn(|_| details.next()),
+            summary,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct JobAdmission<'a> {
+    _collecting: &'a crate::lock::OsLock,
 }
 
 fn configured_agent(home: &Path) -> Option<PathBuf> {
@@ -369,8 +634,8 @@ pub fn hello(dirs: &Dirs) -> Hello {
         build: RemoteText::new(crate::protocol::BUILD_STAMP.to_owned()),
         os: RemoteText::new(crate::platform::OS.to_owned()),
         arch: RemoteText::new(std::env::consts::ARCH.to_owned()),
-        home: RemoteText::new(dirs.home.display().to_string()),
-        state: RemoteText::new(dirs.state.display().to_string()),
+        home: RemoteText::new(dirs.home().display().to_string()),
+        state: RemoteText::new(dirs.state().display().to_string()),
         shell: RemoteText::new(crate::shell::default_shell()),
         binary: RemoteText::new(match crate::dist::running() {
             Ok(binary) => binary.get().sha256().to_owned(),
@@ -380,6 +645,11 @@ pub fn hello(dirs: &Dirs) -> Hello {
 }
 
 const KEEP_FINISHED: usize = 500;
+
+const MAX_UNFINISHED_JOBS: usize = 64;
+
+#[cfg(test)]
+const LOG_SCAN_BATCH: usize = crate::bounded::DIRECTORY_BATCH.get();
 
 const ROOM_AT_LEAST: u64 = 10 << 30;
 
@@ -396,16 +666,9 @@ fn retire_old_binaries(dirs: &Dirs) {
     retire_cached_binaries(dirs, crate::protocol::build_key());
 }
 
-fn retire_cached_binaries(dirs: &Dirs, current: &str) {
-    let bin = dirs.cache.join("bin");
-    let Ok(entries) = std::fs::read_dir(&bin) else {
-        return;
-    };
-    let mut versions = Vec::new();
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
+fn cached_version_dirs(bin: &Path, mut visit: impl FnMut(String, PathBuf)) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(bin)? {
+        let Ok(entry) = entry else { continue };
         let Ok(kind) = entry.file_type() else {
             continue;
         };
@@ -413,22 +676,44 @@ fn retire_cached_binaries(dirs: &Dirs, current: &str) {
             continue;
         };
         if kind.is_dir() && !kind.is_symlink() {
-            versions.push((name, entry.path()));
+            visit(name, entry.path());
         }
     }
-    versions.sort_by(|a, b| b.0.cmp(&a.0));
-    let mut kept_others = 0usize;
-    for (name, path) in versions {
-        if name == current {
-            continue;
+    Ok(())
+}
+
+fn retire_cached_binaries(dirs: &Dirs, current: &str) {
+    let bin = dirs.cache().join("bin");
+    let mut newest = std::collections::BTreeSet::new();
+    if cached_version_dirs(&bin, |name, path| {
+        if name != current {
+            newest.insert((name, path));
+            if newest.len() > KEPT_BINARIES.saturating_sub(1) {
+                newest.pop_first();
+            }
         }
-        if kept_others < KEPT_BINARIES.saturating_sub(1) {
-            kept_others = kept_others.saturating_add(1);
-            continue;
-        }
-        match crate::state_file::remove_dir_all(&path) {
-            Ok(()) | Err(_) => {}
-        }
+    })
+    .is_err()
+    {
+        return;
+    }
+    match crate::bounded::SortedScan::<(String, PathBuf)>::new().walk(
+        |offer| {
+            cached_version_dirs(&bin, |name, path| {
+                let candidate = (name, path);
+                if candidate.0 != current && !newest.contains(&candidate) {
+                    offer(candidate);
+                }
+            })
+        },
+        |(_, path)| {
+            match crate::state_file::remove_dir_all(&path) {
+                Ok(()) | Err(_) => {}
+            }
+            Ok(ScanFlow::Continue)
+        },
+    ) {
+        Ok(_) | Err(_) => {}
     }
 }
 
@@ -462,53 +747,37 @@ fn read_line<T: crate::ingress::Ingress>(input: &mut dyn BufRead) -> Result<T, N
     crate::ingress::json(&line).map_err(NodeError::Request)
 }
 
-fn subject(request: &Request) -> Option<String> {
-    match request {
-        Request::Kill { job }
-        | Request::Status { job }
-        | Request::Wait { job, .. }
-        | Request::Retry { job }
-        | Request::Logs { job, .. }
-        | Request::Tail { job, .. }
-        | Request::Digest { job, .. }
-        | Request::Search { job, .. }
-        | Request::Changes { job } => Some(job.to_string()),
-        Request::Get { job, path } => Some(format!("{job} {path}")),
-        Request::Submit { submission } => Some(submission.command.display()),
-        Request::Hello
-        | Request::Report
-        | Request::Watch
-        | Request::Clean { .. }
-        | Request::Configure { .. }
-        | Request::Hold
-        | Request::AuditAt { .. }
-        | Request::AuditHead
-        | Request::Missing { .. }
-        | Request::Upload { .. }
-        | Request::List { .. } => None,
+struct SnapshotTransfer<'a> {
+    cas: &'a Cas,
+    collecting: crate::lock::OsLock,
+}
+
+impl<'a> SnapshotTransfer<'a> {
+    fn begin(cas: &'a Cas, store: &Store) -> Result<Self, NodeError> {
+        Ok(Self {
+            cas,
+            collecting: crate::lock::OsLock::exclusive(&store.collection_lock_path())?,
+        })
     }
-}
 
-#[derive(Debug)]
-struct Commanded(());
+    fn receive(&self, input: &mut dyn BufRead, frame: &Frame) -> Result<(), NodeError> {
+        Ok(self.cas.receive(input, &frame.blob, frame.size)?)
+    }
 
-enum Routed {
-    Query(Request),
-    Command(Request, Commanded),
-}
+    fn missing(&self, manifest: &BlobId) -> Result<Vec<BlobId>, NodeError> {
+        Ok(self.cas.missing(&self.cas.manifest(manifest)?.blobs())?)
+    }
 
-const fn route(request: Request) -> Routed {
-    match authz::nature(&request).effect {
-        authz::Effect::Command => Routed::Command(request, Commanded(())),
-        authz::Effect::Query => Routed::Query(request),
+    fn into_collection_lock(self) -> crate::lock::OsLock {
+        self.collecting
     }
 }
 
 impl Node {
     pub fn open(dirs: Dirs) -> Result<Self, NodeError> {
-        crate::state_file::private_dir(&dirs.state)?;
+        crate::state_file::private_dir(dirs.state())?;
         let store = Store::open(&dirs)?;
-        let cas = Cas::open(dirs.state.join("objects"))?;
+        let cas = Cas::open(dirs.state().join("objects"))?;
         let audit = AuditLog::at(&dirs);
         Ok(Self {
             dirs,
@@ -534,12 +803,15 @@ impl Node {
         mut input: impl Input,
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
-        let outcome = read_line::<Request>(&mut input).and_then(|request| {
-            let verb = authz::nature(&request).name;
-            let about = subject(&request);
-            let must_audit = authz::nature(&request).audit == authz::Audit::Always
-                || matches!(principal, Principal::Peer { .. });
-            let decision = authz::authorize(principal.clone(), request);
+        let outcome = read_line::<crate::ingress::PeerRequest>(&mut input).and_then(|peer| {
+            let (nature, about) = peer.audit();
+            let verb = nature.name;
+            let is_peer = match principal {
+                Principal::Owner => false,
+                Principal::Peer { .. } => true,
+            };
+            let must_audit = nature.audit == authz::Audit::Always || is_peer;
+            let decision = authz::authorize(principal.clone(), peer);
             let verdict = match &decision {
                 Ok(_) => Verdict::Allowed,
                 Err(_) => Verdict::Denied,
@@ -567,58 +839,90 @@ impl Node {
         input: impl Input,
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
-        let (principal, request) = authorized.into_parts();
-        let request = match route(request) {
-            Routed::Command(Request::Configure { change }, commanded) => {
-                self.upkeep(&commanded)?;
-                self.configure(change)?;
-                return send(output, &Reply::Report(Box::new(self.report()?)));
-            }
-            Routed::Query(request)
-            | Routed::Command(request @ (Request::Upload { .. } | Request::Kill { .. }), _) => {
-                request
-            }
-            Routed::Command(request, commanded) => {
-                self.upkeep(&commanded)?;
-                if let Request::Submit { submission } = request {
-                    let job = self.accept(&principal, *submission, &commanded)?;
-                    return send(output, &Reply::Job(Box::new(job)));
+        match authorized.route() {
+            Routed::Query(queried) => self.handle_query(queried, input, output),
+            Routed::Command(commanded) => self.handle_command(commanded, input, output),
+        }
+    }
+
+    fn handle_command(
+        &self,
+        commanded: Commanded,
+        input: impl Input,
+        output: &mut dyn Write,
+    ) -> Result<(), NodeError> {
+        match commanded.effect() {
+            authz::Effect::Submit => {
+                let submitted = commanded
+                    .into_submission()
+                    .map_err(|_not_submission| NodeError::Misrouted("submit"))?;
+                self.upkeep_including(&submitted, submitted.submission().location.source())?;
+                match &submitted.submission().location {
+                    Location::Snapshot { .. } => {
+                        return self.submit_snapshot(submitted, (input, output));
+                    }
+                    Location::Home => {}
                 }
-                request
+                let job = self.accept(submitted)?;
+                return send(output, &Reply::Job(Box::new(job)));
             }
-        };
-        match request {
+            authz::Effect::Kill => {}
+            authz::Effect::MaintainedCommand => self.upkeep(&commanded)?,
+            authz::Effect::Query => return Err(NodeError::Misrouted("query")),
+        }
+        let reply = self.reply_command(commanded, input)?;
+        send(output, &reply)
+    }
+
+    fn handle_query(
+        &self,
+        queried: Queried,
+        input: impl Input,
+        output: &mut dyn Write,
+    ) -> Result<(), NodeError> {
+        match queried.request() {
             Request::Hold => self.hold(input, output),
             Request::Logs {
                 job,
                 offset,
                 follow,
             } => {
-                let cursor = Cursor { offset, follow };
-                self.logs(&self.own(&principal, &job)?, cursor, (input, output))
+                let cursor = Cursor {
+                    offset: *offset,
+                    follow: *follow,
+                };
+                self.logs(
+                    &self.own(queried.principal(), job)?,
+                    cursor,
+                    (input, output),
+                )
             }
-            Request::Tail { job, lines } => self.tail(&self.own(&principal, &job)?, lines, output),
-            Request::Get { job, path } => self.get(&self.own(&principal, &job)?, &path, output),
-            Request::Changes { job } => self.changes(&self.own(&principal, &job)?, output),
-            Request::Watch => self.watch(&principal, input, output),
-            single @ (Request::Hello
+            Request::Tail { job, lines } => {
+                self.tail(&self.own(queried.principal(), job)?, *lines, output)
+            }
+            Request::Get { job, path } => {
+                self.get(&self.own(queried.principal(), job)?, path, output)
+            }
+            Request::Changes { job } => self.changes(&self.own(queried.principal(), job)?, output),
+            Request::Watch => self.watch(queried.principal(), input, output),
+            Request::Hello
             | Request::Report
-            | Request::Clean { .. }
-            | Request::Configure { .. }
             | Request::AuditAt { .. }
             | Request::AuditHead
             | Request::Digest { .. }
             | Request::Search { .. }
-            | Request::Missing { .. }
-            | Request::Upload { .. }
-            | Request::Submit { .. }
             | Request::List { .. }
             | Request::Status { .. }
-            | Request::Wait { .. }
-            | Request::Retry { .. }
-            | Request::Kill { .. }) => {
-                let reply = self.reply(&principal, single, input)?;
+            | Request::Wait { .. } => {
+                let reply = self.reply_query(queried, input)?;
                 send(output, &reply)
+            }
+            Request::Submit { .. }
+            | Request::Retry { .. }
+            | Request::Kill { .. }
+            | Request::Clean { .. }
+            | Request::Configure { .. } => {
+                Err(NodeError::Misrouted(authz::nature(queried.request()).name))
             }
         }
     }
@@ -629,28 +933,17 @@ impl Node {
         Ok(())
     }
 
-    fn reply(
-        &self,
-        principal: &Principal,
-        request: Request,
-        mut input: impl Input,
-    ) -> Result<Reply, NodeError> {
+    fn reply_query(&self, queried: Queried, input: impl Input) -> Result<Reply, NodeError> {
+        let (principal, request) = queried.into_parts();
         Ok(match request {
             Request::Hello => Reply::Hello(hello(&self.dirs)),
             Request::Report => Reply::Report(Box::new(self.report()?)),
-            Request::Configure { change } => {
-                self.configure(change)?;
-                Reply::Report(Box::new(self.report()?))
-            }
-            Request::Clean { apply, logs, idle } => {
-                Reply::Cleaned(Box::new(self.clean((apply, logs, idle))?))
-            }
             Request::AuditAt { epoch, seq } => Reply::AuditAt {
                 hash: self.audit.hash_at(epoch, seq)?,
             },
             Request::AuditHead => Reply::AuditHead(self.audit.head()?),
             Request::Digest { job, tail } => {
-                Reply::Digest(Box::new(self.digest(&self.own(principal, &job)?, tail)?))
+                Reply::Digest(Box::new(self.digest(&self.own(&principal, &job)?, tail)?))
             }
             Request::Search {
                 job,
@@ -658,46 +951,55 @@ impl Node {
                 context,
                 limit,
             } => Reply::Found(self.search(
-                &self.own(principal, &job)?,
+                &self.own(&principal, &job)?,
                 &pattern,
                 crate::logscan::Window { context, limit },
             )?),
-            Request::Missing { blobs } => Reply::Missing {
-                blobs: self.cas.missing(&blobs)?,
-            },
-            Request::Upload { count } => Reply::Stored {
-                count: self.upload(count, &mut input)?,
-            },
             Request::List { limit } => {
-                let (jobs, unreadable) = self.list(principal, limit)?;
+                let (jobs, unreadable) = self.list(&principal, limit)?;
                 Reply::Jobs { jobs, unreadable }
             }
             Request::Status { job } => {
-                Reply::Job(Box::new(self.store.job(&self.own(principal, &job)?)?))
+                Reply::Job(Box::new(self.store.job(&self.own(&principal, &job)?)?))
             }
             Request::Wait { job } => Reply::Job(Box::new(self.settle(
-                &self.own(principal, &job)?,
+                &self.own(&principal, &job)?,
                 Order::Wait,
                 input,
             )?)),
-            Request::Retry { job } => {
-                let id = self.own(principal, &job)?;
-                self.retry(&id)?;
-                Reply::Job(Box::new(self.settle(&id, Order::Wait, input)?))
-            }
-            Request::Kill { job } => {
-                let id = self.own(principal, &job)?;
-                self.recover(&id)?;
-                Reply::Job(Box::new(self.settle(&id, Order::Kill, input)?))
-            }
             Request::Hold
             | Request::Submit { .. }
             | Request::Logs { .. }
             | Request::Tail { .. }
             | Request::Get { .. }
             | Request::Watch
-            | Request::Changes { .. } => {
+            | Request::Changes { .. }
+            | Request::Retry { .. }
+            | Request::Kill { .. }
+            | Request::Clean { .. }
+            | Request::Configure { .. } => {
                 return Err(NodeError::Misrouted(authz::nature(&request).name));
+            }
+        })
+    }
+
+    fn reply_command(&self, commanded: Commanded, input: impl Input) -> Result<Reply, NodeError> {
+        let action = commanded
+            .into_action()
+            .map_err(|_not_action| NodeError::Misrouted("command"))?;
+        Ok(match action {
+            CommandAction::Configure(authorized) => {
+                self.configure(&authorized)?;
+                Reply::Report(Box::new(self.report()?))
+            }
+            CommandAction::Clean(authorized) => Reply::Cleaned(Box::new(self.clean(&authorized)?)),
+            CommandAction::Retry(authorized) => {
+                let id = self.retry(&authorized)?;
+                Reply::Job(Box::new(self.settle(&id, Order::Wait, input)?))
+            }
+            CommandAction::Kill(authorized) => {
+                let id = self.kill(&authorized)?;
+                Reply::Job(Box::new(self.settle(&id, Order::Kill, input)?))
             }
         })
     }
@@ -710,43 +1012,97 @@ impl Node {
         }
     }
 
-    fn upload(&self, count: u64, input: &mut dyn BufRead) -> Result<u64, NodeError> {
-        if count > crate::bounded::UPLOAD_COUNT {
-            return Err(NodeError::TooMany(count));
-        }
-        for _ in 0..count {
-            let frame: Frame = read_line(input)?;
-            self.cas.receive(input, &frame.blob, frame.size)?;
-        }
-        Ok(count)
-    }
-
-    fn accept(
-        &self,
-        principal: &Principal,
-        submission: Submission,
-        commanded: &Commanded,
-    ) -> Result<Job, NodeError> {
+    fn accept(&self, authorized: AuthorizedSubmission) -> Result<Job, NodeError> {
+        let submission = authorized.submission();
         let settings = self.store.settings()?;
         if submission.queue == crate::protocol::Queue::Slot && settings.paused {
             return Err(NodeError::Paused);
         }
-        self.make_room(&|| self.disk_pressure(), commanded)?;
+        self.make_room(&|| self.disk_pressure(), &authorized, &submission.location)?;
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
+        self.accept_with_lock(authorized, collecting)
+    }
+
+    fn submit_snapshot(
+        &self,
+        authorized: AuthorizedSubmission,
+        (mut input, output): (impl Input, &mut dyn Write),
+    ) -> Result<(), NodeError> {
+        let submission = authorized.submission();
+        let source = submission
+            .location
+            .source()
+            .ok_or(NodeError::Misrouted("submit snapshot"))?;
+        let manifest_id = source.manifest.clone();
+        let settings = self.store.settings()?;
+        if submission.queue == crate::protocol::Queue::Slot && settings.paused {
+            return Err(NodeError::Paused);
+        }
+        self.make_room(&|| self.disk_pressure(), &authorized, &Location::Home)?;
+        let transfer = SnapshotTransfer::begin(&self.cas, &self.store)?;
+        let manifest_frame: Frame = read_line(&mut input)?;
+        if manifest_frame.blob != manifest_id {
+            return Err(NodeError::UnexpectedBlob {
+                expected: manifest_id,
+                got: manifest_frame.blob,
+            });
+        }
+        if manifest_frame.size > crate::bounded::IN_MEMORY_FILE {
+            return Err(CasError::InMemoryLimit {
+                blob: manifest_frame.blob,
+                size: manifest_frame.size,
+                limit: crate::bounded::IN_MEMORY_FILE,
+            }
+            .into());
+        }
+        transfer.receive(&mut input, &manifest_frame)?;
+        let missing = transfer.missing(&manifest_frame.blob)?;
+        send(
+            output,
+            &Reply::NeedBlobs {
+                blobs: missing.clone(),
+            },
+        )?;
+        for expected in missing {
+            let content_frame: Frame = read_line(&mut input)?;
+            if content_frame.blob != expected {
+                return Err(NodeError::UnexpectedBlob {
+                    expected,
+                    got: content_frame.blob,
+                });
+            }
+            transfer.receive(&mut input, &content_frame)?;
+        }
+        let job = self.accept_with_lock(authorized, transfer.into_collection_lock())?;
+        send(output, &Reply::Job(Box::new(job)))
+    }
+
+    fn accept_with_lock(
+        &self,
+        authorized: AuthorizedSubmission,
+        collecting: crate::lock::OsLock,
+    ) -> Result<Job, NodeError> {
+        let pending = authorized.submission();
+        let settings = self.store.settings()?;
+        if pending.queue == crate::protocol::Queue::Slot && settings.paused {
+            return Err(NodeError::Paused);
+        }
         let nonce_path = self.store.nonce_path(
-            &crate::supervisor::scope_name(&principal.submitter()),
-            &submission.nonce,
+            &crate::supervisor::scope_name(&authorized.principal().submitter()),
+            &pending.nonce,
         );
         if let Some(job) = self.earlier_attempt(&nonce_path)? {
             collecting.release()?;
             return Ok(job);
         }
-        if let Location::Snapshot { source, .. } = &submission.location {
+        let admission = self.admit_job(&collecting)?;
+        if let Some(source) = pending.location.source() {
             let manifest = self.cas.manifest(&source.manifest)?;
             if let Some(blob) = self.cas.missing(&manifest.blobs())?.first() {
                 return Err(NodeError::Incomplete(format!("blob {blob}")));
             }
         }
+        let (principal, submission) = authorized.into_parts();
         let spec = Spec {
             id: JobId::generate()?,
             name: submission.name,
@@ -760,9 +1116,10 @@ impl Node {
             submitted_at: Timestamp::observe(),
         };
         let launch = crate::store::LaunchEnv::of_this_process()
-            .with_agent(configured_agent(&self.dirs.home));
+            .with_agent(configured_agent(self.dirs.home()));
         let staging = crate::lock::OsLock::exclusive(&self.store.staging_lock_path(&spec.id))?;
-        self.store.stage(&spec, (&submission.env, &launch))?;
+        self.store
+            .stage_admitted(&admission, &spec, (submission.env, &launch))?;
         if submission.queue == crate::protocol::Queue::Now {
             self.store.skip_the_queue(&spec.id)?;
         }
@@ -783,6 +1140,32 @@ impl Node {
         staging.release()?;
         self.store.forget_staging_lock(&spec.id)?;
         Ok(self.store.job(&spec.id)?)
+    }
+
+    fn admit_job<'a>(
+        &self,
+        collecting: &'a crate::lock::OsLock,
+    ) -> Result<JobAdmission<'a>, NodeError> {
+        let mut unfinished = 0usize;
+        for id in self.store.ids_iter()? {
+            let id = id?;
+            if self.store.phase(&id)?.kind() != PhaseKind::Finished {
+                unfinished = unfinished.saturating_add(1);
+                if unfinished >= MAX_UNFINISHED_JOBS {
+                    return Err(NodeError::JobCapacity(MAX_UNFINISHED_JOBS));
+                }
+            }
+        }
+        for id in self.store.staged_ids_iter()? {
+            id?;
+            unfinished = unfinished.saturating_add(1);
+            if unfinished >= MAX_UNFINISHED_JOBS {
+                return Err(NodeError::JobCapacity(MAX_UNFINISHED_JOBS));
+            }
+        }
+        Ok(JobAdmission {
+            _collecting: collecting,
+        })
     }
 
     fn earlier_attempt(&self, nonce_path: &Path) -> Result<Option<Job>, NodeError> {
@@ -819,12 +1202,12 @@ impl Node {
                 crate::template::Arg::literal("--supervise"),
                 crate::template::Arg::word(id),
                 crate::template::Arg::literal("--state-dir"),
-                crate::template::Arg::path(&self.dirs.state),
+                crate::template::Arg::path(&self.dirs.state_path()),
                 crate::template::Arg::literal("--home-dir"),
-                crate::template::Arg::path(&self.dirs.home),
+                crate::template::Arg::path(&self.dirs.home_path()),
             ],
         )
-        .in_dir(&self.dirs.home);
+        .in_dir(&self.dirs.home_path());
         Ok(proc::launch(&invocation)?)
     }
 
@@ -852,7 +1235,15 @@ impl Node {
         self.settle(id, Order::Kill, std::io::empty())
     }
 
-    fn upkeep(&self, _commanded: &Commanded) -> Result<(), NodeError> {
+    fn upkeep(&self, commanded: &impl CommandAuthority) -> Result<(), NodeError> {
+        self.upkeep_including(commanded, None)
+    }
+
+    fn upkeep_including(
+        &self,
+        _commanded: &impl CommandAuthority,
+        incoming: Option<&Source>,
+    ) -> Result<(), NodeError> {
         for id in self.store.ids_iter()? {
             let id = id?;
             self.recover(&id)?;
@@ -861,7 +1252,7 @@ impl Node {
             let id = id?;
             self.abandon_staging(&id)?;
         }
-        match self.retire(KEEP_FINISHED) {
+        match self.retire_including(KEEP_FINISHED, incoming) {
             Ok(()) | Err(_) => {}
         }
         match self.empty_trash() {
@@ -907,14 +1298,8 @@ impl Node {
         })
     }
 
-    fn configure(&self, change: Change) -> Result<(), NodeError> {
-        let admission = crate::lock::OsLock::exclusive(&self.store.admission_lock_path())?;
-        crate::state_file::write_json(
-            &self.store.settings_path(),
-            &self.store.settings()?.with(change),
-        )?;
-        self.store.signal_queue()?;
-        Ok(admission.release()?)
+    fn configure(&self, authorized: &AuthorizedConfigure) -> Result<(), NodeError> {
+        Ok(self.store.configure(*authorized.payload())?)
     }
 
     fn disk_pressure(&self) -> Result<DiskPressure, NodeError> {
@@ -924,31 +1309,23 @@ impl Node {
     fn make_room(
         &self,
         pressure: &impl Fn() -> Result<DiskPressure, NodeError>,
-        _commanded: &Commanded,
+        _commanded: &impl CommandAuthority,
+        location: &Location,
     ) -> Result<(), NodeError> {
         match pressure()? {
             DiskPressure::Enough => return Ok(()),
             DiskPressure::Short => {}
         }
-        for (workspace, lock) in self.idle_workspaces()? {
-            match self.evict(&workspace, &lock)? {
-                Reclamation::Busy => {}
-                Reclamation::Done => match pressure()? {
-                    DiskPressure::Enough => return Ok(()),
-                    DiskPressure::Short => {}
-                },
-            }
+        if self
+            .visit_idle_workspaces(|workspace, lock| self.evict(workspace, lock)?.visit(pressure))?
+            == ScanFlow::Stop
+        {
+            return Ok(());
         }
-        for id in self.finished_largest_log_first()? {
-            match self.discard_log(&id)? {
-                Reclamation::Busy => {}
-                Reclamation::Done => match pressure()? {
-                    DiskPressure::Enough => return Ok(()),
-                    DiskPressure::Short => {}
-                },
-            }
+        if self.visit_finished_logs(|id| self.discard_log(id)?.visit(pressure))? == ScanFlow::Stop {
+            return Ok(());
         }
-        self.collect(Keep::Unfinished)
+        self.collect_including(Keep::Unfinished, location.source())
     }
 
     fn freshness(&self, workspace: &Path) -> Result<WorkspaceFreshness, NodeError> {
@@ -991,30 +1368,28 @@ impl Node {
         Ok(Reclamation::Done)
     }
 
-    fn clean(
-        &self,
-        (apply, logs, idle): (bool, bool, bool),
-    ) -> Result<crate::protocol::Cleaned, NodeError> {
+    fn clean(&self, authorized: &AuthorizedClean) -> Result<crate::protocol::Cleaned, NodeError> {
+        let (apply, logs, idle) = *authorized.payload();
         let work = self.store.area("work");
-        let mut items = Vec::new();
-        for (workspace, lock) in self.idle_workspaces()? {
-            let freshness = self.freshness(&workspace)?;
+        let mut items = CleanItems::new();
+        self.visit_idle_workspaces(|workspace, lock| {
+            let freshness = self.freshness(workspace)?;
             match freshness {
-                WorkspaceFreshness::Current if !idle => continue,
+                WorkspaceFreshness::Current if !idle => return Ok(ScanFlow::Continue),
                 WorkspaceFreshness::Current | WorkspaceFreshness::Stale => {}
             }
-            let bytes = size_of(&workspace)?;
+            let bytes = size_of(workspace)?;
             if apply {
-                match self.evict(&workspace, &lock)? {
-                    Reclamation::Busy => continue,
+                match self.evict(workspace, lock)? {
+                    Reclamation::Busy => return Ok(ScanFlow::Continue),
                     Reclamation::Done => {}
                 }
             }
             let shown = match workspace.strip_prefix(&work) {
                 Ok(inside) => inside,
-                Err(_elsewhere) => &workspace,
+                Err(_elsewhere) => workspace,
             };
-            items.push(crate::protocol::Freeable {
+            items.add(crate::protocol::Freeable {
                 what: RemoteText::new(format!(
                     "{} workspace {}",
                     match freshness {
@@ -1025,25 +1400,26 @@ impl Node {
                 )),
                 bytes,
             });
-        }
+            Ok(ScanFlow::Continue)
+        })?;
         if logs {
-            let finished = self.finished_largest_log_first()?;
             let mut bytes = 0u64;
             let mut count = 0u64;
-            for id in &finished {
+            self.visit_finished_logs(|id| {
                 let size = size_of(&self.store.log_path(id))?;
                 if apply {
                     match self.discard_log(id)? {
-                        Reclamation::Busy => continue,
+                        Reclamation::Busy => return Ok(ScanFlow::Continue),
                         Reclamation::Done => {}
                     }
                 }
                 bytes = bytes
                     .saturating_add(size.saturating_sub(crate::domain::len_u64(DISCARDED.len())));
                 count = count.saturating_add(1);
-            }
+                Ok(ScanFlow::Continue)
+            })?;
             if count > 0 {
-                items.push(crate::protocol::Freeable {
+                items.add(crate::protocol::Freeable {
                     what: RemoteText::new(format!("the logs of {count} finished jobs")),
                     bytes,
                 });
@@ -1051,7 +1427,7 @@ impl Node {
         }
         let trash = size_of(&self.store.area("trash"))?;
         if trash > 0 {
-            items.push(crate::protocol::Freeable {
+            items.add(crate::protocol::Freeable {
                 what: RemoteText::new("things set aside to remove".to_owned()),
                 bytes: trash,
             });
@@ -1062,38 +1438,45 @@ impl Node {
         }
         Ok(crate::protocol::Cleaned {
             applied: apply,
-            items,
+            items: items.finish(),
         })
     }
 
-    fn idle_workspaces(&self) -> Result<Vec<(PathBuf, PathBuf)>, NodeError> {
-        let mut found = Vec::new();
+    fn visit_idle_workspaces(
+        &self,
+        mut visit: impl FnMut(&Path, &Path) -> Result<ScanFlow, NodeError>,
+    ) -> Result<ScanFlow, NodeError> {
         let work = self.store.area("work");
-        let Some(scopes) = entries(&work)? else {
-            return Ok(found);
-        };
-        for scope in scopes {
-            let scope = scope.map_err(io("listing", &work))?;
-            let Some(projects) = entries(&scope.path())? else {
-                continue;
-            };
-            for project in projects {
-                let project = project.map_err(io("listing", &scope.path()))?;
-                let Some(slots) = entries(&project.path())? else {
-                    continue;
+        crate::bounded::SortedScan::<PathBuf>::new().walk(
+            |offer| {
+                let Some(scopes) = entries(&work)? else {
+                    return Ok(());
                 };
-                for slot in slots {
-                    let slot = slot.map_err(io("listing", &project.path()))?;
-                    let name = slot.file_name();
-                    let Some(index) = name.to_str().filter(|n| n.parse::<usize>().is_ok()) else {
+                for scope in scopes {
+                    let scope = scope.map_err(io("listing", &work))?;
+                    let scope_path = scope.path();
+                    if !scope
+                        .file_type()
+                        .map_err(io("checking", &scope_path))?
+                        .is_dir()
+                    {
+                        continue;
+                    }
+                    let Some(projects) = entries(&scope_path)? else {
                         continue;
                     };
-                    let lock = project.path().join("locks").join(format!("{index}.lock"));
-                    found.push((slot.path(), lock));
+                    for project in projects {
+                        let project = project.map_err(io("listing", &scope_path))?;
+                        let path = project.path();
+                        if project.file_type().map_err(io("checking", &path))?.is_dir() {
+                            offer(path);
+                        }
+                    }
                 }
-            }
-        }
-        Ok(found)
+                Ok::<(), NodeError>(())
+            },
+            |project| visit_project_workspaces(&project, &mut visit),
+        )
     }
 
     fn empty_trash(&self) -> Result<(), NodeError> {
@@ -1108,45 +1491,57 @@ impl Node {
         Ok(())
     }
 
-    fn finished_largest_log_first(&self) -> Result<Vec<JobId>, NodeError> {
-        let mut logs = Vec::new();
-        for id in self.finished_oldest_first()? {
-            let path = self.store.log_path(&id);
-            let size = match std::fs::symlink_metadata(&path) {
-                Ok(meta) => meta.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(io("checking", &path)(error)),
-            };
-            if size > crate::domain::len_u64(DISCARDED.len()) {
-                logs.push((std::cmp::Reverse(size), id));
-            }
-        }
-        logs.sort();
-        Ok(logs.into_iter().map(|(_, id)| id).collect())
+    fn visit_finished_logs(
+        &self,
+        mut visit: impl FnMut(&JobId) -> Result<ScanFlow, NodeError>,
+    ) -> Result<ScanFlow, NodeError> {
+        crate::bounded::SortedScan::<(std::cmp::Reverse<u64>, JobId)>::new().walk(
+            |offer| {
+                for id in self.store.ids_iter()? {
+                    let id = id?;
+                    if self.store.phase(&id)?.kind() != PhaseKind::Finished {
+                        continue;
+                    }
+                    let path = self.store.log_path(&id);
+                    let size = match std::fs::symlink_metadata(&path) {
+                        Ok(meta) => meta.len(),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(io("checking", &path)(error)),
+                    };
+                    if size > crate::domain::len_u64(DISCARDED.len()) {
+                        offer((std::cmp::Reverse(size), id));
+                    }
+                }
+                Ok::<(), NodeError>(())
+            },
+            |(_size, id)| visit(&id),
+        )
     }
 
-    fn finished_oldest_first(&self) -> Result<Vec<JobId>, NodeError> {
-        let mut finished = Vec::new();
+    fn retire_including(&self, keep: usize, incoming: Option<&Source>) -> Result<(), NodeError> {
+        let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
+        let mut newest = std::collections::BTreeSet::new();
+        let mut excess = false;
         for id in self.store.ids_iter()? {
             let id = id?;
-            match self.store.phase(&id)? {
-                Phase::Finished { .. } => finished.push((self.store.spec(&id)?.sequence, id)),
-                Phase::Queued
-                | Phase::Preparing { .. }
-                | Phase::Starting { .. }
-                | Phase::Running { .. } => {}
+            if self.store.phase(&id)?.kind() == PhaseKind::Finished {
+                newest.insert((self.store.spec(&id)?.sequence, id));
+                if newest.len() > keep {
+                    newest.pop_first();
+                    excess = true;
+                }
             }
         }
-        finished.sort();
-        Ok(finished.into_iter().map(|(_, id)| id).collect())
-    }
-
-    fn retire(&self, keep: usize) -> Result<(), NodeError> {
-        let finished = self.finished_oldest_first()?;
-        let Some(excess) = finished.len().checked_sub(keep).filter(|n| *n > 0) else {
-            return Ok(());
-        };
-        for id in finished.into_iter().take(excess) {
+        if !excess {
+            return Ok(collecting.release()?);
+        }
+        for id in self.store.ids_iter()? {
+            let id = id?;
+            if self.store.phase(&id)?.kind() != PhaseKind::Finished
+                || newest.contains(&(self.store.spec(&id)?.sequence, id.clone()))
+            {
+                continue;
+            }
             let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(&id))?
             else {
                 continue;
@@ -1155,7 +1550,8 @@ impl Node {
             alive.release()?;
         }
         self.forget_stale_nonces()?;
-        self.collect(Keep::Every)
+        collecting.release()?;
+        self.collect_including(Keep::Every, incoming)
     }
 
     fn forget_stale_nonces(&self) -> Result<(), NodeError> {
@@ -1170,7 +1566,15 @@ impl Node {
                 continue;
             };
             let gone = match String::from_utf8_lossy(&bytes).trim().parse::<JobId>() {
-                Ok(id) => matches!(self.store.publication(&id)?, Publication::Unpublished),
+                Ok(id) => match self.store.publication(&id)? {
+                    Publication::Published => false,
+                    Publication::Unpublished => {
+                        match crate::lock::OsLock::probe(&self.store.staging_lock_path(&id))? {
+                            crate::lock::Probe::Held => false,
+                            crate::lock::Probe::Absent | crate::lock::Probe::Free => true,
+                        }
+                    }
+                },
                 Err(_foreign) => true,
             };
             if gone {
@@ -1181,89 +1585,188 @@ impl Node {
     }
 
     fn collect(&self, keep: Keep) -> Result<(), NodeError> {
+        self.collect_including(keep, None)
+    }
+
+    fn collect_including(&self, keep: Keep, incoming: Option<&Source>) -> Result<(), NodeError> {
+        self.collect_with_mark_limit(keep, incoming, CAS_MARK_LIMIT)
+    }
+
+    fn collect_with_mark_limit(
+        &self,
+        keep: Keep,
+        incoming: Option<&Source>,
+        limit: usize,
+    ) -> Result<(), NodeError> {
+        if limit == 0 {
+            return Err(NodeError::CollectionBudget(limit));
+        }
         let collecting = crate::lock::OsLock::exclusive(&self.store.collection_lock_path())?;
-        let mut needed = Vec::new();
-        let mut spent = Vec::new();
-        for id in self.store.ids_iter()? {
-            let id = id?;
-            let spec = self.store.spec(&id)?;
-            if keep == Keep::Unfinished && matches!(self.store.phase(&id)?, Phase::Finished { .. })
-            {
-                spent.push(spec);
-            } else {
-                needed.push(spec);
-            }
-        }
-        for id in self.store.staged_ids_iter()? {
-            let id = id?;
-            needed.push(self.store.staged_spec(&id)?);
-        }
-        let mut reachable = self.reachable(&needed)?;
-        reachable.extend(spent.iter().filter_map(|spec| match &spec.location {
-            Location::Snapshot { source, .. } => Some(source.manifest.clone()),
-            Location::Home => None,
-        }));
-        let doomed: Vec<BlobId> = match keep {
-            Keep::Every => self.cas.stored()?,
-            Keep::Unfinished => self.reachable(&spent)?.into_iter().collect(),
-        };
-        for blob in doomed {
-            if !reachable.contains(&blob) {
-                self.cas.remove(&blob)?;
-            }
-        }
+        self.collect_partition(
+            CollectionPlan {
+                keep,
+                incoming,
+                limit,
+            },
+            "",
+        )?;
         Ok(collecting.release()?)
     }
 
-    fn reachable(&self, specs: &[Spec]) -> Result<std::collections::BTreeSet<BlobId>, NodeError> {
-        let mut reachable = std::collections::BTreeSet::new();
-        for spec in specs {
-            if let Location::Snapshot { source, .. } = &spec.location {
-                reachable.insert(source.manifest.clone());
-                match self.cas.manifest(&source.manifest) {
-                    Ok(manifest) => reachable.extend(manifest.blobs()),
-                    Err(CasError::Missing(_) | CasError::Damaged(_)) => {}
-                    Err(other) => return Err(other.into()),
+    fn collect_partition(&self, plan: CollectionPlan<'_>, prefix: &str) -> Result<(), NodeError> {
+        match self.scan_marks(plan, prefix)? {
+            MarkScan::Ready(marks) => match plan.keep {
+                Keep::Every => self
+                    .cas
+                    .for_each_stored_matching::<NodeError>(prefix, |blob| {
+                        if !marks.ids.contains_key(&blob) {
+                            self.cas.remove(&blob)?;
+                        }
+                        Ok(())
+                    }),
+                Keep::Unfinished => {
+                    for (blob, use_kind) in marks.ids {
+                        if use_kind == BlobUse::Spent {
+                            self.cas.remove(&blob)?;
+                        }
+                    }
+                    Ok(())
                 }
-                for left in self.store.left(&spec.id)?.unwrap_or_default() {
-                    if let Some(crate::snapshot::Entry::File { blob, .. }) = left.now {
-                        reachable.insert(blob);
+            },
+            MarkScan::Split(children) => {
+                if children.is_empty() {
+                    return Err(NodeError::CollectionBudget(plan.limit));
+                }
+                for child in "0123456789abcdef".chars() {
+                    let next = format!("{prefix}{child}");
+                    if children.contains(&child) {
+                        self.collect_partition(plan, &next)?;
+                    } else if plan.keep == Keep::Every {
+                        self.cas
+                            .for_each_stored_matching::<NodeError>(&next, |blob| {
+                                self.cas.remove(&blob)?;
+                                Ok(())
+                            })?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn scan_marks(&self, plan: CollectionPlan<'_>, prefix: &str) -> Result<MarkScan, NodeError> {
+        let mut marks = Marks::new(prefix, plan.limit);
+        if let Some(source) = plan.incoming {
+            self.mark_source(
+                MarkInput {
+                    source,
+                    job: None,
+                    use_kind: BlobUse::Needed,
+                    missing: MissingManifest::Refuse,
+                },
+                &mut marks,
+            )?;
+        }
+        for id in self.store.ids_iter()? {
+            let id = id?;
+            let spec = self.store.spec(&id)?;
+            let use_kind = if plan.keep == Keep::Unfinished
+                && self.store.phase(&id)?.kind() == PhaseKind::Finished
+            {
+                BlobUse::Spent
+            } else {
+                BlobUse::Needed
+            };
+            self.mark_spec(&spec, use_kind, &mut marks)?;
+        }
+        for id in self.store.staged_ids_iter()? {
+            let id = id?;
+            self.mark_spec(&self.store.staged_spec(&id)?, BlobUse::Needed, &mut marks)?;
+        }
+        if marks.overflow {
+            Ok(MarkScan::Split(marks.children.into_iter().collect()))
+        } else {
+            Ok(MarkScan::Ready(marks))
+        }
+    }
+
+    fn mark_spec(
+        &self,
+        spec: &Spec,
+        use_kind: BlobUse,
+        marks: &mut Marks,
+    ) -> Result<(), NodeError> {
+        if let Some(source) = spec.source() {
+            self.mark_source(
+                MarkInput {
+                    source,
+                    job: Some(&spec.id),
+                    use_kind,
+                    missing: MissingManifest::Ignore,
+                },
+                marks,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn mark_source(&self, input: MarkInput<'_>, marks: &mut Marks) -> Result<(), NodeError> {
+        marks.record(&input.source.manifest, BlobUse::Needed);
+        match self.cas.manifest(&input.source.manifest) {
+            Ok(manifest) => {
+                for entry in manifest.entries.values() {
+                    if let Some(file) = entry.file() {
+                        marks.record(file.blob, input.use_kind);
                     }
                 }
             }
+            Err(error @ (CasError::Missing(_) | CasError::Damaged(_))) => match input.missing {
+                MissingManifest::Ignore => {}
+                MissingManifest::Refuse => return Err(error.into()),
+            },
+            Err(other) => return Err(other.into()),
         }
-        Ok(reachable)
+        if let Some(id) = input.job {
+            for left in self.store.left(id)?.unwrap_or_default() {
+                if let Some(file) = left.now.as_ref().and_then(crate::snapshot::Entry::file) {
+                    marks.record(file.blob, input.use_kind);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn recover(&self, id: &JobId) -> Result<(), NodeError> {
         let phase = self.store.phase(id)?;
-        if matches!(&phase, Phase::Finished { .. }) {
+        if phase.kind() == PhaseKind::Finished {
             return Ok(());
         }
         let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
             return Ok(());
         };
         let failure = self.store.start_failure(id)?;
-        let (started_at, reason) = match (&phase, failure) {
-            (_, Some(why)) => (None, format!("the job could not start: {why}")),
-            (Phase::Queued | Phase::Preparing { .. }, None) => return Ok(alive.release()?),
-            (Phase::Starting { started_at, .. } | Phase::Running { started_at, .. }, None) => {
-                let rebooted = match (
-                    self.store.supervisor_boot(id)?,
-                    crate::platform::boot_identity(),
-                ) {
-                    (Some(before), Some(now)) if before != now => " when the machine restarted",
-                    (Some(_), Some(_)) => " without the machine restarting",
-                    (Some(_) | None, Some(_) | None) => "",
-                };
-                (
-                    Some(*started_at),
-                    format!(
-                        "its supervisor vanished{rebooted} after the command may have started; it was not run again because it may already have had effects"
-                    ),
-                )
-            }
-            (Phase::Finished { .. }, None) => return Ok(()),
+        let (started_at, reason) = match failure {
+            Some(why) => (None, format!("the job could not start: {why}")),
+            None => match &phase {
+                Phase::Queued | Phase::Preparing { .. } => return Ok(alive.release()?),
+                Phase::Starting { started_at, .. } | Phase::Running { started_at, .. } => {
+                    let rebooted = match (
+                        self.store.supervisor_boot(id)?,
+                        crate::platform::boot_identity(),
+                    ) {
+                        (Some(before), Some(now)) if before != now => " when the machine restarted",
+                        (Some(_), Some(_)) => " without the machine restarting",
+                        (Some(_) | None, Some(_) | None) => "",
+                    };
+                    (
+                        Some(*started_at),
+                        format!(
+                            "its supervisor vanished{rebooted} after the command may have started; it was not run again because it may already have had effects"
+                        ),
+                    )
+                }
+                Phase::Finished { .. } => return Ok(()),
+            },
         };
         let finished = Phase::Finished {
             started_at,
@@ -1279,26 +1782,33 @@ impl Node {
         Ok(alive.release()?)
     }
 
-    fn retry(&self, id: &JobId) -> Result<(), NodeError> {
-        let phase = self.store.phase(id)?;
-        if matches!(phase, Phase::Finished { .. }) {
-            return Ok(());
+    fn retry(&self, authorized: &AuthorizedRetry) -> Result<JobId, NodeError> {
+        let id = self.own(authorized.principal(), authorized.payload())?;
+        let phase = self.store.phase(&id)?;
+        if phase.kind() == PhaseKind::Finished {
+            return Ok(id);
         }
-        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(id))? else {
-            return Ok(());
+        let Some(alive) = crate::lock::OsLock::try_exclusive(&self.store.alive_path(&id))? else {
+            return Ok(id);
         };
         match phase {
             Phase::Queued | Phase::Preparing { .. } => {
                 alive.release()?;
-                self.launch_supervisor(id)?;
-                Ok(())
+                self.launch_supervisor(&id)?;
+                Ok(id)
             }
             Phase::Starting { .. } | Phase::Running { .. } => {
                 alive.release()?;
-                Err(NodeError::UnsafeRetry(id.clone()))
+                Err(NodeError::UnsafeRetry(id))
             }
-            Phase::Finished { .. } => Ok(()),
+            Phase::Finished { .. } => Ok(id),
         }
+    }
+
+    fn kill(&self, authorized: &AuthorizedKill) -> Result<JobId, NodeError> {
+        let id = self.own(authorized.principal(), authorized.payload())?;
+        self.recover(&id)?;
+        Ok(id)
     }
 
     fn abandon_staging(&self, id: &JobId) -> Result<(), NodeError> {
@@ -1342,8 +1852,8 @@ impl Node {
                     }
                     Relation::Stranger => {}
                 },
-                Err(error) => {
-                    if matches!(principal, Principal::Owner) {
+                Err(error) => match principal {
+                    Principal::Owner => {
                         if unreadable.len() >= MAX_UNREADABLE {
                             return Err(NodeError::TooManyUnreadable(MAX_UNREADABLE));
                         }
@@ -1352,7 +1862,8 @@ impl Node {
                             why: RemoteText::new(error.to_string()),
                         });
                     }
-                }
+                    Principal::Peer { .. } => {}
+                },
             }
         }
         let jobs = jobs.into_iter().rev().map(|(_, job)| job).collect();
@@ -1362,7 +1873,7 @@ impl Node {
     fn settle(&self, id: &JobId, order: Order, input: impl Input) -> Result<Job, NodeError> {
         let session =
             Session::open(&self.store.control_path(id), order).map_err(NodeError::Control)?;
-        if let Reach::Reached(session) = session {
+        if let Some(session) = session.into_option() {
             let session = abandon_when_the_client_leaves(input, session);
             session
                 .relay(&mut std::io::sink())
@@ -1395,7 +1906,7 @@ impl Node {
                 let order = Order::Follow { offset };
                 let session = Session::open(&self.store.control_path(id), order)
                     .map_err(NodeError::Control)?;
-                if let Reach::Reached(session) = session {
+                if let Some(session) = session.into_option() {
                     let session = abandon_when_the_client_leaves(input, session);
                     let relayed = session.relay(framed).map_err(NodeError::Output)?;
                     offset = offset.saturating_add(relayed);
@@ -1486,8 +1997,9 @@ impl Node {
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
         let job = self.store.job(id)?;
-        let Location::Snapshot { subdir, .. } = &job.spec.location else {
-            return Err(NodeError::NoWorkspace(job.spec.id));
+        let subdir = match &job.spec.location {
+            Location::Snapshot { subdir, .. } => subdir,
+            Location::Home => return Err(NodeError::NoWorkspace(job.spec.id)),
         };
         let (_, workspace) = self.workspace_of(id)?;
         let inside = match subdir {
@@ -1504,9 +2016,10 @@ impl Node {
 
     fn changes(&self, id: &JobId, output: &mut dyn Write) -> Result<(), NodeError> {
         let job = self.store.job(id)?;
-        let Location::Snapshot { source, .. } = &job.spec.location else {
-            return Err(NodeError::NoWorkspace(job.spec.id));
-        };
+        let source = job
+            .spec
+            .source()
+            .ok_or_else(|| NodeError::NoWorkspace(job.spec.id.clone()))?;
         if !job.is_settled() {
             return Err(NodeError::Unfinished(job.spec.id));
         }
@@ -1529,16 +2042,16 @@ impl Node {
             framed.write_all(&line).map_err(NodeError::Output)?;
             framed.write_all(&raw).map_err(NodeError::Output)?;
             for item in &header.left {
-                if let Some(crate::snapshot::Entry::File { blob, size, .. }) = &item.now {
+                if let Some(file) = item.now.as_ref().and_then(crate::snapshot::Entry::file) {
                     let copied = match &workspace {
                         Some(workspace) => {
-                            let file = workspace.open_file(&item.path)?;
-                            std::io::copy(&mut file.take(*size), framed)
+                            let opened = workspace.open_file(&item.path)?;
+                            std::io::copy(&mut opened.take(file.size), framed)
                                 .map_err(NodeError::Output)?
                         }
-                        None => self.cas.stream(blob, framed)?,
+                        None => self.cas.stream(file.blob, framed)?,
                     };
-                    if copied != *size {
+                    if copied != file.size {
                         return Err(NodeError::Output(std::io::Error::other(format!(
                             "{} changed while it was being sent",
                             item.path
@@ -1656,12 +2169,74 @@ fn abandon_when_the_client_leaves(mut input: impl Input, session: Session) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::Commanded;
     use crate::domain::{Concurrency, Nonce as RetryNonce};
-    use crate::protocol::{Command, Location, Spec};
+    use crate::protocol::{Change, Command, Location, Spec, Submission};
     use crate::store::LaunchEnv;
 
     fn dirs(root: &Path) -> Dirs {
         Dirs::for_test(root)
+    }
+
+    fn command(request: Request) -> Commanded {
+        let authorized = authz::authorize(
+            Principal::Owner,
+            crate::ingress::PeerRequest::for_test(request),
+        )
+        .unwrap();
+        match authorized.route() {
+            Routed::Command(commanded) => commanded,
+            Routed::Query(_) => panic!("expected a command"),
+        }
+    }
+
+    fn commanded() -> Commanded {
+        command(Request::Clean {
+            apply: false,
+            logs: false,
+            idle: false,
+        })
+    }
+
+    fn authorized_configure(change: Change) -> AuthorizedConfigure {
+        let CommandAction::Configure(authorized) = command(Request::Configure { change })
+            .into_action()
+            .unwrap()
+        else {
+            panic!("configure is a command");
+        };
+        authorized
+    }
+
+    fn authorized_clean(options: (bool, bool, bool)) -> AuthorizedClean {
+        let (apply, logs, idle) = options;
+        let CommandAction::Clean(authorized) = command(Request::Clean { apply, logs, idle })
+            .into_action()
+            .unwrap()
+        else {
+            panic!("clean is a command");
+        };
+        authorized
+    }
+
+    fn submitted(submission: Submission) -> AuthorizedSubmission {
+        command(Request::Submit {
+            submission: Box::new(submission),
+        })
+        .into_submission()
+        .unwrap()
+    }
+
+    fn query(candidate: Request) -> Option<Request> {
+        let authorized = authz::authorize(
+            Principal::Owner,
+            crate::ingress::PeerRequest::for_test(candidate),
+        )
+        .unwrap();
+        match authorized.route() {
+            Routed::Query(queried) => Some(queried.into_parts().1),
+            Routed::Command(_) => None,
+        }
     }
 
     fn stage_with_sequence(store: &Store, id: &JobId, script: &str, sequence: u64) {
@@ -1696,7 +2271,7 @@ mod tests {
         let store = staged(root, &id, "true");
         store.publish(&id).unwrap();
         store
-            .set_phase(
+            .force_phase(
                 &id,
                 &Phase::Finished {
                     started_at: None,
@@ -1748,6 +2323,76 @@ mod tests {
             node.list(&Principal::Owner, 1001),
             Err(NodeError::ListLimit(1000))
         ));
+    }
+
+    #[test]
+    fn admission_counts_staged_and_published_unfinished_jobs_but_not_finished_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        for index in 0..MAX_UNFINISHED_JOBS {
+            let id: JobId = format!("{index:016X}").parse().unwrap();
+            stage_with_sequence(&store, &id, "true", crate::domain::len_u64(index));
+            if index == 0 {
+                store.publish(&id).unwrap();
+            }
+        }
+        let finished: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        stage_with_sequence(&store, &finished, "true", 100);
+        store.publish(&finished).unwrap();
+        store
+            .force_phase(
+                &finished,
+                &Phase::Finished {
+                    started_at: None,
+                    finished_at: Timestamp::at_millis(1),
+                    outcome: crate::protocol::Outcome::Succeeded,
+                },
+            )
+            .unwrap();
+        let node = Node {
+            pressure: |_| Ok(DiskPressure::Enough),
+            ..Node::open(dirs(tmp.path())).unwrap()
+        };
+        let collecting = crate::lock::OsLock::exclusive(&store.collection_lock_path()).unwrap();
+        assert!(matches!(
+            node.admit_job(&collecting),
+            Err(NodeError::JobCapacity(MAX_UNFINISHED_JOBS))
+        ));
+        collecting.release().unwrap();
+        let submit = |nonce| Submission {
+            queue: crate::protocol::Queue::Slot,
+            nonce,
+            name: None,
+            command: Command::Script("true".into()),
+            location: Location::Home,
+            env: std::collections::BTreeMap::new(),
+            shell: None,
+        };
+        let fresh = crate::domain::Nonce::generate().unwrap();
+        assert!(matches!(
+            node.accept(submitted(submit(fresh))),
+            Err(NodeError::JobCapacity(MAX_UNFINISHED_JOBS))
+        ));
+        let replay = crate::domain::Nonce::generate().unwrap();
+        let nonce_path = store.nonce_path("owner", &replay);
+        crate::state_file::write_bytes(&nonce_path, finished.as_str().as_bytes()).unwrap();
+        let job = node.accept(submitted(submit(replay))).unwrap();
+        assert_eq!(job.spec.id, finished);
+        let first: JobId = "0000000000000000".parse().unwrap();
+        store
+            .force_phase(
+                &first,
+                &Phase::Finished {
+                    started_at: None,
+                    finished_at: Timestamp::at_millis(2),
+                    outcome: crate::protocol::Outcome::Succeeded,
+                },
+            )
+            .unwrap();
+        let collecting_after_finish =
+            crate::lock::OsLock::exclusive(&store.collection_lock_path()).unwrap();
+        node.admit_job(&collecting_after_finish).unwrap();
+        collecting_after_finish.release().unwrap();
     }
 
     fn ask(node: &Node, request: &Request) -> Vec<u8> {
@@ -1872,7 +2517,7 @@ mod tests {
         let text = |path: &Path| path.display().to_string();
         let nonce = crate::domain::Nonce::generate().unwrap();
         let snapshot = Location::Snapshot {
-            source: crate::protocol::Source {
+            source: Source {
                 project: "proj".parse().unwrap(),
                 manifest: BlobId::of(b"never sent"),
                 revision: crate::protocol::Revision::WorkingDirectory,
@@ -1958,10 +2603,6 @@ mod tests {
         vec![
             Request::Hello,
             Request::Hold,
-            Request::Missing {
-                blobs: vec![BlobId::of(b"absent")],
-            },
-            Request::Upload { count: 0 },
             submission(crate::domain::Nonce::generate().unwrap(), Location::Home),
             Request::List { limit: 10 },
             Request::Status { job: job.clone() },
@@ -2028,7 +2669,7 @@ mod tests {
             pid: 1,
             workspace: String::new(),
         };
-        store.set_phase(&vanished.id, &running).unwrap();
+        store.force_phase(&vanished.id, &running).unwrap();
         let mut abandoned = vanished.clone();
         abandoned.id = "0CCCCCCCCCCCCCCC".parse().unwrap();
         abandoned.sequence = 3;
@@ -2052,7 +2693,7 @@ mod tests {
         };
         let before = not_audit(state_of(&state));
         for request in &every {
-            if let Routed::Query(question) = route(request.clone()) {
+            if let Some(question) = query(request.clone()) {
                 let audited = crate::state_file::read_bytes(&audit)
                     .unwrap()
                     .unwrap_or_default();
@@ -2140,7 +2781,7 @@ mod tests {
 
         let killed = staged("0BBBBBBBBBBBBBBB", 2);
         store
-            .set_phase(&killed, &finished_as(crate::protocol::Outcome::Killed))
+            .force_phase(&killed, &finished_as(crate::protocol::Outcome::Killed))
             .unwrap();
         assert_eq!(
             holds_anywhere(&state, CANARY.as_bytes()),
@@ -2156,10 +2797,10 @@ mod tests {
         );
 
         let vanished = staged("0DDDDDDDDDDDDDDD", 4);
-        store.set_phase(&vanished, &running).unwrap();
+        store.force_phase(&vanished, &running).unwrap();
         let unstarted = staged("0EEEEEEEEEEEEEEE", 5);
         store.record_start_failure(&unstarted, "no shell").unwrap();
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         assert_eq!(
             holds_anywhere(&state, CANARY.as_bytes()),
             Vec::<String>::new()
@@ -2265,9 +2906,13 @@ mod tests {
     fn only_the_current_and_two_other_binary_builds_are_kept() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = dirs(tmp.path());
-        let bin = dirs.cache.join("bin");
+        let bin = dirs.cache().join("bin");
         for name in ["current", "100", "200", "300", "400"] {
             crate::state_file::private_dir(&bin.join(name)).unwrap();
+        }
+        let last = crate::bounded::DIRECTORY_BATCH.get();
+        for index in 0..=last {
+            crate::state_file::private_dir(&bin.join(format!("build-{index:03}"))).unwrap();
         }
         retire_cached_binaries(&dirs, "current");
         let mut kept: Vec<String> = std::fs::read_dir(bin)
@@ -2275,7 +2920,28 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         kept.sort();
-        assert_eq!(kept, ["300", "400", "current"]);
+        assert_eq!(
+            kept,
+            [
+                format!("build-{:03}", last.saturating_sub(1)),
+                format!("build-{last:03}"),
+                "current".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_managed_binary_file_survives_legacy_directory_reclamation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = dirs(tmp.path());
+        let bin = dirs.cache().join("bin");
+        for name in ["current", "100", "200", "300", "400"] {
+            crate::state_file::private_dir(&bin.join(name)).unwrap();
+        }
+        let managed = bin.join("domyjob-new-build");
+        crate::state_file::write_bytes(&managed, b"binary").unwrap();
+        retire_cached_binaries(&dirs, "current");
+        assert_eq!(std::fs::read(managed).unwrap(), b"binary");
     }
 
     #[test]
@@ -2284,13 +2950,13 @@ mod tests {
         let (node, job) = published(tmp.path(), &[b'x'; 10_000]);
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+        node.make_room(&|| Ok(DiskPressure::Enough), &commanded(), &Location::Home)
             .unwrap();
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), [b'x'; 10_000]);
         let same_size = vec![b'z'; DISCARDED.len()];
         for log in [b"tiny".to_vec(), same_size] {
             crate::state_file::write_bytes(&store.log_path(&id), &log).unwrap();
-            node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+            node.make_room(&|| Ok(DiskPressure::Short), &commanded(), &Location::Home)
                 .unwrap();
             assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), log);
         }
@@ -2305,7 +2971,7 @@ mod tests {
         finished_like(&store, &first, &["0FFFFFFFFFFFFFFF"]);
         let upload = BlobId::of(b"on its way");
         node.cas.put(&upload, b"on its way").unwrap();
-        node.retire(2).unwrap();
+        node.retire_including(2, None).unwrap();
         assert!(node.cas.stored().unwrap().contains(&upload));
         let nonce = crate::domain::Nonce::generate().unwrap();
         let nonce_path = store.nonce_path("owner", &nonce);
@@ -2318,7 +2984,7 @@ mod tests {
             ("state_file::read", text(&nonce_path)),
         ] {
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.retire(1).unwrap_err();
+            node.retire_including(1, None).unwrap_err();
         }
     }
 
@@ -2330,7 +2996,7 @@ mod tests {
         let id = store.resolve(&job).unwrap();
         crate::state_file::write_bytes(&store.job_dir(&id).join("failure"), b"once").unwrap();
         let finished = store.phase(&id).unwrap();
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         assert_eq!(store.phase(&id).unwrap(), finished);
         let open: JobId = "0FFFFFFFFFFFFFFF".parse().unwrap();
         finished_like(&store, &id, &[open.as_str()]);
@@ -2360,7 +3026,7 @@ mod tests {
                 text(&store.staging_lock_path(&staged)),
             ),
         ] {
-            store.set_phase(&open, &running).unwrap();
+            store.force_phase(&open, &running).unwrap();
             if !store.staged_ids().unwrap().contains(&staged) {
                 store
                     .stage(
@@ -2370,13 +3036,13 @@ mod tests {
                     .unwrap();
             }
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.upkeep(&Commanded(())).unwrap_err();
+            node.upkeep(&commanded()).unwrap_err();
         }
         Node::open(node.dirs.clone()).unwrap();
         for area in [
-            node.dirs.state.clone(),
+            node.dirs.state().to_path_buf(),
             store.area(""),
-            node.dirs.state.join("objects"),
+            node.dirs.state().join("objects"),
         ] {
             let _faults = crate::faults::inject(&[("state_file::dir", &text(&area))]);
             Node::open(node.dirs.clone()).unwrap_err();
@@ -2483,7 +3149,7 @@ mod tests {
         crate::remote::receive("m", &mut again.as_slice(), &mut kept).unwrap();
         assert_eq!(kept, payload, "a job's changes outlive its workspace");
 
-        store.set_phase(&id, &Phase::Queued).unwrap();
+        store.force_phase(&id, &Phase::Queued).unwrap();
         let _alive = crate::lock::OsLock::exclusive(&store.alive_path(&id)).unwrap();
         assert!(refused(&ask(&node, &Request::Changes { job })));
     }
@@ -2491,7 +3157,7 @@ mod tests {
     fn sent_manifest(store: &Store, id: &JobId, manifest: &BlobId) {
         let mut spec = store.spec(id).unwrap();
         spec.location = Location::Snapshot {
-            source: crate::protocol::Source {
+            source: Source {
                 project: "proj".parse().unwrap(),
                 manifest: manifest.clone(),
                 revision: crate::protocol::Revision::WorkingDirectory,
@@ -2532,10 +3198,10 @@ mod tests {
             "{reply:?}"
         );
         let five = Concurrency::try_from(5).unwrap();
-        node.configure(Change {
+        node.configure(&authorized_configure(Change {
             paused: Some(false),
             max_jobs: Some(five),
-        })
+        }))
         .unwrap();
         let resumed = node.report().unwrap();
         assert!(!resumed.paused && resumed.max_jobs == five);
@@ -2560,7 +3226,7 @@ mod tests {
             id.as_str().as_bytes(),
         )
         .unwrap();
-        let listed = node.clean((false, true, false)).unwrap();
+        let listed = node.clean(&authorized_clean((false, true, false))).unwrap();
         assert!(!listed.applied);
         assert!(
             listed.items.iter().any(|item| item.bytes == 5_000),
@@ -2569,17 +3235,163 @@ mod tests {
         assert!(project.join("0").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
 
-        let freed = node.clean((true, false, false)).unwrap();
+        let freed = node.clean(&authorized_clean((true, false, false))).unwrap();
         assert!(freed.applied);
         assert_eq!(freed.items.len(), 1, "{freed:?}");
         assert!(recent.join("out").try_exists().unwrap());
         assert!(!project.join("0").try_exists().unwrap());
         assert!(project.join("1").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
-        node.clean((true, true, true)).unwrap();
+        node.clean(&authorized_clean((true, true, true))).unwrap();
         assert!(!recent.join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
         busy.release().unwrap();
+    }
+
+    #[test]
+    fn cleaning_reports_many_canonical_workspaces_with_a_bounded_complete_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let projects: Vec<_> = (0..5)
+            .map(|group| {
+                node.store
+                    .area("work")
+                    .join("owner")
+                    .join(format!("project-{group}"))
+            })
+            .collect();
+        let mut workspaces = 0;
+        for project in &projects {
+            for slot in SlotIndex::all() {
+                workspaces += 1;
+                crate::state_file::write_bytes(
+                    &project.join(slot.to_string()).join("out"),
+                    &vec![b'x'; workspaces],
+                )
+                .unwrap();
+            }
+        }
+        let total = (1..=workspaces).map(crate::domain::len_u64).sum::<u64>();
+        for apply in [false, true] {
+            let cleaned = node.clean(&authorized_clean((apply, false, true))).unwrap();
+            assert_eq!(cleaned.applied, apply);
+            assert_eq!(cleaned.items.len(), crate::protocol::CLEAN_DETAIL_LIMIT + 1);
+            assert_eq!(
+                cleaned.items.iter().map(|item| item.bytes).sum::<u64>(),
+                total
+            );
+            let summary = cleaned.items.iter().find(|item| {
+                item.what.as_raw_str()
+                    == format!(
+                        "the other {} cleanable items",
+                        workspaces - crate::protocol::CLEAN_DETAIL_LIMIT
+                    )
+            });
+            let summary = summary.expect("omitted cleanable items have a summary");
+            let mut details: Vec<_> = cleaned
+                .items
+                .iter()
+                .filter(|item| item.what != summary.what)
+                .map(|item| item.bytes)
+                .collect();
+            details.sort_unstable();
+            assert_eq!(
+                details,
+                (workspaces - crate::protocol::CLEAN_DETAIL_LIMIT + 1..=workspaces)
+                    .map(crate::domain::len_u64)
+                    .collect::<Vec<_>>()
+            );
+        }
+        for project in projects {
+            assert!(
+                std::fs::read_dir(&project)
+                    .unwrap()
+                    .all(|entry| entry.unwrap().file_name() == "locks")
+            );
+        }
+    }
+
+    #[test]
+    fn cleaning_never_borrows_a_canonical_lock_for_an_alias_or_out_of_range_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let project = node.store.area("work").join("owner").join("project");
+        for name in ["0", "01", "64"] {
+            crate::state_file::write_bytes(&project.join(name).join("out"), b"stale").unwrap();
+        }
+        let cleaned = node.clean(&authorized_clean((true, false, true))).unwrap();
+        assert_eq!(cleaned.items.len(), 1);
+        assert!(!project.join("0").try_exists().unwrap());
+        assert!(project.join("01").join("out").try_exists().unwrap());
+        assert!(project.join("64").join("out").try_exists().unwrap());
+        assert!(!project.join("locks").join("64.lock").try_exists().unwrap());
+    }
+
+    #[test]
+    fn idle_workspace_order_is_stable_across_project_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let work = node.store.area("work").join("owner");
+        let projects = crate::bounded::DIRECTORY_BATCH.get() + 2;
+        for index in (0..projects).rev() {
+            crate::state_file::write_bytes(
+                &work
+                    .join(format!("project-{index:03}"))
+                    .join("0")
+                    .join("out"),
+                b"stale",
+            )
+            .unwrap();
+        }
+        crate::state_file::write_bytes(&work.join("unrelated-file"), b"ignored").unwrap();
+        crate::state_file::write_bytes(
+            &node.store.area("work").join("unrelated-scope-file"),
+            b"ignored",
+        )
+        .unwrap();
+        let mut visited = Vec::new();
+        let result = node
+            .visit_idle_workspaces(|workspace, _lock| {
+                visited.push(workspace.to_path_buf());
+                Ok(ScanFlow::Continue)
+            })
+            .unwrap();
+        assert_eq!(result, ScanFlow::Continue);
+        assert_eq!(visited.len(), projects);
+        for (index, path) in visited.iter().enumerate() {
+            assert_eq!(path, &work.join(format!("project-{index:03}")).join("0"));
+        }
+    }
+
+    #[test]
+    fn measuring_wide_trees_streams_entries_and_deep_trees_fail_at_the_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        for index in 0..=WORKSPACE_SCAN_BATCH {
+            crate::state_file::write_bytes(&tree.join(format!("{index:03}")), b"x").unwrap();
+        }
+        assert_eq!(
+            size_of(&tree).unwrap(),
+            crate::domain::len_u64(WORKSPACE_SCAN_BATCH + 1)
+        );
+        let mut deep = tree.clone();
+        for _ in 1..MAX_MEASURE_DIRS {
+            deep.push("d");
+        }
+        crate::state_file::write_bytes(&deep.join("leaf"), b"y").unwrap();
+        assert_eq!(
+            size_of(&tree).unwrap(),
+            crate::domain::len_u64(WORKSPACE_SCAN_BATCH + 2)
+        );
+        deep.push("d");
+        crate::state_file::write_bytes(&deep.join("too_deep"), b"z").unwrap();
+        assert!(matches!(
+            size_of(&tree),
+            Err(NodeError::MeasureDepth {
+                limit: MAX_MEASURE_DIRS,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2596,7 +3408,7 @@ mod tests {
             let tag = path.display().to_string();
             let _faults = crate::faults::inject(&[(site, &tag)]);
             assert!(matches!(
-                node.clean((false, false, true)),
+                node.clean(&authorized_clean((false, false, true))),
                 Err(NodeError::Io(_))
             ));
         }
@@ -2662,10 +3474,6 @@ mod tests {
                     })
                 ));
             }
-            assert!(matches!(
-                reply_to(&node, line_of(&Request::Upload { count: 0 })),
-                Reply::Stored { count: 0 }
-            ));
             let killed = reply_to(&node, line_of(&Request::Kill { job }));
             assert!(matches!(killed, Reply::Job(_)), "{killed:?}");
         }
@@ -2680,7 +3488,7 @@ mod tests {
         let store = staged(tmp.path(), &id, "true");
         store.publish(&id).unwrap();
         store
-            .set_phase(
+            .force_phase(
                 &id,
                 &Phase::Running {
                     started_at: Timestamp::at_millis(1),
@@ -2730,7 +3538,7 @@ mod tests {
             if chunk.windows(8).any(|w| w == b"\"report\"") {
                 surveys += 1;
                 if surveys == 1 {
-                    store.set_phase(&id, &Phase::Queued).unwrap();
+                    store.force_phase(&id, &Phase::Queued).unwrap();
                 }
             }
             wire.extend(chunk);
@@ -2845,20 +3653,156 @@ mod tests {
         line
     }
 
-    fn uploaded(node: &Node, contents: &[u8]) -> Reply {
-        let mut bytes = line_of(&Request::Upload { count: 1 });
-        bytes.extend(line_of(&Frame {
-            blob: BlobId::of(contents),
-            size: crate::domain::len_u64(contents.len()),
+    fn snapshot_frames(nonce: RetryNonce, contents: &[u8]) -> (Vec<u8>, Vec<u8>, BlobId) {
+        let content = BlobId::of(contents);
+        let manifest = crate::snapshot::Manifest {
+            entries: std::collections::BTreeMap::from([(
+                "a.txt".parse().unwrap(),
+                crate::snapshot::Entry::File {
+                    blob: content.clone(),
+                    size: crate::domain::len_u64(contents.len()),
+                    mode: crate::snapshot::Mode::Regular,
+                },
+            )]),
+        };
+        let (manifest_id, encoded) = manifest.encode().unwrap();
+        let location = Location::Snapshot {
+            source: Source {
+                project: "proj".parse().unwrap(),
+                manifest: manifest_id.clone(),
+                revision: crate::protocol::Revision::WorkingDirectory,
+            },
+            subdir: None,
+            workspace: crate::protocol::Workspace::Warm,
+        };
+        let mut first = line_of(&submission(nonce, location));
+        first.extend(line_of(&Frame {
+            blob: manifest_id,
+            size: crate::domain::len_u64(encoded.len()),
         }));
-        bytes.extend_from_slice(contents);
-        reply_to(node, bytes)
+        first.extend(encoded);
+        let mut second = line_of(&Frame {
+            blob: content.clone(),
+            size: crate::domain::len_u64(contents.len()),
+        });
+        second.extend_from_slice(contents);
+        (first, second, content)
+    }
+
+    struct Feed {
+        chunk: std::io::Cursor<Vec<u8>>,
+        next: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl Read for Feed {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            while self.chunk.position() == crate::domain::len_u64(self.chunk.get_ref().len()) {
+                self.chunk = match self.next.recv() {
+                    Ok(bytes) => std::io::Cursor::new(bytes),
+                    Err(_) => return Ok(0),
+                };
+            }
+            self.chunk.read(target)
+        }
+    }
+
+    struct Replies(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl Write for Replies {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.send(bytes.to_vec()).map_err(std::io::Error::other)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_snapshot_holds_collection_lock_from_manifest_through_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second, content) =
+            snapshot_frames(RetryNonce::generate().unwrap(), b"source content");
+        let (send_input, receive_input) = std::sync::mpsc::channel();
+        let (send_reply, receive_reply) = std::sync::mpsc::channel();
+        send_input.send(first).unwrap();
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        let server = std::thread::spawn(move || {
+            node.serve(
+                &Principal::Owner,
+                std::io::BufReader::new(Feed {
+                    chunk: std::io::Cursor::new(Vec::new()),
+                    next: receive_input,
+                }),
+                &mut Replies(send_reply),
+            )
+        });
+        let first_reply = receive_reply.recv().unwrap();
+        let need = crate::remote::receive("m", &mut first_reply.as_slice(), &mut Vec::new())
+            .unwrap()
+            .into_need_blobs()
+            .unwrap();
+        assert_eq!(need, vec![content.clone()]);
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        assert!(
+            crate::lock::OsLock::try_exclusive(&store.collection_lock_path())
+                .unwrap()
+                .is_none()
+        );
+        let root = tmp.path().to_path_buf();
+        let collector =
+            std::thread::spawn(move || Node::open(dirs(&root)).unwrap().collect(Keep::Every));
+        send_input.send(second).unwrap();
+        drop(send_input);
+        let last_reply = receive_reply.recv().unwrap();
+        let final_reply = crate::remote::receive("m", &mut last_reply.as_slice(), &mut Vec::new());
+        assert!(
+            matches!(
+                &final_reply,
+                Ok(Reply::Job(_)
+                    | Reply::Refused(Refusal {
+                        code: RefusalCode::Spawn,
+                        ..
+                    }))
+            ),
+            "{final_reply:?}"
+        );
+        server.join().unwrap().unwrap();
+        collector.join().unwrap().unwrap();
+        let cas = Cas::open(tmp.path().join("state/objects")).unwrap();
+        if matches!(&final_reply, Ok(Reply::Job(_))) {
+            assert!(cas.has(&content).unwrap());
+        }
+        for stored in cas.stored().unwrap() {
+            cas.get(&stored).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_legacy_split_upload_requests_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        for request in [
+            br#"{"op":"missing","blobs":[]}"#.as_slice(),
+            br#"{"op":"upload","count":0}"#.as_slice(),
+        ] {
+            let mut line = request.to_vec();
+            line.push(b'\n');
+            assert!(matches!(
+                reply_to(&node, line),
+                Reply::Refused(Refusal {
+                    code: RefusalCode::BadRequest,
+                    ..
+                })
+            ));
+        }
     }
 
     fn sound_after_a_crash(root: &Path, step: usize, retried: &RetryNonce) {
         let at = |what: &str| format!("after a crash before step {step}: {what}");
         let node = Node::open(dirs(root)).unwrap_or_else(|e| panic!("{}", at(&e.to_string())));
-        match node.upkeep(&Commanded(())) {
+        match node.upkeep(&commanded()) {
             Ok(()) | Err(_) => {}
         }
         node.audit
@@ -2875,6 +3819,16 @@ mod tests {
                 .get(&blob)
                 .unwrap_or_else(|e| panic!("{}", at(&format!("blob {blob}: {e}"))));
         }
+        for id in node.store.staged_ids().unwrap() {
+            let alive = crate::lock::OsLock::exclusive(&node.store.alive_path(&id))
+                .unwrap_or_else(|e| panic!("{}", at(&format!("waiting for {id}: {e}"))));
+            alive
+                .release()
+                .unwrap_or_else(|e| panic!("{}", at(&format!("releasing {id}: {e}"))));
+        }
+        match node.upkeep(&commanded()) {
+            Ok(()) | Err(_) => {}
+        }
         assert!(
             node.store.staged_ids().unwrap().is_empty(),
             "{}",
@@ -2888,7 +3842,7 @@ mod tests {
                 at(&format!("{id} still reads as running: {phase:?}"))
             );
         }
-        node.configure(Change::default())
+        node.configure(&authorized_configure(Change::default()))
             .unwrap_or_else(|e| panic!("{}", at(&format!("configuring: {e}"))));
         for nonce in [retried.clone(), RetryNonce::generate().unwrap()] {
             let reply = reply_to(&node, line_of(&submission(nonce, Location::Home)));
@@ -2931,7 +3885,7 @@ mod tests {
         let store = Store::open(&dirs(root)).unwrap();
         let id = store.resolve(&job).unwrap();
         store
-            .set_phase(
+            .force_phase(
                 &id,
                 &Phase::Running {
                     started_at: Timestamp::at_millis(1),
@@ -2954,23 +3908,12 @@ mod tests {
     }
 
     #[test]
-    fn a_crash_at_any_step_of_an_upload_leaves_only_whole_blobs() {
-        crash_everywhere(nothing_yet, |node, _retried| {
-            let reply = uploaded(node, b"contents");
-            assert!(
-                matches!(reply, Reply::Stored { .. } | Reply::Refused(_)),
-                "{reply:?}"
-            );
-        });
-    }
-
-    #[test]
     fn a_crash_at_any_step_of_settling_the_machine_leaves_it_answering() {
         crash_everywhere(nothing_yet, |node, _retried| {
-            match node.configure(Change {
+            match node.configure(&authorized_configure(Change {
                 paused: Some(true),
                 max_jobs: Some(Concurrency::try_from(2).unwrap()),
-            }) {
+            })) {
                 Ok(()) | Err(_) => {}
             }
         });
@@ -2979,7 +3922,7 @@ mod tests {
     #[test]
     fn a_crash_at_any_step_of_recovering_a_lost_job_is_recovered_from_next_time() {
         crash_everywhere(one_running_job, |node, _retried| {
-            match node.upkeep(&Commanded(())) {
+            match node.upkeep(&commanded()) {
                 Ok(()) | Err(_) => {}
             }
         });
@@ -3046,7 +3989,7 @@ mod tests {
         let node = Node::open(dirs(tmp.path())).unwrap();
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             started_at,
@@ -3070,14 +4013,14 @@ mod tests {
             pid: 1,
             workspace: "w".into(),
         };
-        store.set_phase(&id, &running).unwrap();
+        store.force_phase(&id, &running).unwrap();
         let phase_file = store.job_dir(&id).join("phase.json").display().to_string();
         {
             let _faults = crate::faults::inject(&[("state_file::write", &phase_file)]);
-            node.upkeep(&Commanded(())).unwrap_err();
+            node.upkeep(&commanded()).unwrap_err();
         }
         assert_eq!(store.phase(&id).unwrap(), running);
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         assert!(matches!(store.phase(&id).unwrap(), Phase::Finished { .. }));
     }
 
@@ -3092,7 +4035,7 @@ mod tests {
             pid: 1,
             workspace: String::new(),
         };
-        store.set_phase(&id, &running).unwrap();
+        store.force_phase(&id, &running).unwrap();
         let spec_file = store.job_dir(&id).join("spec.json").display().to_string();
         {
             let _faults = crate::faults::inject(&[("state_file::read", &spec_file)]);
@@ -3109,9 +4052,9 @@ mod tests {
         let (node, job) = published(tmp.path(), b"");
         let store = Store::open(&dirs(tmp.path())).unwrap();
         let id = store.resolve(&job).unwrap();
-        store.set_phase(&id, &Phase::Queued).unwrap();
+        store.force_phase(&id, &Phase::Queued).unwrap();
         store.record_start_failure(&id, "no shell").unwrap();
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         let Phase::Finished {
             outcome: crate::protocol::Outcome::Errored { reason },
             ..
@@ -3142,7 +4085,7 @@ mod tests {
         spec_of(&orphan);
         spec_of(&busy);
         let held = crate::lock::OsLock::exclusive(&store.staging_lock_path(&busy)).unwrap();
-        node.upkeep(&Commanded(())).unwrap();
+        node.upkeep(&commanded()).unwrap();
         assert_eq!(store.staged_ids().unwrap(), vec![busy]);
         held.release().unwrap();
     }
@@ -3165,13 +4108,68 @@ mod tests {
             .unwrap();
         store.publish(&newer).unwrap();
         store
-            .set_phase(&newer, &store.phase(&older).unwrap())
+            .force_phase(&newer, &store.phase(&older).unwrap())
             .unwrap();
         let stray = BlobId::of(b"nobody needs this");
         node.cas.put(&stray, b"nobody needs this").unwrap();
-        node.retire(1).unwrap();
+        node.retire_including(1, None).unwrap();
         assert_eq!(store.ids().unwrap(), vec![newer]);
         assert!(!node.cas.stored().unwrap().contains(&stray));
+    }
+
+    #[test]
+    fn retiring_preserves_a_nonce_while_its_job_is_still_being_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let first: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        finished_like(&store, &first, &["0BBBBBBBBBBBBBBB"]);
+        let staged: JobId = "0CCCCCCCCCCCCCCC".parse().unwrap();
+        stage_with_sequence(&store, &staged, "true", 3);
+        let nonce = crate::domain::Nonce::generate().unwrap();
+        let path = store.nonce_path("owner", &nonce);
+        crate::state_file::write_bytes(&path, staged.as_str().as_bytes()).unwrap();
+        let staging = crate::lock::OsLock::exclusive(&store.staging_lock_path(&staged)).unwrap();
+        node.retire_including(1, None).unwrap();
+        assert!(crate::state_file::read_bytes(&path).unwrap().is_some());
+        staging.release().unwrap();
+        node.retire_including(0, None).unwrap();
+        assert!(crate::state_file::read_bytes(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn finished_log_visits_cross_batches_without_revisiting_discarded_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        for index in 0..=LOG_SCAN_BATCH {
+            let id: JobId = format!("{index:016X}").parse().unwrap();
+            stage_with_sequence(&store, &id, "true", crate::domain::len_u64(index));
+            store.publish(&id).unwrap();
+            store
+                .force_phase(
+                    &id,
+                    &Phase::Finished {
+                        started_at: None,
+                        finished_at: Timestamp::at_millis(1),
+                        outcome: crate::protocol::Outcome::Succeeded,
+                    },
+                )
+                .unwrap();
+            crate::state_file::write_bytes(
+                &store.log_path(&id),
+                &vec![b'x'; DISCARDED.len() + index + 1],
+            )
+            .unwrap();
+        }
+        let node = Node::open(dirs(tmp.path())).unwrap();
+        let mut seen = Vec::new();
+        node.visit_finished_logs(|id| {
+            seen.push(usize::from_str_radix(id.as_str(), 16).unwrap());
+            assert!(matches!(node.discard_log(id)?, Reclamation::Done));
+            Ok(ScanFlow::Continue)
+        })
+        .unwrap();
+        assert_eq!(seen, (0..=LOG_SCAN_BATCH).rev().collect::<Vec<_>>());
     }
 
     #[test]
@@ -3204,7 +4202,7 @@ mod tests {
         node.cas.put(&blob, manifest).unwrap();
         let mut spec = store.spec(id).unwrap();
         spec.location = Location::Snapshot {
-            source: crate::protocol::Source {
+            source: Source {
                 project: "proj".parse().unwrap(),
                 manifest: blob.clone(),
                 revision: crate::protocol::Revision::WorkingDirectory,
@@ -3243,7 +4241,7 @@ mod tests {
             ("state_file::overwrite", text(&log)),
         ] {
             let _faults = crate::faults::inject(&[(site, &tag)]);
-            node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+            node.make_room(&|| Ok(DiskPressure::Short), &commanded(), &Location::Home)
                 .unwrap_err();
         }
     }
@@ -3256,16 +4254,7 @@ mod tests {
         let first: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         let ids = finished_like(&store, &first, &["0FFFFFFFFFFFFFFF"]);
         let running = ids.last().unwrap();
-        store
-            .set_phase(
-                running,
-                &Phase::Running {
-                    started_at: Timestamp::at_millis(1),
-                    pid: 1,
-                    workspace: String::new(),
-                },
-            )
-            .unwrap();
+        set_running(&store, running);
         let (finished_manifest, finished_content) =
             holding(&node, b"only a finished job used this");
         let finished = sent(&node, &store, &first, &finished_manifest);
@@ -3286,7 +4275,7 @@ mod tests {
             (
                 Keep::Every,
                 "cas::list",
-                text(&node.dirs.state.join("objects")),
+                text(&node.dirs.state().join("objects")),
             ),
             (Keep::Every, "state_file::remove", blob_tag(&stray)),
             (Keep::Unfinished, "cas::read", blob_tag(&finished)),
@@ -3298,10 +4287,160 @@ mod tests {
         let kept = node.cas.stored().unwrap();
         assert!(kept.contains(&finished) && kept.contains(&unfinished));
         assert!(!kept.contains(&stray));
+        let incoming = Location::Snapshot {
+            source: Source {
+                project: "incoming".parse().unwrap(),
+                manifest: finished.clone(),
+                revision: crate::protocol::Revision::WorkingDirectory,
+            },
+            subdir: None,
+            workspace: crate::protocol::Workspace::Warm,
+        };
+        node.make_room(&|| Ok(DiskPressure::Short), &commanded(), &incoming)
+            .unwrap();
+        assert!(node.cas.has(&finished_content).unwrap());
         node.collect(Keep::Unfinished).unwrap();
         let left = node.cas.stored().unwrap();
         assert!(left.contains(&finished) && left.contains(&unfinished));
         assert!(!left.contains(&finished_content));
+    }
+
+    struct PartitionedCollection {
+        _tmp: tempfile::TempDir,
+        node: Node,
+        finished_manifest: BlobId,
+        finished_blob: BlobId,
+        running_manifest: BlobId,
+        running_blob: BlobId,
+        stray: BlobId,
+    }
+
+    fn partitioned_collection() -> PartitionedCollection {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let finished: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let running = finished_like(&store, &finished, &["0FFFFFFFFFFFFFFF"])
+            .last()
+            .cloned()
+            .unwrap();
+        set_running(&store, &running);
+        let (finished_manifest, finished_blob) = holding(&node, b"finished content");
+        let first_nibble = finished_blob.as_str().get(..1).unwrap();
+        let running_content = (0..1024)
+            .map(|index| format!("running content {index}"))
+            .find(|bytes| {
+                BlobId::of(bytes.as_bytes())
+                    .as_str()
+                    .starts_with(first_nibble)
+            })
+            .unwrap();
+        let (running_manifest, running_blob) = holding(&node, running_content.as_bytes());
+        let finished_manifest = sent(&node, &store, &finished, &finished_manifest);
+        let running_manifest = sent(&node, &store, &running, &running_manifest);
+        let occupied = [
+            &finished_manifest,
+            &finished_blob,
+            &running_manifest,
+            &running_blob,
+        ]
+        .map(|blob| blob.as_str().get(..1).unwrap());
+        let stray_content = (0..1024)
+            .map(|index| format!("stray content {index}"))
+            .find(|bytes| {
+                !occupied.contains(&BlobId::of(bytes.as_bytes()).as_str().get(..1).unwrap())
+            })
+            .unwrap();
+        let stray = BlobId::of(stray_content.as_bytes());
+        node.cas.put(&stray, stray_content.as_bytes()).unwrap();
+        PartitionedCollection {
+            _tmp: tmp,
+            node,
+            finished_manifest,
+            finished_blob,
+            running_manifest,
+            running_blob,
+            stray,
+        }
+    }
+
+    #[test]
+    fn collection_partitions_reachability_without_losing_shared_prefixes_or_incoming_blobs() {
+        let fixture = partitioned_collection();
+        let PartitionedCollection {
+            node,
+            finished_manifest,
+            finished_blob,
+            running_manifest,
+            running_blob,
+            stray,
+            ..
+        } = &fixture;
+        assert!(matches!(
+            node.collect_with_mark_limit(Keep::Every, None, 0),
+            Err(NodeError::CollectionBudget(0))
+        ));
+        assert!(matches!(
+            node.scan_marks(
+                CollectionPlan {
+                    keep: Keep::Every,
+                    incoming: None,
+                    limit: 1,
+                },
+                "",
+            )
+            .unwrap(),
+            MarkScan::Split(_)
+        ));
+        node.collect_with_mark_limit(Keep::Every, None, 1).unwrap();
+        for blob in [
+            &finished_manifest,
+            &finished_blob,
+            &running_manifest,
+            &running_blob,
+        ] {
+            assert!(node.cas.has(blob).unwrap());
+        }
+        assert!(!node.cas.has(stray).unwrap());
+
+        let incoming = Source {
+            project: "incoming".parse().unwrap(),
+            manifest: finished_manifest.clone(),
+            revision: crate::protocol::Revision::WorkingDirectory,
+        };
+        node.collect_with_mark_limit(Keep::Unfinished, Some(&incoming), 1)
+            .unwrap();
+        assert!(node.cas.has(finished_blob).unwrap());
+        node.collect_with_mark_limit(Keep::Unfinished, None, 1)
+            .unwrap();
+        assert!(node.cas.has(finished_manifest).unwrap());
+        assert!(!node.cas.has(finished_blob).unwrap());
+        assert!(node.cas.has(running_manifest).unwrap());
+        assert!(node.cas.has(running_blob).unwrap());
+    }
+
+    #[test]
+    fn retiring_a_finished_job_preserves_blobs_for_the_incoming_submission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let (manifest, content) = holding(&node, b"shared with the incoming submission");
+        let manifest = sent(&node, &store, &id, &manifest);
+        let source = Source {
+            project: "incoming".parse().unwrap(),
+            manifest: manifest.clone(),
+            revision: crate::protocol::Revision::WorkingDirectory,
+        };
+
+        node.retire_including(0, Some(&source)).unwrap();
+        assert!(store.ids().unwrap().is_empty());
+        assert!(node.cas.has(&manifest).unwrap());
+        assert!(node.cas.has(&content).unwrap());
+
+        node.collect(Keep::Every).unwrap();
+        assert!(!node.cas.has(&manifest).unwrap());
+        assert!(!node.cas.has(&content).unwrap());
     }
 
     fn holding(node: &Node, content: &[u8]) -> (Vec<u8>, BlobId) {
@@ -3320,6 +4459,19 @@ mod tests {
         (serde_json::to_vec(&manifest).unwrap(), blob)
     }
 
+    fn set_running(store: &Store, id: &JobId) {
+        store
+            .force_phase(
+                id,
+                &Phase::Running {
+                    started_at: Timestamp::at_millis(1),
+                    pid: 1,
+                    workspace: String::new(),
+                },
+            )
+            .unwrap();
+    }
+
     fn finished_like(store: &Store, first: &JobId, more: &[&str]) -> Vec<JobId> {
         let mut ids = vec![first.clone()];
         for (sequence, id) in (2..).zip(more) {
@@ -3334,7 +4486,9 @@ mod tests {
                 )
                 .unwrap();
             store.publish(&id).unwrap();
-            store.set_phase(&id, &store.phase(first).unwrap()).unwrap();
+            store
+                .force_phase(&id, &store.phase(first).unwrap())
+                .unwrap();
             ids.push(id);
         }
         ids
@@ -3354,8 +4508,10 @@ mod tests {
         let there = |slot: &str| project.join(slot).try_exists().unwrap();
         let busy = crate::lock::OsLock::exclusive(&project.join("locks").join("1.lock")).unwrap();
         let running = crate::lock::OsLock::exclusive(&store.alive_path(&oldest)).unwrap();
+        let home = Location::Home;
+        let commanded = commanded();
 
-        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+        node.make_room(&|| Ok(DiskPressure::Enough), &commanded, &home)
             .unwrap();
         assert!(there("0") && there("2"));
         let until_one_workspace_is_gone = || {
@@ -3365,7 +4521,7 @@ mod tests {
                 DiskPressure::Enough
             })
         };
-        node.make_room(&until_one_workspace_is_gone, &Commanded(()))
+        node.make_room(&until_one_workspace_is_gone, &commanded, &home)
             .unwrap();
         assert_ne!(there("0"), there("2"));
         assert!(project.join("1").join("file").try_exists().unwrap());
@@ -3384,7 +4540,7 @@ mod tests {
                 },
             )
         };
-        node.make_room(&until_the_biggest_log_is_gone, &Commanded(()))
+        node.make_room(&until_the_biggest_log_is_gone, &commanded, &home)
             .unwrap();
         assert_eq!(std::fs::read(store.log_path(big)).unwrap(), DISCARDED);
         assert_eq!(std::fs::read(store.log_path(small)).unwrap(), [b'y'; 9_000]);
@@ -3393,7 +4549,7 @@ mod tests {
         let snapshot = |id: &JobId, manifest: &[u8]| sent(&node, &store, id, manifest);
         let needed = snapshot(&oldest, br#"{"entries":{}}"#);
         store
-            .set_phase(
+            .force_phase(
                 &oldest,
                 &Phase::Running {
                     started_at: Timestamp::at_millis(1),
@@ -3408,7 +4564,7 @@ mod tests {
         node.cas
             .put(&uploaded, b"sent for a submission still on its way")
             .unwrap();
-        node.make_room(&|| Ok(DiskPressure::Short), &Commanded(()))
+        node.make_room(&|| Ok(DiskPressure::Short), &commanded, &home)
             .unwrap();
         assert!(!there("0") && !there("2"));
         assert_eq!(store.ids().unwrap().len(), 3);
@@ -3418,7 +4574,7 @@ mod tests {
         assert!(kept.contains(&needed) && kept.contains(&spent));
         assert!(!kept.contains(&spent_content));
         assert!(kept.contains(&uploaded));
-        node.make_room(&|| Ok(DiskPressure::Enough), &Commanded(()))
+        node.make_room(&|| Ok(DiskPressure::Enough), &commanded, &home)
             .unwrap();
         busy.release().unwrap();
         running.release().unwrap();

@@ -17,9 +17,13 @@ pub enum TrustError {
     #[error(transparent)]
     Key(#[from] crate::keystore::KeyError),
     #[error("the random source failed: {0}")]
-    Random(getrandom::Error),
+    Random(std::io::Error),
     #[error("nothing paired matches {0}")]
     Unknown(String),
+    #[error(
+        "{0} matches both a machine name and a different key fingerprint; use name:{0} or fingerprint:{0}"
+    )]
+    Ambiguous(String),
     #[error(transparent)]
     Lock(#[from] crate::lock::LockError),
     #[error(
@@ -115,14 +119,14 @@ fn derive_public(secret: &[u8; 32]) -> PublicKey {
 
 impl Identity {
     pub fn load_or_create(dirs: &Dirs) -> Result<Self, TrustError> {
-        if let Some(found) = dirs.keys.load(&dirs.state, "identity")? {
+        if let Some(found) = dirs.keys.load(dirs.state(), "identity")? {
             return Ok(Self {
                 public: derive_public(found.expose()),
                 secret: found,
             });
         }
-        let lock = crate::lock::OsLock::exclusive(&dirs.state.join("identity.lock"))?;
-        let secret = match dirs.keys.load(&dirs.state, "identity")? {
+        let lock = crate::lock::OsLock::exclusive(&dirs.state().join("identity.lock"))?;
+        let secret = match dirs.keys.load(dirs.state(), "identity")? {
             Some(found) => found,
             None => {
                 let trust = Trust::load(dirs)?;
@@ -130,9 +134,12 @@ impl Identity {
                     return Err(TrustError::Vanished(Trust::path(dirs)));
                 }
                 let mut fresh = [0u8; 32];
-                getrandom::fill(&mut fresh).map_err(TrustError::Random)?;
+                let identity_file = dirs.state().join("identity.json");
+                crate::faults::at("trust::random", &identity_file)
+                    .and_then(|()| getrandom::fill(&mut fresh).map_err(std::io::Error::other))
+                    .map_err(TrustError::Random)?;
                 let fresh = Secret::new(fresh);
-                dirs.keys.store(&dirs.state, "identity", fresh.expose())?;
+                dirs.keys.store(dirs.state(), "identity", fresh.expose())?;
                 fresh
             }
         };
@@ -216,21 +223,102 @@ pub struct Trust {
     grants: Vec<Grant>,
 }
 
+pub(crate) struct RevocationSelector<'a> {
+    raw: &'a str,
+    kind: SelectorKind<'a>,
+}
+
+enum SelectorKind<'a> {
+    Name(&'a str),
+    Fingerprint(&'a str),
+    Either(&'a str),
+}
+
+enum Selection {
+    Selected,
+    Unselected,
+}
+
+enum Resolution {
+    Unambiguous,
+    Ambiguous,
+}
+
+impl<'a> RevocationSelector<'a> {
+    pub(crate) fn parse(raw: &'a str) -> Self {
+        let kind = if let Some(name) = raw.strip_prefix("name:") {
+            SelectorKind::Name(name)
+        } else if let Some(fingerprint) = raw.strip_prefix("fingerprint:") {
+            SelectorKind::Fingerprint(fingerprint)
+        } else {
+            SelectorKind::Either(raw)
+        };
+        Self { raw, kind }
+    }
+
+    fn classify(&self, name: &str, key: &PublicKey) -> Selection {
+        let selected = match &self.kind {
+            SelectorKind::Name(who) => *who == name,
+            SelectorKind::Fingerprint(who) => key.fingerprint() == *who,
+            SelectorKind::Either(who) => *who == name || key.fingerprint() == *who,
+        };
+        if selected {
+            Selection::Selected
+        } else {
+            Selection::Unselected
+        }
+    }
+
+    fn resolve(&self, trust: &Trust) -> Resolution {
+        let who = match &self.kind {
+            SelectorKind::Name(_) | SelectorKind::Fingerprint(_) => {
+                return Resolution::Unambiguous;
+            }
+            SelectorKind::Either(who) => who,
+        };
+        let named: BTreeSet<_> = trust
+            .servers
+            .iter()
+            .filter(|(name, _)| name.as_str() == *who)
+            .map(|(_, server)| server.public_key)
+            .chain(
+                trust
+                    .grants
+                    .iter()
+                    .filter(|grant| grant.label.as_str() == *who)
+                    .map(|grant| grant.public_key),
+            )
+            .collect();
+        let keyed: BTreeSet<_> = trust
+            .servers
+            .values()
+            .map(|server| server.public_key)
+            .chain(trust.grants.iter().map(|grant| grant.public_key))
+            .filter(|key| key.fingerprint() == *who)
+            .collect();
+        if !named.is_empty() && !keyed.is_empty() && named != keyed {
+            Resolution::Ambiguous
+        } else {
+            Resolution::Unambiguous
+        }
+    }
+}
+
 impl Trust {
     fn path(dirs: &Dirs) -> PathBuf {
-        dirs.state.join("trust.json")
+        dirs.state().join("trust.json")
+    }
+
+    fn file(dirs: &Dirs) -> state_file::StateFile<Self> {
+        state_file::StateFile::at(&Self::path(dirs))
     }
 
     pub fn load(dirs: &Dirs) -> Result<Self, TrustError> {
-        Ok(state_file::read_json(&Self::path(dirs))?.unwrap_or_default())
+        Ok(Self::file(dirs).read()?.unwrap_or_default())
     }
 
     fn update<R>(dirs: &Dirs, change: impl FnOnce(&mut Self) -> R) -> Result<R, TrustError> {
-        Ok(state_file::update_json(
-            &Self::path(dirs),
-            Self::default,
-            change,
-        )?)
+        Ok(Self::file(dirs).update(Self::default, change)?)
     }
 
     pub(crate) fn record_grant(
@@ -256,16 +344,36 @@ impl Trust {
         })
     }
 
-    pub(crate) fn remove(dirs: &Dirs, who: &str) -> Result<usize, TrustError> {
-        Self::update(dirs, |trust| {
+    pub(crate) fn remove(
+        dirs: &Dirs,
+        selector: &RevocationSelector<'_>,
+    ) -> Result<usize, TrustError> {
+        Self::file(dirs).try_update(Self::default, |trust| {
+            match selector.resolve(trust) {
+                Resolution::Unambiguous => {}
+                Resolution::Ambiguous => {
+                    return Err(TrustError::Ambiguous(selector.raw.to_owned()));
+                }
+            }
             let before = trust.grants.len().saturating_add(trust.servers.len());
             trust.grants.retain(|grant| {
-                grant.label.as_str() != who && grant.public_key.fingerprint() != who
+                match selector.classify(grant.label.as_str(), &grant.public_key) {
+                    Selection::Selected => false,
+                    Selection::Unselected => true,
+                }
             });
             trust.servers.retain(|name, server| {
-                name.as_str() != who && server.public_key.fingerprint() != who
+                match selector.classify(name.as_str(), &server.public_key) {
+                    Selection::Selected => false,
+                    Selection::Unselected => true,
+                }
             });
-            before.saturating_sub(trust.grants.len().saturating_add(trust.servers.len()))
+            let removed =
+                before.saturating_sub(trust.grants.len().saturating_add(trust.servers.len()));
+            if removed == 0 {
+                return Err(TrustError::Unknown(selector.raw.to_owned()));
+            }
+            Ok(removed)
         })
     }
 
@@ -304,6 +412,14 @@ mod tests {
         }
     }
 
+    fn server(key: PublicKey) -> Server {
+        Server {
+            public_key: key,
+            address: "127.0.0.1:4747".to_owned(),
+            paired_at: Timestamp::at_millis(1),
+        }
+    }
+
     fn add_observer(dirs: &Dirs, key: PublicKey) -> Result<(), TrustError> {
         Trust::update(dirs, |trust| trust.grants.push(observed(key)))
     }
@@ -327,7 +443,7 @@ mod tests {
         let d = dirs(tmp.path());
         let key = *Identity::load_or_create(&d).unwrap().public();
         add_observer(&d, key).unwrap();
-        state_file::remove_file(&d.state.join("identity.json")).unwrap();
+        state_file::remove_file(&d.state().join("identity.json")).unwrap();
         assert!(matches!(
             Identity::load_or_create(&d),
             Err(TrustError::Vanished(_))
@@ -346,6 +462,104 @@ mod tests {
         assert!(trust.grant_for(&key).is_some());
         Trust::update(&d, |all| all.grants.clear()).unwrap();
         assert!(Trust::load(&d).unwrap().grant_for(&key).is_none());
+    }
+
+    #[test]
+    fn revocation_requires_an_explicit_selector_when_a_name_is_another_keys_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let first = PublicKey::from_slice(&[1; 32]).unwrap();
+        let second = PublicKey::from_slice(&[2; 32]).unwrap();
+        let collision = first.fingerprint();
+        Trust::update(&d, |trust| {
+            trust.grants.push(observed(first));
+            trust.grants.push(Grant {
+                label: collision.parse().unwrap(),
+                ..observed(second)
+            });
+        })
+        .unwrap();
+        {
+            let path = Trust::path(&d).display().to_string();
+            let _fault = crate::faults::inject(&[("state_file::write", &path)]);
+            assert!(matches!(
+                Trust::remove(&d, &RevocationSelector::parse(&collision)),
+                Err(TrustError::Ambiguous(who)) if who == collision
+            ));
+            assert!(matches!(
+                Trust::remove(&d, &RevocationSelector::parse("missing")),
+                Err(TrustError::Unknown(who)) if who == "missing"
+            ));
+        }
+        assert_eq!(Trust::load(&d).unwrap().grants.len(), 2);
+        assert_eq!(
+            Trust::remove(
+                &d,
+                &RevocationSelector::parse(&format!("fingerprint:{collision}"))
+            )
+            .unwrap(),
+            1
+        );
+        let remaining = Trust::load(&d).unwrap();
+        assert!(remaining.grant_for(&first).is_none());
+        assert!(remaining.grant_for(&second).is_some());
+        assert_eq!(
+            Trust::remove(&d, &RevocationSelector::parse(&format!("name:{collision}"))).unwrap(),
+            1
+        );
+        assert!(Trust::load(&d).unwrap().grants.is_empty());
+    }
+
+    #[test]
+    fn revocation_detects_a_server_name_matching_another_keys_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let first = PublicKey::from_slice(&[3; 32]).unwrap();
+        let second = PublicKey::from_slice(&[4; 32]).unwrap();
+        let collision = first.fingerprint();
+        let first_name: MachineName = "first".parse().unwrap();
+        let second_name: MachineName = collision.parse().unwrap();
+        Trust::update(&d, |trust| {
+            trust.servers.insert(first_name.clone(), server(first));
+            trust.servers.insert(second_name.clone(), server(second));
+        })
+        .unwrap();
+        assert!(matches!(
+            Trust::remove(&d, &RevocationSelector::parse(&collision)),
+            Err(TrustError::Ambiguous(_))
+        ));
+        assert_eq!(Trust::load(&d).unwrap().servers.len(), 2);
+        assert_eq!(
+            Trust::remove(&d, &RevocationSelector::parse(&format!("name:{collision}"))).unwrap(),
+            1
+        );
+        let remaining = Trust::load(&d).unwrap();
+        assert_eq!(remaining.server_for(&first_name), Some(&server(first)));
+        assert!(remaining.server_for(&second_name).is_none());
+        assert_eq!(
+            Trust::remove(
+                &d,
+                &RevocationSelector::parse(&format!("fingerprint:{collision}"))
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn into_parts_preserves_nonempty_servers_and_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let key = PublicKey::from_slice(&[5; 32]).unwrap();
+        let name: MachineName = "peer".parse().unwrap();
+        Trust::update(&d, |trust| {
+            trust.servers.insert(name.clone(), server(key));
+            trust.grants.push(observed(key));
+        })
+        .unwrap();
+        let (servers, grants) = Trust::load(&d).unwrap().into_parts();
+        assert_eq!(servers.get(&name), Some(&server(key)));
+        assert_eq!(grants, [observed(key)]);
     }
 
     #[test]
@@ -378,11 +592,58 @@ mod tests {
     fn damaged_or_unwritable_state_is_an_error_never_a_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        state_file::write_bytes(&d.state.join("trust.json"), b"not trust").unwrap();
+        state_file::write_bytes(&d.state().join("trust.json"), b"not trust").unwrap();
         Trust::load(&d).unwrap_err();
         Trust::update(&d, |_| ()).unwrap_err();
-        state_file::write_bytes(&d.state.join("identity.json"), b"not a key").unwrap();
+        assert!(matches!(
+            Identity::load_or_create(&d),
+            Err(TrustError::State(_))
+        ));
+        state_file::write_bytes(&d.state().join("identity.json"), b"not a key").unwrap();
         Identity::load_or_create(&d).map(drop).unwrap_err();
+    }
+
+    #[test]
+    fn identity_creation_propagates_each_failure_and_allows_retry() {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            SecondRead,
+            Entropy,
+            Store,
+            Unlock,
+        }
+        for (fault, site, passes, file) in [
+            (Fault::SecondRead, "state_file::read", 1, "identity.json"),
+            (Fault::Entropy, "trust::random", 0, "identity.json"),
+            (Fault::Store, "state_file::write", 0, "identity.json"),
+            (Fault::Unlock, "lock::release", 0, "identity.lock"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = dirs(tmp.path());
+            let path = d.state().join(file);
+            {
+                let _injected = crate::faults::inject_after(site, passes, &path);
+                let error = Identity::load_or_create(&d).unwrap_err();
+                match fault {
+                    Fault::SecondRead | Fault::Store => assert!(matches!(
+                        error,
+                        TrustError::Key(crate::keystore::KeyError::State(_))
+                    )),
+                    Fault::Entropy => assert!(matches!(error, TrustError::Random(_))),
+                    Fault::Unlock => assert!(matches!(error, TrustError::Lock(_))),
+                }
+            }
+            let identity = d.state().join("identity.json");
+            match fault {
+                Fault::SecondRead | Fault::Entropy | Fault::Store => {
+                    assert!(state_file::read_bytes(&identity).unwrap().is_none());
+                }
+                Fault::Unlock => {
+                    assert!(state_file::read_bytes(&identity).unwrap().is_some());
+                }
+            }
+            Identity::load_or_create(&d).unwrap();
+        }
     }
 
     #[test]
@@ -392,7 +653,7 @@ mod tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        let _read_only = crate::platform::ReadOnly::make(&d.state).unwrap();
+        let _read_only = crate::platform::ReadOnly::make(d.state()).unwrap();
         Identity::load_or_create(&d).map(drop).unwrap_err();
     }
 

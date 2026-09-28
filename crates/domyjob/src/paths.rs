@@ -1,12 +1,32 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy)]
+pub struct LocalDirectory<'a>(&'a Path);
+
+impl LocalDirectory<'_> {
+    #[must_use]
+    pub const fn path(&self) -> &Path {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceLog(PathBuf);
+
+impl ServiceLog {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dirs {
-    pub home: PathBuf,
-    pub state: PathBuf,
-    pub config: PathBuf,
-    pub cache: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    config: PathBuf,
+    cache: PathBuf,
     pub keys: crate::keystore::KeyStore,
 }
 
@@ -16,12 +36,67 @@ fn var(name: &str) -> Option<OsString> {
 
 impl Dirs {
     #[must_use]
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    #[must_use]
+    pub fn state(&self) -> &Path {
+        &self.state
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &Path {
+        &self.config
+    }
+
+    #[must_use]
+    pub fn cache(&self) -> &Path {
+        &self.cache
+    }
+
+    #[must_use]
+    pub(crate) fn with_supervisor_paths(
+        mut self,
+        state: Option<&PathBuf>,
+        home: Option<&PathBuf>,
+    ) -> Self {
+        if let Some(state) = state {
+            self.state.clone_from(state);
+        }
+        if let Some(home) = home {
+            self.home.clone_from(home);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn home_path(&self) -> LocalDirectory<'_> {
+        LocalDirectory(&self.home)
+    }
+
+    #[must_use]
+    pub fn state_path(&self) -> LocalDirectory<'_> {
+        LocalDirectory(&self.state)
+    }
+
+    #[must_use]
+    pub fn cache_path(&self) -> LocalDirectory<'_> {
+        LocalDirectory(&self.cache)
+    }
+
+    #[must_use]
+    pub fn service_log(&self) -> ServiceLog {
+        ServiceLog(self.state.join("serve.log"))
+    }
+
+    #[must_use]
     pub fn from_env() -> Self {
         Self::of(crate::platform::FAMILY, &var)
     }
 
     #[must_use]
-    pub fn of(family: Family, var: &dyn Fn(&str) -> Option<OsString>) -> Self {
+    fn of(family: Family, var: &dyn Fn(&str) -> Option<OsString>) -> Self {
         let home = var("HOME")
             .or_else(|| var("USERPROFILE"))
             .map_or_else(|| PathBuf::from("."), PathBuf::from);
@@ -71,7 +146,7 @@ impl Dirs {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn for_test(root: &std::path::Path) -> Self {
+    pub(crate) fn for_test(root: &Path) -> Self {
         Self {
             home: root.into(),
             state: root.join("state"),
@@ -81,9 +156,23 @@ impl Dirs {
         }
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_test_state(mut self, state: PathBuf) -> Self {
+        self.state = state;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_test_cache(mut self, cache: PathBuf) -> Self {
+        self.cache = cache;
+        self
+    }
+
     #[cfg(any(test, feature = "failpoints"))]
     #[must_use]
-    pub fn isolated_for_test(root: &std::path::Path) -> Self {
+    pub fn isolated_for_test(root: &Path) -> Self {
         Self {
             home: root.join("home"),
             state: root.join("state"),
@@ -100,39 +189,81 @@ pub enum Family {
     Windows,
 }
 
+#[derive(Clone, Copy)]
+enum Availability {
+    Available,
+    Unavailable,
+}
+
+impl Availability {
+    const fn enabled(self) -> bool {
+        match self {
+            Self::Available => true,
+            Self::Unavailable => false,
+        }
+    }
+}
+
+struct FamilyCapabilities {
+    links: Availability,
+    modes: Availability,
+    load_average: Availability,
+    agent_socket: Availability,
+    replaces_running_executables: Availability,
+}
+
 impl Family {
+    const fn capabilities(self) -> FamilyCapabilities {
+        match self {
+            Self::Unix => FamilyCapabilities {
+                links: Availability::Available,
+                modes: Availability::Available,
+                load_average: Availability::Available,
+                agent_socket: Availability::Available,
+                replaces_running_executables: Availability::Available,
+            },
+            Self::Windows => FamilyCapabilities {
+                links: Availability::Unavailable,
+                modes: Availability::Unavailable,
+                load_average: Availability::Unavailable,
+                agent_socket: Availability::Unavailable,
+                replaces_running_executables: Availability::Unavailable,
+            },
+        }
+    }
+
     #[must_use]
     pub const fn links(self) -> bool {
-        matches!(self, Self::Unix)
+        self.capabilities().links.enabled()
     }
 
     #[must_use]
     pub const fn modes(self) -> bool {
-        matches!(self, Self::Unix)
+        self.capabilities().modes.enabled()
     }
 
     #[must_use]
     pub const fn load_average(self) -> bool {
-        matches!(self, Self::Unix)
+        self.capabilities().load_average.enabled()
     }
 
     #[must_use]
     pub const fn agent_socket(self) -> bool {
-        matches!(self, Self::Unix)
+        self.capabilities().agent_socket.enabled()
     }
 
     #[must_use]
     pub const fn replaces_running_executables(self) -> bool {
-        matches!(self, Self::Unix)
+        self.capabilities().replaces_running_executables.enabled()
     }
 
     #[must_use]
     pub fn remote_bin(self) -> crate::template::Arg {
         let key = crate::protocol::build_key();
         match self {
-            Self::Unix => crate::template::Arg::joined(&[".cache/domyjob/bin/", key, "/domyjob"]),
+            Self::Unix => crate::template::Arg::joined(&[".cache/domyjob/bin/domyjob-", key]),
             Self::Windows => {
-                crate::template::Arg::joined(&[".cache/domyjob/bin/", key, "/domyjob.exe"])
+                crate::template::Arg::joined(&[".cache/domyjob/bin/domyjob-", key, ".exe"])
             }
         }
     }
@@ -142,12 +273,12 @@ impl Family {
         let key = crate::protocol::build_key();
         match self {
             Self::Unix => {
-                crate::template::Arg::joined(&["./.cache/domyjob/bin/", key, "/domyjob node"])
+                crate::template::Arg::joined(&["./.cache/domyjob/bin/domyjob-", key, " node"])
             }
             Self::Windows => crate::template::Arg::joined(&[
-                ".\\.cache\\domyjob\\bin\\",
+                ".\\.cache\\domyjob\\bin\\domyjob-",
                 key,
-                "\\domyjob.exe node",
+                ".exe node",
             ]),
         }
     }
@@ -198,11 +329,11 @@ mod tests {
         assert!(key.starts_with(crate::protocol::VERSION));
         assert_eq!(
             Family::Unix.invoke().as_arg_str(),
-            format!("./.cache/domyjob/bin/{key}/domyjob node")
+            format!("./.cache/domyjob/bin/domyjob-{key} node")
         );
         assert_eq!(
             Family::Windows.invoke().as_arg_str(),
-            format!(".\\.cache\\domyjob\\bin\\{key}\\domyjob.exe node")
+            format!(".\\.cache\\domyjob\\bin\\domyjob-{key}.exe node")
         );
     }
 }

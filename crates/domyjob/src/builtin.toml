@@ -20,7 +20,7 @@ run = [
   "-o",
   "ControlMaster=no",
   "-o",
-  "ControlPath={cache}/s{session}-%C",
+  "ControlPath={cache}/s{control}",
   "{host}",
   "{remote}",
 ]
@@ -36,7 +36,7 @@ share = [
   "-o",
   "ControlMaster=auto",
   "-o",
-  "ControlPath={cache}/s{session}-%C",
+  "ControlPath={cache}/s{control}",
   "-o",
   "ControlPersist=no",
   "{host}",

@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
 pub mod comments;
+pub mod dependencies;
 pub mod proverif;
 pub mod release;
 pub mod syntax;
+pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
@@ -49,6 +51,7 @@ const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
     ("crates/domyjob/src/keystore.rs", 5),
     ("crates/domyjob/src/proc.rs", 5),
     ("crates/domyjob/src/spawn.rs", 1),
+    ("crates/domyjob/tests/crash_process.rs", 4),
     ("xtask/src/release.rs", 1),
 ];
 
@@ -77,7 +80,8 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
         rust_files(&root.join(dir), &mut files)?;
     }
     files.sort();
-    let mut count = 0usize;
+    let mut sources = Vec::with_capacity(files.len());
+    let mut enum_names = std::collections::BTreeSet::new();
     for path in files {
         let source = std::fs::read_to_string(&path).map_err(|source| GateError::Read {
             path: path.clone(),
@@ -88,6 +92,18 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
             Err(_outside) => path.display().to_string(),
         }
         .replace('\\', "/");
+        if shown.starts_with("crates/domyjob/src/") {
+            enum_names.extend(
+                syntax::enum_names(&source).map_err(|source| GateError::Parse {
+                    path: path.clone(),
+                    source,
+                })?,
+            );
+        }
+        sources.push((path, shown, source));
+    }
+    let mut count = 0usize;
+    for (path, shown, source) in sources {
         let branches = syntax::os_branches(&source).map_err(|source| GateError::Parse {
             path: path.clone(),
             source,
@@ -103,10 +119,13 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
             );
             count = count.saturating_add(1);
         }
-        let findings = syntax::check_file(&source, &shown).map_err(|source| GateError::Parse {
-            path: path.clone(),
-            source,
-        })?;
+        let findings =
+            syntax::check_file_with_enums(&source, &shown, &enum_names).map_err(|source| {
+                GateError::Parse {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
         for finding in findings {
             eprintln!("{shown}:{}: {}", finding.line, finding.rule);
             count = count.saturating_add(1);

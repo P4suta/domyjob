@@ -16,6 +16,16 @@ pub enum Reach<T> {
     NobodyListening,
 }
 
+impl<T> Reach<T> {
+    #[must_use]
+    pub fn into_option(self) -> Option<T> {
+        match self {
+            Self::Reached(value) => Some(value),
+            Self::NobodyListening => None,
+        }
+    }
+}
+
 pub const PATH_LIMIT: usize = crate::platform::SOCKET_PATH_LIMIT;
 
 fn fits(path: &Path) -> std::io::Result<()> {

@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{EnvName, Invalid, JobId, JobRef};
-use crate::lock::{LockError, OsLock};
+use crate::lock::{LockError, OsLock, SlotIndex};
 use crate::paths::Dirs;
-use crate::protocol::{Job, Phase, Settings, Spec, Supervisor};
+use crate::protocol::{Change, Job, Phase, PhaseKind, Settings, Spec, Supervisor};
 
 const SCHEMA: &str = "v3";
 
@@ -68,6 +68,8 @@ pub enum StoreError {
     InvalidHolder { path: PathBuf },
     #[error("{path} does not hold a finished job outcome")]
     InvalidOutcome { path: PathBuf },
+    #[error("job {id} cannot move from {from:?} to {to:?}")]
+    InvalidPhaseTransition { id: JobId, from: Phase, to: Phase },
     #[error(transparent)]
     Invalid(#[from] Invalid),
 }
@@ -90,8 +92,37 @@ enum Blocker {
     Cleared,
 }
 
-fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<T, StoreError> {
-    crate::state_file::read_json(path)?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhaseTransition {
+    Advance,
+    Refuse,
+}
+
+const fn phase_transition(from: &Phase, to: &Phase) -> PhaseTransition {
+    use Phase::{Finished, Preparing, Queued, Running, Starting};
+    use PhaseTransition::{Advance, Refuse};
+
+    match (from, to) {
+        (Queued, Preparing { .. } | Finished { .. })
+        | (Preparing { .. }, Starting { .. } | Finished { .. })
+        | (Starting { .. }, Running { .. } | Finished { .. })
+        | (Running { .. }, Finished { .. }) => Advance,
+        (Queued, Queued | Starting { .. } | Running { .. })
+        | (Preparing { .. }, Queued | Preparing { .. } | Running { .. })
+        | (Starting { .. }, Queued | Preparing { .. } | Starting { .. })
+        | (Running { .. }, Queued | Preparing { .. } | Starting { .. } | Running { .. })
+        | (
+            Finished { .. },
+            Queued | Preparing { .. } | Starting { .. } | Running { .. } | Finished { .. },
+        ) => Refuse,
+    }
+}
+
+fn read_required<T: crate::ingress::Ingress>(
+    file: &crate::state_file::StateFile<T>,
+) -> Result<T, StoreError> {
+    let path = file.path();
+    file.read()?
         .ok_or_else(|| io("reading", path)(ErrorKind::NotFound.into()).into())
 }
 
@@ -101,6 +132,14 @@ pub struct LaunchEnv {
     pub vars: BTreeMap<String, String>,
     pub not_unicode: Vec<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredEnv(BTreeMap<EnvName, String>);
+
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredLeft(Vec<crate::snapshot::Left>);
 
 impl LaunchEnv {
     #[must_use]
@@ -197,6 +236,22 @@ pub struct Launch {
     not_unicode: Vec<String>,
 }
 
+pub(crate) struct PreparedJobCommand {
+    command: std::process::Command,
+}
+
+impl std::fmt::Debug for PreparedJobCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedJobCommand(<redacted>)")
+    }
+}
+
+impl PreparedJobCommand {
+    pub(crate) fn into_command(self) -> std::process::Command {
+        self.command
+    }
+}
+
 impl std::fmt::Debug for Launch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Launch")
@@ -207,12 +262,19 @@ impl std::fmt::Debug for Launch {
 }
 
 impl Launch {
-    pub fn apply(self, command: &mut std::process::Command) -> Vec<String> {
+    pub(crate) fn prepare(
+        self,
+        mut command: std::process::Command,
+        id: &JobId,
+    ) -> (PreparedJobCommand, Vec<String>) {
         command.env_clear();
         for (key, value) in &self.vars {
             command.env(key, value.as_str());
         }
-        self.not_unicode
+        command
+            .env("DOMYJOB", "1")
+            .env("DOMYJOB_JOB_ID", id.as_str());
+        (PreparedJobCommand { command }, self.not_unicode)
     }
 }
 
@@ -247,7 +309,7 @@ impl Store {
     }
 
     pub fn open(dirs: &Dirs) -> Result<Self, StoreError> {
-        let root = dirs.state.join(SCHEMA);
+        let root = dirs.state().join(SCHEMA);
         for dir in [
             root.clone(),
             root.join("jobs"),
@@ -270,8 +332,20 @@ impl Store {
         self.root.join("settings.json")
     }
 
+    fn settings_file(&self) -> crate::state_file::StateFile<Settings> {
+        crate::state_file::StateFile::at(&self.settings_path())
+    }
+
     pub fn settings(&self) -> Result<Settings, StoreError> {
-        Ok(crate::state_file::read_json(&self.settings_path())?.unwrap_or_default())
+        Ok(self.settings_file().read()?.unwrap_or_default())
+    }
+
+    pub fn configure(&self, change: Change) -> Result<(), StoreError> {
+        let admission = OsLock::exclusive(&self.admission_lock_path())?;
+        self.settings_file()
+            .replace(&self.settings()?.with(change))?;
+        self.signal_queue()?;
+        Ok(admission.release()?)
     }
 
     #[must_use]
@@ -300,6 +374,34 @@ impl Store {
         self.root.join("staging").join(id.as_str())
     }
 
+    fn spec_file(&self, id: &JobId) -> crate::state_file::StateFile<Spec> {
+        crate::state_file::StateFile::at(&self.job_dir(id).join("spec.json"))
+    }
+
+    fn staged_spec_file(&self, id: &JobId) -> crate::state_file::StateFile<Spec> {
+        crate::state_file::StateFile::at(&self.staged_dir(id).join("spec.json"))
+    }
+
+    fn phase_file(&self, id: &JobId) -> crate::state_file::StateFile<Phase> {
+        crate::state_file::StateFile::at(&self.job_dir(id).join("phase.json"))
+    }
+
+    fn staged_phase_file(&self, id: &JobId) -> crate::state_file::StateFile<Phase> {
+        crate::state_file::StateFile::at(&self.staged_dir(id).join("phase.json"))
+    }
+
+    fn env_file(dir: &Path) -> crate::state_file::StateFile<StoredEnv> {
+        crate::state_file::StateFile::at(&dir.join(ENV))
+    }
+
+    fn launch_env_file(dir: &Path) -> crate::state_file::StateFile<LaunchEnv> {
+        crate::state_file::StateFile::at(&dir.join(LAUNCH_ENV))
+    }
+
+    fn sequence_file(&self) -> crate::state_file::StateFile<Sequence> {
+        crate::state_file::StateFile::at(&self.root.join("sequence.json"))
+    }
+
     #[must_use]
     pub fn log_path(&self, id: &JobId) -> PathBuf {
         self.job_dir(id).join("log")
@@ -315,8 +417,20 @@ impl Store {
         self.job_dir(id).join("left.json")
     }
 
+    fn left_file(&self, id: &JobId) -> crate::state_file::StateFile<StoredLeft> {
+        crate::state_file::StateFile::at(&self.left_path(id))
+    }
+
+    pub(crate) fn record_left(
+        &self,
+        id: &JobId,
+        items: Vec<crate::snapshot::Left>,
+    ) -> Result<(), StoreError> {
+        Ok(self.left_file(id).replace(&StoredLeft(items))?)
+    }
+
     pub fn left(&self, id: &JobId) -> Result<Option<Vec<crate::snapshot::Left>>, StoreError> {
-        Ok(crate::state_file::read_json(&self.left_path(id))?)
+        Ok(self.left_file(id).read()?.map(|stored| stored.0))
     }
 
     #[must_use]
@@ -330,20 +444,35 @@ impl Store {
     }
 
     pub fn next_sequence(&self) -> Result<u64, StoreError> {
-        Ok(crate::state_file::update_json(
-            &self.root.join("sequence.json"),
-            Sequence::default,
-            |sequence| {
-                sequence.last = sequence.last.saturating_add(1);
-                sequence.last
-            },
-        )?)
+        Ok(self.sequence_file().update(Sequence::default, |sequence| {
+            sequence.last = sequence.last.saturating_add(1);
+            sequence.last
+        })?)
     }
 
+    pub(crate) fn stage_admitted(
+        &self,
+        _admission: &crate::node::JobAdmission<'_>,
+        spec: &Spec,
+        state: (BTreeMap<EnvName, String>, &LaunchEnv),
+    ) -> Result<(), StoreError> {
+        self.stage_inner(spec, state.0, state.1)
+    }
+
+    #[cfg(any(test, feature = "failpoints"))]
     pub fn stage(
         &self,
         spec: &Spec,
-        (env, launch): (&BTreeMap<EnvName, String>, &LaunchEnv),
+        state: (&BTreeMap<EnvName, String>, &LaunchEnv),
+    ) -> Result<(), StoreError> {
+        self.stage_inner(spec, state.0.clone(), state.1)
+    }
+
+    fn stage_inner(
+        &self,
+        spec: &Spec,
+        env: BTreeMap<EnvName, String>,
+        launch: &LaunchEnv,
     ) -> Result<(), StoreError> {
         let dir = self.staged_dir(&spec.id);
         for taken in [&dir, &self.job_dir(&spec.id)] {
@@ -355,10 +484,10 @@ impl Store {
             }
         }
         crate::state_file::private_dir(&dir)?;
-        crate::state_file::write_json(&dir.join("spec.json"), spec)?;
-        crate::state_file::write_json(&dir.join(ENV), env)?;
-        crate::state_file::write_json(&dir.join(LAUNCH_ENV), launch)?;
-        crate::state_file::write_json(&dir.join("phase.json"), &Phase::Queued)?;
+        self.staged_spec_file(&spec.id).replace(spec)?;
+        Self::env_file(&dir).replace(&StoredEnv(env))?;
+        Self::launch_env_file(&dir).replace(launch)?;
+        self.staged_phase_file(&spec.id).replace(&Phase::Queued)?;
         crate::state_file::create_empty(&dir.join("log"))?;
         crate::state_file::write_bytes(&dir.join("outcome"), &[b' '; OUTCOME_RESERVED])?;
         Ok(())
@@ -381,10 +510,9 @@ impl Store {
     }
 
     pub fn publish(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::publish_dir(
-            &self.staged_dir(id),
-            &self.job_dir(id),
-        )?)
+        let collecting = OsLock::exclusive(&self.collection_lock_path())?;
+        crate::state_file::publish_dir(&self.staged_dir(id), &self.job_dir(id))?;
+        Ok(collecting.release()?)
     }
 
     pub fn publication(&self, id: &JobId) -> Result<Publication, StoreError> {
@@ -454,7 +582,7 @@ impl Store {
     }
 
     pub fn staged_spec(&self, id: &JobId) -> Result<Spec, StoreError> {
-        read_json(&self.staged_dir(id).join("spec.json"))
+        read_required(&self.staged_spec_file(id))
     }
 
     #[must_use]
@@ -477,20 +605,20 @@ impl Store {
     }
 
     pub fn spec(&self, id: &JobId) -> Result<Spec, StoreError> {
-        read_json(&self.job_dir(id).join("spec.json"))
+        read_required(&self.spec_file(id))
     }
 
     pub fn take_launch(&self, id: &JobId) -> Result<Launch, StoreError> {
         let dir = self.job_dir(id);
-        let base: LaunchEnv = read_json(&dir.join(LAUNCH_ENV))?;
-        let env: BTreeMap<EnvName, String> = read_json(&dir.join(ENV))?;
+        let base = read_required(&Self::launch_env_file(&dir))?;
+        let env = read_required(&Self::env_file(&dir))?;
         self.purge_secrets(id)?;
         let mut vars: BTreeMap<String, zeroize::Zeroizing<String>> = base
             .vars
             .into_iter()
             .map(|(key, value)| (key, zeroize::Zeroizing::new(value)))
             .collect();
-        for (key, value) in env {
+        for (key, value) in env.0 {
             vars.insert(key.as_str().to_owned(), zeroize::Zeroizing::new(value));
         }
         Ok(Launch {
@@ -507,7 +635,20 @@ impl Store {
     }
 
     pub fn set_phase(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
-        crate::state_file::write_json(&self.job_dir(id).join("phase.json"), phase)?;
+        let mut file = self.phase_file(id).lock()?;
+        let from = self.phase(id)?;
+        match phase_transition(&from, phase) {
+            PhaseTransition::Advance => {}
+            PhaseTransition::Refuse => {
+                return Err(StoreError::InvalidPhaseTransition {
+                    id: id.clone(),
+                    from,
+                    to: phase.clone(),
+                });
+            }
+        }
+        file.write(phase)?;
+        file.release()?;
         match phase {
             Phase::Finished { .. } => self.purge_secrets(id),
             Phase::Queued
@@ -517,9 +658,18 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
+    pub fn force_phase(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
+        self.phase_file(id).replace(phase)?;
+        if phase.kind() == PhaseKind::Finished {
+            self.purge_secrets(id)?;
+        }
+        Ok(())
+    }
+
     pub fn phase(&self, id: &JobId) -> Result<Phase, StoreError> {
-        let phase: Phase = read_json(&self.job_dir(id).join("phase.json"))?;
-        if matches!(phase, Phase::Finished { .. }) {
+        let phase = read_required(&self.phase_file(id))?;
+        if phase.kind() == PhaseKind::Finished {
             return Ok(phase);
         }
         let path = self.job_dir(id).join("outcome");
@@ -530,13 +680,18 @@ impl Store {
         }
         match crate::ingress::json::<Phase>(written) {
             Ok(finished @ Phase::Finished { .. }) => Ok(finished),
-            Ok(_) => Err(StoreError::InvalidOutcome { path }),
+            Ok(
+                Phase::Queued
+                | Phase::Preparing { .. }
+                | Phase::Starting { .. }
+                | Phase::Running { .. },
+            ) => Err(StoreError::InvalidOutcome { path }),
             Err(source) => Err(StoreError::Json { path, source }),
         }
     }
 
     pub fn record_outcome_in_place(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
-        if !matches!(phase, Phase::Finished { .. }) {
+        if phase.kind() != PhaseKind::Finished {
             return Err(StoreError::InvalidOutcome {
                 path: self.job_dir(id).join("outcome"),
             });
@@ -575,15 +730,20 @@ impl Store {
         let mut earliest: Option<(u64, JobId)> = None;
         for id in self.ids_iter()? {
             let id = id?;
-            if id == waiting.id || matches!(self.queue_mode(&id)?, QueueMode::Immediate) {
+            if id == waiting.id {
                 continue;
             }
+            match self.queue_mode(&id)? {
+                QueueMode::Immediate => continue,
+                QueueMode::Ordinary => {}
+            }
             let spec = self.spec(&id)?;
-            if spec.sequence >= waiting.sequence
-                || !matches!(self.phase(&id)?, Phase::Queued)
-                || !matches!(self.supervisor(&id)?, Supervisor::Alive)
-            {
+            if spec.sequence >= waiting.sequence || self.phase(&id)?.kind() != PhaseKind::Queued {
                 continue;
+            }
+            match self.supervisor(&id)? {
+                Supervisor::Alive => {}
+                Supervisor::Gone => continue,
             }
             if earliest
                 .as_ref()
@@ -601,7 +761,14 @@ impl Store {
         let phase = self.phase(id)?;
         let behind = match (&phase, supervisor) {
             (Phase::Queued, Supervisor::Alive) => self.slot_holders(&spec)?,
-            _ => Vec::new(),
+            (Phase::Queued, Supervisor::Gone)
+            | (
+                Phase::Preparing { .. }
+                | Phase::Starting { .. }
+                | Phase::Running { .. }
+                | Phase::Finished { .. },
+                Supervisor::Alive | Supervisor::Gone,
+            ) => Vec::new(),
         };
         Ok(Job {
             spec,
@@ -648,39 +815,37 @@ impl Store {
         slot_lock.with_extension("holder")
     }
 
-    fn slot_holders(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
+    pub(crate) fn held_slots(&self) -> Result<Vec<PathBuf>, StoreError> {
         let slots = self.area("slots");
-        let entries = match std::fs::read_dir(&slots) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(io("listing", &slots)(error).into()),
-        };
-        let mut names = Vec::new();
-        for entry in entries {
-            names.push(entry.map_err(io("listing", &slots))?.file_name());
-        }
-        names.sort();
-        let mut holders = Vec::new();
-        for name in names {
-            let Some(index) = name.to_str().and_then(|name| name.strip_suffix(".holder")) else {
-                continue;
+        let mut held = Vec::new();
+        for index in SlotIndex::all() {
+            let lock = index.lock_path(&slots);
+            let occupied = match OsLock::probe(&lock)? {
+                crate::lock::Probe::Held => true,
+                crate::lock::Probe::Absent | crate::lock::Probe::Free => false,
             };
-            let Ok(index) = index.parse::<usize>() else {
-                continue;
-            };
-            let lock = slots.join(format!("{index}.lock"));
-            if !matches!(OsLock::probe(&lock)?, crate::lock::Probe::Held) {
-                continue;
+            if occupied {
+                held.push(lock);
             }
-            let path = slots.join(&name);
+        }
+        Ok(held)
+    }
+
+    fn slot_holders(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
+        let mut holders = Vec::new();
+        for lock in self.held_slots()? {
+            let path = Self::slot_holder_path(&lock);
             let Some(bytes) = crate::state_file::read_bytes(&path)? else {
                 continue;
             };
             let holder = String::from_utf8_lossy(bytes.trim_ascii())
                 .parse::<JobId>()
                 .map_err(|_invalid| StoreError::InvalidHolder { path })?;
-            if holder != waiting.id && matches!(self.holds_on(&holder)?, Blocker::Active) {
-                holders.push(holder);
+            if holder != waiting.id {
+                match self.holds_on(&holder)? {
+                    Blocker::Active => holders.push(holder),
+                    Blocker::Cleared => {}
+                }
             }
         }
         holders.sort();
@@ -689,8 +854,9 @@ impl Store {
     }
 
     fn holds_on(&self, holder: &JobId) -> Result<Blocker, StoreError> {
-        if matches!(self.publication(holder)?, Publication::Unpublished) {
-            return Ok(Blocker::Cleared);
+        match self.publication(holder)? {
+            Publication::Published => {}
+            Publication::Unpublished => return Ok(Blocker::Cleared),
         }
         Ok(match self.supervisor(holder)? {
             Supervisor::Gone => Blocker::Cleared,
@@ -745,10 +911,54 @@ impl Store {
 
 impl crate::ingress::Ingress for Sequence {}
 impl crate::ingress::Ingress for LaunchEnv {}
+impl crate::ingress::Ingress for StoredEnv {}
+impl crate::ingress::Ingress for StoredLeft {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_phases_advance_only_in_lifecycle_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0PPPPPPPPPPPPPPP".parse().unwrap();
+        store
+            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
+            .unwrap();
+        store.publish(&id).unwrap();
+        let started_at = crate::clock::Timestamp::at_millis(1);
+        let running = Phase::Running {
+            started_at,
+            pid: 42,
+            workspace: "workspace".to_owned(),
+        };
+        assert!(matches!(
+            store.set_phase(&id, &running),
+            Err(StoreError::InvalidPhaseTransition { .. })
+        ));
+        assert_eq!(store.phase(&id).unwrap(), Phase::Queued);
+        for phase in [
+            Phase::Preparing { started_at },
+            Phase::Starting {
+                started_at,
+                workspace: "workspace".to_owned(),
+            },
+            running,
+            Phase::Finished {
+                started_at: Some(started_at),
+                finished_at: crate::clock::Timestamp::at_millis(2),
+                outcome: crate::protocol::Outcome::Succeeded,
+            },
+        ] {
+            store.set_phase(&id, &phase).unwrap();
+            assert_eq!(store.phase(&id).unwrap(), phase);
+        }
+        assert!(matches!(
+            store.set_phase(&id, &Phase::Queued),
+            Err(StoreError::InvalidPhaseTransition { .. })
+        ));
+    }
 
     #[test]
     fn a_job_keeps_its_last_notes_apart_from_its_log() {
@@ -823,6 +1033,45 @@ mod tests {
         if std::env::var_os("CI_CANARY").is_some() {
             assert!(!LaunchEnv::of_this_process().vars.contains_key("CI_CANARY"));
         }
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test gives job preparation a raw command with an environment entry to remove"
+    )]
+    #[test]
+    fn job_process_proof_clears_ambient_environment_and_sets_its_identity() {
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let launch = Launch {
+            vars: BTreeMap::from([(
+                "PATH".to_owned(),
+                zeroize::Zeroizing::new("/bin".to_owned()),
+            )]),
+            not_unicode: vec!["UNREADABLE".to_owned()],
+        };
+        let mut raw = std::process::Command::new("unused");
+        raw.env("LEAK", "must-not-reach-the-job");
+        let (prepared, omitted) = launch.prepare(raw, &id);
+        assert_eq!(format!("{prepared:?}"), "PreparedJobCommand(<redacted>)");
+        assert_eq!(omitted, ["UNREADABLE"]);
+        let vars: BTreeMap<_, _> = prepared
+            .into_command()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|text| text.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            vars,
+            BTreeMap::from([
+                ("DOMYJOB".to_owned(), Some("1".to_owned())),
+                ("DOMYJOB_JOB_ID".to_owned(), Some(id.as_str().to_owned())),
+                ("PATH".to_owned(), Some("/bin".to_owned())),
+            ])
+        );
     }
 
     fn spec(id: &JobId, sequence: u64) -> Spec {
@@ -903,6 +1152,22 @@ mod tests {
                 (&BTreeMap::new(), &LaunchEnv::default()),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn publication_requires_the_same_lock_as_collection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let id: JobId = "0BBBBBBBBBBBBBBB".parse().unwrap();
+        staged(&store, &id, 1);
+        let path = store.collection_lock_path().display().to_string();
+        {
+            let _faults = crate::faults::inject(&[("state_file::lock", &path)]);
+            store.publish(&id).unwrap_err();
+        }
+        assert_eq!(store.publication(&id).unwrap(), Publication::Unpublished);
+        store.publish(&id).unwrap();
+        assert_eq!(store.publication(&id).unwrap(), Publication::Published);
     }
 
     fn at(path: &Path) -> String {
@@ -1089,7 +1354,7 @@ mod tests {
             finished_at: crate::clock::Timestamp::at_millis(2),
             outcome: crate::protocol::Outcome::Killed,
         };
-        store.set_phase(&id, &written).unwrap();
+        store.force_phase(&id, &written).unwrap();
         store.record_outcome_in_place(&id, &reserved).unwrap();
         assert_eq!(store.phase(&id).unwrap(), written);
 
@@ -1103,7 +1368,7 @@ mod tests {
         let bare = serde_json::to_vec(&errored(0)).unwrap().len();
         let exact = errored(OUTCOME_RESERVED.saturating_sub(bare));
         assert_eq!(serde_json::to_vec(&exact).unwrap().len(), OUTCOME_RESERVED);
-        store.set_phase(&id, &Phase::Queued).unwrap();
+        store.force_phase(&id, &Phase::Queued).unwrap();
         store.record_outcome_in_place(&id, &exact).unwrap();
         assert_eq!(store.phase(&id).unwrap(), exact);
     }
@@ -1186,12 +1451,12 @@ mod tests {
             finished_at: crate::clock::Timestamp::at_millis(millis),
             outcome: crate::protocol::Outcome::Succeeded,
         };
-        store.set_phase(&first, &finished(1)).unwrap();
+        store.force_phase(&first, &finished(1)).unwrap();
         assert_eq!(
             store.earliest_waiter(&requested).unwrap(),
             Some(second.clone())
         );
-        store.set_phase(&second, &finished(2)).unwrap();
+        store.force_phase(&second, &finished(2)).unwrap();
         assert_eq!(store.earliest_waiter(&requested).unwrap(), None);
         for lock in alive {
             lock.release().unwrap();
@@ -1225,10 +1490,10 @@ mod tests {
             pid: 1,
             workspace: String::new(),
         };
-        store.set_phase(&holding, &running).unwrap();
-        store.set_phase(&outside, &running).unwrap();
+        store.force_phase(&holding, &running).unwrap();
+        store.force_phase(&outside, &running).unwrap();
         store
-            .set_phase(
+            .force_phase(
                 &done,
                 &Phase::Finished {
                     started_at: None,
@@ -1246,7 +1511,6 @@ mod tests {
         holder("0.holder", done.as_str().as_bytes());
         holder("0.lock", b"");
         crate::state_file::private_dir(&slots.join("01.holder")).unwrap();
-        holder("0a.holder", holding.as_str().as_bytes());
         holder("1.holder", b"not a job");
         holder("10.holder", outside.as_str().as_bytes());
         holder("2.holder", waiting.as_str().as_bytes());
@@ -1260,14 +1524,16 @@ mod tests {
         let damaged_slot = OsLock::exclusive(&slots.join("1.lock")).unwrap();
         assert!(matches!(
             store.job(&waiting),
-            Err(StoreError::State(StateError::NotFile { .. }))
-        ));
-        crate::state_file::remove_tree_forcibly(&slots.join("01.holder")).unwrap();
-        assert!(matches!(
-            store.job(&waiting),
             Err(StoreError::InvalidHolder { .. })
         ));
         crate::state_file::remove_file(&slots.join("1.holder")).unwrap();
+        crate::state_file::private_dir(&slots.join("1.holder")).unwrap();
+        assert!(matches!(
+            store.job(&waiting),
+            Err(StoreError::State(StateError::NotFile { .. }))
+        ));
+        crate::state_file::remove_tree_forcibly(&slots.join("1.holder")).unwrap();
+        assert!(store.job(&waiting).unwrap().behind.is_empty());
         damaged_slot.release().unwrap();
         let slot = OsLock::exclusive(&slots.join("3.lock")).unwrap();
         assert_eq!(
@@ -1281,6 +1547,20 @@ mod tests {
             lock.release().unwrap();
         }
         assert!(store.job(&waiting).unwrap().behind.is_empty());
+    }
+
+    #[test]
+    fn only_canonical_bounded_slot_locks_are_considered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&dirs(tmp.path())).unwrap();
+        let slots = store.area("slots");
+        let alias = OsLock::exclusive(&slots.join("01.lock")).unwrap();
+        let maximum = OsLock::exclusive(&slots.join("63.lock")).unwrap();
+        let beyond = OsLock::exclusive(&slots.join("64.lock")).unwrap();
+        assert_eq!(store.held_slots().unwrap(), vec![slots.join("63.lock")]);
+        alias.release().unwrap();
+        maximum.release().unwrap();
+        beyond.release().unwrap();
     }
 
     #[test]
@@ -1299,7 +1579,7 @@ mod tests {
         };
         let full = store.job_dir(&id).join("phase.json").display().to_string();
         let _faults = crate::faults::inject(&[("state_file::write", &full)]);
-        store.set_phase(&id, &finished).unwrap_err();
+        store.force_phase(&id, &finished).unwrap_err();
         store.record_outcome_in_place(&id, &finished).unwrap();
         assert_eq!(store.phase(&id).unwrap(), finished);
     }

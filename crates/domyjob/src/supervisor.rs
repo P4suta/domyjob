@@ -11,13 +11,34 @@ use crate::clock::Timestamp;
 use crate::control::Order;
 use crate::domain::JobId;
 use crate::local_socket::{Listener, Stream};
-use crate::lock::OsLock;
+use crate::lock::{OsLock, SlotIndex};
 use crate::node::NodeError;
 use crate::paths::Dirs;
 use crate::proc::{self, Group, Readiness};
 use crate::protocol::{Location, Outcome, Phase, Settings, Spec, Workspace};
 use crate::store::{Publication, QueueMode, Store};
 use crate::terminal::RemoteText;
+
+pub(crate) struct WorkingDirectory(PathBuf);
+
+impl WorkingDirectory {
+    fn for_job(location: &Location, root: &Path) -> Self {
+        let path = match (location, root) {
+            (
+                Location::Snapshot {
+                    subdir: Some(sub), ..
+                },
+                root,
+            ) => sub.parts().fold(root.to_path_buf(), |p, part| p.join(part)),
+            (Location::Snapshot { subdir: None, .. } | Location::Home, root) => root.to_path_buf(),
+        };
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
 
 #[derive(Debug)]
 enum Event {
@@ -71,27 +92,29 @@ impl QueueWatchers {
         WatchRegistration::Start
     }
 
-    fn observe_slots(&mut self, held: &[PathBuf], sender: &Sender<Event>) {
-        for path in held {
-            if self.register_slot(path) == WatchRegistration::Start {
-                watch_lock_release(path.clone(), sender.clone());
-            }
-        }
-    }
-
     fn register_earlier(&mut self, path: &Path) -> WatchRegistration {
-        if self.earlier.is_some() {
+        if self.earlier.as_deref() == Some(path) {
             return WatchRegistration::Ignore;
         }
         self.earlier = Some(path.to_path_buf());
         WatchRegistration::Start
     }
 
-    fn observe_earlier(&mut self, path: Option<PathBuf>, sender: &Sender<Event>) {
-        if let Some(path) = path
-            && self.register_earlier(&path) == WatchRegistration::Start
-        {
-            watch_lock_release(path, sender.clone());
+    fn observe(&mut self, decision: &Admission, held: &[PathBuf], mut watch: impl FnMut(PathBuf)) {
+        match decision {
+            Admission::Paused => {}
+            Admission::EarlierWaiter(path) => {
+                if self.register_earlier(path) == WatchRegistration::Start {
+                    watch(path.clone());
+                }
+            }
+            Admission::Full | Admission::Open => {
+                for path in held {
+                    if self.register_slot(path) == WatchRegistration::Start {
+                        watch(path.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -147,19 +170,19 @@ impl Stop {
 const LOG_HEAD: u64 = 256 << 20;
 const LOG_TAIL: usize = 8 << 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Admission {
     Open,
     Paused,
-    EarlierWaiter,
+    EarlierWaiter(PathBuf),
     Full,
 }
 
-fn decide_admission(settings: Settings, held: usize, earlier: usize) -> Admission {
+fn decide_admission(settings: Settings, held: usize, earlier: Option<PathBuf>) -> Admission {
     if settings.paused {
         Admission::Paused
-    } else if earlier > 0 {
-        Admission::EarlierWaiter
+    } else if let Some(path) = earlier {
+        Admission::EarlierWaiter(path)
     } else if held >= settings.max_jobs.slots() {
         Admission::Full
     } else {
@@ -494,7 +517,12 @@ pub fn scope_name(submitter: &Submitter) -> String {
     }
 }
 
-fn workspace_root(store: &Store, spec: &Spec, slot: usize) -> Option<PathBuf> {
+fn acquire_warm_slot(locks: &Path) -> Result<(SlotIndex, OsLock), NodeError> {
+    let limit = crate::domain::to_usize(crate::domain::Concurrency::MOST);
+    OsLock::first_free(locks)?.ok_or(NodeError::WorkspaceSlotsFull(limit))
+}
+
+fn workspace_root(store: &Store, spec: &Spec, slot: SlotIndex) -> Option<PathBuf> {
     match &spec.location {
         Location::Snapshot {
             source, workspace, ..
@@ -518,7 +546,7 @@ pub fn fresh_root(store: &Store, spec: &Spec) -> Option<PathBuf> {
         Location::Snapshot {
             workspace: Workspace::Fresh,
             ..
-        } => workspace_root(store, spec, 0),
+        } => workspace_root(store, spec, SlotIndex::FIRST),
         Location::Snapshot {
             workspace: Workspace::Warm,
             ..
@@ -535,6 +563,10 @@ pub fn discard_workspace(root: &Path) -> Result<(), crate::state_file::StateErro
 
 fn applied_path(root: &Path) -> PathBuf {
     beside(root, ".applied.json")
+}
+
+fn applied_file(root: &Path) -> crate::state_file::StateFile<Applied> {
+    crate::state_file::StateFile::at(&applied_path(root))
 }
 
 #[must_use]
@@ -639,9 +671,10 @@ fn take_charge(
             source,
         })
     })?;
-    let cas = Cas::open(dirs.state.join("objects"))?;
-    if matches!(store.publication(id)?, Publication::Unpublished) {
-        store.publish(id)?;
+    let cas = Cas::open(dirs.state().join("objects"))?;
+    match store.publication(id)? {
+        Publication::Published => {}
+        Publication::Unpublished => store.publish(id)?,
     }
     store.record_supervisor_boot(id)?;
     let spec = store.spec(id)?;
@@ -726,11 +759,14 @@ impl Supervisor {
             self.shared.say(&format!("cleaning up: {error}"));
         }
         let released = held.release();
-        let outcome = match (self.shared.close_log(), outcome) {
-            (Some(failure), Outcome::Succeeded | Outcome::Failed { .. }) => Outcome::Errored {
-                reason: RemoteText::new(format!("the log could not be written: {failure}")),
+        let outcome = match self.shared.close_log() {
+            Some(failure) => match outcome {
+                Outcome::Succeeded | Outcome::Failed { .. } => Outcome::Errored {
+                    reason: RemoteText::new(format!("the log could not be written: {failure}")),
+                },
+                Outcome::Killed | Outcome::Errored { .. } => outcome,
             },
-            (Some(_) | None, outcome) => outcome,
+            None => outcome,
         };
         let finished = Phase::Finished {
             started_at: started,
@@ -782,34 +818,25 @@ impl Supervisor {
             .map_err(|error| crate::node::watching(&watched, &error))?;
         let mut watchers = QueueWatchers::new();
         loop {
-            let admission = OsLock::exclusive(&self.store.admission_lock_path())?;
+            let admission_lock = OsLock::exclusive(&self.store.admission_lock_path())?;
             let settings = self.store.settings()?;
-            let mut held = Vec::new();
-            for index in 0..crate::domain::Concurrency::MOST {
-                let path = slots.join(format!("{index}.lock"));
-                if matches!(OsLock::probe(&path)?, crate::lock::Probe::Held) {
-                    held.push(path);
-                }
-            }
-            let earlier = self.store.earliest_waiter(&self.spec)?;
-            let slot = match decide_admission(settings, held.len(), usize::from(earlier.is_some()))
-            {
-                Admission::Open => OsLock::first_free(
-                    &slots,
-                    crate::domain::to_usize(crate::domain::Concurrency::MOST),
-                )?
-                .map(|(_, lock)| lock),
-                Admission::Paused | Admission::EarlierWaiter | Admission::Full => None,
+            let held = self.store.held_slots()?;
+            let predecessor = self
+                .store
+                .earliest_waiter(&self.spec)?
+                .map(|id| self.store.alive_path(&id));
+            let decision = decide_admission(settings, held.len(), predecessor);
+            let slot = match &decision {
+                Admission::Open => OsLock::first_free(&slots)?.map(|(_, lock)| lock),
+                Admission::Paused | Admission::EarlierWaiter(_) | Admission::Full => None,
             };
-            admission.release()?;
+            admission_lock.release()?;
             if slot.is_some() {
                 return Ok(slot);
             }
-            watchers.observe_slots(&held, &self.shared.events);
-            watchers.observe_earlier(
-                earlier.map(|id| self.store.alive_path(&id)),
-                &self.shared.events,
-            );
+            watchers.observe(&decision, &held, |path| {
+                watch_lock_release(path, self.shared.events.clone());
+            });
             match events.recv() {
                 Ok(Event::Changed) => {}
                 Ok(Event::Released(path)) => {
@@ -828,7 +855,10 @@ impl Supervisor {
         held: &mut Held,
         started: &mut Option<Timestamp>,
     ) -> Result<Ending, NodeError> {
-        if matches!(self.store.queue_mode(&self.spec.id)?, QueueMode::Ordinary) {
+        if match self.store.queue_mode(&self.spec.id)? {
+            QueueMode::Ordinary => true,
+            QueueMode::Immediate => false,
+        } {
             let Some(slot) = self.queue(events)? else {
                 return Ok(self.shared.before_start("queued"));
             };
@@ -851,8 +881,9 @@ impl Supervisor {
             Err(other) => return Err(other),
         };
         held.workspace = workspace_lock;
-        if matches!(self.shared.kill_state(), KillState::Asked) {
-            return Ok(self.shared.before_start("preparing"));
+        match self.shared.kill_state() {
+            KillState::Asked => return Ok(self.shared.before_start("preparing")),
+            KillState::Open => {}
         }
         self.store.set_phase(
             &self.spec.id,
@@ -869,11 +900,14 @@ impl Supervisor {
             }
             return Err(NodeError::AlreadySupervised(self.spec.id.clone()));
         }
-        if matches!(self.shared.kill_state(), KillState::Asked)
-            && let Err(error) = group.kill()
-        {
-            self.shared
-                .say(&format!("stopping the job failed: {error}"));
+        match self.shared.kill_state() {
+            KillState::Asked => {
+                if let Err(error) = group.kill() {
+                    self.shared
+                        .say(&format!("stopping the job failed: {error}"));
+                }
+            }
+            KillState::Open => {}
         }
         let running = Phase::Running {
             started_at,
@@ -889,27 +923,20 @@ impl Supervisor {
     }
 
     fn start(&self, root: &Path) -> Result<(Group, Collecting), NodeError> {
-        let cwd = match (&self.spec.location, root) {
-            (
-                Location::Snapshot {
-                    subdir: Some(sub), ..
-                },
-                root,
-            ) => sub.parts().fold(root.to_path_buf(), |p, part| p.join(part)),
-            (Location::Snapshot { subdir: None, .. } | Location::Home, root) => root.to_path_buf(),
-        };
-        let mut command =
-            crate::shell::process(&self.spec.command, self.spec.shell.as_deref()).command();
-        command.current_dir(&cwd);
-        for name in self.store.take_launch(&self.spec.id)?.apply(&mut command) {
+        let cwd = WorkingDirectory::for_job(&self.spec.location, root);
+        let command = crate::shell::process(&self.spec.command, self.spec.shell.as_deref())
+            .in_dir(&cwd)
+            .command();
+        let (command, omitted) = self
+            .store
+            .take_launch(&self.spec.id)?
+            .prepare(command, &self.spec.id);
+        for name in omitted {
             self.shared.say(&format!(
                 "the environment variable {} was not passed on because it is not Unicode",
                 crate::terminal::neutralize(&name)
             ));
         }
-        command
-            .env("DOMYJOB", "1")
-            .env("DOMYJOB_JOB_ID", self.spec.id.as_str());
         let (collector, stopper, writer) = proc::output_pipe()?;
         let group = Group::spawn(command, writer)?;
         let shared = Arc::clone(&self.shared);
@@ -949,18 +976,18 @@ impl Supervisor {
                     .join(source.project.as_str())
                     .join("locks");
                 let (slot, lock) = match workspace {
-                    Workspace::Warm => match OsLock::first_free(&locks, usize::MAX)? {
-                        Some((slot, lock)) => (slot, Some(lock)),
-                        None => (0, None),
-                    },
-                    Workspace::Fresh => (0, None),
+                    Workspace::Warm => {
+                        let (slot, lock) = acquire_warm_slot(&locks)?;
+                        (slot, Some(lock))
+                    }
+                    Workspace::Fresh => (SlotIndex::FIRST, None),
                 };
                 let root = workspace_root(&self.store, &self.spec, slot)
-                    .unwrap_or_else(|| self.dirs.home.clone());
+                    .unwrap_or_else(|| self.dirs.home().to_path_buf());
                 self.fill(&root, &source.manifest)?;
                 (root, lock)
             }
-            Location::Home => (self.dirs.home.clone(), None),
+            Location::Home => (self.dirs.home().to_path_buf(), None),
         };
         crate::state_file::write_bytes(
             &self.store.workspace_record(&self.spec.id),
@@ -994,27 +1021,26 @@ impl Supervisor {
 
     fn fill_once(&self, root: &Path, manifest_id: &crate::domain::BlobId) -> Result<(), NodeError> {
         let manifest = self.cas.manifest(manifest_id)?;
-        let state = applied_path(root);
-        let previous: Applied = crate::state_file::read_json(&state)?.unwrap_or_default();
+        let previous: Applied = applied_file(root).read()?.unwrap_or_default();
         let mut intent = previous.clone();
         for rel in manifest.entries.keys() {
             intent.insert(rel.clone());
         }
         crate::state_file::remove_file(&filled_by_path(root))?;
-        crate::state_file::write_json(&state, &intent)?;
+        applied_file(root).replace(&intent)?;
         let workspace = crate::workspace::Workspace::open(root)?;
         let plan = crate::workspace::Plan {
             manifest: &manifest,
             previous: &previous,
         };
         let (applied, _) = workspace.materialize(&self.cas, plan, &self.shared.killed)?;
-        crate::state_file::write_json(&state, &applied)?;
+        applied_file(root).replace(&applied)?;
         crate::state_file::write_bytes(&filled_by_path(root), self.spec.id.as_str().as_bytes())?;
         Ok(())
     }
 
     fn record_left(&self) -> Result<(), NodeError> {
-        let Location::Snapshot { source, .. } = &self.spec.location else {
+        let Some(source) = self.spec.source() else {
             return Ok(());
         };
         let Some(root) =
@@ -1029,28 +1055,18 @@ impl Supervisor {
         let sent = self.cas.manifest(&source.manifest)?;
         let left = workspace.left(&sent)?;
         for item in &left {
-            if let Some(crate::snapshot::Entry::File { blob, size, .. }) = &item.now
-                && !self.cas.has(blob)?
+            if let Some(content) = item.now.as_ref().and_then(crate::snapshot::Entry::file)
+                && !self.cas.has(content.blob)?
             {
                 let mut file = workspace.open_file(&item.path)?;
-                self.cas.receive(&mut file, blob, *size)?;
+                self.cas.receive(&mut file, content.blob, content.size)?;
             }
         }
-        Ok(crate::state_file::write_json(
-            &self.store.left_path(&self.spec.id),
-            &left,
-        )?)
+        Ok(self.store.record_left(&self.spec.id, left)?)
     }
 
     fn cleanup(&self) -> Result<(), NodeError> {
-        let Location::Snapshot {
-            workspace: Workspace::Fresh,
-            ..
-        } = &self.spec.location
-        else {
-            return Ok(());
-        };
-        let Some(root) = workspace_root(&self.store, &self.spec, 0) else {
+        let Some(root) = fresh_root(&self.store, &self.spec) else {
             return Ok(());
         };
         crate::state_file::remove_dir_all(&root)?;
@@ -1094,16 +1110,16 @@ mod tests {
             },
             ..owner.clone()
         };
-        let owner_root = workspace_root(&store, &owner, 0).unwrap();
-        let peer_one_root = workspace_root(&store, &peer(1, "first"), 0).unwrap();
+        let owner_root = workspace_root(&store, &owner, SlotIndex::FIRST).unwrap();
+        let peer_one_root = workspace_root(&store, &peer(1, "first"), SlotIndex::FIRST).unwrap();
         assert_ne!(owner_root, peer_one_root);
         assert_ne!(
             peer_one_root,
-            workspace_root(&store, &peer(2, "second"), 0).unwrap()
+            workspace_root(&store, &peer(2, "second"), SlotIndex::FIRST).unwrap()
         );
         assert_eq!(
             peer_one_root,
-            workspace_root(&store, &peer(1, "renamed"), 0).unwrap()
+            workspace_root(&store, &peer(1, "renamed"), SlotIndex::FIRST).unwrap()
         );
     }
 
@@ -1131,8 +1147,8 @@ mod tests {
             paused: false,
             max_jobs: crate::domain::Concurrency::try_from(2).unwrap(),
         };
-        assert_eq!(decide_admission(two, 1, 0), Admission::Open);
-        assert_eq!(decide_admission(two, 2, 0), Admission::Full);
+        assert_eq!(decide_admission(two, 1, None), Admission::Open);
+        assert_eq!(decide_admission(two, 2, None), Admission::Full);
         assert_eq!(
             decide_admission(
                 Settings {
@@ -1140,21 +1156,25 @@ mod tests {
                     ..two
                 },
                 0,
-                0
+                None
             ),
             Admission::Paused
         );
-        assert_eq!(decide_admission(two, 0, 1), Admission::EarlierWaiter);
+        let predecessor = PathBuf::from("earlier.alive");
+        assert_eq!(
+            decide_admission(two, 0, Some(predecessor.clone())),
+            Admission::EarlierWaiter(predecessor)
+        );
 
         let three = Settings {
             max_jobs: crate::domain::Concurrency::try_from(3).unwrap(),
             ..two
         };
-        assert_eq!(decide_admission(three, 2, 0), Admission::Open);
+        assert_eq!(decide_admission(three, 2, None), Admission::Open);
     }
 
     #[test]
-    fn queue_watcher_registration_has_a_fixed_slot_and_predecessor_budget() {
+    fn queue_watcher_registration_caps_slots_and_replaces_a_changed_predecessor() {
         let mut watchers = QueueWatchers::new();
         for index in 0..crate::domain::Concurrency::MOST {
             assert_eq!(
@@ -1176,18 +1196,66 @@ mod tests {
         );
         assert_eq!(
             watchers.register_earlier(Path::new("second.alive")),
+            WatchRegistration::Start
+        );
+        assert_eq!(
+            watchers.register_earlier(Path::new("second.alive")),
             WatchRegistration::Ignore
         );
         watchers.released(Path::new("first.alive"));
         watchers.released(Path::new("0.lock"));
         assert_eq!(
             watchers.register_earlier(Path::new("second.alive")),
+            WatchRegistration::Ignore
+        );
+        watchers.released(Path::new("second.alive"));
+        assert_eq!(
+            watchers.register_earlier(Path::new("third.alive")),
             WatchRegistration::Start
         );
         assert_eq!(
             watchers.register_slot(Path::new("extra.lock")),
             WatchRegistration::Start
         );
+    }
+
+    #[test]
+    fn a_queued_job_watches_only_the_event_that_can_change_its_admission() {
+        let held = [PathBuf::from("0.lock"), PathBuf::from("1.lock")];
+        let earlier = PathBuf::from("first.alive");
+        for (decision, expected) in [
+            (Admission::Paused, Vec::new()),
+            (Admission::EarlierWaiter(earlier.clone()), vec![earlier]),
+            (Admission::Full, held.to_vec()),
+            (Admission::Open, held.to_vec()),
+        ] {
+            let mut watchers = QueueWatchers::new();
+            let mut started = Vec::new();
+            watchers.observe(&decision, &held, |path| started.push(path));
+            assert_eq!(started, expected, "{decision:?}");
+        }
+    }
+
+    #[test]
+    fn warm_workspace_slots_stop_at_the_job_capacity_and_never_reuse_a_locked_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let locks = tmp.path().join("locks");
+        let limit = crate::domain::to_usize(crate::domain::Concurrency::MOST);
+        let mut held: Vec<_> = (0..limit)
+            .map(|index| OsLock::exclusive(&locks.join(format!("{index}.lock"))).unwrap())
+            .collect();
+        assert!(matches!(
+            acquire_warm_slot(&locks),
+            Err(NodeError::WorkspaceSlotsFull(full)) if full == limit
+        ));
+        assert!(matches!(
+            std::fs::symlink_metadata(locks.join(format!("{limit}.lock"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        held.remove(0).release().unwrap();
+        let (slot, free) = acquire_warm_slot(&locks).unwrap();
+        assert_eq!(slot, SlotIndex::FIRST);
+        free.release().unwrap();
     }
 
     #[test]

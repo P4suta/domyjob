@@ -66,8 +66,12 @@ fn file(state: &Path, name: &str) -> PathBuf {
     state.join(format!("{name}.json"))
 }
 
+fn stored_file(path: &Path) -> state_file::StateFile<StoredKey> {
+    state_file::StateFile::at(path)
+}
+
 fn read_file(path: &Path) -> Result<Option<Secret<[u8; 32]>>, KeyError> {
-    match state_file::read_json::<StoredKey>(path)? {
+    match stored_file(path).read()? {
         Some(stored) => crate::trust::unhex32(&stored.secret)
             .map(|bytes| Some(Secret::new(bytes)))
             .ok_or_else(|| KeyError::Malformed(path.to_path_buf())),
@@ -76,12 +80,9 @@ fn read_file(path: &Path) -> Result<Option<Secret<[u8; 32]>>, KeyError> {
 }
 
 fn write_file(path: &Path, secret: &[u8; 32]) -> Result<(), KeyError> {
-    Ok(state_file::write_json(
-        path,
-        &StoredKey {
-            secret: crate::trust::hex(secret),
-        },
-    )?)
+    Ok(stored_file(path).replace(&StoredKey {
+        secret: crate::trust::hex(secret),
+    })?)
 }
 
 impl KeyStore {

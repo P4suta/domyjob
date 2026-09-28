@@ -1,5 +1,5 @@
 use crate::failure::io;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Write as _};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -187,11 +187,13 @@ impl Plan<Forward> {
                 return Err(Malformed::Unordered(path));
             }
             previous = Some(path.clone());
-            if let Some(Entry::File { blob, size, .. }) = &now {
+            if let Some(file) = now.as_ref().and_then(Entry::file) {
                 let bytes = contents
                     .remove(&path)
                     .ok_or_else(|| Malformed::Missing(path.clone()))?;
-                if crate::domain::len_u64(bytes.len()) != *size || blobs.insert(bytes) != *blob {
+                if crate::domain::len_u64(bytes.len()) != file.size
+                    || blobs.insert(bytes) != *file.blob
+                {
                     return Err(Malformed::Damaged(path));
                 }
             }
@@ -288,10 +290,12 @@ impl Checked<Forward> {
     pub fn keep(self, tree: &Tree, journal: &Journal) -> Result<Kept, PullError> {
         journal.record(tree, &self.pending.steps)?;
         for step in &self.pending.steps {
-            if let Some(entry @ Entry::File { blob, .. }) = &step.before {
+            if let Some(entry) = &step.before
+                && let Some(file) = entry.file()
+            {
                 match tree.holds(&step.path, Some(entry), &Removed::new())? {
                     EntryMatch::Matches => {
-                        journal.keep(blob, &tree.read(&step.path)?, &step.path)?;
+                        journal.keep(file.blob, &tree.read(&step.path)?, &step.path)?;
                     }
                     EntryMatch::Differs => {}
                 }
@@ -483,23 +487,37 @@ pub struct Journal {
 }
 
 impl Journal {
+    fn plan_file(&self) -> crate::state_file::StateFile<Record> {
+        crate::state_file::StateFile::at(&self.dir.join("plan.json"))
+    }
+
     pub fn open(pulls: &Path, name: &str) -> Result<Self, PullError> {
         crate::state_file::private_dir(pulls)?;
         let dir = match Self::existing(pulls, name)? {
             Some(dir) => dir,
             None => {
-                let journals = Self::listed(pulls)?;
-                let next = journals
-                    .last()
-                    .and_then(|(sequence, _)| sequence.checked_add(1))
+                let mut last = None::<u64>;
+                let mut newest = BTreeSet::new();
+                Self::for_each_entry(pulls, |entry| {
+                    last = Some(last.map_or(entry.0, |prior| prior.max(entry.0)));
+                    newest.insert(entry);
+                    if newest.len() == KEPT_PULLS {
+                        newest.pop_first();
+                    }
+                    Ok(())
+                })?;
+                let next = last
+                    .and_then(|sequence| sequence.checked_add(1))
                     .unwrap_or(0);
-                let excess = journals.len().saturating_add(1).saturating_sub(KEPT_PULLS);
-                for (_, old) in journals.iter().take(excess) {
-                    if let Some(lock) = OsLock::try_exclusive(&old.join("lock"))? {
-                        crate::state_file::remove_dir_all(old)?;
+                Self::for_each_sorted(pulls, |entry| {
+                    if !newest.contains(&entry)
+                        && let Some(lock) = OsLock::try_exclusive(&entry.1.join("lock"))?
+                    {
+                        crate::state_file::remove_dir_all(&entry.1)?;
                         drop(lock);
                     }
-                }
+                    Ok(())
+                })?;
                 pulls.join(format!("{next:010}-{name}"))
             }
         };
@@ -518,13 +536,15 @@ impl Journal {
         }
     }
 
-    fn listed(pulls: &Path) -> Result<Vec<(u64, PathBuf)>, PullError> {
+    fn for_each_entry(
+        pulls: &Path,
+        mut visit: impl FnMut((u64, PathBuf)) -> Result<(), PullError>,
+    ) -> Result<(), PullError> {
         let listing = match std::fs::read_dir(pulls) {
             Ok(listing) => listing,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io("listing", pulls)(error).into()),
         };
-        let mut found = Vec::new();
         for item in listing {
             let item = item.map_err(io("listing", pulls))?;
             let name = item.file_name();
@@ -533,46 +553,66 @@ impl Journal {
                 .and_then(|name| name.split_once('-'))
                 .map(|(sequence, _)| sequence.parse::<u64>());
             if let Some(Ok(sequence)) = sequence {
-                found.push((sequence, item.path()));
+                visit((sequence, item.path()))?;
             }
         }
-        found.sort();
-        Ok(found)
+        Ok(())
+    }
+
+    fn for_each_sorted(
+        pulls: &Path,
+        mut visit: impl FnMut((u64, PathBuf)) -> Result<(), PullError>,
+    ) -> Result<(), PullError> {
+        crate::bounded::SortedScan::<(u64, PathBuf)>::new().walk(
+            |offer| {
+                Self::for_each_entry(pulls, |entry| {
+                    offer(entry);
+                    Ok(())
+                })
+            },
+            |entry| {
+                visit(entry)?;
+                Ok(crate::bounded::ScanFlow::Continue)
+            },
+        )?;
+        Ok(())
     }
 
     fn existing(pulls: &Path, name: &str) -> Result<Option<PathBuf>, PullError> {
-        Ok(Self::listed(pulls)?.into_iter().find_map(|(_, dir)| {
-            dir.file_name()
+        let mut first = None::<(u64, PathBuf)>;
+        Self::for_each_entry(pulls, |entry| {
+            let matches = entry
+                .1
+                .file_name()
                 .and_then(|file| file.to_str())
                 .and_then(|file| file.split_once('-'))
-                .is_some_and(|(_, rest)| rest == name)
-                .then_some(dir)
-        }))
+                .is_some_and(|(_, rest)| rest == name);
+            if matches && first.as_ref().is_none_or(|prior| &entry < prior) {
+                first = Some(entry);
+            }
+            Ok(())
+        })?;
+        Ok(first.map(|(_, dir)| dir))
     }
 
     fn record(&self, tree: &Tree, pending: &[Step]) -> Result<(), PullError> {
-        let path = self.dir.join("plan.json");
-        let mut steps: BTreeMap<RelPath, Step> =
-            match crate::state_file::read_json::<Record>(&path)? {
-                Some(earlier) => earlier
-                    .steps
-                    .into_iter()
-                    .map(|step| (step.path.clone(), step))
-                    .collect(),
-                None => BTreeMap::new(),
-            };
+        let mut steps: BTreeMap<RelPath, Step> = match self.plan_file().read()? {
+            Some(earlier) => earlier
+                .steps
+                .into_iter()
+                .map(|step| (step.path.clone(), step))
+                .collect(),
+            None => BTreeMap::new(),
+        };
         for step in pending {
             steps
                 .entry(step.path.clone())
                 .or_insert_with(|| step.clone());
         }
-        Ok(crate::state_file::write_json(
-            &path,
-            &Record {
-                root: tree.root().to_path_buf(),
-                steps: steps.into_values().collect(),
-            },
-        )?)
+        Ok(self.plan_file().replace(&Record {
+            root: tree.root().to_path_buf(),
+            steps: steps.into_values().collect(),
+        })?)
     }
 
     fn keep(&self, blob: &BlobId, bytes: &[u8], rel: &RelPath) -> Result<(), PullError> {
@@ -623,18 +663,20 @@ impl Journal {
     }
 
     pub fn undo(&self) -> Result<(Tree, Plan<Back>), PullError> {
-        let record: Record = crate::state_file::read_json(&self.dir.join("plan.json"))?
+        let record: Record = self
+            .plan_file()
+            .read()?
             .ok_or_else(|| PullError::NeverPulled(self.dir.display().to_string()))?;
         let tree = Tree::open(&record.root)?;
         let mut contents = Blobs::default();
         let mut steps = Vec::with_capacity(record.steps.len());
         for step in &record.steps {
             let back = step.reversed();
-            if let Some(Entry::File { blob, .. }) = &back.after {
+            if let Some(file) = back.after.as_ref().and_then(Entry::file) {
                 let kept =
-                    crate::state_file::read_bytes(&self.dir.join("kept").join(blob.as_str()))?
+                    crate::state_file::read_bytes(&self.dir.join("kept").join(file.blob.as_str()))?
                         .ok_or_else(|| PullError::NotKept(step.path.clone()))?;
-                if contents.insert(kept) != *blob {
+                if contents.insert(kept) != *file.blob {
                     return Err(PullError::NotKept(step.path.clone()));
                 }
             }
@@ -665,6 +707,31 @@ mod tests {
     const PATHS: &[&str] = &["a", "b", "d", "d/x", "d/y", "e/f/g", "l", "l/x"];
     const CONTENTS: &[&[u8]] = &[b"", b"one", b"two", b"three"];
     const TARGETS: &[&str] = &["../outside", "a", "/nowhere/at/all"];
+
+    #[test]
+    fn journal_cleanup_streams_across_batches_and_preserves_a_locked_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pulls = tmp.path().join("pulls");
+        let largest = crate::bounded::DIRECTORY_BATCH.get();
+        for index in 0..=largest {
+            crate::state_file::private_dir(&pulls.join(format!("{index:010}-old-{index}")))
+                .unwrap();
+        }
+        let oldest = pulls.join("0000000000-old-0");
+        let busy = OsLock::exclusive(&oldest.join("lock")).unwrap();
+        let opened = Journal::open(&pulls, "fresh").unwrap();
+        assert_eq!(
+            opened.dir,
+            pulls.join(format!("{:010}-fresh", largest.saturating_add(1)))
+        );
+        assert!(oldest.exists());
+        assert!(!pulls.join("0000000001-old-1").exists());
+        assert!(pulls.join(format!("{largest:010}-old-{largest}")).exists());
+        assert_eq!(std::fs::read_dir(&pulls).unwrap().count(), KEPT_PULLS + 1);
+        assert_eq!(Journal::existing(&pulls, "old-0").unwrap(), Some(oldest));
+        drop(opened);
+        busy.release().unwrap();
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Node {

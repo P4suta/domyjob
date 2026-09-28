@@ -613,7 +613,7 @@ mod tests {
 
 #[cfg(kani)]
 mod proofs {
-    use super::*;
+    use super::Concurrency;
 
     #[kani::proof]
     fn concurrency_is_exactly_one_to_sixty_four() {

@@ -161,11 +161,10 @@ pub fn machine_card(
     let mut out = String::new();
     let health = if report.paused {
         ui::paint(Tone::Stopped, ui::symbol(Symbol::Stopped))
-    } else if matches!(
-        report.disk,
-        crate::protocol::DiskSpace::Measured { short: true, .. }
-            | crate::protocol::DiskSpace::Unavailable { .. }
-    ) {
+    } else if match &report.disk {
+        crate::protocol::DiskSpace::Measured { short, .. } => *short,
+        crate::protocol::DiskSpace::Unavailable { .. } => true,
+    } {
         ui::paint(Tone::Bad, ui::symbol(Symbol::Warning))
     } else {
         ui::paint(Tone::Good, ui::symbol(Symbol::Running))
@@ -234,7 +233,7 @@ fn activity(
 ) -> Result<Vec<String>, std::fmt::Error> {
     let running: Vec<&Job> = jobs
         .iter()
-        .filter(|job| matches!(job.state(), State::Running | State::Preparing))
+        .filter(|job| job.state().counts_as_running())
         .collect();
     let queued = jobs
         .iter()
@@ -370,22 +369,12 @@ pub fn cleaned(
     )?;
     let mut items: Vec<&crate::protocol::Freeable> = cleaned.items.iter().collect();
     items.sort_by_key(|item| std::cmp::Reverse(item.bytes));
-    for item in items.iter().take(8) {
+    for item in items {
         writeln!(
             out,
             "  {:>9}  {}",
             ui::bytes(item.bytes),
             ui::paint(Tone::Dim, &item.what.to_string())
-        )?;
-    }
-    if items.len() > 8 {
-        writeln!(
-            out,
-            "  {}",
-            ui::paint(
-                Tone::Dim,
-                &format!("… and {} more", items.len().saturating_sub(8))
-            )
         )?;
     }
     Ok(out)
@@ -804,15 +793,42 @@ pub mod tests {
                 &machine,
                 &crate::protocol::Cleaned {
                     applied: false,
-                    items: vec![crate::protocol::Freeable {
+                    items: crate::protocol::CleanReportItems::one(crate::protocol::Freeable {
                         what: crate::terminal::RemoteText::new("workspace a/0".to_owned()),
                         bytes: 2_000_000,
-                    }],
+                    }),
                 },
             )
             .unwrap(),
         );
         assert!(cleaned.contains("would free") && cleaned.contains("workspace a/0"));
+    }
+
+    #[test]
+    fn cleaning_shows_the_bounded_summary_even_when_it_is_the_smallest_item() {
+        let machine: MachineName = "linux".parse().unwrap();
+        let details = std::array::from_fn(|index| {
+            Some(crate::protocol::Freeable {
+                what: crate::terminal::RemoteText::new(format!("workspace {index}")),
+                bytes: 100,
+            })
+        });
+        let items = crate::protocol::CleanReportItems::from_parts(
+            details,
+            Some(crate::protocol::Freeable {
+                what: crate::terminal::RemoteText::new("the other 2 cleanable items".to_owned()),
+                bytes: 2,
+            }),
+        );
+        let shown = cleaned(
+            &machine,
+            &crate::protocol::Cleaned {
+                applied: false,
+                items,
+            },
+        )
+        .unwrap();
+        assert!(shown.contains("the other 2 cleanable items"));
     }
 
     #[test]

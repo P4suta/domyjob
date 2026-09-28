@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::io::{BufRead, ErrorKind, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -6,7 +8,6 @@ use std::sync::mpsc;
 pub const REQUEST_LINE: u64 = 1 << 20;
 pub const REPLY_LINE: u64 = 64 << 20;
 pub const BLOB: u64 = 8 << 30;
-pub const UPLOAD_COUNT: u64 = 2_000_000;
 pub const TAIL_WINDOW: u64 = 4 << 20;
 pub const IN_MEMORY_FILE: u64 = 64 << 20;
 pub const CAPTURE: u64 = 4 << 20;
@@ -15,6 +16,81 @@ pub const CONFIG_TEXT: u64 = 4 << 20;
 pub const BOOT_ID: u64 = 128;
 pub const SIGNED_METADATA: u64 = 4 << 20;
 pub const SOURCE_ARCHIVE: u64 = 64 << 20;
+pub const DIRECTORY_BATCH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(255);
+
+#[derive(Debug)]
+pub struct SortedScan<K> {
+    after: Option<K>,
+}
+
+#[derive(Debug)]
+struct SortedBatch<K> {
+    values: BTreeSet<K>,
+    final_batch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFlow {
+    Continue,
+    Stop,
+}
+
+impl<K: Ord + Clone> SortedScan<K> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { after: None }
+    }
+
+    fn next<E>(
+        &mut self,
+        scan: impl FnOnce(&mut dyn FnMut(K)) -> Result<(), E>,
+    ) -> Result<Option<SortedBatch<K>>, E> {
+        let mut values = BTreeSet::new();
+        scan(&mut |key| {
+            if self.after.as_ref().is_some_and(|previous| &key <= previous) {
+                return;
+            }
+            values.insert(key);
+            if values.len() > DIRECTORY_BATCH.get() {
+                values.pop_last();
+            }
+        })?;
+        let Some(last) = values.last() else {
+            return Ok(None);
+        };
+        self.after = Some(last.clone());
+        Ok(Some(SortedBatch {
+            final_batch: values.len() < DIRECTORY_BATCH.get(),
+            values,
+        }))
+    }
+
+    pub fn walk<E>(
+        mut self,
+        mut scan: impl FnMut(&mut dyn FnMut(K)) -> Result<(), E>,
+        mut visit: impl FnMut(K) -> Result<ScanFlow, E>,
+    ) -> Result<ScanFlow, E> {
+        loop {
+            let Some(batch) = self.next(|offer| scan(offer))? else {
+                return Ok(ScanFlow::Continue);
+            };
+            for key in batch.values {
+                if visit(key)? == ScanFlow::Stop {
+                    return Ok(ScanFlow::Stop);
+                }
+            }
+            if batch.final_batch {
+                return Ok(ScanFlow::Continue);
+            }
+        }
+    }
+}
+
+impl<K: Ord + Clone> Default for SortedScan<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Capture {
@@ -300,6 +376,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sorted_scan_keeps_a_fixed_batch_and_emits_every_key_once() {
+        let mut found = Vec::new();
+        let mut scans = 0;
+        let flow = SortedScan::<usize>::new()
+            .walk(
+                |offer| {
+                    scans += 1;
+                    for key in (0..513).rev() {
+                        offer(key);
+                        offer(key);
+                    }
+                    Ok::<(), ()>(())
+                },
+                |key| {
+                    found.push(key);
+                    Ok(ScanFlow::Continue)
+                },
+            )
+            .unwrap();
+        assert_eq!(flow, ScanFlow::Continue);
+        assert_eq!(scans, 3);
+        assert_eq!(found, (0..513).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sorted_scan_stops_before_a_second_directory_read() {
+        let mut scans = 0;
+        let mut found = Vec::new();
+        let flow = SortedScan::<usize>::new()
+            .walk(
+                |offer| {
+                    scans += 1;
+                    for key in (0..513).rev() {
+                        offer(key);
+                    }
+                    Ok::<(), ()>(())
+                },
+                |key| {
+                    found.push(key);
+                    Ok(if key == 2 {
+                        ScanFlow::Stop
+                    } else {
+                        ScanFlow::Continue
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(flow, ScanFlow::Stop);
+        assert_eq!(scans, 1);
+        assert_eq!(found, [0, 1, 2]);
+    }
+
+    #[test]
     fn child_output_fixture() {
         match std::env::var("DOMYJOB_CAPTURE_FIXTURE") {
             Ok(mode) if mode == "overflow" => {
@@ -318,7 +447,7 @@ mod tests {
     fn fixture(mode: &str) -> Command {
         let exe = std::env::current_exe().unwrap();
         let mut command = crate::spawn::Invocation::new(
-            crate::template::Arg::path(&exe),
+            crate::template::Arg::for_test(exe.display().to_string()),
             vec![
                 crate::template::Arg::literal("--exact"),
                 crate::template::Arg::literal("bounded::tests::child_output_fixture"),

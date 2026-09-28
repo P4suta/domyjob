@@ -34,7 +34,7 @@ pub fn series(jobs: &[(MachineName, Job)]) -> Vec<Series> {
             let newest = *runs.last()?;
             let mut took: Vec<Elapsed> = runs
                 .iter()
-                .filter(|job| matches!(job.state(), State::Succeeded | State::Failed))
+                .filter(|job| job.state().has_timing_sample())
                 .filter_map(|job| job.took())
                 .collect();
             took.sort_by_key(|span| span.millis());
