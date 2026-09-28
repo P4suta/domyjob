@@ -247,11 +247,11 @@ fn machine(
             ExitCode::SUCCESS
         }
         ChatCommand::Service { command } => {
-            let store = Store::open()?;
+            let paths = crate::layout::State::here()?.chat();
             let finding = match command {
-                ServiceCommand::Install => setup::service_install(&store)?,
-                ServiceCommand::Uninstall => setup::service_uninstall(&store)?,
-                ServiceCommand::Status => setup::service_status(&store)?,
+                ServiceCommand::Install => setup::service_install(&paths)?,
+                ServiceCommand::Uninstall => setup::service_uninstall(&paths)?,
+                ServiceCommand::Status => setup::service_status(&paths)?,
             };
             findings(out, &[finding])?
         }
@@ -304,12 +304,17 @@ fn sync_now(machine: Option<&str>, out: &Printer<'_>) -> Result<ExitCode, CliErr
     })
 }
 
-fn reset(out: &Printer<'_>) -> Result<ExitCode, CliError> {
-    let store = Store::open()?;
-    if matches!(setup::service_status(&store)?, Finding { ok: true, .. }) {
-        setup::service_uninstall(&store)?;
+/// Stop the service and replace the chat store without opening the old one, which may be unreadable.
+fn replace_store(state: &crate::layout::State) -> Result<Store, CliError> {
+    let paths = state.chat();
+    if matches!(setup::service_status(&paths)?, Finding { ok: true, .. }) {
+        setup::service_uninstall(&paths)?;
     }
-    let fresh = Store::reset(&crate::layout::State::here()?)?;
+    Ok(Store::reset(state)?)
+}
+
+fn reset(out: &Printer<'_>) -> Result<ExitCode, CliError> {
+    let fresh = replace_store(&crate::layout::State::here()?)?;
     out.print(
         &json!({"origin": fresh.origin()}),
         &format!("new chat identity {}", fresh.origin()),
@@ -486,4 +491,26 @@ pub(crate) fn run(args: ChatArgs, output: &Output) -> Result<ExitCode, CliError>
     let outcome = ops::around(&mut session, read, |session| act(session, command))?;
     out.print(&outcome.json(), &outcome.text())?;
     Ok(ExitCode::from(outcome.exit_code()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replace_store;
+    use crate::chat::store::Store;
+    use crate::layout::State;
+
+    #[test]
+    fn a_store_this_build_cannot_read_can_still_be_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::at(&root.path().join("state"));
+        let old = Store::open_in(&state).unwrap();
+        old.forget_format_for_test().unwrap();
+        assert!(
+            Store::open_in(&state).is_err(),
+            "the unreadable store is refused"
+        );
+        let fresh = replace_store(&state).unwrap();
+        assert_ne!(fresh.origin(), old.origin());
+        Store::open_in(&state).unwrap();
+    }
 }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::ops::{self, OpsError};
 use super::store::{LinkState, Store, StoreError};
 use super::sync::{self, Ssh, SyncError};
+use crate::layout;
 use crate::lock::{OsLock, Probe};
 use crate::platform::clock::Deadline;
 use crate::platform::service::{self as manager, ServiceError};
@@ -87,12 +88,8 @@ struct Installed {
     program: String,
 }
 
-fn installed_path(store: &Store) -> PathBuf {
-    store.paths().service_record()
-}
-
-fn installed(store: &Store) -> Result<Option<Installed>, SetupError> {
-    match state_io::read_bytes(&installed_path(store))? {
+fn installed(paths: &layout::Chat) -> Result<Option<Installed>, SetupError> {
+    match state_io::read_bytes(&paths.service_record())? {
         Some(bytes) => Ok(Some(domyjob_core::ingress::json(
             &bytes,
             domyjob_core::wire::MAX_CONTROL_BYTES,
@@ -112,28 +109,28 @@ fn utf8(path: &Path) -> Result<&str, SetupError> {
     path.to_str().ok_or(SetupError::Path)
 }
 
-pub(crate) fn service_install(store: &Store) -> Result<Finding, SetupError> {
+pub(crate) fn service_install(paths: &layout::Chat) -> Result<Finding, SetupError> {
     let program = stable_program()?;
-    let place = manager::install(&program, &store.paths().service_log())?;
+    let place = manager::install(&program, &paths.service_log())?;
     let record = Installed {
         program: utf8(&program)?.to_owned(),
     };
-    state_io::write_bytes(&installed_path(store), &serde_json::to_vec(&record)?)?;
+    state_io::write_bytes(&paths.service_record(), &serde_json::to_vec(&record)?)?;
     Ok(Finding::ok(
         "service",
         format!("installed {} running {}", place.display(), record.program),
     ))
 }
 
-pub(crate) fn service_uninstall(store: &Store) -> Result<Finding, SetupError> {
+pub(crate) fn service_uninstall(paths: &layout::Chat) -> Result<Finding, SetupError> {
     let removed = manager::uninstall()?;
-    if OsLock::probe(&store.paths().service_lock())? == Probe::Held
-        && let Some(bytes) = state_io::read_bytes(&store.paths().service_pid())?
+    if OsLock::probe(&paths.service_lock())? == Probe::Held
+        && let Some(bytes) = state_io::read_bytes(&paths.service_pid())?
         && let Ok(Ok(pid)) = std::str::from_utf8(&bytes).map(|text| text.trim().parse::<u32>())
     {
         crate::process::terminate(pid)?;
     }
-    state_io::remove_file(&installed_path(store))?;
+    state_io::remove_file(&paths.service_record())?;
     Ok(Finding::ok(
         "service",
         if removed {
@@ -145,10 +142,10 @@ pub(crate) fn service_uninstall(store: &Store) -> Result<Finding, SetupError> {
 }
 
 /// Whether the service is installed, current, and running.
-pub(crate) fn service_status(store: &Store) -> Result<Finding, SetupError> {
-    let running = OsLock::probe(&store.paths().service_lock())? == Probe::Held;
+pub(crate) fn service_status(paths: &layout::Chat) -> Result<Finding, SetupError> {
+    let running = OsLock::probe(&paths.service_lock())? == Probe::Held;
     let current = crate::platform::stable_program(&crate::identity::tag())?;
-    Ok(match (installed(store)?, running) {
+    Ok(match (installed(paths)?, running) {
         (None, false) => Finding::problem(
             "service",
             "not installed; messages arrive only while a chat command runs",
@@ -284,7 +281,7 @@ pub(crate) fn setup(machines: &[String], steps: Steps) -> Result<Vec<Finding>, S
     }
     ops::publish_machine(&store)?;
     if service {
-        findings.push(service_install(&store)?);
+        findings.push(service_install(store.paths())?);
     }
     if register {
         let program = stable_program()?;
@@ -329,8 +326,34 @@ fn logged_in(
 
 /// Check the service, the links, the client registrations and logins, and the local agents.
 pub(crate) fn doctor() -> Result<Vec<Finding>, SetupError> {
-    let store = Store::open()?;
-    let mut findings = vec![service_status(&store)?];
+    let mut findings = vec![service_status(&layout::State::here()?.chat())?];
+    match Store::open() {
+        Ok(store) => findings.extend(store_findings(&store)?),
+        Err(StoreError::Format(found)) => findings.push(Finding::problem(
+            "store",
+            format!("written in format {found}, which this build cannot read"),
+            "domyjob chat reset --yes",
+        )),
+        Err(other) => return Err(other.into()),
+    }
+    let program = crate::platform::stable_program(&crate::identity::tag())?;
+    findings.extend(clients(utf8(&program)?, false)?);
+    for check in [
+        logged_in("claude", &["auth", "status"], false)?,
+        logged_in("codex", &["login", "status"], false)?,
+        logged_in("opencode", &["auth", "list"], true)?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        findings.push(check);
+    }
+    Ok(findings)
+}
+
+/// What the readable chat store says about peers and local agents.
+fn store_findings(store: &Store) -> Result<Vec<Finding>, SetupError> {
+    let mut findings = Vec::new();
     for (alias, link) in store.links()? {
         findings.push(match link.state {
             LinkState::Synced => Finding::ok("peer", format!("{alias} synchronized")),
@@ -348,19 +371,7 @@ pub(crate) fn doctor() -> Result<Vec<Finding>, SetupError> {
             "domyjob chat setup MACHINE...",
         ));
     }
-    let program = crate::platform::stable_program(&crate::identity::tag())?;
-    findings.extend(clients(utf8(&program)?, false)?);
-    for check in [
-        logged_in("claude", &["auth", "status"], false)?,
-        logged_in("codex", &["login", "status"], false)?,
-        logged_in("opencode", &["auth", "list"], true)?,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        findings.push(check);
-    }
-    findings.extend(agents(&store)?);
+    findings.extend(agents(store)?);
     Ok(findings)
 }
 

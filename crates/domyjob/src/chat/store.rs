@@ -109,9 +109,12 @@ fn initialize(database: &Database) -> Result<Origin, StoreError> {
     let origin = {
         let mut meta = write.open_table(tables::META)?;
         let format = crate::formats::chat();
+        let known = tables::get_text(&meta, "origin")?.is_some();
         match tables::get_text(&meta, "format")? {
             Some(found) if found != format => return Err(StoreError::Format(found)),
             Some(_) => {}
+            // A store with an identity but no format was written before formats were recorded.
+            None if known => return Err(StoreError::Format("unrecorded".to_owned())),
             None => {
                 meta.insert("format", format.as_str())?;
             }
@@ -146,6 +149,16 @@ impl Store {
     #[must_use]
     pub(crate) const fn origin(&self) -> &Origin {
         &self.origin
+    }
+
+    /// Remove the recorded format, as a store written before formats were recorded has none.
+    #[cfg(test)]
+    pub(crate) fn forget_format_for_test(&self) -> Result<(), StoreError> {
+        let database = open_database(&self.paths)?;
+        let write = database.begin_write()?;
+        write.open_table(tables::META)?.remove("format")?;
+        write.commit()?;
+        Ok(())
     }
 
     /// Where this store's files live.

@@ -305,3 +305,33 @@ fn a_changed_peer_identity_is_replaced_only_on_request() {
     assert!(a.unpin("linux").unwrap());
     assert!(!a.unpin("linux").unwrap());
 }
+
+#[test]
+fn a_store_in_another_or_unrecorded_format_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let first = store(&root, "a");
+    for (format, expected) in [
+        (Some("0123456789abcdef"), "0123456789abcdef"),
+        (None, "unrecorded"),
+    ] {
+        let database = super::open_database(first.paths()).unwrap();
+        let write = database.begin_write().unwrap();
+        {
+            let mut meta = write.open_table(super::tables::META).unwrap();
+            match format {
+                Some(format) => {
+                    meta.insert("format", format).unwrap();
+                }
+                None => {
+                    meta.remove("format").unwrap();
+                }
+            }
+        }
+        write.commit().unwrap();
+        drop(database);
+        assert!(matches!(
+            Store::open_in(&crate::layout::State::at(&root.path().join("a"))),
+            Err(StoreError::Format(found)) if found == expected
+        ));
+    }
+}
