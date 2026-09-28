@@ -186,14 +186,24 @@ pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
 }
 
 fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
-    if cfg!(windows) {
+    candidates_on(cfg!(windows), directory, name)
+}
+
+/// The files that may run `name` from `directory`; on Windows, a name that already has an extension, such as `powershell.exe`, is tried as written first.
+fn candidates_on(windows: bool, directory: &Path, name: &str) -> Vec<PathBuf> {
+    if !windows {
+        return vec![directory.join(name)];
+    }
+    let mut found = Vec::new();
+    if Path::new(name).extension().is_some() {
+        found.push(directory.join(name));
+    }
+    found.extend(
         ["exe", "cmd", "bat"]
             .iter()
-            .map(|extension| directory.join(format!("{name}.{extension}")))
-            .collect()
-    } else {
-        vec![directory.join(name)]
-    }
+            .map(|extension| directory.join(format!("{name}.{extension}"))),
+    );
+    found
 }
 
 pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
@@ -292,7 +302,26 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_job_environment;
+    use std::path::{Path, PathBuf};
+
+    use super::{candidates_on, prepare_job_environment};
+
+    #[test]
+    fn a_program_named_with_its_extension_is_found_as_written() {
+        let directory = Path::new("bin");
+        assert_eq!(
+            candidates_on(true, directory, "powershell.exe").first(),
+            Some(&PathBuf::from("bin").join("powershell.exe"))
+        );
+        assert_eq!(
+            candidates_on(true, directory, "codex"),
+            ["codex.exe", "codex.cmd", "codex.bat"].map(|file| directory.join(file))
+        );
+        assert_eq!(
+            candidates_on(false, directory, "sh"),
+            [directory.join("sh")]
+        );
+    }
 
     #[test]
     fn a_job_does_not_inherit_ssh_connection_credentials() {
