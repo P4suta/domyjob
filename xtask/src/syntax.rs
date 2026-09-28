@@ -506,6 +506,8 @@ pub struct Gate {
     file: String,
     test_depth: u32,
     function: Option<String>,
+    current_impl: Option<String>,
+    legacy_bool_hits: Vec<usize>,
     state_impl: bool,
     state_enums: std::collections::BTreeSet<String>,
     defined_types: std::collections::BTreeSet<String>,
@@ -1046,44 +1048,53 @@ const DECISION_FILES: &[&str] = &[
     "remote.rs",
 ];
 const DECISION_SIGNATURE_RULE: &str = "security decisions return an enum, never bool";
-const LEGACY_BOOL_SIGNATURES: &[(&str, &str)] = &[
-    ("board.rs", "is_quiet"),
-    ("board.rs", "is_live"),
-    ("build_stamp.rs", "source_dir"),
-    ("build_stamp.rs", "source_file"),
-    ("cas.rs", "has"),
-    ("cli.rs", "is_output_broken_pipe"),
-    ("cli.rs", "wants_json"),
-    ("dist.rs", "run"),
-    ("dist.rs", "fetch"),
-    ("domain.rs", "portable_component"),
-    ("domain.rs", "crockford"),
-    ("domain.rs", "matches"),
-    ("liveness.rs", "silenced"),
-    ("paths.rs", "enabled"),
-    ("paths.rs", "links"),
-    ("paths.rs", "modes"),
-    ("paths.rs", "load_average"),
-    ("paths.rs", "agent_socket"),
-    ("paths.rs", "replaces_running_executables"),
-    ("platform.rs", "is_reparse_point"),
-    ("platform.rs", "elevated"),
-    ("proc.rs", "inside_remote_session"),
-    ("protocol.rs", "counts_as_running"),
-    ("protocol.rs", "has_timing_sample"),
-    ("protocol.rs", "is_settled"),
-    ("protocol.rs", "succeeded"),
-    ("secure.rs", "is_disconnected"),
-    ("service.rs", "is_installed"),
-    ("shell.rs", "on_path"),
-    ("snapshot.rs", "metadata"),
-    ("template.rs", "is_empty"),
-    ("terminal.rs", "dangerous"),
-    ("ui.rs", "unicode"),
-    ("ui.rs", "stderr_is_live"),
-    ("user_files.rs", "present"),
-    ("view.rs", "stdout_is_a_person"),
+const LEGACY_BOOL_BASELINE_RULE: &str =
+    "legacy boolean exception count changed; review and update its exact baseline";
+const LEGACY_BOOL_SIGNATURES: &[(&str, &str, &[&str])] = &[
+    ("board.rs", "is_quiet", &["Board"]),
+    ("board.rs", "is_live", &["Board"]),
+    ("build_stamp.rs", "source_dir", &[]),
+    ("build_stamp.rs", "source_file", &[]),
+    ("cas.rs", "has", &["Cas"]),
+    ("cli.rs", "is_output_broken_pipe", &["CliError"]),
+    ("cli.rs", "wants_json", &[]),
+    ("dist.rs", "run", &[]),
+    ("dist.rs", "fetch", &[]),
+    ("domain.rs", "portable_component", &[]),
+    ("domain.rs", "crockford", &[]),
+    ("domain.rs", "matches", &["RefPattern", "JobId"]),
+    ("liveness.rs", "silenced", &["Watchdog"]),
+    ("paths.rs", "enabled", &["Availability"]),
+    ("paths.rs", "links", &["Family"]),
+    ("paths.rs", "modes", &["Family"]),
+    ("paths.rs", "load_average", &["Family"]),
+    ("paths.rs", "agent_socket", &["Family"]),
+    ("paths.rs", "replaces_running_executables", &["Family"]),
+    ("platform.rs", "is_reparse_point", &[]),
+    ("platform.rs", "elevated", &[]),
+    ("proc.rs", "inside_remote_session", &[]),
+    ("protocol.rs", "counts_as_running", &["State"]),
+    ("protocol.rs", "has_timing_sample", &["State"]),
+    ("protocol.rs", "is_settled", &["Job"]),
+    ("protocol.rs", "succeeded", &["Job"]),
+    ("secure.rs", "is_disconnected", &["SecureError"]),
+    ("service.rs", "is_installed", &[]),
+    ("shell.rs", "on_path", &[]),
+    ("snapshot.rs", "metadata", &[]),
+    ("template.rs", "is_empty", &["Argv"]),
+    ("terminal.rs", "dangerous", &[]),
+    ("ui.rs", "unicode", &[]),
+    ("ui.rs", "stderr_is_live", &[]),
+    ("user_files.rs", "present", &[]),
+    ("view.rs", "stdout_is_a_person", &[]),
 ];
+
+fn expected_legacy_bool_count(file: &str, name: &str) -> usize {
+    match (file, name) {
+        ("domain.rs", "matches") | ("platform.rs", "is_reparse_point" | "elevated") => 2,
+        _ => 1,
+    }
+}
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &[
     "failure.rs",
@@ -2137,17 +2148,36 @@ impl Gate {
     }
 
     fn check_signature(&mut self, sig: &syn::Signature, attrs: &[syn::Attribute]) {
-        let legacy = !self.file_is(DECISION_FILES)
-            && LEGACY_BOOL_SIGNATURES
+        let legacy = if self.file_is(DECISION_FILES) {
+            None
+        } else {
+            LEGACY_BOOL_SIGNATURES
                 .iter()
-                .any(|(file, name)| self.file_is(&[file]) && sig.ident == *name);
+                .enumerate()
+                .find_map(|(index, (file, name, owners))| {
+                    (self.file_is(&[file])
+                        && sig.ident == *name
+                        && match self.current_impl.as_deref() {
+                            Some(owner) => owners.contains(&owner),
+                            None => owners.is_empty(),
+                        })
+                    .then_some(index)
+                })
+        };
         if self.test_depth == 0
             && !is_test_module(attrs)
             && (self.file_is(DECISION_FILES) || self.file.starts_with("crates/domyjob/src/"))
             && returns_bool(&sig.output)
-            && !legacy
         {
-            self.flag(sig.ident.span(), DECISION_SIGNATURE_RULE);
+            if let Some(index) = legacy {
+                let Some(hit) = self.legacy_bool_hits.get_mut(index) else {
+                    self.flag(sig.ident.span(), LEGACY_BOOL_BASELINE_RULE);
+                    return;
+                };
+                *hit = hit.saturating_add(1);
+            } else {
+                self.flag(sig.ident.span(), DECISION_SIGNATURE_RULE);
+            }
         }
     }
 
@@ -2748,12 +2778,19 @@ impl<'ast> Visit<'ast> for Gate {
             self.flag(item.impl_token.span, AUTHORIZED_COMMAND_RULE);
         }
         let previous_state_impl = self.state_impl;
+        let owner = if let syn::Type::Path(ty) = item.self_ty.as_ref() {
+            ty.path.segments.last().map(|part| part.ident.to_string())
+        } else {
+            None
+        };
+        let previous_impl = std::mem::replace(&mut self.current_impl, owner);
         self.state_impl = self
             .state_enums
             .iter()
             .any(|name| is_named_type(&item.self_ty, name));
         syn::visit::visit_item_impl(self, item);
         self.state_impl = previous_state_impl;
+        self.current_impl = previous_impl;
     }
 
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
@@ -3208,6 +3245,23 @@ pub fn check_file_with_enums(
     name: &str,
     known_enums: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<Finding>, syn::Error> {
+    check_file_with_enums_and_baseline(source, name, known_enums, false)
+}
+
+pub fn check_repository_file_with_enums(
+    source: &str,
+    name: &str,
+    known_enums: &std::collections::BTreeSet<String>,
+) -> Result<Vec<Finding>, syn::Error> {
+    check_file_with_enums_and_baseline(source, name, known_enums, true)
+}
+
+fn check_file_with_enums_and_baseline(
+    source: &str,
+    name: &str,
+    known_enums: &std::collections::BTreeSet<String>,
+    baseline: bool,
+) -> Result<Vec<Finding>, syn::Error> {
     let file = syn::parse_file(source)?;
     let mut state_enums: std::collections::BTreeSet<String> = STATE_ENUMS
         .iter()
@@ -3260,11 +3314,27 @@ pub fn check_file_with_enums(
         file: name.to_owned(),
         test_depth: 0,
         function: None,
+        current_impl: None,
+        legacy_bool_hits: vec![0; LEGACY_BOOL_SIGNATURES.len()],
         state_impl: false,
         state_enums,
         defined_types,
     };
     gate.visit_file(&file);
+    if baseline {
+        for ((legacy_file, legacy_name, _), actual) in
+            LEGACY_BOOL_SIGNATURES.iter().zip(&gate.legacy_bool_hits)
+        {
+            if gate.file_is(&[legacy_file])
+                && *actual != expected_legacy_bool_count(legacy_file, legacy_name)
+            {
+                gate.findings.push(Finding {
+                    line: 1,
+                    rule: LEGACY_BOOL_BASELINE_RULE,
+                });
+            }
+        }
+    }
     Ok(gate.findings)
 }
 
@@ -3908,6 +3978,37 @@ mod tests {
             .is_empty()
         );
         assert_rule(
+            "impl Other { fn source_dir(&self) -> bool { true } }",
+            "crates/domyjob/src/build_stamp.rs",
+            DECISION_SIGNATURE_RULE,
+        );
+        assert!(
+            check_file(
+                "impl Board { fn is_quiet(&self) -> bool { true } }",
+                "crates/domyjob/src/board.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_rule(
+            "impl Other { fn is_quiet(&self) -> bool { true } }",
+            "crates/domyjob/src/board.rs",
+            DECISION_SIGNATURE_RULE,
+        );
+        assert!(
+            check_file(
+                "impl RefPattern { fn matches(&self) -> bool { true } } impl JobId { fn matches(&self) -> bool { true } }",
+                "crates/domyjob/src/domain.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_rule(
+            "impl Other { fn matches(&self) -> bool { true } }",
+            "crates/domyjob/src/domain.rs",
+            DECISION_SIGNATURE_RULE,
+        );
+        assert_rule(
             "fn source_dir(path: &Path) -> bool { path.is_dir() }",
             file,
             DECISION_SIGNATURE_RULE,
@@ -3918,6 +4019,37 @@ mod tests {
         .unwrap();
         assert!(names.contains("Production"));
         assert!(!names.contains("Fixture"));
+    }
+
+    #[test]
+    fn legacy_boolean_exceptions_require_the_reviewed_definition_count() {
+        let file = "crates/domyjob/src/board.rs";
+        let checked = |source| {
+            check_repository_file_with_enums(source, file, &std::collections::BTreeSet::new())
+                .unwrap()
+                .into_iter()
+                .map(|finding| finding.rule)
+                .collect::<Vec<_>>()
+        };
+        let complete =
+            "impl Board { fn is_quiet(&self) -> bool { true } fn is_live(&self) -> bool { true } }";
+        assert!(checked(complete).is_empty());
+        assert_eq!(
+            checked("impl Board { fn is_quiet(&self) -> bool { true } }"),
+            [LEGACY_BOOL_BASELINE_RULE]
+        );
+        assert_eq!(
+            checked(
+                "impl Board { fn is_quiet(&self) -> bool { true } fn is_live(&self) -> bool { true } fn is_live(&self) -> bool { true } }"
+            ),
+            [LEGACY_BOOL_BASELINE_RULE]
+        );
+        assert_eq!(
+            checked(
+                "impl Board { fn is_quiet(&self) -> bool { true } fn is_live(&self) -> State { todo!() } }"
+            ),
+            [LEGACY_BOOL_BASELINE_RULE]
+        );
     }
 
     #[test]

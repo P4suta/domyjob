@@ -119,12 +119,10 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
             );
             count = count.saturating_add(1);
         }
-        let findings =
-            syntax::check_file_with_enums(&source, &shown, &enum_names).map_err(|source| {
-                GateError::Parse {
-                    path: path.clone(),
-                    source,
-                }
+        let findings = syntax::check_repository_file_with_enums(&source, &shown, &enum_names)
+            .map_err(|source| GateError::Parse {
+                path: path.clone(),
+                source,
             })?;
         for finding in findings {
             eprintln!("{shown}:{}: {}", finding.line, finding.rule);

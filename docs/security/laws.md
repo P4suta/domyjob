@@ -88,6 +88,8 @@ Queue admission and queued-job status share `Store::held_slots`, which generates
 Remote version comparison now returns a `VersionRelation`; an unparsable peer version stops automatic installation instead of being treated as an older release.
 Client retry classification now exhaustively matches every `RemoteError`, so adding a remote error requires an explicit retry decision.
 The decision-signature gate now rejects boolean-returning functions outside 36 named legacy signatures throughout the product crate; a parsed `cfg` condition grants test-only exemptions only when it requires `test`.
+Legacy exceptions are also tied to their owning type or free function, so a new type cannot inherit an old same-name exception.
+The repository gate counts every allowed boolean definition and fails when one disappears or is duplicated until its reviewed baseline is changed.
 Submission replies now retain the accepted job, the missing-content refusal, or the full unexpected reply in distinct typed outcomes; the client retries only the missing-content outcome, and both reply and refusal-code classification require exhaustive matches.
 Distribution failures now carry an explicit local-source or stop outcome; only the no-trust-root case permits automatic source fallback, and adding a failure variant requires revisiting that policy.
 Watch retries now also classify every `ClientError`, retrying transient remote transport failures while reporting local and invalid-input failures immediately.
