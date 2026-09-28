@@ -141,6 +141,11 @@ pub(crate) fn service_uninstall(paths: &layout::Chat) -> Result<Finding, SetupEr
     ))
 }
 
+/// Whether a chat service is installed or running, whatever its build or health.
+pub(crate) fn service_present(paths: &layout::Chat) -> Result<bool, SetupError> {
+    Ok(installed(paths)?.is_some() || OsLock::probe(&paths.service_lock())? == Probe::Held)
+}
+
 /// Whether the service is installed, current, and running.
 pub(crate) fn service_status(paths: &layout::Chat) -> Result<Finding, SetupError> {
     let running = OsLock::probe(&paths.service_lock())? == Probe::Held;

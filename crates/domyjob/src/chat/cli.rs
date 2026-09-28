@@ -307,7 +307,8 @@ fn sync_now(machine: Option<&str>, out: &Printer<'_>) -> Result<ExitCode, CliErr
 /// Stop the service and replace the chat store without opening the old one, which may be unreadable.
 fn replace_store(state: &crate::layout::State) -> Result<Store, CliError> {
     let paths = state.chat();
-    if matches!(setup::service_status(&paths)?, Finding { ok: true, .. }) {
+    // A service of any build, running or not, would keep writing under the replaced identity.
+    if setup::service_present(&paths)? {
         setup::service_uninstall(&paths)?;
     }
     Ok(Store::reset(state)?)
@@ -498,6 +499,21 @@ mod tests {
     use super::replace_store;
     use crate::chat::store::Store;
     use crate::layout::State;
+
+    #[test]
+    fn a_service_of_any_build_counts_as_present() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::at(&root.path().join("state"));
+        let paths = state.chat();
+        Store::open_in(&state).unwrap();
+        assert!(!crate::chat::setup::service_present(&paths).unwrap());
+        crate::state_io::write_bytes(
+            &paths.service_record(),
+            br#"{"program":"/old/build/domyjob"}"#,
+        )
+        .unwrap();
+        assert!(crate::chat::setup::service_present(&paths).unwrap());
+    }
 
     #[test]
     fn a_store_this_build_cannot_read_can_still_be_reset() {
