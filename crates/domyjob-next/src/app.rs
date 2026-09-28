@@ -205,6 +205,9 @@ pub(crate) fn handle(
             };
             Ok(Reply::Status { state: stopped })
         }
+        Request::Clean { target } => Ok(Reply::Cleaned {
+            count: Store::open()?.clean(&target)?,
+        }),
     }
 }
 

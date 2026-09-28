@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineName, SubmissionId};
+use domyjob_core::wire::CleanTarget;
 
 mod app;
 mod identity;
@@ -24,6 +25,8 @@ enum Command {
         machine: String,
         #[arg(long)]
         submission: Option<String>,
+        #[arg(long)]
+        wait: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -31,11 +34,18 @@ enum Command {
         machine: String,
         #[arg(long)]
         submission: Option<String>,
+        #[arg(long)]
+        wait: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
     Ls {
         machine: String,
+    },
+    Clean {
+        machine: String,
+        #[arg(long)]
+        job: Option<String>,
     },
     Status {
         job: String,
@@ -68,27 +78,35 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
         Command::On {
             machine,
             submission,
+            wait,
             command,
         } => {
             let machine = MachineName::try_from(machine)?;
             let command = JobCommand::try_from(command)?;
             let submission = submission.map(SubmissionId::try_from).transpose()?;
-            transport::on(&machine, submission, command)?;
-            Ok(ExitCode::SUCCESS)
+            transport::on(&machine, submission, command, wait)
         }
         Command::Run {
             machine,
             submission,
+            wait,
             command,
         } => {
             let machine = MachineName::try_from(machine)?;
             let command = JobCommand::try_from(command)?;
             let submission = submission.map(SubmissionId::try_from).transpose()?;
-            transport::run(&machine, submission, command)?;
-            Ok(ExitCode::SUCCESS)
+            transport::run(&machine, submission, command, wait)
         }
         Command::Ls { machine } => {
             transport::ls(&MachineName::try_from(machine)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Clean { machine, job } => {
+            let target = match job {
+                Some(job) => CleanTarget::Job(JobId::try_from(job)?),
+                None => CleanTarget::Finished,
+            };
+            transport::clean(&MachineName::try_from(machine)?, target)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { job } => {

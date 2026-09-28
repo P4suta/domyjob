@@ -16,7 +16,7 @@ use domyjob_core::domain::{
 };
 use domyjob_core::ingress;
 use domyjob_core::state::{JobState, Outcome, PhaseKind};
-use domyjob_core::wire::{self, ErrorCode, Input, Reply, Request, WireError};
+use domyjob_core::wire::{self, CleanTarget, ErrorCode, Input, Reply, Request, WireError};
 use thiserror::Error;
 
 use crate::app::{self, AppError};
@@ -163,19 +163,25 @@ fn source_checkout() -> Result<&'static Path, TransportError> {
 }
 
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
-    let sibling =
-        std::env::current_exe()?.with_file_name(format!("domyjob{}", std::env::consts::EXE_SUFFIX));
-    let executable = if sibling.is_file() {
-        sibling
-    } else {
-        "domyjob".into()
-    };
+    let checkout = source_checkout()?;
     eprintln!(
         "{}: updating remote binary from this checkout",
         machine.as_str()
     );
+    let built = Command::new("mise")
+        .current_dir(checkout)
+        .env("RUSTC_WRAPPER", "")
+        .args(["x", "--", "cargo", "build", "--locked", "-p", "domyjob"])
+        .status()?;
+    if !built.success() {
+        return Err(TransportError::Deployment(built));
+    }
+    let executable = checkout
+        .join("target")
+        .join("debug")
+        .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX));
     let status = Command::new(executable)
-        .current_dir(source_checkout()?)
+        .current_dir(checkout)
         .args([
             "run",
             machine.as_str(),
@@ -236,6 +242,7 @@ fn ensure_deployed(machine: &MachineName) -> Result<(), TransportError> {
         | Reply::Jobs { .. }
         | Reply::Status { .. }
         | Reply::Logs { .. }
+        | Reply::Cleaned { .. }
         | Reply::Error { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -306,9 +313,11 @@ fn submit(
     match call_with_payload(machine, &request, payload)? {
         Reply::Accepted { job } => Ok(job),
         Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. } | Reply::Jobs { .. } | Reply::Status { .. } | Reply::Logs { .. } => {
-            Err(TransportError::UnexpectedReply)
-        }
+        Reply::Hello { .. }
+        | Reply::Jobs { .. }
+        | Reply::Status { .. }
+        | Reply::Logs { .. }
+        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
 
@@ -316,10 +325,25 @@ pub(crate) fn on(
     machine: &MachineName,
     submission: Option<SubmissionId>,
     command: JobCommand,
-) -> Result<(), TransportError> {
+    wait_for_completion: bool,
+) -> Result<ExitCode, TransportError> {
     let job = submit(machine, submission, command, Source::Home)?;
+    finish_submission(machine, job, wait_for_completion)
+}
+
+fn finish_submission(
+    machine: &MachineName,
+    job: JobId,
+    wait_for_completion: bool,
+) -> Result<ExitCode, TransportError> {
     println!("{}:{}", machine.as_str(), job.as_str());
-    Ok(())
+    if !wait_for_completion {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let reference = JobReference::new(machine.clone(), job);
+    let result = wait(&reference)?;
+    logs(&reference)?;
+    Ok(result)
 }
 
 fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
@@ -343,7 +367,8 @@ pub(crate) fn run(
     machine: &MachineName,
     submission: Option<SubmissionId>,
     command: JobCommand,
-) -> Result<(), TransportError> {
+    wait_for_completion: bool,
+) -> Result<ExitCode, TransportError> {
     let (archive, descriptor) = source_archive()?;
     let job = submit(
         machine,
@@ -354,8 +379,7 @@ pub(crate) fn run(
             descriptor,
         },
     )?;
-    println!("{}:{}", machine.as_str(), job.as_str());
-    Ok(())
+    finish_submission(machine, job, wait_for_completion)
 }
 
 pub(crate) fn ls(machine: &MachineName) -> Result<(), TransportError> {
@@ -369,6 +393,22 @@ pub(crate) fn ls(machine: &MachineName) -> Result<(), TransportError> {
         Reply::Error { code } => Err(TransportError::Refused(code)),
         Reply::Hello { .. }
         | Reply::Accepted { .. }
+        | Reply::Status { .. }
+        | Reply::Logs { .. }
+        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
+    }
+}
+
+pub(crate) fn clean(machine: &MachineName, target: CleanTarget) -> Result<(), TransportError> {
+    match call(machine, &Request::Clean { target })? {
+        Reply::Cleaned { count } => {
+            println!("{}: cleaned {count} finished jobs", machine.as_str());
+            Ok(())
+        }
+        Reply::Error { code } => Err(TransportError::Refused(code)),
+        Reply::Hello { .. }
+        | Reply::Accepted { .. }
+        | Reply::Jobs { .. }
         | Reply::Status { .. }
         | Reply::Logs { .. } => Err(TransportError::UnexpectedReply),
     }
@@ -396,9 +436,11 @@ fn observe(reference: &JobReference, observation: Observation) -> Result<JobStat
     match call(reference.machine(), &request)? {
         Reply::Status { state } => Ok(state),
         Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. } | Reply::Accepted { .. } | Reply::Jobs { .. } | Reply::Logs { .. } => {
-            Err(TransportError::UnexpectedReply)
-        }
+        Reply::Hello { .. }
+        | Reply::Accepted { .. }
+        | Reply::Jobs { .. }
+        | Reply::Logs { .. }
+        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
 
@@ -437,7 +479,7 @@ pub(crate) fn wait(reference: &JobReference) -> Result<ExitCode, TransportError>
     print_state(reference, &state);
     match state.outcome() {
         Some(Outcome::Succeeded) => Ok(ExitCode::SUCCESS),
-        Some(Outcome::Failed { code }) => match u8::try_from(*code) {
+        Some(Outcome::Failed { code }) => match u8::try_from(code.get()) {
             Ok(0) | Err(_) => Ok(ExitCode::FAILURE),
             Ok(code) => Ok(ExitCode::from(code)),
         },
@@ -479,7 +521,8 @@ pub(crate) fn logs(reference: &JobReference) -> Result<(), TransportError> {
         Reply::Hello { .. }
         | Reply::Accepted { .. }
         | Reply::Jobs { .. }
-        | Reply::Status { .. } => Err(TransportError::UnexpectedReply),
+        | Reply::Status { .. }
+        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
 
@@ -499,7 +542,8 @@ pub(crate) fn node() -> Result<(), TransportError> {
         | Request::Status { .. }
         | Request::Logs { .. }
         | Request::Wait { .. }
-        | Request::Kill { .. } => None,
+        | Request::Kill { .. }
+        | Request::Clean { .. } => None,
     };
     require_end(&mut input)?;
     drop(input);
@@ -511,6 +555,7 @@ pub(crate) fn node() -> Result<(), TransportError> {
                 AppError::Store(StoreError::Missing) => ErrorCode::MissingJob,
                 AppError::Store(StoreError::Conflict) => ErrorCode::ConflictingSubmission,
                 AppError::Store(StoreError::Capacity) => ErrorCode::ResourceLimit,
+                AppError::Store(StoreError::Active) => ErrorCode::InvalidRequest,
                 AppError::Store(
                     StoreError::Corrupt | StoreError::Transition(_) | StoreError::Wire(_),
                 ) => ErrorCode::CorruptState,

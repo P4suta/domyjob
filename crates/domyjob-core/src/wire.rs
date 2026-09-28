@@ -79,6 +79,21 @@ pub enum Request {
     Kill {
         job: JobId,
     },
+    Clean {
+        target: CleanTarget,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "target",
+    content = "detail"
+)]
+pub enum CleanTarget {
+    Job(JobId),
+    Finished,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +180,7 @@ pub enum Reply {
     Jobs { jobs: Vec<JobId> },
     Status { state: JobState },
     Logs { text: RemoteText, omitted: u64 },
+    Cleaned { count: u16 },
     Error { code: ErrorCode },
 }
 

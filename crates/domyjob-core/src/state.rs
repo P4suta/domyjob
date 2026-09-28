@@ -1,3 +1,5 @@
+use core::num::NonZeroI32;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -16,7 +18,7 @@ pub enum PhaseKind {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "outcome")]
 pub enum Outcome {
     Succeeded,
-    Failed { code: i32 },
+    Failed { code: NonZeroI32 },
     LaunchFailed { reason: RemoteText },
     Lost,
     Killed,
@@ -178,11 +180,11 @@ impl JobState {
                     outcome: Outcome::Lost,
                 }
             }
-            (Phase::Running { .. }, Event::Exited { code: 0 }) => Phase::Finished {
-                outcome: Outcome::Succeeded,
-            },
             (Phase::Running { .. }, Event::Exited { code }) => Phase::Finished {
-                outcome: Outcome::Failed { code: *code },
+                outcome: match NonZeroI32::new(*code) {
+                    Some(code) => Outcome::Failed { code },
+                    None => Outcome::Succeeded,
+                },
             },
             (Phase::Accepted | Phase::Starting | Phase::Running { .. }, Event::Killed) => {
                 Phase::Finished {
@@ -260,6 +262,12 @@ mod tests {
     #[test]
     fn deserialization_cannot_create_a_running_job_without_a_process() {
         let encoded = br#"{"phase":{"phase":"running","pid":0}}"#;
+        crate::ingress::stored_job(encoded).unwrap_err();
+    }
+
+    #[test]
+    fn a_zero_exit_code_cannot_be_stored_as_a_failure() {
+        let encoded = br#"{"phase":{"phase":"finished","outcome":{"outcome":"failed","code":0}}}"#;
         crate::ingress::stored_job(encoded).unwrap_err();
     }
 }

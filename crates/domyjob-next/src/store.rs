@@ -17,7 +17,7 @@ use domyjob_core::domain::RelativePath;
 use domyjob_core::domain::{JobId, RemoteText, SubmissionId};
 use domyjob_core::ingress;
 use domyjob_core::state::{Event, InvalidTransition, JobState, PhaseKind};
-use domyjob_core::wire::{self, Request, WireError};
+use domyjob_core::wire::{self, CleanTarget, Request, WireError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -42,6 +42,8 @@ pub(crate) enum StoreError {
     Conflict,
     #[error("job capacity is full")]
     Capacity,
+    #[error("an active job cannot be cleaned")]
+    Active,
     #[error("the job store contains an invalid identifier or record")]
     Corrupt,
     #[error("the source archive contains a non-portable or unsafe entry")]
@@ -344,7 +346,8 @@ impl Store {
                 | Request::Status { .. }
                 | Request::Logs { .. }
                 | Request::Wait { .. }
-                | Request::Kill { .. },
+                | Request::Kill { .. }
+                | Request::Clean { .. },
                 _,
             ) => return Err(StoreError::ArchiveMismatch),
         }
@@ -490,7 +493,7 @@ impl Store {
         let size = usize::try_from(take).map_err(|_size| StoreError::Capacity)?;
         let mut bytes = vec![0_u8; size];
         file.read_exact(&mut bytes)?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         Ok((
             RemoteText::try_from(text).map_err(|_invalid| StoreError::Corrupt)?,
             omitted,
@@ -501,5 +504,40 @@ impl Store {
         let lock = OsLock::exclusive(&self.verify_job(job)?.alive_lock())?;
         drop(lock);
         self.status(job)
+    }
+
+    fn clean_one(&self, job: &JobId) -> Result<bool, StoreError> {
+        let launch = self.launch_lock(job)?;
+        if self.status(job)?.kind() != PhaseKind::Finished {
+            return Ok(false);
+        }
+        let paths = self.verify_job(job)?;
+        let alive = OsLock::exclusive(&paths.alive_lock())?;
+        drop(alive);
+        drop(launch);
+        state_file::remove_dir_all(&paths.dir)?;
+        Ok(true)
+    }
+
+    pub(crate) fn clean(&self, target: &CleanTarget) -> Result<u16, StoreError> {
+        let _admission = OsLock::exclusive(&self.admission_lock())?;
+        match target {
+            CleanTarget::Job(job) => {
+                if self.clean_one(job)? {
+                    Ok(1)
+                } else {
+                    Err(StoreError::Active)
+                }
+            }
+            CleanTarget::Finished => {
+                let mut count = 0_u16;
+                for job in self.list()? {
+                    if self.clean_one(&job)? {
+                        count = count.checked_add(1).ok_or(StoreError::Capacity)?;
+                    }
+                }
+                Ok(count)
+            }
+        }
     }
 }
