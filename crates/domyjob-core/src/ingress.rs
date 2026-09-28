@@ -3,12 +3,19 @@ use serde::de::DeserializeOwned;
 use crate::state::JobState;
 use crate::wire::{self, Envelope, Reply, Request, WireError};
 
+fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, WireError> {
+    let bytes = wire::payload(frame)?;
+    decode_payload(bytes)
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "all external JSON decoding is confined to this ingress boundary"
 )]
-fn decode<T: DeserializeOwned>(frame: &[u8]) -> Result<T, WireError> {
-    let bytes = wire::payload(frame)?;
+fn decode_payload<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {
+    if bytes.len() > wire::MAX_CONTROL_BYTES {
+        return Err(WireError::TooLarge);
+    }
     let envelope: Envelope<T> = serde_json::from_slice(bytes)?;
     if envelope.version != wire::VERSION {
         return Err(WireError::Version);
@@ -22,6 +29,10 @@ pub fn request(frame: &[u8]) -> Result<Request, WireError> {
 
 pub fn reply(frame: &[u8]) -> Result<Reply, WireError> {
     decode(frame)
+}
+
+pub fn stored_request(bytes: &[u8]) -> Result<Request, WireError> {
+    decode_payload(bytes)
 }
 
 #[expect(
@@ -66,7 +77,7 @@ mod tests {
         let mut frame = Vec::from(u32::try_from(unknown.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(unknown);
         request(&frame).unwrap_err();
-        let oversized = br#"{"version":1,"message":{"request":"submit","body":{"command":["cargo","test"],"snapshot":{"bytes":67108865,"digest":"0000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
+        let oversized = br#"{"version":1,"message":{"request":"run","body":{"submission":"11111111111111111111111111111111","command":["cargo","test"],"input":{"source":"snapshot","detail":{"bytes":67108865,"digest":"0000000000000000000000000000000000000000000000000000000000000000"}}}}}"#;
         let mut oversized_frame = Vec::from(u32::try_from(oversized.len()).unwrap().to_be_bytes());
         oversized_frame.extend_from_slice(oversized);
         request(&oversized_frame).unwrap_err();

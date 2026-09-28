@@ -7,6 +7,7 @@ use crate::domain::RemoteText;
 #[serde(rename_all = "snake_case")]
 pub enum PhaseKind {
     Accepted,
+    Starting,
     Running,
     Finished,
 }
@@ -24,6 +25,7 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     Accepted,
+    Starting,
     Running { pid: u32 },
     Finished { outcome: Outcome },
 }
@@ -44,6 +46,7 @@ struct RawJobState {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 enum RawPhase {
     Accepted,
+    Starting,
     Running { pid: u32 },
     Finished { outcome: Outcome },
 }
@@ -58,6 +61,7 @@ impl TryFrom<RawJobState> for JobState {
     fn try_from(value: RawJobState) -> Result<Self, Self::Error> {
         let phase = match value.phase {
             RawPhase::Accepted => Phase::Accepted,
+            RawPhase::Starting => Phase::Starting,
             RawPhase::Running { pid: 0 } => return Err(InvalidStoredState),
             RawPhase::Running { pid } => Phase::Running { pid },
             RawPhase::Finished { outcome } => Phase::Finished { outcome },
@@ -70,6 +74,7 @@ impl From<JobState> for RawJobState {
     fn from(value: JobState) -> Self {
         let phase = match value.phase {
             Phase::Accepted => RawPhase::Accepted,
+            Phase::Starting => RawPhase::Starting,
             Phase::Running { pid } => RawPhase::Running { pid },
             Phase::Finished { outcome } => RawPhase::Finished { outcome },
         };
@@ -79,6 +84,7 @@ impl From<JobState> for RawJobState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    Starting,
     Spawned { pid: u32 },
     Exited { code: i32 },
     LaunchFailed { reason: RemoteText },
@@ -95,6 +101,7 @@ pub struct InvalidTransition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventKind {
+    Starting,
     Spawned,
     Exited,
     LaunchFailed,
@@ -105,6 +112,7 @@ enum EventKind {
 impl Event {
     const fn kind(&self) -> EventKind {
         match self {
+            Self::Starting => EventKind::Starting,
             Self::Spawned { .. } => EventKind::Spawned,
             Self::Exited { .. } => EventKind::Exited,
             Self::LaunchFailed { .. } => EventKind::LaunchFailed,
@@ -132,6 +140,7 @@ impl JobState {
     pub const fn kind(&self) -> PhaseKind {
         match self.phase {
             Phase::Accepted => PhaseKind::Accepted,
+            Phase::Starting => PhaseKind::Starting,
             Phase::Running { .. } => PhaseKind::Running,
             Phase::Finished { .. } => PhaseKind::Finished,
         }
@@ -141,7 +150,7 @@ impl JobState {
     pub const fn outcome(&self) -> Option<&Outcome> {
         match &self.phase {
             Phase::Finished { outcome } => Some(outcome),
-            Phase::Accepted | Phase::Running { .. } => None,
+            Phase::Accepted | Phase::Starting | Phase::Running { .. } => None,
         }
     }
 
@@ -149,33 +158,52 @@ impl JobState {
     pub const fn pid(&self) -> Option<u32> {
         match self.phase {
             Phase::Running { pid } => Some(pid),
-            Phase::Accepted | Phase::Finished { .. } => None,
+            Phase::Accepted | Phase::Starting | Phase::Finished { .. } => None,
         }
     }
 
     pub fn advance(&mut self, event: &Event) -> Result<(), InvalidTransition> {
         let next = match (&self.phase, event) {
-            (Phase::Accepted, Event::Spawned { pid }) if *pid != 0 => Phase::Running { pid: *pid },
-            (Phase::Accepted, Event::LaunchFailed { reason }) => Phase::Finished {
-                outcome: Outcome::LaunchFailed {
-                    reason: reason.clone(),
-                },
-            },
-            (Phase::Accepted | Phase::Running { .. }, Event::SupervisorGone) => Phase::Finished {
-                outcome: Outcome::Lost,
-            },
+            (Phase::Accepted, Event::Starting) => Phase::Starting,
+            (Phase::Starting, Event::Spawned { pid }) if *pid != 0 => Phase::Running { pid: *pid },
+            (Phase::Accepted | Phase::Starting, Event::LaunchFailed { reason }) => {
+                Phase::Finished {
+                    outcome: Outcome::LaunchFailed {
+                        reason: reason.clone(),
+                    },
+                }
+            }
+            (Phase::Accepted | Phase::Starting | Phase::Running { .. }, Event::SupervisorGone) => {
+                Phase::Finished {
+                    outcome: Outcome::Lost,
+                }
+            }
             (Phase::Running { .. }, Event::Exited { code: 0 }) => Phase::Finished {
                 outcome: Outcome::Succeeded,
             },
             (Phase::Running { .. }, Event::Exited { code }) => Phase::Finished {
                 outcome: Outcome::Failed { code: *code },
             },
-            (Phase::Running { .. }, Event::Killed) => Phase::Finished {
-                outcome: Outcome::Killed,
-            },
-            (Phase::Accepted, Event::Spawned { .. } | Event::Exited { .. } | Event::Killed)
-            | (Phase::Running { .. }, Event::Spawned { .. } | Event::LaunchFailed { .. })
-            | (Phase::Finished { .. }, _) => {
+            (Phase::Accepted | Phase::Starting | Phase::Running { .. }, Event::Killed) => {
+                Phase::Finished {
+                    outcome: Outcome::Killed,
+                }
+            }
+            (Phase::Accepted, Event::Spawned { .. } | Event::Exited { .. })
+            | (Phase::Starting, Event::Starting | Event::Spawned { .. } | Event::Exited { .. })
+            | (
+                Phase::Running { .. },
+                Event::Starting | Event::Spawned { .. } | Event::LaunchFailed { .. },
+            )
+            | (
+                Phase::Finished { .. },
+                Event::Starting
+                | Event::Spawned { .. }
+                | Event::Exited { .. }
+                | Event::LaunchFailed { .. }
+                | Event::SupervisorGone
+                | Event::Killed,
+            ) => {
                 return Err(InvalidTransition {
                     phase: self.kind(),
                     event: event.kind(),
@@ -197,6 +225,10 @@ mod tests {
         assert_eq!(state.kind(), PhaseKind::Accepted);
         state.advance(&Event::Exited { code: 0 }).unwrap_err();
         state.advance(&Event::Spawned { pid: 0 }).unwrap_err();
+        state.advance(&Event::Starting).unwrap();
+        assert_eq!(state.kind(), PhaseKind::Starting);
+        state.advance(&Event::Starting).unwrap_err();
+        state.advance(&Event::Spawned { pid: 0 }).unwrap_err();
         state.advance(&Event::Spawned { pid: 42 }).unwrap();
         assert_eq!(state.pid(), Some(42));
         state.advance(&Event::Spawned { pid: 43 }).unwrap_err();
@@ -210,6 +242,19 @@ mod tests {
         let mut state = JobState::accepted();
         state.advance(&Event::SupervisorGone).unwrap();
         assert_eq!(state.outcome(), Some(&Outcome::Lost));
+    }
+
+    #[test]
+    fn cancellation_is_terminal_before_or_after_process_start() {
+        for starting in [false, true] {
+            let mut state = JobState::accepted();
+            if starting {
+                state.advance(&Event::Starting).unwrap();
+            }
+            state.advance(&Event::Killed).unwrap();
+            assert_eq!(state.outcome(), Some(&Outcome::Killed));
+            state.advance(&Event::Starting).unwrap_err();
+        }
     }
 
     #[test]

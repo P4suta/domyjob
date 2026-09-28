@@ -11,6 +11,10 @@ pub enum Invalid {
     Machine,
     #[error("job identifier must be 32 lowercase hexadecimal digits")]
     JobId,
+    #[error("submission identifier must be 32 lowercase hexadecimal digits")]
+    SubmissionId,
+    #[error("job reference must be MACHINE:JOB")]
+    JobReference,
     #[error("path must be a portable relative path within 4096 bytes and 64 components")]
     RelativePath,
     #[error("command must have 1 to 256 arguments and use at most 64 KiB")]
@@ -64,15 +68,18 @@ impl TryFrom<String> for JobId {
     type Error = Invalid;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.len() != 32
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
+        if !valid_identifier(&value) {
             return Err(Invalid::JobId);
         }
         Ok(Self(value))
     }
+}
+
+fn valid_identifier(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl From<JobId> for String {
@@ -85,6 +92,75 @@ impl JobId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SubmissionId(String);
+
+impl TryFrom<String> for SubmissionId {
+    type Error = Invalid;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !valid_identifier(&value) {
+            return Err(Invalid::SubmissionId);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<SubmissionId> for String {
+    fn from(value: SubmissionId) -> Self {
+        value.0
+    }
+}
+
+impl SubmissionId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&SubmissionId> for JobId {
+    fn from(submission: &SubmissionId) -> Self {
+        Self(submission.0.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobReference {
+    machine: MachineName,
+    job: JobId,
+}
+
+impl TryFrom<String> for JobReference {
+    type Error = Invalid;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let (machine, job) = value.split_once(':').ok_or(Invalid::JobReference)?;
+        Ok(Self {
+            machine: MachineName::try_from(String::from(machine))?,
+            job: JobId::try_from(String::from(job))?,
+        })
+    }
+}
+
+impl JobReference {
+    #[must_use]
+    pub const fn new(machine: MachineName, job: JobId) -> Self {
+        Self { machine, job }
+    }
+
+    #[must_use]
+    pub const fn machine(&self) -> &MachineName {
+        &self.machine
+    }
+
+    #[must_use]
+    pub const fn job(&self) -> &JobId {
+        &self.job
     }
 }
 
@@ -264,10 +340,13 @@ impl RemoteText {
 #[cfg(test)]
 mod tests {
     use alloc::borrow::ToOwned;
+    use alloc::format;
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Command, JobId, MachineName, RelativePath, RemoteText};
+    use super::{
+        Command, JobId, JobReference, MachineName, RelativePath, RemoteText, SubmissionId,
+    };
 
     #[test]
     fn machine_names_cannot_be_ssh_options_or_shell_fragments() {
@@ -306,6 +385,10 @@ mod tests {
     fn identifiers_and_commands_are_bounded() {
         JobId::try_from("0".repeat(32)).unwrap();
         JobId::try_from("g".repeat(32)).unwrap_err();
+        SubmissionId::try_from("1".repeat(32)).unwrap();
+        SubmissionId::try_from("G".repeat(32)).unwrap_err();
+        JobReference::try_from(format!("linux:{}", "a".repeat(32))).unwrap();
+        JobReference::try_from("linux:../bad".to_owned()).unwrap_err();
         Command::try_from(Vec::new()).unwrap_err();
         Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap();
         Command::try_from(vec!["cargo".to_owned(), "x".repeat(8193)]).unwrap_err();

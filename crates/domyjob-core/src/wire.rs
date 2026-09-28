@@ -4,12 +4,23 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{Command, JobId};
+use crate::domain::{Command, JobId, RemoteText, SubmissionId};
 use crate::state::JobState;
 
 pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BuildId(u64);
+
+impl BuildId {
+    #[must_use]
+    pub const fn from_fingerprint(fingerprint: u64) -> Self {
+        Self(fingerprint)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlLength(usize);
@@ -50,9 +61,10 @@ pub struct Envelope<T> {
 )]
 pub enum Request {
     Hello,
-    Submit {
+    Run {
+        submission: SubmissionId,
         command: Command,
-        snapshot: Snapshot,
+        input: Input,
     },
     List,
     Status {
@@ -67,6 +79,18 @@ pub enum Request {
     Kill {
         job: JobId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    deny_unknown_fields,
+    rename_all = "snake_case",
+    tag = "source",
+    content = "detail"
+)]
+pub enum Input {
+    Home,
+    Snapshot(Snapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,12 +160,11 @@ impl Snapshot {
     content = "body"
 )]
 pub enum Reply {
-    Hello,
+    Hello { build: BuildId },
     Accepted { job: JobId },
     Jobs { jobs: Vec<JobId> },
     Status { state: JobState },
-    Logs { bytes: u64 },
-    Stopped,
+    Logs { text: RemoteText, omitted: u64 },
     Error { code: ErrorCode },
 }
 
@@ -150,6 +173,8 @@ pub enum Reply {
 pub enum ErrorCode {
     InvalidRequest,
     MissingJob,
+    ConflictingSubmission,
+    Unsupported,
     CorruptState,
     ResourceLimit,
     Internal,

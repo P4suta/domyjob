@@ -1,6 +1,7 @@
 use std::path::Path;
 
-pub(crate) enum Notice {
+#[derive(Debug)]
+pub enum Notice {
     Relevant,
     Irrelevant,
     Failed(notify::Error),
@@ -19,7 +20,7 @@ fn classify(
     }
 }
 
-pub(crate) fn watcher(
+pub fn watcher(
     mut relevant: impl FnMut(&Path) -> bool + Send + 'static,
     mut signal: impl FnMut(Notice) + Send + 'static,
 ) -> notify::Result<notify::RecommendedWatcher> {

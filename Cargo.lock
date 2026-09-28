@@ -791,8 +791,15 @@ dependencies = [
 name = "domyjob-next"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "clap",
+ "domyjob",
  "domyjob-core",
+ "getrandom 0.3.4",
+ "notify",
+ "serde",
+ "serde_json",
+ "tar",
  "thiserror",
 ]
 

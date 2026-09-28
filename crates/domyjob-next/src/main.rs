@@ -1,8 +1,11 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use domyjob_core::domain::MachineName;
+use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineName, SubmissionId};
 
+mod app;
+mod identity;
+mod store;
 mod transport;
 
 #[derive(Debug, Parser)]
@@ -17,20 +20,106 @@ enum Command {
     Doctor {
         machine: String,
     },
+    On {
+        machine: String,
+        #[arg(long)]
+        submission: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    Run {
+        machine: String,
+        #[arg(long)]
+        submission: Option<String>,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    Ls {
+        machine: String,
+    },
+    Status {
+        job: String,
+    },
+    Wait {
+        job: String,
+    },
+    Kill {
+        job: String,
+    },
+    Logs {
+        job: String,
+    },
     #[command(hide = true)]
     Node,
+    #[command(hide = true)]
+    Worker {
+        job: String,
+        #[arg(long, hide = true)]
+        ready_event: Option<String>,
+    },
+}
+
+fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
+    match command {
+        Command::Doctor { machine } => {
+            transport::doctor(&MachineName::try_from(machine)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::On {
+            machine,
+            submission,
+            command,
+        } => {
+            let machine = MachineName::try_from(machine)?;
+            let command = JobCommand::try_from(command)?;
+            let submission = submission.map(SubmissionId::try_from).transpose()?;
+            transport::on(&machine, submission, command)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Run {
+            machine,
+            submission,
+            command,
+        } => {
+            let machine = MachineName::try_from(machine)?;
+            let command = JobCommand::try_from(command)?;
+            let submission = submission.map(SubmissionId::try_from).transpose()?;
+            transport::run(&machine, submission, command)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Ls { machine } => {
+            transport::ls(&MachineName::try_from(machine)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Status { job } => {
+            transport::status(&JobReference::try_from(job)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Wait { job } => transport::wait(&JobReference::try_from(job)?),
+        Command::Kill { job } => transport::kill(&JobReference::try_from(job)?),
+        Command::Logs { job } => {
+            transport::logs(&JobReference::try_from(job)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Node => {
+            transport::node()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Worker { job, ready_event } => {
+            let job = JobId::try_from(job)?;
+            let ready_event = ready_event
+                .map(domyjob::domain::BlobId::try_from)
+                .transpose()
+                .map_err(app::AppError::from)?;
+            app::worker(&job, ready_event.as_ref())?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Doctor { machine } => MachineName::try_from(machine)
-            .map_err(transport::TransportError::from)
-            .and_then(|machine| transport::doctor(&machine)),
-        Command::Node => transport::node(),
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(Cli::parse().command) {
+        Ok(code) => code,
         Err(error) => {
             eprintln!("domyjob: {error}");
             ExitCode::FAILURE

@@ -1,5 +1,5 @@
 use std::io::{PipeReader, PipeWriter, Read};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
 #[derive(Debug)]
@@ -108,12 +108,24 @@ impl Group {
         prepared: crate::store::PreparedJobCommand,
         output: PipeWriter,
     ) -> Result<Self, ProcError> {
-        let mut command = prepared.into_command();
+        let command = prepared.into_command();
         let spawn_error = |source| ProcError::Spawn {
             what: "the command",
             source,
         };
         let errors = output.try_clone().map_err(spawn_error)?;
+        Self::spawn_stdio(command, Stdio::from(output), Stdio::from(errors))
+    }
+
+    pub fn spawn_stdio(
+        mut command: Command,
+        output: Stdio,
+        errors: Stdio,
+    ) -> Result<Self, ProcError> {
+        let spawn_error = |source| ProcError::Spawn {
+            what: "the command",
+            source,
+        };
         command.stdin(Stdio::null()).stdout(output).stderr(errors);
         platform::isolate(&mut command);
         let mut child = command.spawn().map_err(spawn_error)?;
