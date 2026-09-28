@@ -1,5 +1,5 @@
 {
-  "path": ["crates/domyjob/src", "crates/domyjob/tests", "xtask/src"],
+  "path": ["crates/domyjob/src", "crates/domyjob-core/src", "xtask/src"],
   "format": ["rust"],
   "minTokens": 40,
   "reporters": ["console"],

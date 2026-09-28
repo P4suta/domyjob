@@ -9,37 +9,22 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
+domyjob-core = { path = "../crates/domyjob-core" }
 libfuzzer-sys = "0.4"
-domyjob = { path = "../crates/domyjob" }
 serde_json = "1"
-xtask = { path = "../xtask" }
 
 [workspace]
 
 [[bin]]
-name = "requests"
-path = "fuzz_targets/requests.rs"
+name = "wire"
+path = "fuzz_targets/wire.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "orders"
-path = "fuzz_targets/orders.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "releases"
-path = "fuzz_targets/releases.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "terminal"
-path = "fuzz_targets/terminal.rs"
+name = "state"
+path = "fuzz_targets/state.rs"
 test = false
 doc = false
 bench = false

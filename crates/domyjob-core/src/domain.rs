@@ -47,80 +47,33 @@ impl TryFrom<String> for MachineName {
     }
 }
 
-impl From<MachineName> for String {
-    fn from(value: MachineName) -> Self {
-        value.0
-    }
-}
+macro_rules! identifier {
+    ($name:ident, $invalid:expr) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
 
-impl MachineName {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+        impl TryFrom<String> for $name {
+            type Error = Invalid;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct JobId(String);
-
-impl TryFrom<String> for JobId {
-    type Error = Invalid;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if !valid_identifier(&value) {
-            return Err(Invalid::JobId);
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                if !valid_identifier(&value) {
+                    return Err($invalid);
+                }
+                Ok(Self(value))
+            }
         }
-        Ok(Self(value))
-    }
+    };
 }
+
+identifier!(JobId, Invalid::JobId);
+identifier!(SubmissionId, Invalid::SubmissionId);
 
 fn valid_identifier(value: &str) -> bool {
     value.len() == 32
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-impl From<JobId> for String {
-    fn from(value: JobId) -> Self {
-        value.0
-    }
-}
-
-impl JobId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct SubmissionId(String);
-
-impl TryFrom<String> for SubmissionId {
-    type Error = Invalid;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if !valid_identifier(&value) {
-            return Err(Invalid::SubmissionId);
-        }
-        Ok(Self(value))
-    }
-}
-
-impl From<SubmissionId> for String {
-    fn from(value: SubmissionId) -> Self {
-        value.0
-    }
-}
-
-impl SubmissionId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl From<&SubmissionId> for JobId {
@@ -229,18 +182,27 @@ fn safe_component(component: &str) -> bool {
     )
 }
 
-impl From<RelativePath> for String {
-    fn from(value: RelativePath) -> Self {
-        value.0
-    }
+macro_rules! string_value {
+    ($name:ident) => {
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl $name {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
 }
 
-impl RelativePath {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+string_value!(MachineName);
+string_value!(JobId);
+string_value!(SubmissionId);
+string_value!(RelativePath);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<String>", into = "Vec<String>")]

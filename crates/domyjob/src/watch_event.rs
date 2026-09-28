@@ -1,46 +1,41 @@
-use std::path::Path;
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "the binary composition root uses this private module"
+)]
 
 #[derive(Debug)]
-pub enum Notice {
-    Relevant,
-    Irrelevant,
+pub(crate) enum Notice {
+    Changed,
+    Unrelated,
     Failed(notify::Error),
 }
 
-fn classify(
-    event: notify::Result<notify::Event>,
-    mut relevant: impl FnMut(&Path) -> bool,
-) -> Notice {
+fn classify(event: notify::Result<notify::Event>) -> Notice {
     match event {
-        Ok(event) if event.need_rescan() || event.paths.iter().any(|path| relevant(path)) => {
-            Notice::Relevant
-        }
-        Ok(_) => Notice::Irrelevant,
+        Ok(event) if event.need_rescan() || !event.paths.is_empty() => Notice::Changed,
+        Ok(_irrelevant) => Notice::Unrelated,
         Err(error) => Notice::Failed(error),
     }
 }
 
-pub fn watcher(
-    mut relevant: impl FnMut(&Path) -> bool + Send + 'static,
+pub(crate) fn watcher(
     mut signal: impl FnMut(Notice) + Send + 'static,
 ) -> notify::Result<notify::RecommendedWatcher> {
-    notify::recommended_watcher(move |event| signal(classify(event, &mut relevant)))
+    notify::recommended_watcher(move |event| signal(classify(event)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Notice, classify};
 
     #[test]
-    fn an_empty_rescan_notice_still_requires_a_refresh() {
-        let event =
+    fn rescan_and_errors_are_not_dropped() {
+        let rescan =
             notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
-        assert!(matches!(classify(Ok(event), |_| false), Notice::Relevant));
-    }
-
-    #[test]
-    fn a_watcher_failure_is_never_discarded_as_an_unrelated_path() {
-        let error = notify::Error::generic("the event stream stopped");
-        assert!(matches!(classify(Err(error), |_| false), Notice::Failed(_)));
+        assert!(matches!(classify(Ok(rescan)), Notice::Changed));
+        assert!(matches!(
+            classify(Err(notify::Error::generic("watcher broke"))),
+            Notice::Failed(_)
+        ));
     }
 }

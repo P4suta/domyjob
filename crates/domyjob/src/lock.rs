@@ -1,156 +1,81 @@
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "the binary composition root uses this private module"
+)]
+
 use std::fs::{File, TryLockError};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotIndex(u32);
+use thiserror::Error;
 
-impl SlotIndex {
-    pub const FIRST: Self = Self(0);
+use crate::state_io::{self, StateError};
 
-    pub fn all() -> impl Iterator<Item = Self> {
-        (0..crate::domain::Concurrency::MOST).map(Self)
-    }
-
-    #[must_use]
-    pub fn lock_path(self, dir: &Path) -> PathBuf {
-        dir.join(format!("{}.lock", self.0))
-    }
-}
-
-impl std::fmt::Display for SlotIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SlotIndex;
-
-    #[test]
-    fn slot_paths_cover_exactly_the_canonical_range() {
-        let names: Vec<_> = SlotIndex::all().map(|slot| slot.to_string()).collect();
-        assert_eq!(names.len(), 64);
-        assert_eq!(names.first().map(String::as_str), Some("0"));
-        assert_eq!(names.last().map(String::as_str), Some("63"));
-        assert!(
-            !names
-                .iter()
-                .any(|name| ["01", "64"].contains(&name.as_str()))
-        );
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LockError {
+#[derive(Debug, Error)]
+pub(crate) enum LockError {
     #[error(transparent)]
-    Io(#[from] crate::failure::IoFailure),
-}
-
-#[derive(Debug)]
-pub struct OsLock {
-    file: File,
-    path: PathBuf,
-}
-
-fn open(path: &Path) -> Result<File, LockError> {
-    crate::state_file::open_lock(path).map_err(|error| opening(path, &error))
-}
-
-fn opening(path: &Path, error: &crate::state_file::StateError) -> LockError {
-    LockError::Io(crate::failure::IoFailure {
-        action: "opening",
-        path: path.to_path_buf(),
-        source: std::io::Error::other(error.to_string()),
-    })
+    State(#[from] StateError),
+    #[error("locking the state file failed: {0}")]
+    Io(#[from] io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Probe {
+pub(crate) enum Probe {
     Absent,
     Free,
     Held,
 }
 
-enum Availability {
-    Free,
-    Held,
-}
-
-fn availability(file: &File, path: &Path) -> Result<Availability, LockError> {
-    match file.try_lock() {
-        Ok(()) => Ok(Availability::Free),
-        Err(TryLockError::WouldBlock) => Ok(Availability::Held),
-        Err(TryLockError::Error(source)) => Err(LockError::Io(crate::failure::IoFailure {
-            action: "locking",
-            path: path.to_path_buf(),
-            source,
-        })),
-    }
+#[derive(Debug)]
+pub(crate) struct OsLock {
+    _file: File,
 }
 
 impl OsLock {
-    pub fn probe(path: &Path) -> Result<Probe, LockError> {
-        let opened =
-            crate::state_file::open_existing_lock(path).map_err(|error| opening(path, &error))?;
-        let Some(file) = opened else {
+    pub(crate) fn probe(path: &Path) -> Result<Probe, LockError> {
+        let Some(file) = state_io::open_existing_lock(path)? else {
             return Ok(Probe::Absent);
         };
-        match availability(&file, path)? {
-            Availability::Free => Ok(Probe::Free),
-            Availability::Held => Ok(Probe::Held),
+        match file.try_lock() {
+            Ok(()) => Ok(Probe::Free),
+            Err(TryLockError::WouldBlock) => Ok(Probe::Held),
+            Err(TryLockError::Error(error)) => Err(error.into()),
         }
     }
 
-    pub fn try_exclusive(path: &Path) -> Result<Option<Self>, LockError> {
-        let file = open(path)?;
-        match availability(&file, path)? {
-            Availability::Free => Ok(Some(Self {
-                file,
-                path: path.to_path_buf(),
-            })),
-            Availability::Held => Ok(None),
+    pub(crate) fn try_exclusive(path: &Path) -> Result<Option<Self>, LockError> {
+        let file = state_io::open_lock(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
         }
     }
 
-    pub fn exclusive(path: &Path) -> Result<Self, LockError> {
-        let file = open(path)?;
-        file.lock().map_err(|source| {
-            LockError::Io(crate::failure::IoFailure {
-                action: "locking",
-                path: path.to_path_buf(),
-                source,
-            })
-        })?;
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-        })
+    pub(crate) fn exclusive(path: &Path) -> Result<Self, LockError> {
+        let file = state_io::open_lock(path)?;
+        file.lock()?;
+        Ok(Self { _file: file })
     }
+}
 
-    pub fn first_free(dir: &Path) -> Result<Option<(SlotIndex, Self)>, LockError> {
-        for index in SlotIndex::all() {
-            if let Some(lock) = Self::try_exclusive(&index.lock_path(dir))? {
-                return Ok(Some((index, lock)));
-            }
-        }
-        Ok(None)
-    }
+#[cfg(test)]
+mod tests {
+    use super::{OsLock, Probe};
 
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn release(self) -> Result<(), LockError> {
-        crate::faults::at("lock::release", &self.path)
-            .and_then(|()| self.file.unlock())
-            .map_err(|source| {
-                LockError::Io(crate::failure::IoFailure {
-                    action: "unlocking",
-                    path: self.path.clone(),
-                    source,
-                })
-            })
+    #[test]
+    fn a_held_lock_cannot_be_taken_or_mistaken_for_a_dead_worker() {
+        let root = tempfile::tempdir().expect("temporary lock root");
+        let path = root.path().join("state").join("worker.lock");
+        assert_eq!(OsLock::probe(&path).expect("absent lock"), Probe::Absent);
+        let first = OsLock::exclusive(&path).expect("first lock");
+        assert_eq!(OsLock::probe(&path).expect("held lock"), Probe::Held);
+        assert!(
+            OsLock::try_exclusive(&path)
+                .expect("second attempt")
+                .is_none()
+        );
+        drop(first);
+        assert_eq!(OsLock::probe(&path).expect("released lock"), Probe::Free);
     }
 }

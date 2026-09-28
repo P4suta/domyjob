@@ -14,17 +14,11 @@ keywords = ["xtask"]
 categories = ["development-tools"]
 
 [dependencies]
-blake2.workspace = true
-data-encoding.workspace = true
-ed25519-dalek.workspace = true
-getrandom.workspace = true
-ml-dsa.workspace = true
 proc-macro2.workspace = true
 syn.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-domyjob = { path = "../crates/domyjob" }
 tempfile.workspace = true
 
 [lints]

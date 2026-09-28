@@ -15,7 +15,7 @@ readme = "README.md"
 [workspace.lints.rust]
 unsafe_code = "deny"
 non_ascii_idents = "deny"
-unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }
+unexpected_cfgs = "deny"
 
 unused = { level = "deny", priority = -1 }
 future_incompatible = { level = "deny", priority = -1 }
@@ -98,58 +98,18 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
-ctrlc = { version = "3.5", features = ["termination"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
-schemars = "1"
-semver = "1"
-strsim = "0.11"
-strum = { version = "0.28", features = ["derive"] }
 tar = { version = "0.4", default-features = false }
-uds_windows = "1.2"
-sysinfo = { version = "0.39", default-features = false, features = ["system", "disk"] }
-fs4 = { version = "1", default-features = false, features = ["sync"] }
 cap-std = "4"
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
-anstream = "1"
-anstyle = "1"
-bytesize = "2"
-comfy-table = { version = "8", default-features = false, features = ["custom_styling"] }
-indicatif = "0.18"
-supports-unicode = "3"
-terminal_size = "0.4"
-unicode-width = "0.2"
-vte = "0.15"
-clap_mangen = "0.3"
-fail = "0.5"
 data-encoding = "2.11"
-data-encoding-macro = "0.1"
-shlex = "2"
-socket2 = "0.6"
-blake2 = "0.11"
 blake3 = { version = "1.8", features = ["mmap"] }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
-ed25519-dalek = "3"
 getrandom = "0.3"
 ignore = "0.4"
-if-addrs = "0.15"
-mdns-sd = "0.21"
-ml-dsa = { version = "0.1", default-features = false, features = ["alloc", "zeroize"] }
-ml-kem = { version = "0.3", features = ["hazmat", "zeroize"] }
-minisign-verify = "0.2"
-proptest = "1"
-regex = { version = "1.11", default-features = false, features = [
-  "std",
-  "unicode-perl",
-  "unicode-case",
-] }
 proc-macro2 = { version = "1.0", default-features = false, features = ["span-locations"] }
-security-framework = "3.7"
 rustix = { version = "1.1", features = ["event", "pipe", "process", "system"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.11"
-snow = "0.10"
-spake2 = "0.4"
 syn = { version = "3", default-features = false, features = [
   "full",
   "parsing",
@@ -159,10 +119,6 @@ syn = { version = "3", default-features = false, features = [
 ] }
 tempfile = "3"
 thiserror = "2"
-toml = "1.1"
-toml_edit = "0.25"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-zeroize = "1.8"
 windows-spawn = "0.1"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
@@ -172,11 +128,8 @@ windows-sys = { version = "0.61", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_SystemServices",
   "Win32_System_JobObjects",
-  "Win32_System_Console",
   "Win32_System_Threading",
   "Win32_System_Diagnostics_ToolHelp",
-  "Win32_Networking_WinSock",
-  "Win32_System_Pipes",
 ] }
 
 [profile.test]

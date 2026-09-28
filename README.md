@@ -1,55 +1,54 @@
 # domyjob
 
-Send your work to any machine you can reach, run it there, and walk away.
+Run persistent jobs on machines reachable through OpenSSH.
+The client sends a command to a remote node, records its state, and keeps it running after the SSH connection ends.
+
+## Develop from this checkout
+
+Rust 1.98 and `mise` are pinned in this repository.
+Build the client with `mise x -- cargo build --locked -p domyjob`, then run `target/debug/domyjob`.
+The client compares the complete source fingerprint with its compiled fingerprint and rebuilds itself when the checkout changes.
+Before each remote request, it compares the remote fingerprint and builds and installs the matching node over SSH when needed.
+The remote machine needs `mise`, Rust, Cargo, and a working OpenSSH login.
 
 ```console
-$ domyjob
-$ domyjob run linux,win -- cargo test
-$ domyjob ls
-$ domyjob digest win:latest
-$ domyjob on win -- Get-ChildItem Downloads
+$ target/debug/domyjob doctor linux
+$ target/debug/domyjob on linux --wait -- uname -a
+$ target/debug/domyjob run linux --wait -- cargo test
+$ target/debug/domyjob ls linux
+$ target/debug/domyjob status linux:JOB_ID
+$ target/debug/domyjob logs linux:JOB_ID
 ```
 
-It sends the directory as it is, uncommitted edits included, and the command keeps running there after you disconnect.
-Nothing to host: one binary on your machine, and any host you can ssh into.
+`on` runs in the remote home directory.
+`run` sends the current directory, including uncommitted edits, into a confined remote workspace.
+Add `--wait` to print the result and return the remote command's exit status.
+A submission ID is printed before the request, and `--submission ID` retries the same submission safely if the connection breaks.
 
-## Install
+## Command surface
 
-```console
-$ cargo install --git https://github.com/P4suta/domyjob domyjob
-```
-
-Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as `ssh:HOST`.
-`domyjob doctor` checks them, and the first contact installs domyjob there.
-
-## Use
-
-| Command | Does |
+| Command | Action |
 | --- | --- |
-| *(none)* | Every machine at a glance: load, memory, disk, what runs, what failed, and what to do next |
-| `run MACHINES -- CMD` | Send this directory and run a job; `--wait` stays for the result |
-| `on MACHINES -- CMD` | Run a command right now and print its output, like ssh |
-| `ls`, `status`, `digest`, `logs` | See jobs, their outcome, and their output |
-| `history` | How each kind of job has gone lately: outcomes, success rate, typical duration |
-| `wait`, `kill`, `get` | Wait for a job, stop it, fetch a file from its workspace |
-| `pull JOB` | Bring the files a finished job changed back here, to commit and push with your own keys |
-| `machines`, `setup`, `doctor` | Name machines, install domyjob on them, check them |
-| `clean`, `machines pause` | Free the disk space domyjob holds; stop a machine taking jobs for maintenance |
+| `doctor MACHINE` | Verify SSH access and install the matching node |
+| `on MACHINE [--wait] -- COMMAND` | Run in the remote home directory |
+| `run MACHINE [--wait] -- COMMAND` | Send this directory and run inside its remote snapshot |
+| `ls MACHINE` | List retained jobs |
+| `status MACHINE:JOB` | Read a job's current state |
+| `wait MACHINE:JOB` | Wait for its terminal state and return its outcome |
+| `logs MACHINE:JOB` | Read the bounded log tail |
+| `kill MACHINE:JOB` | Cancel an active job and its process tree |
+| `clean MACHINE [--job JOB]` | Delete one completed job or all completed jobs |
 
-`MACHINES` is a name, `@all`, a label such as `gpu`, or a fact such as `os=windows`.
-A configuration may name at most 64 machines, and each selector may expand to at most 64 distinct targets through 256 terms.
+MACHINE is an OpenSSH host alias or name.
+Job references print as `MACHINE:JOB`.
+There is no separate machine registry or service to configure.
 
-## For agents
+The control message limit is 1 MiB, and a source snapshot is limited to 64 MiB.
+Source paths must be portable and unique across case insensitive filesystems.
+The core crate owns validated domain types, wire messages, and exhaustive state transitions without OS effects.
+The binary owns SSH, process isolation, private storage, and confined workspace extraction.
 
-`domyjob skill` prints a portable Agent Skill, and `domyjob skill install --to path/to/agent/skills/domyjob` writes it to any skills directory you choose.
-The same file works with Codex, Claude Code, OpenCode, and other agents that read Agent Skills; domyjob does not choose or require one of them.
-`domyjob mcp` serves the same operations as MCP tools, and `--json` gives one stable shape.
-
-`domyjob --help` and `domyjob COMMAND --help` explain the rest; `domyjob man` prints the manual page.
-
-For a pipeline whose status must include domyjob's result, enable the shell's pipefail behavior first, for example `set -o pipefail; domyjob run linux --wait -- make check | tee check.log`.
-
-Granting a paired peer `submit` lets that peer run commands as your account on this machine.
-Grant only the capabilities that peer needs, and revoke the pairing if it is lost or compromised.
+Run `mise run lint` and `mise run test` before a change is reviewed.
+Use `mise run check:fleet` to run the same checks on Linux and Windows through domyjob.
 
 Licensed under Apache-2.0 or MIT, at your option.

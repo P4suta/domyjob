@@ -18,50 +18,6 @@ fn gates(root: &Path) -> ExitCode {
     }
 }
 
-fn keygen(path: &Path) -> ExitCode {
-    match xtask::release::keygen(path) {
-        Ok(public) => {
-            println!(
-                "wrote the release secret to {}; keep it offline",
-                path.display()
-            );
-            println!("add this to RELEASE_KEYS in crates/domyjob/src/dist.rs:");
-            println!(
-                "    ReleaseKey {{\n        minisign: \"{}\",\n        ml_dsa: \"{}\",\n    }},",
-                public.minisign, public.ml_dsa
-            );
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("release-keygen: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn sign(secret: &Path, manifest: &Path, trusted: &str) -> ExitCode {
-    match xtask::release::sign(secret, manifest, trusted) {
-        Ok(()) => {
-            println!("signed {} with Ed25519 and ML-DSA-65", manifest.display());
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("release-sign: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn proverif(root: &Path) -> ExitCode {
-    match xtask::proverif::verify(root) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("proverif: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 fn dependencies(root: &Path, check: xtask::dependencies::Check) -> ExitCode {
     match xtask::dependencies::run(root, check) {
         Ok(()) => ExitCode::SUCCESS,
@@ -92,15 +48,8 @@ fn main() -> ExitCode {
         ["dependencies", "deny"] => dependencies(&root, xtask::dependencies::Check::Deny),
         ["dependencies", "audit"] => dependencies(&root, xtask::dependencies::Check::Audit),
         ["dependencies", "vet"] => dependencies(&root, xtask::dependencies::Check::Vet),
-        ["proverif"] => proverif(&root),
-        ["release-keygen", path] => keygen(Path::new(path)),
-        ["release-sign", secret, manifest, trusted] => {
-            sign(Path::new(secret), Path::new(manifest), trusted)
-        }
         _ => {
-            eprintln!(
-                "usage: cargo xtask gates | workflows | dependencies deny|audit|vet | proverif | release-keygen SECRET-PATH | release-sign SECRET-PATH MANIFEST TRUSTED-COMMENT"
-            );
+            eprintln!("usage: cargo xtask gates | workflows | dependencies deny|audit|vet");
             ExitCode::from(2)
         }
     }

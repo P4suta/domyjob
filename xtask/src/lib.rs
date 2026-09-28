@@ -1,11 +1,8 @@
 use std::path::{Path, PathBuf};
 
-pub mod comments;
+use syn::visit::Visit;
+
 pub mod dependencies;
-pub mod proverif;
-pub mod release;
-pub mod syntax;
-pub mod v1_boundary;
 pub mod v1_core;
 pub mod workflows;
 
@@ -18,97 +15,90 @@ pub enum GateError {
     },
     #[error("{path} does not parse: {source}")]
     Parse { path: PathBuf, source: syn::Error },
-    #[error("usage: cargo xtask gates")]
-    Usage,
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GateError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| GateError::Read {
+    for entry in std::fs::read_dir(dir).map_err(|source| GateError::Read {
         path: dir.to_path_buf(),
         source,
-    })?;
-    for entry in entries {
+    })? {
         let entry = entry.map_err(|source| GateError::Read {
             path: dir.to_path_buf(),
             source,
         })?;
         let path = entry.path();
-        let name = entry.file_name();
         let kind = entry.file_type().map_err(|source| GateError::Read {
             path: path.clone(),
             source,
         })?;
-        if kind.is_dir() && name != "target" && name != ".git" {
+        if kind.is_dir() {
             rust_files(&path, out)?;
-        } else if kind.is_file() && path.extension().is_some_and(|e| e == "rs") {
+        } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
             out.push(path);
         }
     }
     Ok(())
 }
 
-const PLATFORM: &str = "crates/domyjob/src/platform.rs";
+#[derive(Debug, Default)]
+struct SourcePolicy {
+    effect_module: bool,
+    findings: Vec<String>,
+}
 
-const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
-    ("crates/domyjob/src/keystore.rs", 5),
-    ("crates/domyjob/src/proc.rs", 5),
-    ("crates/domyjob/src/spawn.rs", 1),
-    ("crates/domyjob/tests/crash_process.rs", 4),
-    ("xtask/src/release.rs", 1),
-];
+impl<'ast> Visit<'ast> for SourcePolicy {
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        let line = attribute
+            .path()
+            .segments
+            .first()
+            .map_or(1, |part| part.ident.span().start().line);
+        if attribute.path().is_ident("allow") {
+            self.findings.push(format!(
+                "{line}: use a reasoned expect attribute instead of allow"
+            ));
+        }
+        let platform_branch = attribute.path().is_ident("cfg")
+            && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string() != "test")
+            || attribute.path().is_ident("cfg_attr");
+        if platform_branch && !self.effect_module {
+            self.findings.push(format!(
+                "{line}: platform branches belong in the platform or process adapter"
+            ));
+        }
+        syn::visit::visit_attribute(self, attribute);
+    }
+}
 
-fn os_findings(shown: &str, branches: usize) -> Option<String> {
-    if shown == PLATFORM
-        || shown == "crates/domyjob-next/src/platform.rs"
-        || shown == "crates/domyjob-next/src/process.rs"
-    {
-        return None;
-    }
-    let allowed = NOT_YET_ONE_PATH
-        .iter()
-        .find(|(file, _)| *file == shown)
-        .map_or(0, |(_, allowed)| *allowed);
-    match branches.cmp(&allowed) {
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Greater => Some(format!(
-            "{shown}: {branches} operating-system branches where {allowed} are allowed; put the difference in {PLATFORM} and use one path everywhere else"
-        )),
-        std::cmp::Ordering::Less => Some(format!(
-            "{shown}: now {branches} operating-system branches; lower its allowance in NOT_YET_ONE_PATH from {allowed} to {branches}"
-        )),
-    }
+fn effect_module(path: &str) -> bool {
+    matches!(
+        path,
+        "crates/domyjob/src/platform.rs" | "crates/domyjob/src/process.rs"
+    ) || path.starts_with("crates/domyjob/src/platform/")
+        || path.starts_with("crates/domyjob/src/process/")
 }
 
 pub fn gates(root: &Path) -> Result<usize, GateError> {
     let mut files = Vec::new();
-    for dir in ["crates", "xtask"] {
-        rust_files(&root.join(dir), &mut files)?;
+    for directory in ["crates", "xtask"] {
+        rust_files(&root.join(directory), &mut files)?;
     }
     files.sort();
-    let mut sources = Vec::with_capacity(files.len());
-    let mut enum_names = std::collections::BTreeSet::new();
+    let mut findings = 0usize;
     for path in files {
         let source = std::fs::read_to_string(&path).map_err(|source| GateError::Read {
             path: path.clone(),
             source,
         })?;
-        let shown = match path.strip_prefix(root) {
-            Ok(inner) => inner.display().to_string(),
-            Err(_outside) => path.display().to_string(),
-        }
-        .replace('\\', "/");
-        if shown.starts_with("crates/domyjob/src/") {
-            enum_names.extend(
-                syntax::enum_names(&source).map_err(|source| GateError::Parse {
-                    path: path.clone(),
-                    source,
-                })?,
-            );
-        }
-        sources.push((path, shown, source));
-    }
-    let mut count = 0usize;
-    for (path, shown, source) in sources {
+        let relative = match path.strip_prefix(root) {
+            Ok(relative) => relative,
+            Err(_outside) => &path,
+        };
+        let shown = relative.to_string_lossy().replace('\\', "/");
+        let parsed = syn::parse_file(&source).map_err(|source| GateError::Parse {
+            path: path.clone(),
+            source,
+        })?;
         if shown.starts_with("crates/domyjob-core/src/") {
             for finding in v1_core::check(&source, shown == "crates/domyjob-core/src/lib.rs")
                 .map_err(|source| GateError::Parse {
@@ -117,42 +107,36 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
                 })?
             {
                 eprintln!("{shown}:{finding}");
-                count = count.saturating_add(1);
+                findings = findings.saturating_add(1);
             }
         }
-        if shown.starts_with("crates/domyjob-next/src/") {
-            for finding in v1_boundary::check(&source).map_err(|source| GateError::Parse {
-                path: path.clone(),
-                source,
-            })? {
-                eprintln!("{shown}:{finding}");
-                count = count.saturating_add(1);
-            }
-        }
-        let branches = syntax::os_branches(&source).map_err(|source| GateError::Parse {
-            path: path.clone(),
-            source,
-        })?;
-        if let Some(finding) = os_findings(&shown, branches) {
-            eprintln!("{finding}");
-            count = count.saturating_add(1);
-        }
-        for comment in comments::find(&source) {
-            eprintln!(
-                "{shown}:{}: comments are not written; put the reason in the commit message",
-                comment.line
-            );
-            count = count.saturating_add(1);
-        }
-        let findings = syntax::check_repository_file_with_enums(&source, &shown, &enum_names)
-            .map_err(|source| GateError::Parse {
-                path: path.clone(),
-                source,
-            })?;
-        for finding in findings {
-            eprintln!("{shown}:{}: {}", finding.line, finding.rule);
-            count = count.saturating_add(1);
+        let mut policy = SourcePolicy {
+            effect_module: effect_module(&shown),
+            findings: Vec::new(),
+        };
+        policy.visit_file(&parsed);
+        for finding in policy.findings {
+            eprintln!("{shown}:{finding}");
+            findings = findings.saturating_add(1);
         }
     }
-    Ok(count)
+    Ok(findings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourcePolicy, effect_module};
+    use syn::visit::Visit;
+
+    #[test]
+    fn platform_branches_and_allow_attributes_are_confined() {
+        let source =
+            syn::parse_file("#[cfg(windows)] fn platform() {} #[allow(dead_code)] fn hidden() {}")
+                .unwrap();
+        let mut policy = SourcePolicy::default();
+        policy.visit_file(&source);
+        assert_eq!(policy.findings.len(), 2);
+        assert!(effect_module("crates/domyjob/src/process/windows.rs"));
+        assert!(!effect_module("crates/domyjob/src/store.rs"));
+    }
 }
