@@ -10,7 +10,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub(crate) use crate::file_kind::reparse_point;
-pub(crate) mod chat_poll;
+pub(crate) mod clock;
+pub(crate) mod service;
 
 #[cfg(windows)]
 mod windows_acl;
@@ -38,6 +39,149 @@ pub(crate) fn state() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(xdg).join("domyjob"));
     }
     Ok(home()?.join(".local").join("state").join("domyjob"))
+}
+
+/// The OpenSSH control socket path for connection sharing, when this system supports it.
+///
+/// Sockets have short path limits, so a state directory that is too deep disables sharing.
+#[cfg(unix)]
+pub(crate) fn ssh_control_path(
+    state: &Path,
+) -> Result<Option<PathBuf>, crate::state_io::StateError> {
+    let directory = state.join("ssh");
+    if directory.as_os_str().len().saturating_add(41) > 100 {
+        return Ok(None);
+    }
+    crate::state_io::private_dir(&directory)?;
+    Ok(Some(directory.join("%C")))
+}
+
+#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the shared SSH options create the Unix socket directory fallibly"
+)]
+pub(crate) const fn ssh_control_path(
+    _state: &Path,
+) -> Result<Option<PathBuf>, crate::state_io::StateError> {
+    Ok(None)
+}
+
+/// Where this build's executable lives outside any checkout, beside the nodes other machines install.
+pub(crate) fn stable_program(build: &str) -> io::Result<PathBuf> {
+    Ok(home()?
+        .join(".cargo")
+        .join("domyjob")
+        .join("versions")
+        .join(build)
+        .join("bin")
+        .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX)))
+}
+
+#[cfg(unix)]
+pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an installed executable needs its execute permission"
+    )]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(windows)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the shared installer marks executables fallibly on Unix"
+)]
+pub(crate) const fn make_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Macos;
+#[cfg(target_os = "linux")]
+const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Linux;
+#[cfg(windows)]
+const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Windows;
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Other;
+
+#[cfg(unix)]
+fn host_name() -> String {
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn host_name() -> String {
+    variable("COMPUTERNAME")
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// How this machine names itself to its peers.
+pub(crate) fn machine_card()
+-> Result<domyjob_core::chat::card::MachineCard, domyjob_core::chat::id::Invalid> {
+    let name = host_name();
+    let label = name.split('.').next().unwrap_or_default().trim().to_owned();
+    Ok(domyjob_core::chat::card::MachineCard {
+        label: domyjob_core::chat::id::Line::try_from(if label.is_empty() {
+            "machine".to_owned()
+        } else {
+            label.chars().take(64).collect()
+        })?,
+        os: OS,
+    })
+}
+
+/// The runtime directory `systemctl --user` needs when a session did not set one.
+#[cfg(target_os = "linux")]
+pub(crate) fn user_runtime_dir() -> String {
+    variable("XDG_RUNTIME_DIR").map_or_else(
+        || format!("/run/user/{}", rustix::process::getuid().as_raw()),
+        |value| value.to_string_lossy().into_owned(),
+    )
+}
+
+/// The executable a bare program name resolves to on `PATH`.
+///
+/// Windows tries `.exe` before `.cmd`, the order npm and native installers leave behind.
+#[must_use]
+pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
+    let path = variable("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .flat_map(|directory| candidates(&directory, name))
+        .find(|candidate| executable(candidate))
+}
+
+#[cfg(unix)]
+fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    vec![directory.join(name)]
+}
+
+#[cfg(windows)]
+fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    ["exe", "cmd", "bat"]
+        .iter()
+        .map(|extension| directory.join(format!("{name}.{extension}")))
+        .collect()
+}
+
+#[cfg(unix)]
+fn executable(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::metadata(candidate)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn executable(candidate: &Path) -> bool {
+    fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
 }
 
 pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {

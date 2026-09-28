@@ -61,7 +61,7 @@ pub struct Envelope<T> {
 )]
 pub enum Request {
     Hello,
-    Chat(crate::chat_wire_v0::ChatRequest),
+    Chat(crate::chat_wire::ChatRequest),
     Run {
         submission: SubmissionId,
         command: Command,
@@ -177,13 +177,44 @@ impl Snapshot {
 )]
 pub enum Reply {
     Hello { build: BuildId },
-    Chat(crate::chat_wire_v0::ChatReply),
+    Chat(crate::chat_wire::ChatReply),
     Accepted { job: JobId },
     Jobs { jobs: Vec<JobId> },
     Status { state: JobState },
     Logs { text: RemoteText, omitted: u64 },
     Cleaned { count: u16 },
     Error { code: ErrorCode },
+}
+
+macro_rules! reply_variant {
+    ($($method:ident: $pattern:pat => $value:expr, $output:ty;)+) => {
+        impl Reply {
+            $(
+                /// The reply's content when it is of this kind, or the reply itself.
+                #[expect(
+                    clippy::result_large_err,
+                    reason = "an unexpected reply is handed back whole to its caller"
+                )]
+                pub fn $method(self) -> Result<$output, Self> {
+                    if let $pattern = self {
+                        Ok($value)
+                    } else {
+                        Err(self)
+                    }
+                }
+            )+
+        }
+    };
+}
+
+reply_variant! {
+    into_hello: Self::Hello { build } => build, BuildId;
+    into_accepted: Self::Accepted { job } => job, JobId;
+    into_jobs: Self::Jobs { jobs } => jobs, Vec<JobId>;
+    into_status: Self::Status { state } => state, JobState;
+    into_logs: Self::Logs { text, omitted } => (text, omitted), (RemoteText, u64);
+    into_cleaned: Self::Cleaned { count } => count, u16;
+    into_chat: Self::Chat(reply) => reply, crate::chat_wire::ChatReply;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

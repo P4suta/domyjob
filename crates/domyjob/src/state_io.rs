@@ -243,6 +243,19 @@ pub(crate) fn create_empty(path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Remove a private regular file; a missing file is already removed.
+pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
+    match open_read(path)? {
+        Some(file) => drop(file),
+        None => return Ok(()),
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_at(path, error)),
+    }
+}
+
 pub(crate) fn remove_dir_all(path: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
         Ok(_metadata) => private_dir(path)?,

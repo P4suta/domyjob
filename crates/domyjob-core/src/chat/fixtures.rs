@@ -11,9 +11,7 @@ use core::num::NonZeroU64;
 
 use super::card::{Access, Card, Mode, Skills, Tag, Tool};
 use super::event::{Body, Chain, Intent};
-use super::id::{
-    AgentId, AgentName, Conversation, DirectId, EventId, Line, Origin, Paragraph, Text,
-};
+use super::id::{AgentId, AgentName, Conversation, EventId, Line, Origin, Paragraph, Text};
 use super::policy::audience;
 
 pub(crate) fn origin(digit: char) -> Origin {
@@ -56,7 +54,7 @@ pub(crate) fn text(value: &str) -> Text {
 /// A direct ask from `from` to `to`.
 pub(crate) fn ask(from: &AgentId, to: &AgentId) -> Body {
     Body::Message {
-        conversation: Conversation::Direct(DirectId::between(from, to)),
+        conversation: Conversation::direct(from, to).unwrap(),
         from: from.name().clone(),
         text: text("question"),
         audience: audience([from, to]).unwrap(),

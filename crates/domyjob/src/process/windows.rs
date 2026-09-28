@@ -73,7 +73,10 @@ pub(super) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
     Ok(())
 }
 
-pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
+pub(super) fn launch_worker(
+    arguments: &[&str],
+    errors: Option<std::fs::File>,
+) -> Result<(), ProcessError> {
     use std::os::windows::io::{AsHandle as _, IntoRawHandle as _};
     use windows_spawn::{Command as WindowsCommand, CreationFlags, SpawnOptions, Stdio};
 
@@ -92,14 +95,19 @@ pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
         .arg(token.as_str())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let flags = CreationFlags::NEW_PROCESS_GROUP | CreationFlags::BREAKAWAY_FROM_JOB;
-    let child = command
-        .spawn_with(SpawnOptions::new().creation_flags(flags))
-        .map_err(|source| ProcessError::Spawn {
-            what: "the worker",
-            source,
-        })?;
+        .stderr(errors.map_or_else(Stdio::null, Stdio::from));
+    let detached = CreationFlags::NEW_PROCESS_GROUP | CreationFlags::BREAKAWAY_FROM_JOB;
+    let child = match command.spawn_with(SpawnOptions::new().creation_flags(detached)) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // A job that forbids breakaway, such as a domyjob job or CI, keeps the worker inside it.
+            command.spawn_with(SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP))
+        }
+        other => other,
+    }
+    .map_err(|source| ProcessError::Spawn {
+        what: "the worker",
+        source,
+    })?;
     let handle = child
         .as_handle()
         .try_clone_to_owned()
@@ -224,6 +232,23 @@ impl Reaper {
         reason = "the shared reaper contract consumes its guard when work finishes"
     )]
     pub(super) const fn stand_down(self) {}
+}
+
+pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
+    let status = Command::new("taskkill.exe")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(ProcessError::Signal)?;
+    if status.success() || status.code() == Some(128) {
+        Ok(())
+    } else {
+        Err(ProcessError::Signal(io::Error::other(format!(
+            "taskkill failed: {status}"
+        ))))
+    }
 }
 
 pub(super) const fn reap(_group: i32) {}

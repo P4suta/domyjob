@@ -196,6 +196,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_messages_travel_inside_the_framed_wire() {
+        let request = crate::wire::Request::Chat(ChatRequest::Wait {
+            from: origin('a'),
+            to: origin('b'),
+            seen: 7,
+        });
+        let sent = crate::wire::frame(&request).unwrap();
+        assert_eq!(crate::ingress::request(&sent).unwrap(), request);
+        let reply = crate::wire::Reply::Chat(ChatReply::Changed {});
+        let answered = crate::wire::frame(&reply).unwrap();
+        assert_eq!(crate::ingress::reply(&answered).unwrap(), reply);
+    }
+
+    #[test]
     fn chat_requests_reject_unknown_fields_before_any_effect() {
         for invalid in [
             r#"{"operation":"identity","extra":true}"#.to_owned(),

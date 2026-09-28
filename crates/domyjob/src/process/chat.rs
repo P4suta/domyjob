@@ -1,17 +1,19 @@
 #![expect(
     clippy::disallowed_methods,
-    reason = "this adapter owns fixed AI CLI invocation and detached chat worker creation"
+    reason = "this adapter owns fixed AI CLI invocation"
 )]
 
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
-use crate::chat::AgentTool;
+use domyjob_core::chat::card::{Access, Tool};
+use domyjob_core::chat::id::{AgentId, EventId};
 
 use super::{Group, ProcessError};
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+const MAX_DIAGNOSTIC: u64 = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ChatProcessError {
@@ -19,60 +21,170 @@ pub(crate) enum ChatProcessError {
     Process(#[from] ProcessError),
     #[error("running the AI CLI: {0}")]
     Io(#[from] io::Error),
-    #[error("the AI CLI exited unsuccessfully: {0}")]
-    Failed(std::process::ExitStatus),
+    #[error("{0} is not installed or not on PATH")]
+    Missing(&'static str),
+    #[error("the AI CLI exited unsuccessfully ({status}): {detail}")]
+    Failed { status: ExitStatus, detail: String },
     #[error("the AI CLI exceeded the 4 MiB output limit")]
     TooLarge,
     #[error("the AI session ID is invalid")]
     Session,
 }
 
-pub(crate) fn valid_session(session: &str) -> bool {
-    !session.is_empty()
-        && session.len() <= 256
-        && session
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && session
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+/// Everything one managed turn passes to its AI client.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Invocation<'a> {
+    pub(crate) tool: Tool,
+    pub(crate) access: Access,
+    pub(crate) cwd: &'a Path,
+    pub(crate) session: Option<&'a str>,
+    pub(crate) prompt: &'a str,
+    pub(crate) agent: &'a AgentId,
+    pub(crate) turn: &'a EventId,
 }
 
-fn command(tool: AgentTool, session: Option<&str>) -> Result<Command, ChatProcessError> {
-    if session.is_some_and(|id| !valid_session(id)) {
+/// The `domyjob mcp` arguments that bind the client's chat tools to this agent and turn.
+fn bound_mcp(invocation: &Invocation<'_>) -> Vec<String> {
+    vec![
+        "mcp".to_owned(),
+        "--as".to_owned(),
+        invocation.agent.to_string(),
+        "--turn".to_owned(),
+        invocation.turn.to_string(),
+    ]
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    value.to_string()
+}
+
+/// Whether `session` is a session ID this client resumes exactly.
+///
+/// Codex treats anything but a UUID as a thread name and silently starts a new thread when none matches.
+pub(crate) fn resumable(tool: Tool, session: &str) -> bool {
+    let uuid = || {
+        let groups: Vec<&str> = session.split('-').collect();
+        groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+            && groups
+                .iter()
+                .all(|group| group.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
+    crate::chat::provider::valid_session(session)
+        && match tool {
+            Tool::Codex => uuid(),
+            Tool::Claude | Tool::Opencode => true,
+        }
+}
+
+/// The read-only agent injected into OpenCode, whose own permissions follow the user's.
+const OPENCODE_READ_AGENT: &str = "domyjob-read";
+
+/// The argument vector after the program, with the prompt read from standard input.
+fn arguments(invocation: &Invocation<'_>, domyjob: &str) -> Result<Vec<String>, ChatProcessError> {
+    if invocation
+        .session
+        .is_some_and(|session| !resumable(invocation.tool, session))
+    {
         return Err(ChatProcessError::Session);
     }
-    let mut command = Command::new(tool.as_str());
-    match tool {
-        AgentTool::Claude => {
-            command.args(["-p", "--output-format", "json"]);
-            if let Some(session) = session {
-                command.args(["--resume", session]);
-            }
+    let mcp = bound_mcp(invocation);
+    let owned = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut words = match invocation.tool {
+        Tool::Claude => {
+            let config = serde_json::json!({
+                "mcpServers": {"domyjob": {"type": "stdio", "command": domyjob, "args": mcp}}
+            });
+            let mut words = owned(&["-p", "--output-format", "json", "--strict-mcp-config"]);
+            words.push(format!("--mcp-config={}", json_text(&config)));
+            words.push("--allowedTools=mcp__domyjob".to_owned());
+            words.extend(match invocation.access {
+                Access::Read => owned(&["--permission-mode", "dontAsk", "--tools=Read,Grep,Glob"]),
+                Access::Write => {
+                    owned(&["--permission-mode", "auto", "--permission-prompts", "none"])
+                }
+            });
+            words
         }
-        AgentTool::Codex => {
-            command.args([
+        Tool::Codex => {
+            let sandbox = match invocation.access {
+                Access::Read => "read-only",
+                Access::Write => "workspace-write",
+            };
+            let mut words = owned(&[
                 "exec",
-                "--sandbox",
-                "read-only",
                 "--json",
                 "--skip-git-repo-check",
-                "-c",
-                "approval_policy=\"never\"",
+                "--sandbox",
+                sandbox,
             ]);
-            if let Some(session) = session {
-                command.args(["resume", session]);
+            for setting in [
+                format!(
+                    "mcp_servers.domyjob.command={}",
+                    json_text(&serde_json::json!(domyjob))
+                ),
+                format!(
+                    "mcp_servers.domyjob.args={}",
+                    json_text(&serde_json::json!(mcp))
+                ),
+                "mcp_servers.domyjob.default_tools_approval_mode=\"approve\"".to_owned(),
+            ] {
+                words.extend(["-c".to_owned(), setting]);
             }
-            command.arg("-");
+            words
         }
-        AgentTool::Opencode => {
-            command.args(["run", "--format", "json"]);
-            if let Some(session) = session {
-                command.args(["--session", session]);
+        Tool::Opencode => {
+            let mut words = owned(&["run", "--format", "json"]);
+            if invocation.access == Access::Read {
+                words.extend(["--agent".to_owned(), OPENCODE_READ_AGENT.to_owned()]);
             }
+            words
+        }
+    };
+    if let Some(session) = invocation.session {
+        let flag = match invocation.tool {
+            Tool::Claude => "--resume",
+            Tool::Codex => "resume",
+            Tool::Opencode => "--session",
+        };
+        words.extend([flag.to_owned(), session.to_owned()]);
+    }
+    if invocation.tool == Tool::Codex {
+        words.push("-".to_owned());
+    }
+    Ok(words)
+}
+
+/// Configuration a client reads from its environment instead of its arguments.
+fn environment(invocation: &Invocation<'_>, domyjob: &str) -> Vec<(&'static str, String)> {
+    match invocation.tool {
+        Tool::Claude | Tool::Codex => Vec::new(),
+        Tool::Opencode => {
+            let mut command = vec![domyjob.to_owned()];
+            command.extend(bound_mcp(invocation));
+            let deny = serde_json::json!({"edit": "deny", "bash": "deny", "task": "deny", "webfetch": "deny"});
+            let config = serde_json::json!({
+                "mcp": {"domyjob": {"type": "local", "command": command, "enabled": true}},
+                "agent": {OPENCODE_READ_AGENT: {"mode": "primary", "permission": deny}},
+            });
+            vec![("OPENCODE_CONFIG_CONTENT", json_text(&config))]
         }
     }
+}
+
+fn command(invocation: &Invocation<'_>) -> Result<Command, ChatProcessError> {
+    let program = crate::platform::find_program(invocation.tool.as_str())
+        .ok_or(ChatProcessError::Missing(invocation.tool.as_str()))?;
+    let domyjob = std::env::current_exe()?;
+    let domyjob = domyjob
+        .to_str()
+        .ok_or_else(|| io::Error::other("the domyjob path is not UTF-8"))?;
+    let mut command = Command::new(program);
+    command.args(arguments(invocation, domyjob)?);
     crate::platform::prepare_job_environment(&mut command);
     for name in [
         "CODEX_HOME",
@@ -89,36 +201,43 @@ fn command(tool: AgentTool, session: Option<&str>) -> Result<Command, ChatProces
             command.env(name, value);
         }
     }
+    for (name, value) in environment(invocation, domyjob) {
+        command.env(name, value);
+    }
+    command
+        .current_dir(invocation.cwd)
+        .env("DOMYJOB_CHAT_AGENT", invocation.agent.to_string())
+        .env("DOMYJOB_CHAT_TURN", invocation.turn.to_string());
     Ok(command)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Invocation<'a> {
-    pub(crate) tool: AgentTool,
-    pub(crate) cwd: &'a Path,
-    pub(crate) session: Option<&'a str>,
-    pub(crate) prompt: &'a str,
-    pub(crate) agent: &'a str,
+fn tail(file: &mut std::fs::File) -> io::Result<String> {
+    let length = file.seek(io::SeekFrom::End(0))?;
+    file.seek(io::SeekFrom::Start(length.saturating_sub(MAX_DIAGNOSTIC)))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_DIAGNOSTIC).read_to_end(&mut bytes)?;
+    Ok(domyjob_core::domain::terminal_text(
+        String::from_utf8_lossy(&bytes).trim(),
+    ))
 }
 
-pub(crate) fn run(invocation: Invocation<'_>) -> Result<Vec<u8>, ChatProcessError> {
-    let mut command = command(invocation.tool, invocation.session)?;
-    command
-        .current_dir(invocation.cwd)
-        .env("DOMYJOB_CHAT_AGENT", invocation.agent);
+/// Run one turn and return the client's complete standard output.
+pub(crate) fn run(invocation: &Invocation<'_>) -> Result<Vec<u8>, ChatProcessError> {
+    let command = command(invocation)?;
     let mut input = tempfile::tempfile()?;
     input.write_all(invocation.prompt.as_bytes())?;
     input.rewind()?;
+    let mut errors = tempfile::tempfile()?;
     let (reader, writer) = io::pipe()?;
     let group = Group::spawn_io(
         command,
         Stdio::from(input),
         Stdio::from(writer),
-        Stdio::null(),
+        Stdio::from(errors.try_clone()?),
     )?;
     let limit = u64::try_from(MAX_OUTPUT.saturating_add(1)).map_err(io::Error::other)?;
-    std::thread::scope(|scope| {
-        let capture = scope.spawn(|| {
+    let (status, bytes) = std::thread::scope(|scope| {
+        let capture = scope.spawn(|| -> Result<Vec<u8>, ChatProcessError> {
             let mut bytes = Vec::new();
             let read = reader.take(limit).read_to_end(&mut bytes);
             if read.is_err() || bytes.len() > MAX_OUTPUT {
@@ -133,89 +252,125 @@ pub(crate) fn run(invocation: Invocation<'_>) -> Result<Vec<u8>, ChatProcessErro
         let status = group.wait();
         let bytes = capture
             .join()
-            .map_err(|_panic| io::Error::other("AI output reader panicked"))??;
-        let status = status?;
-        if !status.success() {
-            return Err(ChatProcessError::Failed(status));
-        }
-        Ok(bytes)
-    })
-}
-
-pub(crate) fn spawn_chat_worker(agent: &str) -> Result<(), ChatProcessError> {
-    Ok(super::launch_chat_worker(agent)?)
-}
-
-pub(crate) fn notify_message(id: &str) -> Result<(), ChatProcessError> {
-    let message = format!("New chat message {id}");
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("osascript");
-        command.args([
-            "-e",
-            "on run argv\ndisplay notification (item 1 of argv) with title \"domyjob\"\nend run",
-            "--",
-            &message,
-        ]);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("notify-send");
-        command.args(["--", "domyjob", &message]);
-        command
-    };
-    #[cfg(windows)]
-    let mut command = {
-        let username = std::env::var_os("USERNAME")
-            .ok_or_else(|| io::Error::other("the notification recipient is unavailable"))?;
-        let mut command = Command::new("msg.exe");
-        command.arg(username).arg(&message);
-        command
-    };
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("domyjob: chat notification failed: {status}"),
-        Err(error) => eprintln!("domyjob: waiting for chat notification: {error}"),
+            .map_err(|_panic| io::Error::other("the AI output reader panicked"));
+        (status, bytes)
     });
-    Ok(())
+    let bytes = bytes??;
+    let status = status?;
+    if !status.success() {
+        return Err(ChatProcessError::Failed {
+            status,
+            detail: tail(&mut errors)?,
+        });
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{command, valid_session};
-    use crate::chat::AgentTool;
+    use std::path::Path;
+
+    use domyjob_core::chat::card::{Access, Tool};
+    use domyjob_core::chat::id::{AgentId, EventId};
+
+    use super::{Invocation, arguments};
+
+    fn invocation(tool: Tool, access: Access, session: Option<&str>) -> Vec<String> {
+        let agent = AgentId::try_from(format!("reviewer@{}", "a".repeat(32))).unwrap();
+        let turn = EventId::try_from(format!("{}:{:016x}", "b".repeat(32), 3)).unwrap();
+        arguments(
+            &Invocation {
+                tool,
+                access,
+                cwd: Path::new("/work"),
+                session,
+                prompt: "hello",
+                agent: &agent,
+                turn: &turn,
+            },
+            "/bin/domyjob",
+        )
+        .unwrap()
+    }
 
     #[test]
-    fn managed_commands_keep_prompts_off_the_command_line_and_preserve_sandboxing() {
-        let command = command(AgentTool::Codex, Some("session-1")).expect("command");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy())
-            .collect();
-        assert_eq!(
-            args,
-            [
-                "exec",
-                "--sandbox",
-                "read-only",
-                "--json",
-                "--skip-git-repo-check",
-                "-c",
-                "approval_policy=\"never\"",
-                "resume",
-                "session-1",
-                "-"
-            ]
+    fn prompts_stay_off_the_command_line_and_access_maps_to_each_client() {
+        let session = "0199a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b";
+        let codex = invocation(Tool::Codex, Access::Read, Some(session));
+        assert!(
+            codex
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "read-only"])
         );
-        for invalid in ["", "--last", "a\nb", "a b", "a/../../b"] {
-            assert!(!valid_session(invalid));
-            super::command(AgentTool::Claude, Some(invalid)).expect_err("invalid session");
+        assert_eq!(
+            codex.iter().rev().take(3).collect::<Vec<_>>(),
+            ["-", session, "resume"]
+        );
+        let resume = codex.iter().position(|word| word == "resume").unwrap();
+        let sandbox = codex.iter().position(|word| word == "--sandbox").unwrap();
+        assert!(
+            sandbox < resume,
+            "codex accepts --sandbox only before resume"
+        );
+        assert!(
+            codex.iter().any(
+                |word| word.starts_with("mcp_servers.domyjob.args=") && word.contains("--turn")
+            )
+        );
+        let write = invocation(Tool::Codex, Access::Write, None);
+        assert!(
+            write
+                .windows(2)
+                .any(|pair| pair == ["--sandbox", "workspace-write"])
+        );
+        let claude = invocation(Tool::Claude, Access::Write, Some("s1"));
+        assert!(
+            claude
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "auto"])
+        );
+        assert!(claude.windows(2).any(|pair| pair == ["--resume", "s1"]));
+        assert!(claude.iter().any(|word| word == "--strict-mcp-config"));
+        let read = invocation(Tool::Claude, Access::Read, None);
+        assert!(
+            read.windows(2)
+                .any(|pair| pair == ["--permission-mode", "dontAsk"])
+        );
+        assert!(read.iter().any(|word| word == "--tools=Read,Grep,Glob"));
+        let opencode = invocation(Tool::Opencode, Access::Read, None);
+        assert!(
+            opencode
+                .windows(2)
+                .any(|pair| pair == ["--agent", "domyjob-read"])
+        );
+        for words in [codex, claude, opencode] {
+            assert!(!words.iter().any(|word| word == "hello"));
+        }
+    }
+
+    #[test]
+    fn invalid_sessions_never_reach_the_command_line() {
+        let agent = AgentId::try_from(format!("reviewer@{}", "a".repeat(32))).unwrap();
+        let turn = EventId::try_from(format!("{}:{:016x}", "b".repeat(32), 3)).unwrap();
+        for (tool, session) in [
+            (Tool::Claude, "--last"),
+            (Tool::Claude, "a b"),
+            (Tool::Claude, ""),
+            (Tool::Codex, "named-thread"),
+        ] {
+            arguments(
+                &Invocation {
+                    tool,
+                    access: Access::Read,
+                    cwd: Path::new("/work"),
+                    session: Some(session),
+                    prompt: "hello",
+                    agent: &agent,
+                    turn: &turn,
+                },
+                "/bin/domyjob",
+            )
+            .unwrap_err();
         }
     }
 }

@@ -10,9 +10,12 @@ pub(crate) enum Notice {
     Failed(notify::Error),
 }
 
+/// Reads and opens of a watched file are not changes, so a watcher that reads never wakes itself.
 fn classify(event: notify::Result<notify::Event>) -> Notice {
     match event {
-        Ok(event) if event.need_rescan() || !event.paths.is_empty() => Notice::Changed,
+        Ok(event) if event.need_rescan() => Notice::Changed,
+        Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => Notice::Unrelated,
+        Ok(event) if !event.paths.is_empty() => Notice::Changed,
         Ok(_irrelevant) => Notice::Unrelated,
         Err(error) => Notice::Failed(error),
     }
@@ -27,6 +30,23 @@ pub(crate) fn watcher(
 #[cfg(test)]
 mod tests {
     use super::{Notice, classify};
+
+    #[test]
+    fn opening_or_reading_a_watched_file_is_not_a_change() {
+        let path = std::path::PathBuf::from("watched");
+        for access in [
+            notify::event::AccessKind::Open(notify::event::AccessMode::Read),
+            notify::event::AccessKind::Close(notify::event::AccessMode::Write),
+        ] {
+            let event =
+                notify::Event::new(notify::EventKind::Access(access)).add_path(path.clone());
+            assert!(matches!(classify(Ok(event)), Notice::Unrelated));
+        }
+        let created =
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(path);
+        assert!(matches!(classify(Ok(created)), Notice::Changed));
+    }
 
     #[test]
     fn rescan_and_errors_are_not_dropped() {

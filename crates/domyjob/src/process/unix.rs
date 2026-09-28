@@ -12,7 +12,10 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group};
 
 use super::{ProcessError, ReadyToken};
 
-pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
+pub(super) fn launch_worker(
+    arguments: &[&str],
+    errors: Option<std::fs::File>,
+) -> Result<(), ProcessError> {
     let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
         what: "the worker",
         source,
@@ -22,7 +25,7 @@ pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(errors.map_or_else(Stdio::null, Stdio::from))
         .process_group(0);
     let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
         what: "the worker",
@@ -137,6 +140,17 @@ impl Reaper {
 
     pub(super) fn stand_down(mut self) {
         let _sent = self.0.write_all(b"d");
+    }
+}
+
+pub(super) fn terminate(id: u32) -> Result<(), ProcessError> {
+    let raw = i32::try_from(id).map_err(|error| ProcessError::Signal(io::Error::other(error)))?;
+    let Some(pid) = Pid::from_raw(raw) else {
+        return Ok(());
+    };
+    match rustix::process::kill_process(pid, Signal::TERM) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(error) => Err(ProcessError::Signal(error.into())),
     }
 }
 

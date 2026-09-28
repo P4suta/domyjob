@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::card::{Card, MachineCard};
 use super::event::{Body, Event, Intent, Members, Outcome, Sealed};
-use super::id::{
-    AgentId, Audience, Conversation, DirectId, EventId, Invalid, Line, Origin, RoomId,
-};
+use super::id::{AgentId, Audience, Conversation, EventId, Invalid, Line, Origin, RoomId};
 
 /// How far one origin's ledger has been stored here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,24 +307,6 @@ fn started<L: Ledger + ?Sized>(
     }
 }
 
-fn direct_reply_allowed<L: Ledger + ?Sized>(
-    ledger: &L,
-    event: &Event,
-    request: &EventId,
-) -> Result<bool, L::Error> {
-    let (Some(Conversation::Direct(direct)), Some(author)) =
-        (event.body().conversation(), event.author())
-    else {
-        return Ok(true);
-    };
-    Ok(match ledger.parent(request)? {
-        Parent::Present(parent) => parent
-            .author()
-            .is_some_and(|asker| DirectId::between(&asker, &author) == *direct),
-        Parent::Opaque | Parent::Missing => true,
-    })
-}
-
 fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failure<L::Error>> {
     let origin = event.origin();
     Ok(match event.body() {
@@ -370,11 +350,6 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
             intent: Intent::Reply { request },
             ..
         } => {
-            if !direct_reply_allowed(ledger, event, request).map_err(Failure::Store)? {
-                return Err(Failure::Rejected(Rejection::Mismatch {
-                    event: event.id().clone(),
-                }));
-            }
             let author = AgentId::new(from.clone(), origin.clone());
             resolve(
                 ledger,

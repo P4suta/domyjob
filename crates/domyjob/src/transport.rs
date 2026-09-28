@@ -7,25 +7,34 @@
     reason = "the composition root needs these names but the binary has no public API"
 )]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 
+use domyjob_core::chat_wire::{ChatReply, ChatRequest};
 use domyjob_core::domain::{
     Command as JobCommand, Invalid, JobId, JobReference, MachineName, SubmissionId,
 };
 use domyjob_core::ingress;
 use domyjob_core::state::{JobState, Outcome, PhaseKind};
 use domyjob_core::wire::{self, CleanTarget, ErrorCode, Input, Reply, Request, WireError};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
-use crate::platform;
+use crate::platform::{self, clock};
 use crate::source::{self, SourceError};
+use crate::state_io::{self, StateError};
 use crate::store::{Store, StoreError};
 
 const EMBEDDED_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/source.tar"));
+/// The exit status a remote wrapper reports when this build's node is not installed.
+const MISSING_NODE: i32 = 97;
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -39,22 +48,40 @@ pub(crate) enum TransportError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Source(#[from] SourceError),
+    #[error(transparent)]
+    State(#[from] StateError),
     #[error("SSH or node I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("the operating system could not provide a submission identifier: {0}")]
     Entropy(getrandom::Error),
     #[error("remote node did not exit successfully: {0}")]
     Remote(ExitStatus),
+    #[error("SSH could not reach the machine; check `ssh -o BatchMode=yes MACHINE true`")]
+    Unreachable,
     #[error("remote node sent a reply of the wrong kind")]
     UnexpectedReply,
     #[error("remote node refused the request: {0:?}")]
     Refused(ErrorCode),
     #[error("automatic build failed: {0}")]
     Deployment(ExitStatus),
-    #[error("remote node still has the wrong build after automatic installation")]
+    #[error("the remote node still reports a different build after installation")]
     BuildMismatch,
+    #[error("this build's node is not installed on the remote machine")]
+    Missing,
     #[error("the remote host does not identify a supported shell")]
     RemoteShell,
+    #[error("the remote call did not finish before its deadline")]
+    Deadline,
+    #[error("the shell cache is corrupt: {0}")]
+    Cache(#[from] serde_json::Error),
+}
+
+/// The shell OpenSSH runs remote commands with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Shell {
+    Unix,
+    Windows,
 }
 
 struct SshChild {
@@ -71,32 +98,43 @@ impl Drop for SshChild {
     }
 }
 
-impl SshChild {
-    fn start(machine: &MachineName) -> Result<Self, TransportError> {
-        Self::start_command(
-            machine,
-            &format!(
-                "~/.cargo/domyjob/versions/{}/bin/domyjob node",
-                identity::tag()
-            ),
-            Stdio::piped(),
-        )
+fn ssh_arguments() -> Result<Vec<String>, TransportError> {
+    let mut arguments: Vec<String> = [
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=3",
+    ]
+    .iter()
+    .map(|word| (*word).to_owned())
+    .collect();
+    if let Some(control) = platform::ssh_control_path(&platform::state()?.join("v1"))? {
+        arguments.extend([
+            "-o".to_owned(),
+            "ControlMaster=auto".to_owned(),
+            "-o".to_owned(),
+            format!("ControlPath={}", control.display()),
+            "-o".to_owned(),
+            "ControlPersist=60".to_owned(),
+        ]);
     }
+    Ok(arguments)
+}
 
-    fn start_command(
+impl SshChild {
+    fn start(
         machine: &MachineName,
         remote_command: &str,
         stdout: Stdio,
     ) -> Result<Self, TransportError> {
         let child = Command::new("ssh")
-            .args([
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "--",
-                machine.as_str(),
-                remote_command,
-            ])
+            .args(ssh_arguments()?)
+            .args(["--", machine.as_str(), remote_command])
             .stdin(Stdio::piped())
             .stdout(stdout)
             .spawn()?;
@@ -110,6 +148,33 @@ impl SshChild {
         let status = self.child.wait()?;
         self.finished = true;
         Ok(status)
+    }
+}
+
+/// Stops an SSH child that outlives its deadline; dropping the guard cancels the watch.
+struct Watchdog(Option<mpsc::Sender<()>>);
+
+impl Watchdog {
+    fn start(child: &Child, deadline: Option<clock::Deadline>) -> Self {
+        let Some(deadline) = deadline else {
+            return Self(None);
+        };
+        let (sender, receiver) = mpsc::channel();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            if matches!(clock::receive(&receiver, deadline), clock::Waited::Expired) {
+                let _stopped = crate::process::terminate(pid);
+            }
+        });
+        Self(Some(sender))
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _stopped = sender.send(());
+        }
     }
 }
 
@@ -134,12 +199,52 @@ fn require_end(input: &mut impl Read) -> Result<(), TransportError> {
     }
 }
 
+/// The remote command that runs this build's node, or reports it missing with status 97.
+fn node_command(shell: Shell, build: &str) -> String {
+    match shell {
+        Shell::Unix => format!(
+            "sh -c 'p=\"$HOME/.cargo/domyjob/versions/{build}/bin/domyjob\"; [ -x \"$p\" ] || {{ echo \"domyjob: node {build} missing\" >&2; exit {MISSING_NODE}; }}; exec \"$p\" node'"
+        ),
+        Shell::Windows => format!(
+            "$p = Join-Path $env:USERPROFILE '.cargo\\domyjob\\versions\\{build}\\bin\\domyjob.exe'; if (-not (Test-Path -LiteralPath $p)) {{ [Console]::Error.WriteLine('domyjob: node {build} missing'); exit {MISSING_NODE} }}; & $p node; exit $LASTEXITCODE"
+        ),
+    }
+}
+
+/// The deadline of one call and whether it holds its input open until the reply.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    deadline: Option<clock::Deadline>,
+    /// A held input lets the node treat the end of input as the client's disconnect.
+    hold_input: bool,
+}
+
+const PLAIN: Policy = Policy {
+    deadline: None,
+    hold_input: false,
+};
+
+fn failure(status: ExitStatus, policy: Policy, error: TransportError) -> TransportError {
+    match status.code() {
+        Some(MISSING_NODE) => TransportError::Missing,
+        Some(255) => TransportError::Unreachable,
+        None if policy.deadline.is_some_and(clock::Deadline::expired) => TransportError::Deadline,
+        Some(_) | None => error,
+    }
+}
+
 fn raw_call(
-    machine: &MachineName,
+    (machine, shell): (&MachineName, Shell),
     request: &Request,
     payload: &[u8],
+    policy: Policy,
 ) -> Result<Reply, TransportError> {
-    let mut child = SshChild::start(machine)?;
+    let mut child = SshChild::start(
+        machine,
+        &node_command(shell, &identity::tag()),
+        Stdio::piped(),
+    )?;
+    let watchdog = Watchdog::start(&child.child, policy.deadline);
     let mut stdin = child
         .child
         .stdin
@@ -147,27 +252,33 @@ fn raw_call(
         .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
     stdin.write_all(&wire::frame(request)?)?;
     stdin.write_all(payload)?;
-    drop(stdin);
+    stdin.flush()?;
+    let held = if policy.hold_input {
+        Some(stdin)
+    } else {
+        drop(stdin);
+        None
+    };
     let mut stdout = child
         .child
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
-    let frame = match read_frame(&mut stdout) {
+    let frame = read_frame(&mut stdout);
+    drop(held);
+    let frame = match frame {
         Ok(frame) => frame,
         Err(error) => {
             let status = child.wait()?;
-            return if status.code() == Some(255) {
-                Err(TransportError::Remote(status))
-            } else {
-                Err(error)
-            };
+            drop(watchdog);
+            return Err(failure(status, policy, error));
         }
     };
     let reply = ingress::reply(&frame)?;
     require_end(&mut stdout)?;
     drop(stdout);
     let status = child.wait()?;
+    drop(watchdog);
     if !status.success() {
         return Err(TransportError::Remote(status));
     }
@@ -181,7 +292,11 @@ fn source_checkout() -> Result<&'static Path, TransportError> {
         .ok_or_else(|| std::io::Error::other("the source checkout is unavailable").into())
 }
 
+/// Rebuild and rerun this client when its checkout changed, unless `DOMYJOB_REFRESH=never`.
 pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
+    if std::env::var_os("DOMYJOB_REFRESH").is_some_and(|value| value == "never") {
+        return Ok(None);
+    }
     let Some(checkout_build) = identity::checkout()? else {
         return Ok(None);
     };
@@ -199,6 +314,7 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
         .env("CARGO_TARGET_DIR", &target)
         .env("RUSTC_WRAPPER", "")
         .args(["x", "--", "cargo", "build", "--locked", "-p", "domyjob"])
+        .stdout(Stdio::from(std::io::stderr()))
         .status()?;
     if !built.success() {
         return Err(TransportError::Deployment(built));
@@ -218,14 +334,8 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteShell {
-    Unix,
-    Windows,
-}
-
-fn remote_shell(machine: &MachineName) -> Result<RemoteShell, TransportError> {
-    let mut child = SshChild::start_command(machine, "echo $env:OS", Stdio::piped())?;
+fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
+    let mut child = SshChild::start(machine, "echo $env:OS", Stdio::piped())?;
     drop(child.child.stdin.take());
     let mut output = child
         .child
@@ -233,39 +343,52 @@ fn remote_shell(machine: &MachineName) -> Result<RemoteShell, TransportError> {
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64];
-    loop {
-        let count = output.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(count) > 64 {
-            return Err(TransportError::RemoteShell);
-        }
-        bytes.extend_from_slice(buffer.get(..count).ok_or(TransportError::RemoteShell)?);
-    }
+    (&mut output).take(65).read_to_end(&mut bytes)?;
     drop(output);
     let status = child.wait()?;
-    if !status.success() {
-        return Err(TransportError::Remote(status));
+    if status.code() == Some(255) {
+        return Err(TransportError::Unreachable);
+    }
+    if !status.success() || bytes.len() > 64 {
+        return Err(TransportError::RemoteShell);
     }
     match std::str::from_utf8(&bytes)
         .map_err(|_utf8| TransportError::RemoteShell)?
         .trim()
     {
-        "Windows_NT" => Ok(RemoteShell::Windows),
-        ":OS" => Ok(RemoteShell::Unix),
+        "Windows_NT" => Ok(Shell::Windows),
+        ":OS" => Ok(Shell::Unix),
         _ => Err(TransportError::RemoteShell),
     }
 }
 
-fn install_command(shell: RemoteShell, build: &str) -> String {
+/// The remote shell of `machine`, detected once and then cached in private state.
+fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
+    let path = platform::state()?.join("v1").join("hosts.json");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the private shell cache is decoded after its bounded state read"
+    )]
+    let mut hosts: BTreeMap<String, Shell> = match state_io::read_bytes(&path)? {
+        Some(bytes) => serde_json::from_slice(&bytes)?,
+        None => BTreeMap::new(),
+    };
+    if let Some(shell) = hosts.get(machine.as_str()) {
+        return Ok(*shell);
+    }
+    let shell = detect_shell(machine)?;
+    hosts.insert(machine.as_str().to_owned(), shell);
+    state_io::write_bytes(&path, &serde_json::to_vec(&hosts)?)?;
+    Ok(shell)
+}
+
+fn install_command(shell: Shell, build: &str) -> String {
     match shell {
-        RemoteShell::Unix => String::from(
+        Shell::Unix => String::from(
             r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; install="$HOME/.cargo/domyjob/versions/@BUILD@"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root "$install" --force; cd "$HOME"; rm -rf -- "$work"'"#,
         )
         .replace("@BUILD@", build),
-        RemoteShell::Windows => {
+        Shell::Windows => {
             let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $install=Join-Path $env:USERPROFILE ".cargo\domyjob\versions\@BUILD@"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root $install --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#.replace("@BUILD@", build);
             let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             format!(
@@ -276,18 +399,19 @@ fn install_command(shell: RemoteShell, build: &str) -> String {
     }
 }
 
-fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
+/// Build and install this build's node on `machine` from the embedded source.
+fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> {
     if u64::try_from(EMBEDDED_SOURCE.len()).map_err(|_size| WireError::Snapshot)?
         > wire::MAX_SNAPSHOT_BYTES
     {
         return Err(WireError::Snapshot.into());
     }
-    let command = install_command(remote_shell(machine)?, &identity::tag());
-    eprintln!(
-        "{}: updating remote binary from this build",
-        machine.as_str()
-    );
-    let mut child = SshChild::start_command(machine, &command, Stdio::inherit())?;
+    eprintln!("{}: installing this build's node", machine.as_str());
+    let mut child = SshChild::start(
+        machine,
+        &install_command(shell, &identity::tag()),
+        Stdio::from(std::io::stderr()),
+    )?;
     let mut input = child
         .child
         .stdin
@@ -303,81 +427,64 @@ fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
     }
 }
 
-fn stale(error: &TransportError) -> bool {
-    match error {
-        TransportError::Wire(WireError::Version | WireError::Json(_)) => true,
-        TransportError::Io(error) => error.kind() == std::io::ErrorKind::UnexpectedEof,
-        TransportError::Invalid(_)
-        | TransportError::Wire(_)
-        | TransportError::App(_)
-        | TransportError::Store(_)
-        | TransportError::Source(_)
-        | TransportError::Entropy(_)
-        | TransportError::Remote(_)
-        | TransportError::UnexpectedReply
-        | TransportError::Refused(_)
-        | TransportError::Deployment(_)
-        | TransportError::BuildMismatch
-        | TransportError::RemoteShell => false,
-    }
-}
-
-fn ensure_deployed(machine: &MachineName) -> Result<(), TransportError> {
-    let first = raw_call(machine, &Request::Hello, &[]);
-    match first {
-        Ok(Reply::Hello { build }) if build == identity::current() => return Ok(()),
-        Ok(Reply::Hello { .. }) => {}
-        Err(ref error) if stale(error) => {}
-        Ok(_) => return Err(TransportError::UnexpectedReply),
-        Err(error) => return Err(error),
-    }
-    bootstrap(machine)?;
-    match raw_call(machine, &Request::Hello, &[])? {
-        Reply::Hello { build } if build == identity::current() => Ok(()),
-        Reply::Hello { .. } => Err(TransportError::BuildMismatch),
-        Reply::Accepted { .. }
-        | Reply::Jobs { .. }
-        | Reply::Status { .. }
-        | Reply::Logs { .. }
-        | Reply::Cleaned { .. }
-        | Reply::Chat(_)
-        | Reply::Error { .. } => Err(TransportError::UnexpectedReply),
-    }
-}
-
-fn call_with_payload(
+/// Call this build's node, installing it first when the machine reports it missing.
+fn call_with(
     machine: &MachineName,
     request: &Request,
     payload: &[u8],
+    policy: Policy,
 ) -> Result<Reply, TransportError> {
-    ensure_deployed(machine)?;
-    raw_call(machine, request, payload)
+    let shell = shell(machine)?;
+    match raw_call((machine, shell), request, payload, policy) {
+        Err(TransportError::Missing) => {
+            bootstrap(machine, shell)?;
+            raw_call((machine, shell), request, payload, policy)
+        }
+        other => other,
+    }
 }
 
-fn call(machine: &MachineName, request: &Request) -> Result<Reply, TransportError> {
-    call_with_payload(machine, request, &[])
+/// Take the one reply kind a request expects.
+fn pick<T>(reply: Reply, kind: fn(Reply) -> Result<T, Reply>) -> Result<T, TransportError> {
+    match kind(reply) {
+        Ok(value) => Ok(value),
+        Err(Reply::Error { code }) => Err(TransportError::Refused(code)),
+        Err(_unexpected) => Err(TransportError::UnexpectedReply),
+    }
+}
+
+fn expect<T>(
+    machine: &MachineName,
+    request: &Request,
+    payload: &[u8],
+    kind: fn(Reply) -> Result<T, Reply>,
+) -> Result<T, TransportError> {
+    pick(call_with(machine, request, payload, PLAIN)?, kind)
 }
 
 pub(crate) fn doctor(machine: &MachineName) -> Result<(), TransportError> {
-    ensure_deployed(machine)?;
+    let build = expect(machine, &Request::Hello, &[], Reply::into_hello)?;
+    if build != identity::current() {
+        return Err(TransportError::BuildMismatch);
+    }
     println!("{}: ready (wire {})", machine.as_str(), wire::VERSION);
     Ok(())
 }
 
+/// One chat request with a deadline; a wait holds the connection until its reply.
 pub(crate) fn chat(
     machine: &MachineName,
-    request: domyjob_core::chat_wire_v0::ChatRequest,
-) -> Result<domyjob_core::chat_wire_v0::ChatReply, TransportError> {
-    match call(machine, &Request::Chat(request))? {
-        Reply::Chat(reply) => Ok(reply),
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Accepted { .. }
-        | Reply::Jobs { .. }
-        | Reply::Status { .. }
-        | Reply::Logs { .. }
-        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
-    }
+    request: &ChatRequest,
+    deadline: clock::Deadline,
+) -> Result<ChatReply, TransportError> {
+    let policy = Policy {
+        deadline: Some(deadline),
+        hold_input: matches!(request, ChatRequest::Wait { .. }),
+    };
+    pick(
+        call_with(machine, &Request::Chat(request.clone()), &[], policy)?,
+        Reply::into_chat,
+    )
 }
 
 fn new_submission() -> Result<SubmissionId, TransportError> {
@@ -424,16 +531,7 @@ fn submit(
         command,
         input,
     };
-    match call_with_payload(machine, &request, payload)? {
-        Reply::Accepted { job } => Ok(job),
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Jobs { .. }
-        | Reply::Status { .. }
-        | Reply::Logs { .. }
-        | Reply::Chat(_)
-        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
-    }
+    expect(machine, &request, payload, Reply::into_accepted)
 }
 
 pub(crate) fn on(
@@ -485,37 +583,21 @@ pub(crate) fn run(
 }
 
 pub(crate) fn ls(machine: &MachineName) -> Result<(), TransportError> {
-    match call(machine, &Request::List)? {
-        Reply::Jobs { jobs } => {
-            for job in jobs {
-                println!("{}:{}", machine.as_str(), job.as_str());
-            }
-            Ok(())
-        }
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Accepted { .. }
-        | Reply::Status { .. }
-        | Reply::Logs { .. }
-        | Reply::Chat(_)
-        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
+    for job in expect(machine, &Request::List, &[], Reply::into_jobs)? {
+        println!("{}:{}", machine.as_str(), job.as_str());
     }
+    Ok(())
 }
 
 pub(crate) fn clean(machine: &MachineName, target: CleanTarget) -> Result<(), TransportError> {
-    match call(machine, &Request::Clean { target })? {
-        Reply::Cleaned { count } => {
-            println!("{}: cleaned {count} finished jobs", machine.as_str());
-            Ok(())
-        }
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Accepted { .. }
-        | Reply::Jobs { .. }
-        | Reply::Status { .. }
-        | Reply::Chat(_)
-        | Reply::Logs { .. } => Err(TransportError::UnexpectedReply),
-    }
+    let count = expect(
+        machine,
+        &Request::Clean { target },
+        &[],
+        Reply::into_cleaned,
+    )?;
+    println!("{}: cleaned {count} finished jobs", machine.as_str());
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,27 +608,13 @@ enum Observation {
 }
 
 fn observe(reference: &JobReference, observation: Observation) -> Result<JobState, TransportError> {
+    let job = reference.job().clone();
     let request = match observation {
-        Observation::Current => Request::Status {
-            job: reference.job().clone(),
-        },
-        Observation::Complete => Request::Wait {
-            job: reference.job().clone(),
-        },
-        Observation::Cancel => Request::Kill {
-            job: reference.job().clone(),
-        },
+        Observation::Current => Request::Status { job },
+        Observation::Complete => Request::Wait { job },
+        Observation::Cancel => Request::Kill { job },
     };
-    match call(reference.machine(), &request)? {
-        Reply::Status { state } => Ok(state),
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Accepted { .. }
-        | Reply::Jobs { .. }
-        | Reply::Logs { .. }
-        | Reply::Chat(_)
-        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
-    }
+    expect(reference.machine(), &request, &[], Reply::into_status)
 }
 
 fn print_state(reference: &JobReference, state: &JobState) {
@@ -614,27 +682,60 @@ pub(crate) fn logs(reference: &JobReference) -> Result<(), TransportError> {
     let request = Request::Logs {
         job: reference.job().clone(),
     };
-    match call(reference.machine(), &request)? {
-        Reply::Logs { text, omitted } => {
-            if omitted != 0 {
-                eprintln!("{omitted} earlier log bytes omitted");
+    let (text, omitted) = expect(reference.machine(), &request, &[], Reply::into_logs)?;
+    if omitted != 0 {
+        eprintln!("{omitted} earlier log bytes omitted");
+    }
+    std::io::stdout().write_all(text.for_terminal().as_bytes())?;
+    Ok(())
+}
+
+/// Watch standard input after a held request; its end means the client disconnected.
+fn watch_disconnect(abandoned: &Arc<AtomicBool>) {
+    let abandoned = Arc::clone(abandoned);
+    std::thread::spawn(move || {
+        let mut sink = [0_u8; 64];
+        let mut input = std::io::stdin();
+        loop {
+            match input.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
-            std::io::stdout().write_all(text.for_terminal().as_bytes())?;
-            Ok(())
         }
-        Reply::Error { code } => Err(TransportError::Refused(code)),
-        Reply::Hello { .. }
-        | Reply::Accepted { .. }
-        | Reply::Jobs { .. }
-        | Reply::Status { .. }
-        | Reply::Chat(_)
-        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
+        abandoned.store(true, std::sync::atomic::Ordering::Release);
+    });
+}
+
+const fn error_code(error: &AppError) -> ErrorCode {
+    match error {
+        AppError::Store(StoreError::Missing) => ErrorCode::MissingJob,
+        AppError::Store(StoreError::Conflict) => ErrorCode::ConflictingSubmission,
+        AppError::Store(StoreError::Capacity) => ErrorCode::ResourceLimit,
+        AppError::Store(
+            StoreError::Active | StoreError::ArchiveEntry | StoreError::ArchiveMismatch,
+        ) => ErrorCode::InvalidRequest,
+        AppError::Store(StoreError::Corrupt | StoreError::Transition(_) | StoreError::Wire(_)) => {
+            ErrorCode::CorruptState
+        }
+        AppError::Chat(_)
+        | AppError::Store(
+            StoreError::State(_)
+            | StoreError::Lock(_)
+            | StoreError::Io(_)
+            | StoreError::Workspace(_)
+            | StoreError::Entropy(_),
+        )
+        | AppError::Proc(_)
+        | AppError::Notify(_)
+        | AppError::Io(_)
+        | AppError::InvalidErrorText => ErrorCode::Internal,
     }
 }
 
 pub(crate) fn node() -> Result<(), TransportError> {
     let mut input = std::io::stdin().lock();
     let request = ingress::request(&read_frame(&mut input)?)?;
+    let abandoned = Arc::new(AtomicBool::new(false));
     let archive = match &request {
         Request::Run {
             input: Input::Snapshot(snapshot),
@@ -652,36 +753,20 @@ pub(crate) fn node() -> Result<(), TransportError> {
         | Request::Kill { .. }
         | Request::Clean { .. } => None,
     };
-    require_end(&mut input)?;
-    drop(input);
-    let reply = match app::handle(request, archive.as_ref()) {
+    if matches!(&request, Request::Chat(ChatRequest::Wait { .. })) {
+        drop(input);
+        watch_disconnect(&abandoned);
+    } else {
+        require_end(&mut input)?;
+        drop(input);
+    }
+    let reply = match app::handle(request, archive.as_ref(), &abandoned) {
         Ok(reply) => reply,
         Err(error) => {
             eprintln!("domyjob node: {error}");
-            let code = match error {
-                AppError::Store(StoreError::Missing) => ErrorCode::MissingJob,
-                AppError::Store(StoreError::Conflict) => ErrorCode::ConflictingSubmission,
-                AppError::Store(StoreError::Capacity) => ErrorCode::ResourceLimit,
-                AppError::Chat(_)
-                | AppError::Store(
-                    StoreError::Active | StoreError::ArchiveEntry | StoreError::ArchiveMismatch,
-                ) => ErrorCode::InvalidRequest,
-                AppError::Store(
-                    StoreError::Corrupt | StoreError::Transition(_) | StoreError::Wire(_),
-                ) => ErrorCode::CorruptState,
-                AppError::Store(
-                    StoreError::State(_)
-                    | StoreError::Lock(_)
-                    | StoreError::Io(_)
-                    | StoreError::Workspace(_)
-                    | StoreError::Entropy(_),
-                )
-                | AppError::Proc(_)
-                | AppError::Notify(_)
-                | AppError::Io(_)
-                | AppError::InvalidErrorText => ErrorCode::Internal,
-            };
-            Reply::Error { code }
+            Reply::Error {
+                code: error_code(&error),
+            }
         }
     };
     let mut output = std::io::stdout().lock();
@@ -694,7 +779,7 @@ pub(crate) fn node() -> Result<(), TransportError> {
 mod tests {
     use domyjob_core::wire::BuildId;
 
-    use super::{EMBEDDED_SOURCE, identity};
+    use super::{EMBEDDED_SOURCE, Shell, identity, node_command};
     use crate::source_fingerprint;
 
     #[test]
@@ -706,5 +791,18 @@ mod tests {
         let fingerprint =
             source_fingerprint::from_checkout(checkout.path(), |_kind, _path| {}).unwrap();
         assert_eq!(BuildId::from_fingerprint(fingerprint), identity::current());
+    }
+
+    #[test]
+    fn remote_node_commands_report_a_missing_build_with_the_reserved_status() {
+        let unix = node_command(Shell::Unix, "0123456789abcdef");
+        assert!(unix.starts_with("sh -c '"));
+        assert!(unix.contains("versions/0123456789abcdef/bin/domyjob"));
+        assert!(unix.contains("exit 97"));
+        assert!(unix.contains("exec \"$p\" node"));
+        let windows = node_command(Shell::Windows, "0123456789abcdef");
+        assert!(windows.contains("Test-Path -LiteralPath $p"));
+        assert!(windows.contains("exit 97"));
+        assert!(windows.ends_with("exit $LASTEXITCODE"));
     }
 }

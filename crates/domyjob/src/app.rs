@@ -29,7 +29,7 @@ use crate::watch_event::{self, Notice};
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
     #[error(transparent)]
-    Chat(#[from] crate::chat_sync::ServerError),
+    Chat(Box<crate::chat::sync::SyncError>),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -154,9 +154,16 @@ fn start_worker(store: &Store, job: &JobId) -> Result<(), AppError> {
 pub(crate) fn handle(
     request: Request,
     archive: Option<&ReceivedArchive>,
+    abandoned: &AtomicBool,
 ) -> Result<Reply, AppError> {
     match request {
-        Request::Chat(request) => Ok(Reply::Chat(crate::chat_sync::handle(request)?)),
+        Request::Chat(request) => {
+            let chat = |error: crate::chat::sync::SyncError| AppError::Chat(Box::new(error));
+            let store = crate::chat::store::Store::open().map_err(|error| chat(error.into()))?;
+            Ok(Reply::Chat(
+                crate::chat::sync::serve(&store, request, abandoned).map_err(chat)?,
+            ))
+        }
         Request::Hello => Ok(Reply::Hello {
             build: identity::current(),
         }),

@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::card::{Card, MachineCard};
 use super::id::{
-    AgentId, AgentName, Audience, Conversation, DirectId, EventId, Invalid, Line, Origin, RoomName,
-    Text,
+    AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
 };
 
 /// The encoded size limit of one event, leaving room for a batch inside a 1 MiB frame.
@@ -292,9 +291,23 @@ fn valid_ask(
         && !chain.contains(sender)
         && audience.includes(responder.origin())
         && match conversation {
-            Conversation::Direct(direct) => *direct == DirectId::between(sender, responder),
+            Conversation::Direct(pair) => pair.other(sender) == Some(responder),
             Conversation::Room(_) => true,
         }
+}
+
+/// A direct conversation belongs to exactly its two agents and their machines.
+fn valid_thread(conversation: &Conversation, audience: &Audience, author: &AgentId) -> bool {
+    match conversation {
+        Conversation::Direct(pair) => {
+            let mut machines: Vec<&Origin> =
+                pair.agents().iter().map(|agent| agent.origin()).collect();
+            machines.sort();
+            machines.dedup();
+            pair.includes(author) && audience.members().iter().eq(machines)
+        }
+        Conversation::Room(_) => true,
+    }
 }
 
 impl Event {
@@ -302,11 +315,15 @@ impl Event {
         if clock == 0 || clock == u64::MAX {
             return Err(Invalid("event clock"));
         }
-        if body
-            .audience()
-            .is_some_and(|audience| !audience.includes(id.origin()))
-        {
-            return Err(Invalid("audience must include the author's machine"));
+        if let Some((conversation, audience)) = body.thread() {
+            let author = body
+                .author()
+                .map(|name| AgentId::new(name.clone(), id.origin().clone()));
+            if !audience.includes(id.origin())
+                || !author.is_some_and(|author| valid_thread(conversation, audience, &author))
+            {
+                return Err(Invalid("conversation author or audience"));
+            }
         }
         if let Body::Message {
             conversation,
@@ -451,7 +468,7 @@ mod tests {
 
     use super::{Body, Chain, Event, Intent, Sealed};
     use crate::chat::fixtures::{agent, ask, card, id, origin};
-    use crate::chat::id::{Conversation, DirectId};
+    use crate::chat::id::Conversation;
 
     #[test]
     #[expect(
@@ -498,11 +515,17 @@ mod tests {
         let bob = agent("bob", 'b');
         let cycle = Chain::try_from(vec![bob.clone()]).unwrap();
         Event::new(id('a', 1), 1, with(bob.clone(), cycle, &conversation)).unwrap_err();
-        let other = Conversation::Direct(DirectId::between(
-            &agent("alice", 'a'),
-            &agent("carol", 'b'),
-        ));
+        let other = Conversation::direct(&agent("alice", 'a'), &agent("carol", 'b')).unwrap();
         Event::new(id('a', 1), 1, with(bob, Chain::default(), &other)).unwrap_err();
+        let outsider = Body::Message {
+            conversation,
+            from: agent("mallory", 'a').name().clone(),
+            text: text.clone(),
+            audience: audience.clone(),
+            intent: Intent::Send {},
+            at: 1,
+        };
+        Event::new(id('a', 1), 1, outsider).unwrap_err();
         Chain::try_from(vec![agent("x", 'a'), agent("x", 'a')]).unwrap_err();
         Chain::try_from(
             (0..9)

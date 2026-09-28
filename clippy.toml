@@ -8,6 +8,8 @@ doc-valid-idents = [
   "ULID",
   "macOS",
   "TOML",
+  "OpenCode",
+  "MCP",
 ]
 
 too-many-arguments-threshold = 4

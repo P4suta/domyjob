@@ -45,9 +45,7 @@ macro_rules! validated_string {
 }
 
 pub mod chat;
-pub mod chat_v0;
 pub mod chat_wire;
-pub mod chat_wire_v0;
 pub mod domain;
 pub mod ingress;
 pub mod jsonc;

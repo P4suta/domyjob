@@ -6,9 +6,7 @@ use super::Model;
 use crate::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
 use crate::chat::exchange::respond;
 use crate::chat::fixtures::{agent, ask, card, id, origin, text};
-use crate::chat::id::{
-    AgentId, Audience, Conversation, DirectId, EventId, Origin, RoomId, RoomName,
-};
+use crate::chat::id::{AgentId, Audience, Conversation, EventId, Origin, RoomId, RoomName};
 use crate::chat::ledger::{Ending, Failure, Ledger, Rejection, receive};
 use crate::chat::policy::audience;
 use crate::chat_wire::{Batch, Offer};
@@ -36,7 +34,7 @@ fn message(
 fn direct(from: &AgentId, to: &AgentId, intent: Intent) -> Body {
     message(
         from,
-        Conversation::Direct(DirectId::between(from, to)),
+        Conversation::direct(from, to).unwrap(),
         &[from, to],
         intent,
     )
@@ -317,7 +315,7 @@ fn turn_starts_come_only_from_the_responder_after_the_question() {
     sync(&mut a, &mut b);
     assert!(matches!(
         b.write(started(&agent("mallory", 'b'))),
-        Err(Failure::Rejected(Rejection::Mismatch { .. }))
+        Err(Failure::Invalid(_))
     ));
     b.write(started(&bob)).unwrap();
     sync(&mut a, &mut b);

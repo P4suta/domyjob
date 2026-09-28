@@ -7,9 +7,6 @@ use domyjob_core::wire::CleanTarget;
 
 mod app;
 mod chat;
-mod chat_cli;
-mod chat_runner;
-mod chat_sync;
 #[path = "platform/file_kind.rs"]
 mod file_kind;
 mod identity;
@@ -23,6 +20,7 @@ mod source_fingerprint;
 mod state_io;
 mod store;
 mod transport;
+mod user_files;
 mod watch_event;
 mod workspace;
 
@@ -51,10 +49,17 @@ impl FromStr for ReaperGroup {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Persistent conversations with local and remote AI agents.
-    Chat(chat_cli::ChatArgs),
-    /// Serve chat tools over the local MCP stdio transport.
-    Mcp,
+    /// Conversations between AI agents on this and other machines.
+    Chat(chat::cli::ChatArgs),
+    /// Serve the chat tools to an AI client over the MCP stdio transport.
+    Mcp {
+        /// Act as this local agent from the start.
+        #[arg(long = "as", value_name = "AGENT")]
+        actor: Option<String>,
+        /// The managed turn this server works inside, for delegated asks.
+        #[arg(long, hide = true)]
+        turn: Option<String>,
+    },
     #[command(hide = true)]
     ChatWorker {
         #[arg(long)]
@@ -131,9 +136,11 @@ enum MainError {
     #[error(transparent)]
     Transport(#[from] transport::TransportError),
     #[error(transparent)]
-    Chat(#[from] chat_cli::ChatCliError),
+    Chat(#[from] chat::cli::CliError),
     #[error(transparent)]
-    Runner(#[from] chat_runner::RunnerError),
+    Runner(#[from] chat::runner::RunnerError),
+    #[error(transparent)]
+    Mcp(#[from] mcp::McpError),
     #[error(transparent)]
     Invalid(#[from] domyjob_core::domain::Invalid),
     #[error(transparent)]
@@ -144,9 +151,9 @@ enum MainError {
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
     match command {
-        Command::Chat(args) => Ok(chat_cli::run(args)?),
-        Command::Mcp => {
-            mcp::serve()?;
+        Command::Chat(args) => Ok(chat::cli::run(args)?),
+        Command::Mcp { actor, turn } => {
+            mcp::serve(actor.as_deref(), turn.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::ChatWorker { agent, ready_event } => {
@@ -154,7 +161,7 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
                 .map(process::ReadyToken::parse)
                 .transpose()
                 .map_err(app::AppError::from)?;
-            chat_runner::worker(&agent, ready_event.as_ref())?;
+            chat::runner::worker(&agent, ready_event.as_ref())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { machine } => {
@@ -205,15 +212,18 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
     }
 }
 
+/// Commands that run as part of an installed node or service and never rebuild themselves.
+fn internal() -> bool {
+    let words: Vec<std::ffi::OsString> = std::env::args_os().skip(1).take(2).collect();
+    let word = |index: usize| words.get(index).and_then(|word| word.to_str());
+    matches!(
+        (word(0), word(1)),
+        (Some("node" | "worker" | "chat-worker" | "mcp"), _) | (Some("chat"), Some("serve"))
+    )
+}
+
 fn main() -> ExitCode {
-    let internal = std::env::args_os()
-        .nth(1)
-        .as_deref()
-        .is_some_and(|command| {
-            command == std::ffi::OsStr::new("node")
-                || command == std::ffi::OsStr::new("worker")
-                || command == std::ffi::OsStr::new("chat-worker")
-        });
+    let internal = internal();
     if !internal {
         match transport::refresh_local() {
             Ok(Some(code)) => return code,

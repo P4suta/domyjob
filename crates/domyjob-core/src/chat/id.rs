@@ -199,32 +199,77 @@ impl RoomId {
     }
 }
 
+impl fmt::Display for RoomId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "room:{}:{}", self.origin, self.name)
+    }
+}
+
 /// Where a message belongs: a two-agent direct conversation or a room.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Conversation {
-    Direct(DirectId),
+    Direct(DirectPair),
     Room(RoomId),
 }
 
-/// The symmetric digest of the two agents of a direct conversation.
+/// The two distinct agents of a direct conversation, in sorted order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DirectId(String);
+pub struct DirectPair {
+    first: AgentId,
+    second: AgentId,
+}
 
-impl DirectId {
-    /// Derive the conversation shared by two agents, independent of their order.
-    #[must_use]
-    pub fn between(first: &AgentId, second: &AgentId) -> Self {
-        let (low, high) = if first <= second {
-            (first, second)
-        } else {
-            (second, first)
+impl DirectPair {
+    /// The conversation shared by two distinct agents, independent of their order.
+    pub fn between(one: &AgentId, other: &AgentId) -> Result<Self, Invalid> {
+        let (first, second) = match one.cmp(other) {
+            core::cmp::Ordering::Less => (one, other),
+            core::cmp::Ordering::Greater => (other, one),
+            core::cmp::Ordering::Equal => return Err(Invalid("direct conversation")),
         };
-        let mut hash = blake3::Hasher::new_derive_key("domyjob chat direct conversation v2");
-        hash.update(format!("{low}").as_bytes());
-        hash.update(&[0]);
-        hash.update(format!("{high}").as_bytes());
-        Self(hash.finalize().to_hex().as_str().to_owned())
+        Ok(Self {
+            first: first.clone(),
+            second: second.clone(),
+        })
+    }
+
+    #[must_use]
+    pub fn includes(&self, agent: &AgentId) -> bool {
+        self.first == *agent || self.second == *agent
+    }
+
+    /// The participant that is not `agent`, when `agent` takes part.
+    #[must_use]
+    pub fn other(&self, agent: &AgentId) -> Option<&AgentId> {
+        if self.first == *agent {
+            Some(&self.second)
+        } else if self.second == *agent {
+            Some(&self.first)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn agents(&self) -> [&AgentId; 2] {
+        [&self.first, &self.second]
+    }
+}
+
+impl Conversation {
+    /// The direct conversation of two distinct agents.
+    pub fn direct(one: &AgentId, other: &AgentId) -> Result<Self, Invalid> {
+        DirectPair::between(one, other).map(Self::Direct)
+    }
+
+    /// Whether `agent` may author in this conversation without consulting room membership.
+    #[must_use]
+    pub fn admits_author(&self, agent: &AgentId) -> bool {
+        match self {
+            Self::Direct(pair) => pair.includes(agent),
+            Self::Room(_) => true,
+        }
     }
 }
 
@@ -232,9 +277,11 @@ impl TryFrom<String> for Conversation {
     type Error = Invalid;
 
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        if let Some(digest) = text.strip_prefix("dm:") {
-            return if lower_hex(digest, 64) {
-                Ok(Self::Direct(DirectId(digest.to_owned())))
+        if let Some(pair) = text.strip_prefix("dm:") {
+            let (first, second): (AgentId, AgentId) = split_pair(pair, ',', "conversation")?;
+            let direct = DirectPair::between(&first, &second)?;
+            return if direct.first == first {
+                Ok(Self::Direct(direct))
             } else {
                 Err(Invalid("conversation"))
             };
@@ -254,8 +301,8 @@ impl From<Conversation> for String {
 impl fmt::Display for Conversation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Direct(DirectId(digest)) => write!(formatter, "dm:{digest}"),
-            Self::Room(room) => write!(formatter, "room:{}:{}", room.origin, room.name),
+            Self::Direct(pair) => write!(formatter, "dm:{},{}", pair.first, pair.second),
+            Self::Room(room) => write!(formatter, "{room}"),
         }
     }
 }
@@ -384,7 +431,7 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        AgentId, AgentName, Audience, Conversation, DirectId, EventId, Line, Origin, Paragraph,
+        AgentId, AgentName, Audience, Conversation, DirectPair, EventId, Line, Origin, Paragraph,
         Text,
     };
     use crate::chat::fixtures::{agent, origin};
@@ -399,7 +446,7 @@ mod tests {
             EventId::try_from(String::from(event.clone())).unwrap(),
             event
         );
-        let direct = Conversation::Direct(DirectId::between(&id, &agent("builder", 'b')));
+        let direct = Conversation::direct(&id, &agent("builder", 'b')).unwrap();
         assert_eq!(
             Conversation::try_from(String::from(direct.clone())).unwrap(),
             direct
@@ -427,22 +474,27 @@ mod tests {
         ] {
             EventId::try_from(invalid).unwrap_err();
         }
-        for invalid in ["dm:abc", "room:x:y", "room:", "other"] {
-            Conversation::try_from(invalid.to_owned()).unwrap_err();
+        let (alice, bob) = (agent("alice", 'a'), agent("bob", 'b'));
+        for invalid in [
+            "dm:abc".to_owned(),
+            "room:x:y".to_owned(),
+            "room:".to_owned(),
+            "other".to_owned(),
+            alloc::format!("dm:{bob},{alice}"),
+            alloc::format!("dm:{alice},{alice}"),
+        ] {
+            Conversation::try_from(invalid).unwrap_err();
         }
     }
 
     #[test]
-    fn direct_conversations_are_symmetric_and_unambiguous() {
+    fn direct_conversations_are_symmetric_and_name_both_agents() {
         let (first, second) = (agent("a", '1'), agent("b", '2'));
-        assert_eq!(
-            DirectId::between(&first, &second),
-            DirectId::between(&second, &first)
-        );
-        assert_ne!(
-            DirectId::between(&first, &second),
-            DirectId::between(&first, &agent("c", '2'))
-        );
+        let pair = DirectPair::between(&first, &second).unwrap();
+        assert_eq!(pair, DirectPair::between(&second, &first).unwrap());
+        assert_eq!(pair.other(&first), Some(&second));
+        assert_eq!(pair.other(&agent("c", '2')), None);
+        DirectPair::between(&first, &first).unwrap_err();
     }
 
     #[test]

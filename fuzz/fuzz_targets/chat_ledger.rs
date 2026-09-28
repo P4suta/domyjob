@@ -5,7 +5,7 @@
 use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
 use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
 use domyjob_core::chat::id::{
-    AgentId, AgentName, Conversation, DirectId, Line, Origin, RoomId, RoomName, Text,
+    AgentId, AgentName, Conversation, Line, Origin, RoomId, RoomName, Text,
 };
 use domyjob_core::chat::model::Model;
 use domyjob_core::chat::policy::audience;
@@ -86,8 +86,20 @@ struct World {
 }
 
 impl World {
+    /// Author an event that must be valid on its machine.
     fn write(&mut self, machine: usize, body: Body) -> Option<Event> {
-        self.models[machine].write(body).ok()
+        Some(self.models[machine].write(body).expect("a valid local write is admitted"))
+    }
+
+    /// Author an event that may legitimately depend on events not yet received.
+    fn try_write(&mut self, machine: usize, body: Body) -> Option<Event> {
+        match self.models[machine].write(body) {
+            Ok(event) => Some(event),
+            Err(domyjob_core::chat::ledger::Failure::Rejected(
+                domyjob_core::chat::ledger::Rejection::MissingDependency { .. },
+            )) => None,
+            Err(other) => panic!("an ending of a known ask is admitted: {other:?}"),
+        }
     }
 
     fn sync(&mut self, first: usize, second: usize, rounds: usize) {
@@ -117,14 +129,17 @@ impl World {
             }
             1 => {
                 let (sender, receiver) = (agent(from, 0), agent(to, 1));
-                let conversation = Conversation::Direct(DirectId::between(&sender, &receiver));
+                if sender == receiver {
+                    return;
+                }
+                let conversation = Conversation::direct(&sender, &receiver).unwrap();
                 self.write(from, message(&sender, conversation, &[&receiver], Intent::Send {}));
             }
             2 | 3 => {
                 let sender = agent(from, 0);
                 let (conversation, responder, audience) = if operation % 8 == 2 {
                     let responder = agent(to, 1);
-                    let direct = Conversation::Direct(DirectId::between(&sender, &responder));
+                    let direct = Conversation::direct(&sender, &responder).unwrap();
                     (direct, responder.clone(), vec![responder])
                 } else {
                     if from == to {
@@ -158,7 +173,7 @@ impl World {
                     _ => (responder_machine, responder, Some(Outcome::Failed)),
                 };
                 if let Some(body) = follow_up(&request, &by, outcome) {
-                    self.write(machine, body);
+                    self.try_write(machine, body);
                 }
             }
             4..=6 => {}

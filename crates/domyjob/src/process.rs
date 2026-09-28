@@ -75,12 +75,114 @@ impl ReadyToken {
     }
 }
 
-pub(crate) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
-    os::launch_worker(&["worker", job.as_str()])
+/// A short command-line tool run by setup, doctor, and the service installer.
+#[derive(Debug)]
+pub(crate) struct Tool<'a> {
+    program: &'a str,
+    arguments: &'a [String],
+    environment: Vec<(&'static str, String)>,
 }
 
-fn launch_chat_worker(agent: &str) -> Result<(), ProcessError> {
-    os::launch_worker(&["chat-worker", "--agent", agent])
+impl<'a> Tool<'a> {
+    #[must_use]
+    pub(crate) const fn new(program: &'a str, arguments: &'a [String]) -> Self {
+        Self {
+            program,
+            arguments,
+            environment: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            dead_code,
+            reason = "only the Linux service manager needs extra environment"
+        )
+    )]
+    pub(crate) fn env(mut self, name: &'static str, value: String) -> Self {
+        self.environment.push((name, value));
+        self
+    }
+}
+
+/// What a tool printed and whether it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ToolError {
+    #[error("{0} is not installed or not on PATH")]
+    Missing(String),
+    #[error("running {program}: {source}")]
+    Run { program: String, source: io::Error },
+}
+
+const MAX_TOOL_OUTPUT: u64 = 1024 * 1024;
+
+fn capture(stream: Option<impl io::Read>) -> String {
+    let mut bytes = Vec::new();
+    if let Some(stream) = stream {
+        let _read = io::Read::read_to_end(&mut io::Read::take(stream, MAX_TOOL_OUTPUT), &mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Run a tool to completion with no input, capturing at most 1 MiB of each output stream.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "setup and service management run fixed local tools"
+)]
+pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
+    let program = crate::platform::find_program(tool.program)
+        .ok_or_else(|| ToolError::Missing(tool.program.to_owned()))?;
+    let failed = |source| ToolError::Run {
+        program: tool.program.to_owned(),
+        source,
+    };
+    let mut command = Command::new(program);
+    command
+        .args(tool.arguments)
+        .envs(
+            tool.environment
+                .iter()
+                .map(|(name, value)| (*name, value.as_str())),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(failed)?;
+    let errors = child.stderr.take();
+    let reader = std::thread::spawn(move || capture(errors));
+    let stdout = capture(child.stdout.take());
+    let status = child.wait().map_err(failed)?;
+    let stderr = reader
+        .join()
+        .map_err(|_panic| failed(io::Error::other("the output reader panicked")))?;
+    Ok(ToolOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+/// Stop a process tree by ID, as the service manager would.
+pub(crate) fn terminate(pid: u32) -> Result<(), ProcessError> {
+    os::terminate(pid)
+}
+
+pub(crate) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
+    os::launch_worker(&["worker", job.as_str()], None)
+}
+
+/// Start a chat worker whose diagnostics append to `log`.
+pub(crate) fn launch_chat_worker(agent: &str, log: std::fs::File) -> Result<(), ProcessError> {
+    os::launch_worker(&["chat-worker", "--agent", agent], Some(log))
 }
 
 pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessError> {
