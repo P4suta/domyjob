@@ -13,8 +13,15 @@ The output file stores at most the first 256 MiB of a job's output, and one fina
 Jobs receive an explicit environment allowlist, so SSH agent and connection variables are not passed to the command.
 
 The client builds and installs remote code from its embedded build source over an authenticated SSH connection.
-The same source fingerprint is checked after installation to prevent a stale node from handling a new wire request.
+Every build runs from its own fingerprint-named path, so a request always reaches the node of its own build.
 The fingerprint detects changes; it does not certify the source or dependencies.
 The remote account and build environment are trusted to compile and execute that checkout.
 
-The first release does not provide peer pairing, a network service, signed release installation, file pullback, or migration from the former state format.
+Chat runs within the same trust boundary.
+A machine pins each peer's chat identity and refuses an exchange meant for another identity.
+Any account that can reach a machine over SSH can read the chat events addressed to that machine's agents and can ask its managed agents to run turns with their configured access.
+Managed agents default to read-only access, and each client's own sandbox or permission mode enforces it.
+The MCP server writes only as an agent that joined or was bound to the connection, and it does not expose job operations.
+Setup changes the user's AI client configuration only through each client's registration command or a comment-preserving edit of the domyjob entry.
+
+The first release does not provide a network service, signed release installation, file pullback, or migration from the former state format.

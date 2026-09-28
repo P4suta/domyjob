@@ -3,18 +3,15 @@
 Run persistent jobs on machines reachable through OpenSSH.
 The client sends a command to a remote node, records its state, and keeps it running after the SSH connection ends.
 
-Development is paused at the AI chat integration checkpoint.
-See [remaining work and verification status](docs/remaining-work.md) before resuming or treating the chat integration as complete.
-
 ## Develop from this checkout
 
 Rust 1.98 and `mise` are pinned in this repository.
 Build the client with `mise x -- cargo build --locked -p domyjob`, then run `target/debug/domyjob`.
 The client compares the complete source fingerprint with its compiled fingerprint and rebuilds itself when the checkout changes.
-On Windows, a client running from Cargo's debug output builds its replacement into a separate target slot so the running executable can remain open.
-Before each remote request, it compares the remote fingerprint and builds and installs the matching node over SSH when needed.
+On Windows, a client running from Cargo's debug output builds its replacement into a target slot that no running client uses.
+Each build runs remotely from its own executable path; when that path is missing, the node reports it and the client builds and installs the matching node over SSH.
 The binary embeds its build source, so an installed copy can perform the first remote installation without its checkout.
-Each build installs into its own remote executable path, allowing older jobs to keep running during an update.
+Older builds keep serving their running jobs and are removed once nothing runs them.
 The remote machine needs `mise`, Rust, Cargo, and a working OpenSSH login.
 
 ```console
@@ -56,29 +53,44 @@ The binary owns SSH, process isolation, private storage, and confined workspace 
 
 ## AI chat
 
-Exchange persistent messages with human participants and Claude Code, Codex, or OpenCode agents over the same SSH connection.
-Register managed agents with `agent start`, or attach existing interactive sessions with `agent attach`.
+AI agents on different machines find each other in a shared directory and talk over the same SSH access.
+Every participant is an agent: a managed agent whose turns domyjob runs with Claude Code, Codex, or OpenCode, or an interactive AI session that joins through MCP.
 
 ```console
 $ target/debug/domyjob chat setup linux win
-$ target/debug/domyjob chat agent start reviewer --kind codex --cwd /absolute/project
-$ target/debug/domyjob chat agent attach assistant --kind claude --cwd /absolute/project --session SESSION_ID
-$ target/debug/domyjob chat send owner@linux "The build is ready."
-$ target/debug/domyjob chat ask reviewer "Review the current changes."
-$ target/debug/domyjob chat room create release reviewer owner@linux
-$ target/debug/domyjob chat ask release "Check the release." --to reviewer
-$ target/debug/domyjob chat inbox --json
-$ target/debug/domyjob chat reply MESSAGE_ID "Done." --from assistant
-$ target/debug/domyjob chat sync
+$ target/debug/domyjob chat agent start reviewer --tool codex --cwd /absolute/project \
+    --role reviewer --description "Reviews Rust changes" --skill rust --skill security
+$ target/debug/domyjob chat directory security
+$ target/debug/domyjob chat --as assistant ask reviewer "Review the current changes."
+$ target/debug/domyjob chat --as assistant inbox
 ```
 
-Setup saves SSH peer identities and prints the configuration for `domyjob mcp`.
-Add that configuration to your AI client's MCP settings.
-`chat thread TARGET` reads a conversation, `chat watch TARGET` follows it, and `chat open TARGET` adds interactive input with `/quit` to leave.
-`chat doctor` checks local registrations and peer synchronization.
-Messages persist before transmission, so offline delivery can be retried with `chat sync`.
-`chat ask` returns an explicit answered, failed, interrupted, or pending result.
-See [chat architecture](docs/chat-architecture.md) for the synchronization and execution guarantees.
+`chat setup` pins the named machines, installs a per-user background service that keeps them synchronized, and registers the `domyjob mcp` server with the installed AI clients.
+An interactive AI session then calls `chat_join` with its name and profile, finds help with `chat_directory`, and asks with `chat_ask`.
+Managed agents answer asks automatically, one turn at a time, and may consult other agents during a turn.
+Every ask ends as answered, failed, interrupted, unavailable, or withdrawn, or stays pending while its responder is unreachable.
+`chat doctor` checks the service, peers, client registrations and logins, and local agents, and prints a fix for each problem.
+See [chat architecture](docs/chat-architecture.md) for the guarantees.
+
+| Command | Action |
+| --- | --- |
+| `chat setup MACHINE...` | Pin peers, start the service, and register MCP with AI clients |
+| `chat doctor` | Diagnose the chat setup |
+| `chat directory [QUERY]` | Find agents and rooms by role, skill, project, or description |
+| `chat agent start NAME --tool T --cwd DIR` | Register a managed agent on this machine |
+| `chat agent join NAME --tool T` | Register an interactive agent from the command line |
+| `chat agent update NAME` / `remove NAME` | Change or remove a local agent |
+| `chat profile` / `chat status [TEXT]` | Update the acting agent's card |
+| `chat send`, `ask`, `reply`, `withdraw`, `wait` | Converse and follow asks |
+| `chat inbox`, `thread`, `watch` | Read messages |
+| `chat room create`, `add`, `remove`, `topic`, `close`, `list` | Manage rooms |
+| `chat peer list`, `remove`, `replace` | Manage pinned machines |
+| `chat service install`, `uninstall`, `status` | Manage the background service |
+| `chat sync [MACHINE]` | Exchange messages now |
+| `chat clean CONVERSATION` / `chat reset --yes` | Reclaim history or replace this machine's identity |
+
+Commands that write act as `--as AGENT` or `DOMYJOB_CHAT_AGENT`.
+Add `--json` for structured output.
 
 Run `mise run lint` and `mise run test` before a change is reviewed.
 Use `mise run check:fleet` to run the same checks on Linux and Windows through domyjob.
