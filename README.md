@@ -8,6 +8,7 @@ The client sends a command to a remote node, records its state, and keeps it run
 Rust 1.98 and `mise` are pinned in this repository.
 Build the client with `mise x -- cargo build --locked -p domyjob`, then run `target/debug/domyjob`.
 The client compares the complete source fingerprint with its compiled fingerprint and rebuilds itself when the checkout changes.
+On Windows, a client running from Cargo's debug output builds its replacement into a separate target slot so the running executable can remain open.
 Before each remote request, it compares the remote fingerprint and builds and installs the matching node over SSH when needed.
 The binary embeds its build source, so an installed copy can perform the first remote installation without its checkout.
 Each build installs into its own remote executable path, allowing older jobs to keep running during an update.

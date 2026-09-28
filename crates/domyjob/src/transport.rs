@@ -21,6 +21,7 @@ use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
+use crate::platform;
 use crate::source::{self, SourceError};
 use crate::store::{Store, StoreError};
 
@@ -191,17 +192,18 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
         return Err(std::io::Error::other("the source changed during the local rebuild").into());
     }
     let checkout = source_checkout()?;
+    let target = platform::local_refresh_target(&platform::cargo_target_dir(checkout))?;
     eprintln!("domyjob: rebuilding the local client from this checkout");
     let built = Command::new("mise")
         .current_dir(checkout)
+        .env("CARGO_TARGET_DIR", &target)
         .env("RUSTC_WRAPPER", "")
         .args(["x", "--", "cargo", "build", "--locked", "-p", "domyjob"])
         .status()?;
     if !built.success() {
         return Err(TransportError::Deployment(built));
     }
-    let executable = checkout
-        .join("target")
+    let executable = target
         .join("debug")
         .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX));
     let status = Command::new(executable)

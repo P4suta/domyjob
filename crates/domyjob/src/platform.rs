@@ -39,6 +39,39 @@ pub(crate) fn state() -> io::Result<PathBuf> {
     Ok(home()?.join(".local").join("state").join("domyjob"))
 }
 
+pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
+    match variable("CARGO_TARGET_DIR").map(PathBuf::from) {
+        Some(target) if target.is_absolute() => target,
+        Some(target) => checkout.join(target),
+        None => checkout.join("target"),
+    }
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the shared Unix and Windows target selector is fallible on Windows"
+)]
+pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
+    Ok(target.to_path_buf())
+}
+
+#[cfg(windows)]
+pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
+    let current = fs::canonicalize(std::env::current_exe()?)?;
+    let primary = target.join("debug").join("domyjob.exe");
+    let running_primary = match fs::canonicalize(primary) {
+        Ok(path) => path == current,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if running_primary {
+        Ok(target.join("domyjob-refresh"))
+    } else {
+        Ok(target.to_path_buf())
+    }
+}
+
 pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
     const COMMON: &[&str] = &["PATH", "HOME", "USERPROFILE", "TEMP", "TMP"];
     #[cfg(unix)]

@@ -39,6 +39,7 @@ Remote text is neutralized before terminal output.
 
 The build script fingerprints every source file under `crates/` and `xtask/`, the root Cargo manifests and lockfile, and the pinned tool configuration.
 The client compares that fingerprint at startup and rebuilds from the checkout if necessary.
+Local rebuilds honor `CARGO_TARGET_DIR` and use another target slot on Windows when the active executable occupies Cargo's output path.
 Before a remote RPC, it compares the node fingerprint and installs a matching binary from a portable archive embedded in the client build.
 That archive remains available when the original checkout is unavailable.
 Nodes use build-specific executable paths under `~/.cargo/domyjob/versions/`, so installing a new build does not replace the executable of a running worker.
