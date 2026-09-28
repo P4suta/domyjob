@@ -32,13 +32,22 @@ env = { RUST_LOG = "warn" }
 description = "Lint every target with warnings denied"
 run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
+[tasks."clippy:targets"]
+description = "Lint every target for Linux and Windows too, whatever the host"
+# BLAKE3 then builds without a C compiler for the foreign target.
+env = { CARGO_FEATURE_PURE = "1" }
+run = [
+  "cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings",
+  "cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings",
+]
+
 [tasks.gates]
 description = "Enforce the pure core and platform effect boundaries"
 run = "cargo xtask gates"
 
 [tasks.lint]
 description = "Check formatting, types, architecture, spelling, workflows, and duplication"
-depends = ["fmt:check", "clippy", "gates"]
+depends = ["fmt:check", "clippy", "clippy:targets", "gates"]
 run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
