@@ -231,4 +231,6 @@ impl Outbox for Model {
 }
 
 #[cfg(test)]
+mod exhaustive;
+#[cfg(test)]
 mod tests;
