@@ -13,7 +13,7 @@ use crate::domain::{
 use crate::paths::Dirs;
 use crate::project::{self, ApprovedProjectJob, ApprovedProjectTargets, ProjectError};
 use crate::protocol::{
-    Command, Follow, Job, Location, Reply, Request, Source, Submission, Workspace,
+    Command, Follow, Job, Location, Reply, Request, Source, Submission, SubmissionReply, Workspace,
 };
 use crate::remote::{Link, RemoteError, cached_facts};
 use crate::snapshot::{self, Entry, Origin, Snapshot, SnapshotError};
@@ -753,11 +753,15 @@ impl Plan<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            let missing = reply.needs_content_retry();
-            if !missing || attempts_left == 0 {
-                break reply
-                    .into_job()
-                    .map_err(|other| link.unexpected("job", *other))?;
+            match reply.submission() {
+                SubmissionReply::Accepted(job) => break job,
+                SubmissionReply::MissingContent(_) if attempts_left > 0 => {}
+                SubmissionReply::MissingContent(refusal) => {
+                    return Err(link.unexpected("job", Reply::Refused(refusal)));
+                }
+                SubmissionReply::Unexpected(reply) => {
+                    return Err(link.unexpected("job", reply));
+                }
             }
         };
         let submitted = Submitted {

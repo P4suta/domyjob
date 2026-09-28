@@ -153,6 +153,13 @@ pub enum Reply {
     Refused(Refusal),
 }
 
+#[derive(Debug)]
+pub(crate) enum SubmissionReply {
+    Accepted(Job),
+    MissingContent(Refusal),
+    Unexpected(Reply),
+}
+
 macro_rules! into_variant {
     ($name:ident, $out:ty, $pattern:pat => $value:expr) => {
         pub fn $name(self) -> Result<$out, Box<Self>> {
@@ -184,10 +191,11 @@ impl Reply {
     }
 
     #[must_use]
-    pub(crate) const fn needs_content_retry(&self) -> bool {
-        match self.refusal() {
-            Some(refusal) => match refusal.code {
-                RefusalCode::MissingContent => true,
+    pub(crate) fn submission(self) -> SubmissionReply {
+        match self {
+            Self::Job(job) => SubmissionReply::Accepted(*job),
+            Self::Refused(refusal) => match refusal.code {
+                RefusalCode::MissingContent => SubmissionReply::MissingContent(refusal),
                 RefusalCode::BadRequest
                 | RefusalCode::NoSuchJob
                 | RefusalCode::AmbiguousJob
@@ -198,9 +206,18 @@ impl Reply {
                 | RefusalCode::NoSuchPath
                 | RefusalCode::NotAFile
                 | RefusalCode::DiskFull
-                | RefusalCode::Paused => false,
+                | RefusalCode::Paused => SubmissionReply::Unexpected(Self::Refused(refusal)),
             },
-            None => false,
+            other @ (Self::Hello(_)
+            | Self::NeedBlobs { .. }
+            | Self::Jobs { .. }
+            | Self::Stream
+            | Self::AuditAt { .. }
+            | Self::AuditHead(_)
+            | Self::Digest(_)
+            | Self::Found(_)
+            | Self::Report(_)
+            | Self::Cleaned(_)) => SubmissionReply::Unexpected(other),
         }
     }
 
@@ -1046,16 +1063,49 @@ mod tests {
     }
 
     #[test]
-    fn only_missing_content_refusals_request_a_submission_retry() {
+    fn submission_reply_preserves_the_job_and_retries_only_missing_content() {
+        let job = crate::view::tests::sample();
+        let expected_id = job.spec.id.clone();
+        assert!(matches!(
+            Reply::Job(Box::new(job)).submission(),
+            SubmissionReply::Accepted(job) if job.spec.id == expected_id
+        ));
         let refused = |code| {
             Reply::Refused(Refusal {
                 code,
                 detail: RemoteText::new("refused".into()),
             })
         };
-        assert!(refused(RefusalCode::MissingContent).needs_content_retry());
-        assert!(!refused(RefusalCode::BadRequest).needs_content_retry());
-        assert!(!Reply::Stream.needs_content_retry());
+        assert!(matches!(
+            refused(RefusalCode::MissingContent).submission(),
+            SubmissionReply::MissingContent(Refusal {
+                code: RefusalCode::MissingContent,
+                ..
+            })
+        ));
+        for code in [
+            RefusalCode::BadRequest,
+            RefusalCode::NoSuchJob,
+            RefusalCode::AmbiguousJob,
+            RefusalCode::NoWorkspace,
+            RefusalCode::Forbidden,
+            RefusalCode::Storage,
+            RefusalCode::Spawn,
+            RefusalCode::NoSuchPath,
+            RefusalCode::NotAFile,
+            RefusalCode::DiskFull,
+            RefusalCode::Paused,
+        ] {
+            assert!(matches!(
+                refused(code).submission(),
+                SubmissionReply::Unexpected(Reply::Refused(Refusal { code: rejected, .. }))
+                    if rejected == code
+            ));
+        }
+        assert!(matches!(
+            Reply::Stream.submission(),
+            SubmissionReply::Unexpected(Reply::Stream)
+        ));
     }
 
     fn job_with(phase: Phase, supervisor: Supervisor) -> Job {

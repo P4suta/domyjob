@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Binary, Config, ConfigError, Machine};
-use crate::dist::Deliverable;
+use crate::dist::{Deliverable, SourceFallback};
 use crate::domain::{BlobId, MachineName, Nonce};
 use crate::paths::{Dirs, Family};
 use crate::protocol::{
@@ -1394,9 +1394,11 @@ impl<'a> Link<'a> {
                 Answer::Unavailable(error) => unavailable = Some(error),
             }
         }
-        let deliverable = match crate::dist::binary_for(self.config, self.dirs, &os, &arch) {
+        let deliverable = match crate::dist::binary_for(self.config, self.dirs, &os, &arch)
+            .map_err(crate::dist::DistError::source_fallback)
+        {
             Ok(deliverable) => deliverable,
-            Err(cause) if cause.permits_source_fallback() => match local_source()? {
+            Err(SourceFallback::LocalSource(cause)) => match local_source()? {
                 Some(source) => source,
                 None => {
                     if let Some(speaker) = outdated {
@@ -1421,7 +1423,7 @@ impl<'a> Link<'a> {
                     });
                 }
             },
-            Err(cause) => {
+            Err(SourceFallback::Stop(cause)) => {
                 return Err(match outdated {
                     Some(speaker) => RemoteError::Outdated {
                         machine: self.name(),

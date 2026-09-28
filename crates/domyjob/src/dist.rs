@@ -85,12 +85,18 @@ pub enum DistError {
     Io(#[from] crate::failure::IoFailure),
 }
 
+#[derive(Debug)]
+pub(crate) enum SourceFallback {
+    LocalSource(DistError),
+    Stop(DistError),
+}
+
 impl DistError {
     #[must_use]
-    pub const fn permits_source_fallback(&self) -> bool {
+    pub(crate) const fn source_fallback(self) -> SourceFallback {
         match self {
-            Self::NoTrustRoot => true,
-            Self::Template { .. }
+            cause @ Self::NoTrustRoot => SourceFallback::LocalSource(cause),
+            cause @ (Self::Template { .. }
             | Self::Start { .. }
             | Self::Failed { .. }
             | Self::TrustRoot
@@ -104,7 +110,7 @@ impl DistError {
             | Self::Invalid(_)
             | Self::State(_)
             | Self::Replace(_)
-            | Self::Io(_) => false,
+            | Self::Io(_)) => SourceFallback::Stop(cause),
         }
     }
 }
@@ -726,8 +732,14 @@ mod tests {
             ml_dsa: String::new(),
         };
         assert!(matches!(
-            verify_manifest_with(b"{}", &unsigned, RELEASE_KEYS),
-            Err(DistError::NoTrustRoot)
+            verify_manifest_with(b"{}", &unsigned, RELEASE_KEYS)
+                .unwrap_err()
+                .source_fallback(),
+            SourceFallback::LocalSource(DistError::NoTrustRoot)
+        ));
+        assert!(matches!(
+            DistError::Signature.source_fallback(),
+            SourceFallback::Stop(DistError::Signature)
         ));
     }
 
