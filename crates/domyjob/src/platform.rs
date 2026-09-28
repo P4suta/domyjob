@@ -202,20 +202,37 @@ pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
     Ok(target.to_path_buf())
 }
 
+/// Whether no running process holds the executable, so a build may replace it.
+#[cfg(windows)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "opening for write is how Windows reports that an executable is running"
+)]
+fn replaceable(executable: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(executable).is_ok()
+}
+
+/// The first target slot whose executable neither this process nor another one is running.
 #[cfg(windows)]
 pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
     let current = fs::canonicalize(std::env::current_exe()?)?;
-    let primary = target.join("debug").join("domyjob.exe");
-    let running_primary = match fs::canonicalize(primary) {
-        Ok(path) => path == current,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
-    if running_primary {
-        Ok(target.join("domyjob-refresh"))
-    } else {
-        Ok(target.to_path_buf())
+    for slot in [
+        target.to_path_buf(),
+        target.join("domyjob-refresh"),
+        target.join("domyjob-refresh-2"),
+    ] {
+        let executable = slot.join("debug").join("domyjob.exe");
+        match fs::canonicalize(&executable) {
+            Ok(path) if path == current => {}
+            Ok(_) if replaceable(&executable) => return Ok(slot),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(slot),
+            Err(error) => return Err(error),
+        }
     }
+    Err(io::Error::other(
+        "every local build slot is running; close other domyjob clients and retry",
+    ))
 }
 
 pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
