@@ -118,7 +118,15 @@ impl JobPaths {
     fn workspace(&self) -> PathBuf {
         self.dir.join("workspace")
     }
+
+    /// When the job was admitted, as the store's admission sequence.
+    fn order(&self) -> PathBuf {
+        self.dir.join("order")
+    }
 }
+
+/// How many finished jobs a store keeps; each admission removes the oldest beyond them.
+const KEEP_FINISHED: usize = 32;
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
@@ -153,6 +161,47 @@ impl Store {
 
     fn incoming_lock(&self) -> PathBuf {
         self.root.join("incoming.lock")
+    }
+
+    /// The last admission sequence handed out.
+    fn sequence(&self) -> PathBuf {
+        self.root.join("sequence")
+    }
+
+    fn read_number(path: &Path) -> Result<u64, StoreError> {
+        match state_file::read_bytes(path)? {
+            None => Ok(0),
+            Some(bytes) => std::str::from_utf8(&bytes)
+                .map_err(|_invalid| StoreError::Corrupt)?
+                .trim()
+                .parse()
+                .map_err(|_invalid| StoreError::Corrupt),
+        }
+    }
+
+    /// The next admission sequence; the caller holds the admission lock.
+    fn next_sequence(&self) -> Result<u64, StoreError> {
+        let next = Self::read_number(&self.sequence())?
+            .checked_add(1)
+            .ok_or(StoreError::Capacity)?;
+        state_file::write_bytes(&self.sequence(), next.to_string().as_bytes())?;
+        Ok(next)
+    }
+
+    /// Remove the oldest finished jobs beyond [`KEEP_FINISHED`]; the caller holds the admission lock.
+    fn reclaim(&self) -> Result<(), StoreError> {
+        let mut finished = Vec::new();
+        for job in self.list()? {
+            if self.status(&job)?.kind() == PhaseKind::Finished {
+                finished.push((Self::read_number(&self.paths(&job).order())?, job));
+            }
+        }
+        finished.sort();
+        let excess = finished.len().saturating_sub(KEEP_FINISHED);
+        for (_, job) in finished.into_iter().take(excess) {
+            self.clean_one(&job)?;
+        }
+        Ok(())
     }
 
     fn staged(&self, job: &JobId) -> JobPaths {
@@ -370,6 +419,10 @@ impl Store {
         state_file::write_bytes(&staged.spec(), wire::payload(&encoded)?)?;
         let initial = serde_json::to_vec(&JobState::accepted()).map_err(WireError::from)?;
         state_file::write_bytes(&staged.state(), &initial)?;
+        state_file::write_bytes(
+            &staged.order(),
+            self.next_sequence()?.to_string().as_bytes(),
+        )?;
         state_file::publish_dir(&staged.dir, &self.paths(job).dir)?;
         Ok(())
     }
@@ -394,6 +447,7 @@ impl Store {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(StoreError::Io(error)),
         }
+        self.reclaim()?;
         if self.list()?.len() >= 1024 {
             return Err(StoreError::Capacity);
         }
@@ -593,6 +647,7 @@ mod tests {
             store.incoming_dir(),
             store.incoming_lock(),
             store.admission_lock(),
+            store.sequence(),
         ]
         .iter()
         .map(|path| format!("path {}", shown(path)))
@@ -608,6 +663,7 @@ mod tests {
                 paths.log(),
                 paths.supervisor_log(),
                 paths.workspace(),
+                paths.order(),
             ] {
                 lines.push(format!("path {}", shown(&path)));
             }
@@ -658,6 +714,66 @@ mod tests {
     #[test]
     fn the_runner_format_is_its_specimen() {
         crate::formats::check("runner", &specimen());
+    }
+
+    fn store(temporary: &tempfile::TempDir) -> Store {
+        let root = temporary.path().join("state");
+        for directory in ["", "jobs", "staging", "incoming"] {
+            state_file::private_dir(&root.join(directory)).expect("private store directory");
+        }
+        Store { root }
+    }
+
+    fn admit_finished(store: &Store, digit: char) -> JobId {
+        let submission = SubmissionId::try_from(digit.to_string().repeat(32)).unwrap();
+        let request = Request::Run {
+            submission: submission.clone(),
+            command: Command::try_from(vec!["true".to_owned()]).unwrap(),
+            input: Input::Home,
+        };
+        let job = store.reserve(&submission, &request, None).unwrap();
+        store
+            .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
+            .unwrap();
+        job
+    }
+
+    #[test]
+    fn admissions_keep_only_the_newest_finished_jobs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = store(&temporary);
+        let digits: Vec<char> = "0123456789abcdef".chars().collect();
+        let mut admitted = Vec::new();
+        for first in &digits {
+            for second in digits.iter().take(3) {
+                let submission = format!("{first}{second}").repeat(16);
+                let submission = SubmissionId::try_from(submission).unwrap();
+                let request = Request::Run {
+                    submission: submission.clone(),
+                    command: Command::try_from(vec!["true".to_owned()]).unwrap(),
+                    input: Input::Home,
+                };
+                let job = store.reserve(&submission, &request, None).unwrap();
+                store
+                    .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
+                    .unwrap();
+                admitted.push(job);
+            }
+        }
+        let last = admit_finished(&store, 'f');
+        admitted.push(last);
+        let kept = store.list().unwrap();
+        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
+        let newest: std::collections::BTreeSet<_> = admitted
+            .iter()
+            .rev()
+            .take(super::KEEP_FINISHED.saturating_add(1))
+            .cloned()
+            .collect();
+        assert_eq!(
+            kept.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            newest
+        );
     }
 
     #[test]

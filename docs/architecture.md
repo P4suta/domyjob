@@ -23,6 +23,7 @@ The node publishes a complete staged job record with one directory rename.
 A worker lock is the evidence of liveness; a dead worker produces the explicit `lost` outcome.
 Cancellation is persisted and delivered through a file change event before the process tree is terminated.
 Finished jobs may be removed; active jobs may not.
+Each admission removes the oldest finished jobs beyond the newest 32, so logs and workspaces never accumulate without bound.
 
 Every path under the state root is defined in `layout`.
 The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs,
