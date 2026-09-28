@@ -38,6 +38,16 @@ fn workflows(root: &Path) -> ExitCode {
     }
 }
 
+fn commit_msg(root: &Path, message: &Path) -> ExitCode {
+    match xtask::fixes::commit_msg(root, message) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("commit-msg: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,11 +55,14 @@ fn main() -> ExitCode {
     match words.as_slice() {
         ["gates"] => gates(&root),
         ["workflows"] => workflows(&root),
+        ["commit-msg", message] => commit_msg(&root, Path::new(message)),
         ["dependencies", "deny"] => dependencies(&root, xtask::dependencies::Check::Deny),
         ["dependencies", "audit"] => dependencies(&root, xtask::dependencies::Check::Audit),
         ["dependencies", "vet"] => dependencies(&root, xtask::dependencies::Check::Vet),
         _ => {
-            eprintln!("usage: cargo xtask gates | workflows | dependencies deny|audit|vet");
+            eprintln!(
+                "usage: cargo xtask gates | workflows | commit-msg FILE | dependencies deny|audit|vet"
+            );
             ExitCode::from(2)
         }
     }

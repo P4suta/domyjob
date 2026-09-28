@@ -22,6 +22,8 @@ commit-msg:
   commands:
     committed:
       run: committed --commit-file {1}
+    fix-has-test:
+      run: cargo xtask commit-msg {1}
 
 pre-push:
   parallel: true

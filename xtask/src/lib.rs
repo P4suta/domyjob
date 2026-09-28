@@ -4,6 +4,7 @@ use syn::visit::Visit;
 
 pub mod dependencies;
 pub mod exceptions;
+pub mod fixes;
 
 mod raw {
     #![expect(
