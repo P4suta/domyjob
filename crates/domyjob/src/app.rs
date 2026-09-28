@@ -396,6 +396,15 @@ mod tests {
     }
 
     #[test]
+    fn stopping_a_relay_that_already_reached_the_end_succeeds() {
+        let (reader, writer, stop) = process::output_pipe().expect("output pipe");
+        drop(writer);
+        let mut stored = Vec::new();
+        relay_output(reader, &mut stored, 4).expect("relay to the end");
+        stop.stop().expect("nothing is left to stop");
+    }
+
+    #[test]
     fn a_stopped_relay_keeps_written_output_even_when_a_writer_outlives_the_job() {
         if cfg!(windows) {
             // A Job Object ends every holder of the write end, so Windows needs no stop.

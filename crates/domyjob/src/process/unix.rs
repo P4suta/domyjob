@@ -182,9 +182,13 @@ pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputS
 }
 
 impl Stop for OutputStop {
+    /// A reader that already reached the end of its output has closed the stop pipe,
+    /// and nothing is left to stop.
     fn stop(self) -> io::Result<()> {
-        rustix::io::write(&self.0, b"s")?;
-        Ok(())
+        match rustix::io::write(&self.0, b"s") {
+            Ok(_) | Err(Errno::PIPE) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
