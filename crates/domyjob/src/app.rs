@@ -381,9 +381,9 @@ mod tests {
 
     #[test]
     fn a_real_job_logs_both_streams_through_one_bounded_pipe() {
-        let combined = b"0123456789abcdefghij";
         let mut expected = Vec::new();
-        let counts = relay_output(combined.as_slice(), &mut expected, 4).expect("reference relay");
+        let counts =
+            relay_output(process::STDOUT_THEN_STDERR, &mut expected, 4).expect("reference relay");
         assert!(counts.1 > 0, "the command must write past the limit");
         let root = tempfile::tempdir().expect("temporary job directory");
         let path = root.path().join("job").join("output.log");

@@ -346,6 +346,12 @@ impl Group {
     }
 }
 
+/// What [`stdout_then_stderr`] writes, in order.
+#[cfg(all(test, unix))]
+pub(crate) const STDOUT_THEN_STDERR: &[u8] = b"0123456789abcdefghij";
+#[cfg(all(test, windows))]
+pub(crate) const STDOUT_THEN_STDERR: &[u8] = b"0123456789\r\nabcdefghij\r\n";
+
 /// A command that writes `0123456789` to standard output and then `abcdefghij` to standard error.
 #[cfg(all(test, unix))]
 pub(crate) fn stdout_then_stderr() -> Command {
