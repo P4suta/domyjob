@@ -7,9 +7,11 @@ use domyjob_core::wire::CleanTarget;
 
 mod app;
 mod identity;
+mod lock;
 mod platform;
 mod source;
 mod source_fingerprint;
+mod state_io;
 mod store;
 mod transport;
 mod watch_event;

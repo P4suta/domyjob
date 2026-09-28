@@ -1,6 +1,6 @@
 use syn::visit::Visit;
 
-const EFFECT_MODULES: &[&str] = &["domain", "lock", "proc", "spawn", "state_file", "template"];
+const EFFECT_MODULES: &[&str] = &["domain", "proc", "spawn", "template"];
 
 #[derive(Default)]
 struct OldImports {

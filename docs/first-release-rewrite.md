@@ -1,7 +1,7 @@
 # First-release rewrite
 
 The first release has no compatibility requirement with the previous CLI, wire format, or stored jobs.
-The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies the remaining state, lock, and process adapters.
+The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies the remaining process adapter.
 
 ## Enforced boundaries
 
@@ -17,6 +17,7 @@ The client assigns a random submission ID before connecting and prints it so an 
 The node derives the job ID from that typed submission ID, making repeat submissions idempotent without a second persistent index.
 An accepted job is published by one directory rename after its request, state, and optional workspace are complete.
 The worker owns an operating-system liveness lock, and a missing worker becomes an explicit `lost` outcome.
+State records are private, size bounded, and atomically replaced after a file sync; their owner and Unix mode or Windows ACL are checked before use.
 Cancellation is a durable request delivered through a file-change event and terminates the isolated process tree.
 Completed jobs can be removed individually or in a batch, while active jobs are protected from deletion.
 
@@ -32,5 +33,5 @@ Automatic rebuild requires the development checkout and `mise` on the remote hos
 ## Cutover conditions
 
 The default binary is still the previous `domyjob` CLI, and `domyjob-next` is the replacement under test.
-Cutover requires extraction of the needed operating-system adapters from the old application crate and a final review of the new command surface and storage limits.
+Cutover requires extraction of the process adapter from the old application crate and a final review of the new command surface and storage limits.
 The old CLI and its duplicated application logic can then be removed without weakening the process, filesystem, or transport boundaries.

@@ -1037,6 +1037,7 @@ const SNAPSHOT_TRANSFER_RULE: &str =
     "source blobs must arrive within one Submit exchange under the collection lock";
 const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
+    ("crates/domyjob-next/src/state_io.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
     ("crates/domyjob/src/tree.rs", "create_file"),
     ("crates/domyjob-next/src/workspace.rs", "create_file"),
@@ -1112,6 +1113,7 @@ fn expected_legacy_bool_count(file: &str, name: &str) -> usize {
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &[
     "failure.rs",
+    "crates/domyjob-next/src/state_io.rs",
     "xtask/src/lib.rs",
     "xtask/src/dependencies.rs",
     "xtask/src/proverif.rs",

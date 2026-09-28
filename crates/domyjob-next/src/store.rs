@@ -11,8 +11,6 @@ use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use domyjob::lock::{LockError, OsLock, Probe};
-use domyjob::state_file::{self, StateError};
 use domyjob_core::domain::RelativePath;
 use domyjob_core::domain::{JobId, RemoteText, SubmissionId};
 use domyjob_core::ingress;
@@ -20,7 +18,9 @@ use domyjob_core::state::{Event, InvalidTransition, JobState, PhaseKind};
 use domyjob_core::wire::{self, CleanTarget, Request, WireError};
 use thiserror::Error;
 
+use crate::lock::{LockError, OsLock, Probe};
 use crate::platform;
+use crate::state_io::{self as state_file, StateError};
 use crate::workspace::{Rooted, WorkspaceError};
 
 #[derive(Debug, Error)]

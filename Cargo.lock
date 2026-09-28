@@ -800,11 +800,13 @@ dependencies = [
  "getrandom 0.3.4",
  "ignore",
  "notify",
+ "rustix",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

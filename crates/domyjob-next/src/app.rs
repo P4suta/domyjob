@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::identity;
 use crate::platform;
+use crate::state_io as state_file;
 use crate::store::{ReceivedArchive, Store, StoreError};
 use crate::watch_event::{self, Notice};
 
@@ -237,7 +238,7 @@ fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Res
         Input::Snapshot(_) => store.workspace(job)?,
     };
     let process = job_command(&command, &directory);
-    let log = domyjob::state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
+    let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
     match domyjob::proc::Group::spawn_stdio(
         process,
         Stdio::from(log.try_clone()?),
@@ -262,7 +263,7 @@ pub(crate) fn worker(job: &JobId, event: Option<&domyjob::domain::BlobId>) -> Re
     if let Err(error) = &result
         && let Ok(store) = Store::open()
         && let Ok(path) = store.supervisor_log_path(job)
-        && let Ok(mut file) = domyjob::state_file::open_append(&path)
+        && let Ok(mut file) = state_file::open_append(&path)
     {
         let detail: String = error.to_string().chars().take(4096).collect();
         let _recorded = writeln!(file, "{detail}");
