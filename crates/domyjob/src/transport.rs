@@ -27,6 +27,7 @@ use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
+use crate::lock::{LockError, OsLock};
 use crate::platform::{self, clock};
 use crate::source::{self, SourceError};
 use crate::state_io::{self, StateError};
@@ -50,6 +51,8 @@ pub(crate) enum TransportError {
     Source(#[from] SourceError),
     #[error(transparent)]
     State(#[from] StateError),
+    #[error(transparent)]
+    Lock(#[from] LockError),
     #[error("SSH or node I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("the operating system could not provide a submission identifier: {0}")]
@@ -431,6 +434,9 @@ fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> 
 }
 
 /// Call this build's node, installing it first when the machine reports it missing.
+///
+/// Installations on one machine are serialized, and a caller that waited retries before installing,
+/// because another process may have installed the node meanwhile.
 fn call_with(
     machine: &MachineName,
     request: &Request,
@@ -438,10 +444,21 @@ fn call_with(
     policy: Policy,
 ) -> Result<Reply, TransportError> {
     let shell = shell(machine)?;
-    match raw_call((machine, shell), request, payload, policy) {
+    let call = || raw_call((machine, shell), request, payload, policy);
+    match call() {
+        Err(TransportError::Missing) => {}
+        other => return other,
+    }
+    let _installing = OsLock::exclusive(
+        &platform::state()?
+            .join("v1")
+            .join("install")
+            .join(format!("{}.lock", machine.as_str())),
+    )?;
+    match call() {
         Err(TransportError::Missing) => {
             bootstrap(machine, shell)?;
-            raw_call((machine, shell), request, payload, policy)
+            call()
         }
         other => other,
     }
