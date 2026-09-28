@@ -20,6 +20,9 @@ use domyjob_core::state::{Event, InvalidTransition, JobState, PhaseKind};
 use domyjob_core::wire::{self, CleanTarget, Request, WireError};
 use thiserror::Error;
 
+use crate::platform;
+use crate::workspace::{Rooted, WorkspaceError};
+
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error(transparent)]
@@ -31,7 +34,7 @@ pub(crate) enum StoreError {
     #[error(transparent)]
     Transition(#[from] InvalidTransition),
     #[error(transparent)]
-    Tree(#[from] domyjob::tree::TreeError),
+    Workspace(#[from] WorkspaceError),
     #[error("job state I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("the operating system could not provide a job identifier: {0}")]
@@ -121,7 +124,7 @@ impl JobPaths {
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
-        let root = domyjob::paths::Dirs::from_env().state().join("v1");
+        let root = platform::state()?.join("v1");
         for dir in [
             &root,
             &root.join("jobs"),
@@ -140,9 +143,7 @@ impl Store {
     fn verify_job(&self, job: &JobId) -> Result<JobPaths, StoreError> {
         let paths = self.paths(job);
         match std::fs::symlink_metadata(&paths.dir) {
-            Ok(metadata)
-                if metadata.is_dir() && !domyjob::platform::is_reparse_point(&metadata) =>
-            {
+            Ok(metadata) if metadata.is_dir() && !platform::reparse_point(&metadata) => {
                 state_file::private_dir(&paths.dir)?;
                 Ok(paths)
             }
@@ -262,7 +263,7 @@ impl Store {
     fn extract_archive(staged: &Path, archive: &ReceivedArchive) -> Result<(), StoreError> {
         let workspace = staged.join("workspace");
         state_file::private_dir(&workspace)?;
-        let rooted = domyjob::tree::Rooted::open(&workspace)?.ok_or(StoreError::ArchiveEntry)?;
+        let rooted = Rooted::open(&workspace)?;
         let source = state_file::open_read(&archive.path)?.ok_or(StoreError::ArchiveMismatch)?;
         let mut tar = tar::Archive::new(source);
         let mut paths = BTreeSet::new();
@@ -286,15 +287,9 @@ impl Store {
             if content_bytes > wire::MAX_SNAPSHOT_BYTES {
                 return Err(StoreError::ArchiveEntry);
             }
-            let old_path = domyjob::domain::RelPath::try_from(validated.as_str().to_owned())
-                .map_err(|_invalid| StoreError::ArchiveEntry)?;
-            rooted.make_parents(&old_path, domyjob::tree::Blockers::Refuse)?;
-            let mode = if entry.header().mode()? & 0o111 == 0 {
-                domyjob::snapshot::Mode::Regular
-            } else {
-                domyjob::snapshot::Mode::Executable
-            };
-            let mut output = rooted.create_file(&old_path, mode)?;
+            rooted.make_parents(&validated)?;
+            let executable = entry.header().mode()? & 0o111 != 0;
+            let mut output = rooted.create_file(&validated, executable)?;
             if std::io::copy(&mut entry, &mut output)? != size {
                 return Err(StoreError::ArchiveMismatch);
             }
@@ -467,11 +462,7 @@ impl Store {
     pub(crate) fn workspace(&self, job: &JobId) -> Result<PathBuf, StoreError> {
         let path = self.verify_job(job)?.workspace();
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata)
-                if metadata.is_dir() && !domyjob::platform::is_reparse_point(&metadata) =>
-            {
-                Ok(path)
-            }
+            Ok(metadata) if metadata.is_dir() && !platform::reparse_point(&metadata) => Ok(path),
             Ok(_other) => Err(StoreError::Corrupt),
             Err(error) if error.kind() == ErrorKind::NotFound => Err(StoreError::Missing),
             Err(error) => Err(StoreError::Io(error)),

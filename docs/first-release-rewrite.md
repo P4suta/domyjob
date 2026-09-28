@@ -1,7 +1,7 @@
 # First-release rewrite
 
 The first release has no compatibility requirement with the previous CLI, wire format, or stored jobs.
-The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies verified operating-system adapters.
+The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies the remaining state, lock, and process adapters.
 
 ## Enforced boundaries
 
@@ -22,7 +22,7 @@ Completed jobs can be removed individually or in a batch, while active jobs are 
 
 ## Source and deployment
 
-`run` snapshots the current directory, including uncommitted work, and verifies the archive size, digest, portable paths, and file types before extraction.
+`run` archives the current directory, including uncommitted work, and verifies the archive size, digest, portable paths, and file types before extraction through a confined directory capability.
 The source archive limit is 64 MiB, and the control-frame limit is 1 MiB.
 On client startup, source files are compared with the compiled fingerprint and the local client is rebuilt when they differ.
 Before an RPC, the client checks the remote fingerprint and transfers a validated checkout archive over SSH to rebuild and install a matching remote binary when needed.

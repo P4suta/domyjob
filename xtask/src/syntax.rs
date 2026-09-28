@@ -752,7 +752,11 @@ const REQUIRED_FIELDS: &[RequiredField] = &[
 const RESTRICTIONS: &[Restriction] = &[
     Restriction {
         path: &["notify", "recommended_watcher"],
-        allowed_in: &["watch_event.rs", "crates/domyjob/tests/crash_process.rs"],
+        allowed_in: &[
+            "watch_event.rs",
+            "crates/domyjob-next/src/watch_event.rs",
+            "crates/domyjob/tests/crash_process.rs",
+        ],
         rule: "construct product file watchers through watch_event so rescan and errors cannot be ignored",
     },
     Restriction {
@@ -1035,6 +1039,7 @@ const EXCLUSIVE_CREATE: &[(&str, &str)] = &[
     ("crates/domyjob/src/state_file.rs", "create_empty"),
     ("crates/domyjob/src/durable.rs", "beside"),
     ("crates/domyjob/src/tree.rs", "create_file"),
+    ("crates/domyjob-next/src/workspace.rs", "create_file"),
     ("xtask/src/release.rs", "keygen"),
 ];
 

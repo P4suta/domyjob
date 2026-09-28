@@ -7,9 +7,13 @@ use domyjob_core::wire::CleanTarget;
 
 mod app;
 mod identity;
+mod platform;
+mod source;
 mod source_fingerprint;
 mod store;
 mod transport;
+mod watch_event;
+mod workspace;
 
 #[derive(Debug, Parser)]
 #[command(name = "domyjob-next", about = "Run persistent jobs over SSH")]

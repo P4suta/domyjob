@@ -1,18 +1,6 @@
 use syn::visit::Visit;
 
-const EFFECT_MODULES: &[&str] = &[
-    "domain",
-    "lock",
-    "paths",
-    "platform",
-    "proc",
-    "snapshot",
-    "spawn",
-    "state_file",
-    "template",
-    "tree",
-    "watch_event",
-];
+const EFFECT_MODULES: &[&str] = &["domain", "lock", "proc", "spawn", "state_file", "template"];
 
 #[derive(Default)]
 struct OldImports {
@@ -59,5 +47,11 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(check("fn f() { domyjob::cli::run(); }").unwrap().len(), 1);
+        assert_eq!(
+            check("fn f() { domyjob::snapshot::archive(); }")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

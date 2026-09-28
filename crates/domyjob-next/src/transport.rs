@@ -7,13 +7,12 @@
     reason = "the composition root needs these names but the binary has no public API"
 )]
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 
 use domyjob_core::domain::{
-    Command as JobCommand, Invalid, JobId, JobReference, MachineName, RelativePath, SubmissionId,
+    Command as JobCommand, Invalid, JobId, JobReference, MachineName, SubmissionId,
 };
 use domyjob_core::ingress;
 use domyjob_core::state::{JobState, Outcome, PhaseKind};
@@ -22,7 +21,7 @@ use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
-use crate::source_fingerprint::{self, SourceKind};
+use crate::source::{self, SourceError};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -36,7 +35,7 @@ pub(crate) enum TransportError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
-    Snapshot(#[from] domyjob::snapshot::SnapshotError),
+    Source(#[from] SourceError),
     #[error("SSH or node I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("the operating system could not provide a submission identifier: {0}")]
@@ -51,10 +50,6 @@ pub(crate) enum TransportError {
     Deployment(ExitStatus),
     #[error("remote node still has the wrong build after automatic installation")]
     BuildMismatch,
-    #[error("the source contains a symlink, which the first release cannot transfer")]
-    SourceLink,
-    #[error("the source contains paths that collide on a case-insensitive filesystem")]
-    SourceCollision,
     #[error("the remote host does not identify a supported shell")]
     RemoteShell,
 }
@@ -277,50 +272,8 @@ fn install_command(shell: RemoteShell) -> String {
     }
 }
 
-fn checkout_archive(root: &Path) -> Result<Vec<u8>, TransportError> {
-    let mut files = Vec::new();
-    source_fingerprint::from_checkout(root, |kind, path| {
-        if kind == SourceKind::File {
-            files.push(path.to_path_buf());
-        }
-    })?;
-    let mut archive = tar::Builder::new(Vec::new());
-    let mut names = BTreeSet::new();
-    for file in files {
-        let relative = file
-            .strip_prefix(root)
-            .map_err(|_prefix| std::io::Error::other("source is outside the checkout"))?;
-        let mut parts = Vec::new();
-        for component in relative.components() {
-            parts.push(
-                component
-                    .as_os_str()
-                    .to_str()
-                    .ok_or_else(|| std::io::Error::other("a source path is not UTF-8"))?,
-            );
-        }
-        let name = RelativePath::try_from(parts.join("/"))?;
-        if !names.insert(name.as_str().to_lowercase()) {
-            return Err(TransportError::SourceCollision);
-        }
-        let metadata = std::fs::symlink_metadata(&file)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(TransportError::SourceLink);
-        }
-        let mut content = std::fs::File::open(&file)?;
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(metadata.len());
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-        archive.append_data(&mut header, name.as_str(), &mut content)?;
-    }
-    Ok(archive.into_inner()?)
-}
-
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
-    let archive = checkout_archive(source_checkout()?)?;
+    let archive = source::checkout(source_checkout()?)?;
     if u64::try_from(archive.len()).map_err(|_size| WireError::Snapshot)? > wire::MAX_SNAPSHOT_BYTES
     {
         return Err(WireError::Snapshot.into());
@@ -354,15 +307,13 @@ fn stale(error: &TransportError) -> bool {
         | TransportError::Wire(_)
         | TransportError::App(_)
         | TransportError::Store(_)
-        | TransportError::Snapshot(_)
+        | TransportError::Source(_)
         | TransportError::Entropy(_)
         | TransportError::Remote(_)
         | TransportError::UnexpectedReply
         | TransportError::Refused(_)
         | TransportError::Deployment(_)
         | TransportError::BuildMismatch
-        | TransportError::SourceLink
-        | TransportError::SourceCollision
         | TransportError::RemoteShell => false,
     }
 }
@@ -488,25 +439,8 @@ fn finish_submission(
     Ok(result)
 }
 
-fn archive_directory(root: &Path) -> Result<Vec<u8>, TransportError> {
-    let source = domyjob::snapshot::from_directory(root)?;
-    for (path, entry) in &source.manifest.entries {
-        RelativePath::try_from(path.as_str().to_owned())?;
-        match entry {
-            domyjob::snapshot::Entry::File { .. } => {}
-            domyjob::snapshot::Entry::Symlink { .. } => return Err(TransportError::SourceLink),
-        }
-    }
-    let archive = domyjob::snapshot::archive(&source)?;
-    Ok(archive)
-}
-
 fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
-    let archive = archive_directory(&std::env::current_dir()?)?;
-    let bytes = u64::try_from(archive.len()).map_err(|_length| WireError::Snapshot)?;
-    let digest = blake3::hash(&archive).to_hex().to_string();
-    let descriptor = wire::Snapshot::new(bytes, digest)?;
-    Ok((archive, descriptor))
+    Ok(source::working_directory(&std::env::current_dir()?)?)
 }
 
 pub(crate) fn run(
@@ -712,7 +646,7 @@ pub(crate) fn node() -> Result<(), TransportError> {
                     StoreError::State(_)
                     | StoreError::Lock(_)
                     | StoreError::Io(_)
-                    | StoreError::Tree(_)
+                    | StoreError::Workspace(_)
                     | StoreError::Entropy(_),
                 )
                 | AppError::Proc(_)

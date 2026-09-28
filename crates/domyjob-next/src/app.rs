@@ -12,7 +12,6 @@ use std::process::{Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use domyjob::watch_event::{self, Notice};
 use domyjob_core::domain::{Command, JobId, RemoteText};
 use domyjob_core::state::{Event, PhaseKind};
 use domyjob_core::wire::{Input, Reply, Request};
@@ -20,7 +19,9 @@ use notify::Watcher;
 use thiserror::Error;
 
 use crate::identity;
+use crate::platform;
 use crate::store::{ReceivedArchive, Store, StoreError};
+use crate::watch_event::{self, Notice};
 
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
@@ -54,19 +55,16 @@ impl CancellationWatch {
     fn start(store: &Store, job: &JobId) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::channel();
         let callback = sender.clone();
-        let mut watcher = watch_event::watcher(
-            |_path| true,
-            move |notice| {
-                let wake = match notice {
-                    Notice::Relevant => Some(Wake::Changed),
-                    Notice::Irrelevant => None,
-                    Notice::Failed(error) => Some(Wake::Broken(error.to_string())),
-                };
-                if let Some(wake) = wake {
-                    let _sent = callback.send(wake);
-                }
-            },
-        )?;
+        let mut watcher = watch_event::watcher(move |notice| {
+            let wake = match notice {
+                Notice::Changed => Some(Wake::Changed),
+                Notice::Unrelated => None,
+                Notice::Failed(error) => Some(Wake::Broken(error.to_string())),
+            };
+            if let Some(wake) = wake {
+                let _sent = callback.send(wake);
+            }
+        })?;
         watcher.watch(&store.watch_dir(job)?, notify::RecursiveMode::NonRecursive)?;
         Ok(Self {
             _watcher: watcher,
@@ -235,7 +233,7 @@ fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Res
         return Ok(());
     }
     let directory = match input {
-        Input::Home => domyjob::paths::Dirs::from_env().home().to_path_buf(),
+        Input::Home => platform::home()?,
         Input::Snapshot(_) => store.workspace(job)?,
     };
     let process = job_command(&command, &directory);
