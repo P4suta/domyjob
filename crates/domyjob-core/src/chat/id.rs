@@ -437,6 +437,36 @@ mod tests {
     use crate::chat::fixtures::{agent, origin};
 
     #[test]
+    fn malformed_addresses_and_event_ids_are_refused_part_by_part() {
+        let machine = origin('a');
+        AgentId::try_from(alloc::format!("reviewer{machine}")).unwrap_err();
+        AgentId::try_from(alloc::format!("Bad@{machine}")).unwrap_err();
+        AgentId::try_from("reviewer@nothex".to_owned()).unwrap_err();
+        EventId::try_from(alloc::format!("zz:{:016x}", 1)).unwrap_err();
+        EventId::try_from(alloc::format!("{machine}:{:016x}", 0)).unwrap_err();
+        EventId::try_from(alloc::format!("{machine}:{:016x}", 1)).unwrap();
+    }
+
+    #[test]
+    fn text_holds_its_length_limit_exactly() {
+        Line::<8>::try_from("x".repeat(8)).unwrap();
+        Line::<8>::try_from("x".repeat(9)).unwrap_err();
+    }
+
+    #[test]
+    fn only_the_pair_authors_in_a_direct_conversation() {
+        let (alice, bob, carol) = (agent("alice", 'a'), agent("bob", 'b'), agent("carol", 'c'));
+        let direct = Conversation::direct(&alice, &bob).unwrap();
+        assert!(direct.admits_author(&alice) && direct.admits_author(&bob));
+        assert!(!direct.admits_author(&carol));
+        let room = super::RoomId::new(
+            origin('a'),
+            super::RoomName::try_from("all".to_owned()).unwrap(),
+        );
+        assert!(Conversation::Room(room).admits_author(&carol));
+    }
+
+    #[test]
     fn identities_round_trip_through_their_canonical_text() {
         let id = agent("reviewer", 'a');
         assert_eq!(AgentId::try_from(String::from(id.clone())).unwrap(), id);

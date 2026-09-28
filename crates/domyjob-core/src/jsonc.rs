@@ -771,6 +771,40 @@ mod tests {
     }
 
     #[test]
+    fn edits_handle_the_corners_real_configurations_have() {
+        for invalid in ["[ ,]", "{ ,}"] {
+            ingress::foreign_json::<Value>(&strip(invalid)).unwrap_err();
+        }
+        assert_eq!(parse("{\"a\": \"\", \"b\": 1,}"), json!({"a": "", "b": 1}));
+        assert_eq!(
+            parse("{\"a\": \"x\\\" // y\", \"b\": 1,}"),
+            json!({"a": "x\" // y", "b": 1})
+        );
+        let after = set_member("{\"a\": {/* } */}}", &["b"], "1").unwrap();
+        assert!(after.contains("/* } */"), "{after}");
+        assert_eq!(parse(&after), json!({"a": {}, "b": 1}), "{after}");
+        let braced = set_member("{\"mcp\": {/* } */}, \"x\": 1}", &PATH, "1").unwrap();
+        assert!(braced.contains("/* } */"), "{braced}");
+        assert_eq!(
+            parse(&braced),
+            json!({"mcp": {"domyjob": 1}, "x": 1}),
+            "{braced}"
+        );
+        assert_eq!(
+            set_member("{\n  \"mcp\": {\"a\": 1}\n}", &PATH, "1").unwrap(),
+            "{\n  \"mcp\": {\"a\": 1, \"domyjob\": 1}\n}"
+        );
+        assert_eq!(
+            remove_member("{\n  \"a\": 1, \"b\": 2\n}", &["b"]).unwrap(),
+            "{\n  \"a\": 1\n}"
+        );
+        assert_eq!(
+            set_member("{\n\"a\": 1\n}", &["b", "c"], "2").unwrap(),
+            "{\n\"a\": 1,\n  \"b\": {\n    \"c\": 2\n  }\n}"
+        );
+    }
+
+    #[test]
     fn edits_change_only_the_member_across_documents() {
         for original in [
             "",

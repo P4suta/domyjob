@@ -130,12 +130,49 @@ pub const fn fits_received(usage: Usage) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::{
         ENDING_LIMIT, ORDINARY_LIMIT, Priority, Refusal, Usage, check_ask, check_capacity,
-        delegated,
+        check_member, check_resolution, delegated,
     };
-    use crate::chat::event::{Chain, MAX_CHAIN};
-    use crate::chat::fixtures::agent;
+    use crate::chat::event::{Chain, MAX_CHAIN, Members};
+    use crate::chat::fixtures::{agent, id, origin};
+    use crate::chat::ledger::{Ending, Resolution, Room};
+
+    #[test]
+    fn members_post_in_their_room_and_a_machine_ends_an_ask_once() {
+        let (alice, bob) = (agent("alice", 'a'), agent("bob", 'b'));
+        let room = Room {
+            topic: None,
+            members: Members::try_from(vec![alice.clone()]).unwrap(),
+        };
+        check_member(&room, &alice).unwrap();
+        assert!(matches!(
+            check_member(&room, &bob),
+            Err(Refusal::NotMember { agent }) if agent == bob
+        ));
+        let ending = |digit| Resolution {
+            event: id(digit, 3),
+            clock: 3,
+            ending: Ending::Answered,
+            asker: alice.clone(),
+            responder: bob.clone(),
+        };
+        check_resolution(None, &origin('a')).unwrap();
+        assert!(matches!(
+            check_resolution(Some(&ending('a')), &origin('a')),
+            Err(Refusal::AlreadyResolved)
+        ));
+        check_resolution(Some(&ending('b')), &origin('a')).unwrap();
+    }
+
+    #[test]
+    fn a_delegated_chain_never_holds_an_agent_twice() {
+        let alice = agent("alice", 'a');
+        let chain = Chain::try_from(vec![alice.clone()]).unwrap();
+        assert!(matches!(delegated(&chain, alice), Err(Refusal::Invalid(_))));
+    }
 
     #[test]
     fn asks_cannot_close_a_waiting_cycle_or_exceed_the_depth() {
@@ -153,7 +190,7 @@ mod tests {
         let full = Chain::try_from(
             (0..MAX_CHAIN)
                 .map(|index| agent(&alloc::format!("a{index}"), 'd'))
-                .collect::<alloc::vec::Vec<_>>(),
+                .collect::<vec::Vec<_>>(),
         )
         .unwrap();
         assert_eq!(delegated(&full, carol), Err(Refusal::TooDeep));

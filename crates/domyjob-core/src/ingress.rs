@@ -89,17 +89,60 @@ pub fn foreign_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::wire::{self, Request, WireError};
     use alloc::vec::Vec;
 
-    use super::request;
+    use super::{JsonError, json, request, stored_job, stored_request};
+    use crate::state::JobState;
+    use crate::wire::{self, Request, WireError};
+
+    /// `text` padded with spaces, which JSON ignores, to exactly `length` bytes.
+    fn padded(text: &[u8], length: usize) -> Vec<u8> {
+        let mut bytes = text.to_vec();
+        bytes.resize(length, b' ');
+        bytes
+    }
+
+    #[test]
+    fn every_decoder_refuses_input_past_its_limit_before_parsing() {
+        json::<serde_json::Value>(b"[1]", 3).unwrap();
+        assert!(matches!(
+            json::<serde_json::Value>(b"[1]", 2),
+            Err(JsonError::TooLarge { limit: 2 })
+        ));
+        let hello = br#"{"request":"hello"}"#;
+        assert_eq!(
+            stored_request(&padded(hello, wire::MAX_CONTROL_BYTES)).unwrap(),
+            Request::Hello
+        );
+        assert!(matches!(
+            stored_request(&padded(hello, wire::MAX_CONTROL_BYTES.saturating_add(1))),
+            Err(WireError::TooLarge)
+        ));
+        let running = stored_job(br#"{"phase":{"phase":"running","pid":42}}"#).unwrap();
+        assert_eq!(running.pid(), Some(42));
+        let accepted = br#"{"phase":{"phase":"accepted"}}"#;
+        assert_eq!(
+            stored_job(&padded(accepted, wire::MAX_CONTROL_BYTES)).unwrap(),
+            JobState::accepted()
+        );
+        assert!(matches!(
+            stored_job(&padded(accepted, wire::MAX_CONTROL_BYTES.saturating_add(1))),
+            Err(WireError::TooLarge)
+        ));
+    }
 
     #[test]
     fn framed_requests_have_one_exact_length() {
         let valid = wire::frame(&Request::Hello).unwrap();
         assert_eq!(request(&valid).unwrap(), Request::Hello);
         for end in 0..valid.len() {
-            request(valid.get(..end).unwrap()).unwrap_err();
+            assert!(
+                matches!(
+                    request(valid.get(..end).unwrap()),
+                    Err(WireError::Incomplete)
+                ),
+                "a frame cut at {end} bytes is incomplete"
+            );
         }
         let mut trailing = valid;
         trailing.push(0);

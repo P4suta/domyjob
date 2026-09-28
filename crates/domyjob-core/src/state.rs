@@ -222,6 +222,12 @@ mod tests {
     use super::{Event, JobState, Outcome, PhaseKind};
 
     #[test]
+    fn a_new_job_starts_accepted() {
+        assert_eq!(JobState::default(), JobState::accepted());
+        assert_eq!(JobState::default().kind(), PhaseKind::Accepted);
+    }
+
+    #[test]
     fn transition_matrix_has_one_terminal_outcome() {
         let mut state = JobState::accepted();
         assert_eq!(state.kind(), PhaseKind::Accepted);

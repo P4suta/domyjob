@@ -196,7 +196,10 @@ pub struct MachineCard {
 #[cfg(test)]
 mod tests {
     use alloc::borrow::ToOwned;
+    use alloc::format;
+    use alloc::string::String;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use super::{Relevance, Skills, Tag};
     use crate::chat::fixtures::{card, tags};
@@ -217,6 +220,23 @@ mod tests {
     }
 
     #[test]
+    fn tags_and_skills_hold_their_exact_limits() {
+        Tag::try_from("a".repeat(32)).unwrap();
+        Tag::try_from("a".repeat(33)).unwrap_err();
+        Tag::try_from(String::new()).unwrap_err();
+        Tag::try_from("-rust".to_owned()).unwrap_err();
+        Tag::try_from("Rust".to_owned()).unwrap_err();
+        Tag::try_from("c++".to_owned()).unwrap();
+        let names: Vec<String> = (0..17).map(|n| format!("t{n:02}")).collect();
+        let all: Vec<&str> = names.iter().map(String::as_str).collect();
+        let sixteen: Vec<&str> = all.iter().take(16).copied().collect();
+        let skills = Skills::collect(tags(&sixteen)).unwrap();
+        assert_eq!(Vec::<Tag>::from(skills), tags(&sixteen));
+        Skills::collect(tags(&all)).unwrap_err();
+        Skills::try_from(tags(&["b", "a"])).unwrap_err();
+    }
+
+    #[test]
     fn directory_relevance_prefers_exact_skills_then_names_then_roles() {
         let reviewer = card("Code Reviewer", "reviewer", &["rust", "security"]);
         let name = AgentName::try_from("alice".to_owned()).unwrap();
@@ -227,6 +247,9 @@ mod tests {
         assert_eq!(reviewer.relevance(&name, "changes"), Some(Relevance::Text));
         assert_eq!(reviewer.relevance(&name, "curity"), Some(Relevance::Text));
         assert_eq!(reviewer.relevance(&name, "kubernetes"), None);
+        assert_eq!(reviewer.relevance(&name, "  "), Some(Relevance::Text));
+        let guard = card("Alice", "security guard", &["rust"]);
+        assert_eq!(guard.relevance(&name, "guard"), Some(Relevance::Role));
         assert_eq!(
             vec![Relevance::Text, Relevance::Skill].into_iter().min(),
             Some(Relevance::Skill)

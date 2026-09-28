@@ -154,6 +154,15 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_hands_back_its_events_in_order() {
+        let events = vec![event(1), event(2)];
+        let batch = Batch::new(events.clone(), true).unwrap();
+        assert!(batch.more());
+        assert_eq!(batch.events(), events.as_slice());
+        assert_eq!(batch.into_events(), events);
+    }
+
+    #[test]
     fn chat_messages_round_trip_through_their_strict_encoding() {
         let requests = [
             ChatRequest::Identity {},

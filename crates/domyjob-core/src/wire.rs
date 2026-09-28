@@ -282,3 +282,63 @@ pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
     framed.extend_from_slice(&json);
     Ok(framed)
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use super::{
+        ControlLength, MAX_CONTROL_BYTES, MAX_SNAPSHOT_BYTES, Snapshot, WireError, frame, payload,
+    };
+
+    fn header(length: usize) -> [u8; 4] {
+        u32::try_from(length).unwrap().to_be_bytes()
+    }
+
+    #[test]
+    fn frames_and_their_lengths_hold_the_control_limit_exactly() {
+        assert_eq!(
+            ControlLength::try_from(header(MAX_CONTROL_BYTES))
+                .unwrap()
+                .bytes(),
+            MAX_CONTROL_BYTES
+        );
+        assert!(matches!(
+            ControlLength::try_from(header(MAX_CONTROL_BYTES.saturating_add(1))),
+            Err(WireError::TooLarge)
+        ));
+        assert!(matches!(
+            payload(&header(MAX_CONTROL_BYTES.saturating_add(1))),
+            Err(WireError::TooLarge)
+        ));
+        // A JSON string is its text and two quotes.
+        let fits = "x".repeat(MAX_CONTROL_BYTES.saturating_sub(2));
+        assert_eq!(
+            frame(&fits).unwrap().len(),
+            MAX_CONTROL_BYTES.saturating_add(4)
+        );
+        assert!(matches!(
+            frame(&"x".repeat(MAX_CONTROL_BYTES.saturating_sub(1))),
+            Err(WireError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn snapshots_hold_their_size_and_digest_rules() {
+        let digest = "0123456789abcdef".repeat(4);
+        let snapshot = Snapshot::new(MAX_SNAPSHOT_BYTES, digest.clone()).unwrap();
+        assert_eq!(
+            (snapshot.bytes(), snapshot.digest()),
+            (MAX_SNAPSHOT_BYTES, digest.as_str())
+        );
+        assert!(matches!(
+            Snapshot::new(MAX_SNAPSHOT_BYTES.saturating_add(1), digest),
+            Err(WireError::Snapshot)
+        ));
+        let invalid: [String; 3] = ["0".repeat(63), "A".repeat(64), "g".repeat(64)];
+        for bad in invalid {
+            assert!(matches!(Snapshot::new(1, bad), Err(WireError::Snapshot)));
+        }
+        Snapshot::new(0, "f".repeat(64)).unwrap();
+    }
+}

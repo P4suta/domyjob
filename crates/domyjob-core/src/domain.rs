@@ -263,6 +263,7 @@ pub fn terminal_text(text: &str) -> String {
 mod tests {
     use alloc::borrow::ToOwned;
     use alloc::format;
+    use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -314,6 +315,56 @@ mod tests {
         Command::try_from(Vec::new()).unwrap_err();
         Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap();
         Command::try_from(vec!["cargo".to_owned(), "x".repeat(8193)]).unwrap_err();
+    }
+
+    /// `make(limit)` is accepted and `make(limit + 1)` refused, so a limit holds exactly.
+    fn boundary<T, E: core::fmt::Debug>(limit: usize, make: impl Fn(usize) -> Result<T, E>) {
+        assert!(make(limit).is_ok(), "the limit {limit} itself is allowed");
+        assert!(
+            make(limit.saturating_add(1)).is_err(),
+            "one past the limit {limit} is refused"
+        );
+    }
+
+    #[test]
+    fn every_limit_holds_exactly_at_its_boundary() {
+        boundary(128, |length| MachineName::try_from("m".repeat(length)));
+        boundary(4096, |length| {
+            RelativePath::try_from(format!("{}/b", "a".repeat(length.saturating_sub(2))))
+        });
+        boundary(64, |count| {
+            RelativePath::try_from(vec!["a"; count].join("/"))
+        });
+        boundary(256, |count| Command::try_from(vec!["w".to_owned(); count]));
+        boundary(8192, |length| {
+            Command::try_from(vec!["cargo".to_owned(), "x".repeat(length)])
+        });
+        boundary(65536, |total| {
+            let mut words = vec!["x".repeat(8192); 7];
+            words.push("x".repeat(total.saturating_sub(7 * 8192)));
+            Command::try_from(words)
+        });
+        boundary(65536, |length| RemoteText::try_from("x".repeat(length)));
+    }
+
+    #[test]
+    fn commands_need_a_program_and_keep_their_words_in_order() {
+        Command::try_from(vec![String::new(), "argument".to_owned()]).unwrap_err();
+        Command::try_from(vec!["cargo".to_owned(), "a\0b".to_owned()]).unwrap_err();
+        let command = Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap();
+        assert_eq!(command.program(), "cargo");
+        assert_eq!(command.arguments(), ["test"]);
+        assert_eq!(Vec::<String>::from(command), ["cargo", "test"]);
+    }
+
+    #[test]
+    fn job_references_need_a_machine_and_a_job() {
+        let job = "a".repeat(32);
+        JobReference::try_from(job.clone()).unwrap_err();
+        JobReference::try_from(format!("-oProxy:{job}")).unwrap_err();
+        let reference = JobReference::try_from(format!("linux:{job}")).unwrap();
+        assert_eq!(reference.machine().as_str(), "linux");
+        assert_eq!(reference.job().as_str(), job);
     }
 
     #[test]
