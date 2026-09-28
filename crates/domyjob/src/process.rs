@@ -171,6 +171,13 @@ pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
     })
 }
 
+pub(crate) use os::{OutputReader, OutputStop};
+
+/// A pipe for a job's output whose reader can be told to stop at the data already written.
+pub(crate) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputStop)> {
+    os::output_pipe()
+}
+
 /// Stop a process tree by ID, as the service manager would.
 pub(crate) fn terminate(pid: u32) -> Result<(), ProcessError> {
     os::terminate(pid)

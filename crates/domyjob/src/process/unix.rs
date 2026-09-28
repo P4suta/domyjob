@@ -143,6 +143,73 @@ impl Reaper {
     }
 }
 
+/// A job output pipe whose reader stops at the data already written once `OutputStop` fires.
+///
+/// A descendant that left the job's process group may keep the write end open forever,
+/// so waiting for end of file alone could keep a finished job from completing.
+#[derive(Debug)]
+pub(crate) struct OutputReader {
+    pipe: io::PipeReader,
+    stop: rustix::fd::OwnedFd,
+    stopped: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct OutputStop(rustix::fd::OwnedFd);
+
+pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputStop)> {
+    let (pipe, writer) = io::pipe()?;
+    let (stop, signal) = rustix::pipe::pipe()?;
+    Ok((
+        OutputReader {
+            pipe,
+            stop,
+            stopped: false,
+        },
+        writer,
+        OutputStop(signal),
+    ))
+}
+
+impl OutputStop {
+    /// Let the reader finish once it has read what is already in the pipe.
+    pub(crate) fn stop(self) -> io::Result<()> {
+        rustix::io::write(&self.0, b"s")?;
+        Ok(())
+    }
+}
+
+impl Read for OutputReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use rustix::event::{PollFd, PollFlags, poll};
+
+        loop {
+            if self.stopped {
+                return match self.pipe.read(buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                    other => other,
+                };
+            }
+            let mut fds = [
+                PollFd::new(&self.pipe, PollFlags::IN),
+                PollFd::new(&self.stop, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let [output, stop] = &fds;
+            if !output.revents().is_empty() {
+                return self.pipe.read(buffer);
+            }
+            if !stop.revents().is_empty() {
+                rustix::io::ioctl_fionbio(&self.pipe, true)?;
+                self.stopped = true;
+            }
+        }
+    }
+}
+
 pub(super) fn terminate(id: u32) -> Result<(), ProcessError> {
     let raw = i32::try_from(id).map_err(|error| ProcessError::Signal(io::Error::other(error)))?;
     let Some(pid) = Pid::from_raw(raw) else {

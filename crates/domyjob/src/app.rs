@@ -185,18 +185,24 @@ fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Resu
 type Relay = JoinHandle<std::io::Result<(u64, u64)>>;
 
 /// Starts the job with standard output and standard error on one pipe, which a relay thread stores in `log`.
-fn spawn_logged(process: Process, log: File, limit: u64) -> Result<(Group, Relay), ProcessError> {
+fn spawn_logged(
+    process: Process,
+    log: File,
+    limit: u64,
+) -> Result<(Group, Relay, process::OutputStop), ProcessError> {
     let piping = |source: std::io::Error| ProcessError::Spawn {
         what: "the job output pipe",
         source,
     };
-    let (reader, writer) = std::io::pipe().map_err(piping)?;
+    let (reader, writer, stop) = process::output_pipe().map_err(piping)?;
     let errors = writer.try_clone().map_err(piping)?;
-    // The command owns the only write ends and drops them once the job starts, so the relay reaches EOF when the process tree exits.
+    // The command owns the only write ends and drops them once the job starts.
+    // The relay ends at end of file, or when stopped after the process tree exits.
     let group = Group::spawn_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
     Ok((
         group,
         std::thread::spawn(move || relay_output(reader, log, limit)),
+        stop,
     ))
 }
 
@@ -307,12 +313,15 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
     let process = job_command(&command, &directory);
     let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
     match spawn_logged(process, log, MAX_LOG_BYTES) {
-        Ok((child, relay)) => {
+        Ok((child, relay, stop)) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
             let completion = cancellation.wait(&store, job, &child)?;
-            // The relay ends at EOF after the process tree exits, so the log is complete before the job finishes.
+            // The process tree is gone, so the relay stores what is already in the pipe and ends,
+            // even when an escaped descendant still holds the write end.
             // Its failure is reported after the transition so that the job keeps its own outcome.
+            let stopped = stop.stop();
             let relayed = relay.join();
+            stopped?;
             store.transition(job, &completion)?;
             relayed.map_err(|_panic| {
                 AppError::Io(std::io::Error::other("the job output relay panicked"))
@@ -390,11 +399,32 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary job directory");
         let path = root.path().join("job").join("output.log");
         let log = state_file::open_append(&path).expect("job log");
-        let (_group, relay) =
+        let (_group, relay, _stop) =
             spawn_logged(process::stdout_then_stderr(), log, 4).expect("started job");
         // Nothing kills the job here, so the relay reaches EOF only if no write end outlives the job itself.
         let relayed = relay.join().expect("relay thread").expect("relayed output");
         assert_eq!(relayed, counts);
         assert_eq!(std::fs::read(&path).expect("stored log"), expected);
+    }
+
+    #[test]
+    fn a_stopped_relay_keeps_written_output_even_when_a_writer_outlives_the_job() {
+        if cfg!(windows) {
+            // A Job Object ends every holder of the write end, so Windows needs no stop.
+            return;
+        }
+        let (reader, writer, stop) = process::output_pipe().expect("output pipe");
+        let mut escaped = writer.try_clone().expect("escaped descendant's copy");
+        std::io::Write::write_all(&mut escaped, b"before the job ended\n").expect("write");
+        drop(writer);
+        let relay = std::thread::spawn(move || {
+            let mut stored = Vec::new();
+            relay_output(reader, &mut stored, 1024).map(|counts| (counts, stored))
+        });
+        stop.stop().expect("stop the relay");
+        let (counts, stored) = relay.join().expect("relay thread").expect("relayed output");
+        assert_eq!(stored, b"before the job ended\n");
+        assert_eq!(counts, (21, 0));
+        drop(escaped);
     }
 }

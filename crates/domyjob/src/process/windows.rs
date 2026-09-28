@@ -234,6 +234,29 @@ impl Reaper {
     pub(super) const fn stand_down(self) {}
 }
 
+/// The job output pipe; a Job Object ends every holder of its write end with the job.
+pub(crate) type OutputReader = io::PipeReader;
+
+#[derive(Debug)]
+pub(crate) struct OutputStop;
+
+pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputStop)> {
+    let (reader, writer) = io::pipe()?;
+    Ok((reader, writer, OutputStop))
+}
+
+impl OutputStop {
+    #[expect(
+        clippy::unnecessary_wraps,
+        clippy::missing_const_for_fn,
+        clippy::unused_self,
+        reason = "the shared job output interface stops Unix readers fallibly"
+    )]
+    pub(crate) fn stop(self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
     let status = Command::new("taskkill.exe")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
