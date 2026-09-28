@@ -20,6 +20,8 @@ mod source_archive;
 mod source_fingerprint;
 mod state_io;
 mod store;
+#[cfg(test)]
+mod testing;
 mod transport;
 mod watch_event;
 mod workspace;

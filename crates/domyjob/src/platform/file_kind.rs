@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the platform file check is compiled into both the build script and the application"
-)]
-
 use std::fs;
 
 #[cfg(unix)]

@@ -1,12 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-#![expect(
-    clippy::disallowed_methods,
-    reason = "the workspace effect creates files exclusively beneath an open directory capability"
-)]
-
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +6,19 @@ use domyjob_core::domain::RelativePath;
 use thiserror::Error;
 
 use crate::platform;
+
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "workspace files are created only beneath an open directory capability"
+    )]
+
+    use cap_std::fs::OpenOptions;
+
+    pub(super) fn exclusive(options: &mut OpenOptions) -> &mut OpenOptions {
+        options.create_new(true)
+    }
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum WorkspaceError {
@@ -61,7 +65,7 @@ impl Rooted {
         executable: bool,
     ) -> Result<cap_std::fs::File, WorkspaceError> {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        raw::exclusive(options.write(true));
         platform::creation_mode(&mut options, executable);
         Ok(self.0.open_with(path.as_str(), &options)?)
     }

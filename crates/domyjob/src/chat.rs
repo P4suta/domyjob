@@ -1,9 +1,5 @@
 //! The AI chat: one replicated ledger per machine, exchanged over SSH,
 //! with managed turns, a background service, and MCP tools.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses these private modules"
-)]
 
 pub(crate) mod address;
 pub(crate) mod args;

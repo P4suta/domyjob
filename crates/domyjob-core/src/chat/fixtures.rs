@@ -1,8 +1,4 @@
 //! Values shared by the chat test modules.
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "rustc requires crate visibility for fixtures reached from sibling test modules"
-)]
 
 use alloc::borrow::ToOwned;
 use alloc::string::String;

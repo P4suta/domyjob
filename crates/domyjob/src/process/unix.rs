@@ -1,8 +1,3 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns isolated worker and reaper process creation"
-)]
-
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
@@ -10,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group};
 
-use super::{ProcessError, ReadyToken};
+use super::{Guard, ProcessError, ReadyToken, Stop};
 
 pub(super) fn launch_worker(
     arguments: &[&str],
@@ -20,7 +15,7 @@ pub(super) fn launch_worker(
         what: "the worker",
         source,
     })?;
-    let mut command = Command::new(executable);
+    let mut command = super::command(executable);
     command
         .args(arguments)
         .stdin(Stdio::null())
@@ -109,13 +104,13 @@ impl Tree {
 #[derive(Debug)]
 pub(super) struct Reaper(std::process::ChildStdin);
 
-impl Reaper {
-    pub(super) fn stand_guard(tree: &Tree) -> Result<Self, ProcessError> {
+impl Guard for Reaper {
+    fn stand_guard(tree: &Tree) -> Result<Self, ProcessError> {
         let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
             what: "the reaper",
             source,
         })?;
-        let mut command = Command::new(executable);
+        let mut command = super::command(executable);
         command
             .arg("node")
             .arg("--reap")
@@ -138,8 +133,23 @@ impl Reaper {
         Ok(Self(input))
     }
 
-    pub(super) fn stand_down(mut self) {
+    fn stand_down(mut self) {
         let _sent = self.0.write_all(b"d");
+    }
+
+    fn reap(group: i32) {
+        let mut input = io::stdin().lock();
+        let mut buffer = [0_u8; 256];
+        loop {
+            match input.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) if buffer.get(..count).is_some_and(|part| part.contains(&b'd')) => return,
+                Ok(_) => {}
+            }
+        }
+        if let Some(group) = Pid::from_raw(group) {
+            let _stopped = kill_process_group(group, Signal::KILL);
+        }
     }
 }
 
@@ -171,9 +181,8 @@ pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputS
     ))
 }
 
-impl OutputStop {
-    /// Let the reader finish once it has read what is already in the pipe.
-    pub(crate) fn stop(self) -> io::Result<()> {
+impl Stop for OutputStop {
+    fn stop(self) -> io::Result<()> {
         rustix::io::write(&self.0, b"s")?;
         Ok(())
     }
@@ -218,20 +227,5 @@ pub(super) fn terminate(id: u32) -> Result<(), ProcessError> {
     match rustix::process::kill_process(pid, Signal::TERM) {
         Ok(()) | Err(Errno::SRCH) => Ok(()),
         Err(error) => Err(ProcessError::Signal(error.into())),
-    }
-}
-
-pub(super) fn reap(group: i32) {
-    let mut input = io::stdin().lock();
-    let mut buffer = [0_u8; 256];
-    loop {
-        match input.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(count) if buffer.get(..count).is_some_and(|part| part.contains(&b'd')) => return,
-            Ok(_) => {}
-        }
-    }
-    if let Some(group) = Pid::from_raw(group) {
-        let _stopped = kill_process_group(group, Signal::KILL);
     }
 }

@@ -1,8 +1,4 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
+use std::ffi::OsStr;
 use std::io;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -22,6 +18,32 @@ use unix as os;
 #[cfg(windows)]
 use windows as os;
 
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "`process::command` is the only constructor of child processes"
+    )]
+
+    pub(super) fn command(program: &std::ffi::OsStr) -> std::process::Command {
+        std::process::Command::new(program)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn detached(program: &std::path::Path) -> windows_spawn::Command {
+        windows_spawn::Command::new(program)
+    }
+}
+
+/// A command for `program` whose standard input and output start closed.
+///
+/// Every child process starts here, so a child writes into this process's own output,
+/// such as an MCP server's JSON-RPC stream, only where a caller connects it on purpose.
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = raw::command(program.as_ref());
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    command
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ProcessError {
     #[error("starting {what}: {source}")]
@@ -40,7 +62,7 @@ pub(crate) enum ProcessError {
     #[error("the process state lock was poisoned")]
     Poisoned,
     #[error("the operating system could not provide a readiness token: {0}")]
-    #[cfg_attr(unix, expect(dead_code, reason = "Windows creates readiness tokens"))]
+    #[cfg(windows)]
     Entropy(getrandom::Error),
     #[error("the readiness token is invalid")]
     InvalidReadyToken,
@@ -94,13 +116,6 @@ impl<'a> Tool<'a> {
     }
 
     #[must_use]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        expect(
-            dead_code,
-            reason = "only the Linux service manager needs extra environment"
-        )
-    )]
     pub(crate) fn env(mut self, name: &'static str, value: String) -> Self {
         self.environment.push((name, value));
         self
@@ -134,10 +149,6 @@ fn capture(stream: Option<impl io::Read>) -> String {
 }
 
 /// Run a tool to completion with no input, capturing at most 1 MiB of each output stream.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "setup and service management run fixed local tools"
-)]
 pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
     let program = crate::platform::find_program(tool.program)
         .ok_or_else(|| ToolError::Missing(tool.program.to_owned()))?;
@@ -145,7 +156,7 @@ pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
         program: tool.program.to_owned(),
         source,
     };
-    let mut command = Command::new(program);
+    let mut command = command(program);
     command
         .args(tool.arguments)
         .envs(
@@ -196,15 +207,22 @@ pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
     os::announce_ready(token)
 }
 
-#[cfg_attr(
-    windows,
-    expect(
-        clippy::missing_const_for_fn,
-        reason = "the shared Unix and Windows process interface is non-const"
-    )
-)]
+/// Watches a job's process group from another process, so the group stops even when its supervisor dies.
+trait Guard: Sized {
+    fn stand_guard(tree: &os::Tree) -> Result<Self, ProcessError>;
+    /// The supervisor stopped the group itself, so the guard leaves without stopping anything.
+    fn stand_down(self);
+    /// The guard process: wait for the supervisor to stand down, or stop the group once it is gone.
+    fn reap(group: i32);
+}
+
+/// Tells a job's output reader to finish once it has read what is already in the pipe.
+pub(crate) trait Stop {
+    fn stop(self) -> io::Result<()>;
+}
+
 pub(crate) fn reap(group: i32) {
-    os::reap(group);
+    <os::Reaper as Guard>::reap(group);
 }
 
 #[derive(Debug)]
@@ -320,25 +338,17 @@ impl Group {
 
 /// A command that writes `0123456789` to standard output and then `abcdefghij` to standard error.
 #[cfg(all(test, unix))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "job output tests run this real command"
-)]
 pub(crate) fn stdout_then_stderr() -> Command {
-    let mut command = Command::new("/bin/sh");
+    let mut command = command("/bin/sh");
     command.args(["-c", "printf 0123456789; printf abcdefghij >&2"]);
     command
 }
 
 #[cfg(all(test, windows))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "job output tests run this real command"
-)]
 pub(crate) fn stdout_then_stderr() -> Command {
     use std::os::windows::process::CommandExt as _;
 
-    let mut command = Command::new("cmd.exe");
+    let mut command = command("cmd.exe");
     command.raw_arg("/d /c echo 0123456789& echo abcdefghij>&2");
     command
 }

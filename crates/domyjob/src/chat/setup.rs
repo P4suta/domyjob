@@ -45,7 +45,9 @@ pub(crate) enum SetupError {
     #[error(transparent)]
     Tool(#[from] ToolError),
     #[error("the service record is corrupt: {0}")]
-    Record(#[from] serde_json::Error),
+    Record(#[from] domyjob_core::ingress::JsonError),
+    #[error("encoding the service record failed: {0}")]
+    Encode(#[from] serde_json::Error),
 }
 
 /// What setup and doctor report, one line per step or finding.
@@ -89,13 +91,12 @@ fn installed_path(store: &Store) -> PathBuf {
     store.root().join("service.json")
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the private service record is decoded after its bounded state read"
-)]
 fn installed(store: &Store) -> Result<Option<Installed>, SetupError> {
     match state_io::read_bytes(&installed_path(store))? {
-        Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Some(bytes) => Ok(Some(domyjob_core::ingress::json(
+            &bytes,
+            domyjob_core::wire::MAX_CONTROL_BYTES,
+        )?)),
         None => Ok(None),
     }
 }

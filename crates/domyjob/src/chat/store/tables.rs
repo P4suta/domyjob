@@ -114,15 +114,8 @@ impl Reader for WriteTransaction {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "stored chat records are decoded only through this bounded store codec"
-)]
 pub(super) fn decode<T: DeserializeOwned>(text: &str) -> Result<T, StoreError> {
-    if text.len() > MAX_RECORD {
-        return Err(StoreError::Corrupt("stored chat record exceeds its limit"));
-    }
-    Ok(serde_json::from_str(text)?)
+    Ok(domyjob_core::ingress::json(text.as_bytes(), MAX_RECORD)?)
 }
 
 pub(super) fn encode<T: Serialize>(value: &T) -> Result<String, StoreError> {

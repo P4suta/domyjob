@@ -52,6 +52,8 @@ pub(crate) enum StoreError {
     Compaction(#[from] redb::CompactionError),
     #[error("chat record encoding failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("a stored chat record is corrupt: {0}")]
+    Record(#[from] domyjob_core::ingress::JsonError),
     #[error("stored chat data is corrupt: {0}")]
     Corrupt(&'static str),
     #[error("the chat store was reset or replaced; restart this process")]

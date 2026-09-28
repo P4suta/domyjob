@@ -186,20 +186,40 @@ pub enum Reply {
     Error { code: ErrorCode },
 }
 
+/// A reply of another kind than the one its request expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unexpected {
+    /// The node refused the request.
+    Refused(ErrorCode),
+    /// The node answered with a reply of another kind.
+    Other,
+}
+
+impl Reply {
+    fn unexpected(self) -> Unexpected {
+        match self {
+            Self::Error { code } => Unexpected::Refused(code),
+            Self::Hello { .. }
+            | Self::Chat(_)
+            | Self::Accepted { .. }
+            | Self::Jobs { .. }
+            | Self::Status { .. }
+            | Self::Logs { .. }
+            | Self::Cleaned { .. } => Unexpected::Other,
+        }
+    }
+}
+
 macro_rules! reply_variant {
     ($($method:ident: $pattern:pat => $value:expr, $output:ty;)+) => {
         impl Reply {
             $(
-                /// The reply's content when it is of this kind, or the reply itself.
-                #[expect(
-                    clippy::result_large_err,
-                    reason = "an unexpected reply is handed back whole to its caller"
-                )]
-                pub fn $method(self) -> Result<$output, Self> {
+                /// The reply's content when it is of this kind.
+                pub fn $method(self) -> Result<$output, Unexpected> {
                     if let $pattern = self {
                         Ok($value)
                     } else {
-                        Err(self)
+                        Err(self.unexpected())
                     }
                 }
             )+

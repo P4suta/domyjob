@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{GENERIC_EXECUTE, GENERIC_READ, LocalFree};
+use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT,
@@ -19,13 +19,12 @@ use windows_sys::Win32::Security::{
     TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, READ_CONTROL,
+    CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
 };
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use super::Ownership;
+use super::{Exposure, Ownership};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Sid(String);
@@ -172,7 +171,6 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
     const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
     const MAX_ACES: u32 = 32;
-    let read_only = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
@@ -198,7 +196,7 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
         return Ok(Ownership::Foreign);
     }
     if dacl.is_null() {
-        return Ok(Ownership::ExposedAcl);
+        return Ok(Ownership::Exposed(Exposure));
     }
     let mut size = ACL_SIZE_INFORMATION::default();
     let bytes = u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).map_err(io::Error::other)?;
@@ -206,7 +204,7 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
         return Err(io::Error::last_os_error());
     }
     if size.AceCount > MAX_ACES {
-        return Ok(Ownership::ExposedAcl);
+        return Ok(Ownership::Exposed(Exposure));
     }
     for index in 0..size.AceCount {
         let mut raw = std::ptr::null_mut();
@@ -217,28 +215,21 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
         if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
             || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
         {
-            return Ok(Ownership::ExposedAcl);
+            return Ok(Ownership::Exposed(Exposure));
         }
         let ace: &ACCESS_ALLOWED_ACE = unsafe { &*raw.cast() };
         let sid = sid_text((&raw const ace.SidStart).cast_mut().cast())?;
         if sid != user && sid.as_str() != SYSTEM {
-            if sid.as_str() != ADMINISTRATORS && ace.Mask & !read_only != 0 {
-                return Ok(Ownership::ExposedAcl);
-            }
-            return Ok(Ownership::ExposedAcl);
+            return Ok(Ownership::Exposed(Exposure));
         }
     }
     Ok(Ownership::Private)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "ACL inspection opens a handle without following a reparse point"
-)]
 pub(super) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
-    let mut options = fs::OpenOptions::new();
+    let mut options = super::raw::options();
     options.access_mode(READ_CONTROL);
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     options.open(path)

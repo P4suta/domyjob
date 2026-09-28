@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 use std::fs::{File, TryLockError};
 use std::io;
 use std::path::Path;

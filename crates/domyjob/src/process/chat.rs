@@ -1,8 +1,3 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this adapter owns fixed AI CLI invocation"
-)]
-
 use std::io::{self, Read, Seek, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -12,7 +7,8 @@ use domyjob_core::chat::id::{AgentId, EventId};
 
 use super::{Group, ProcessError};
 
-const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+/// The most output a client may write in one turn.
+pub(crate) const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
@@ -183,7 +179,7 @@ fn command(invocation: &Invocation<'_>) -> Result<Command, ChatProcessError> {
     let domyjob = domyjob
         .to_str()
         .ok_or_else(|| io::Error::other("the domyjob path is not UTF-8"))?;
-    let mut command = Command::new(program);
+    let mut command = super::command(program);
     command.args(arguments(invocation, domyjob)?);
     crate::platform::prepare_job_environment(&mut command);
     for name in [

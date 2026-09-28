@@ -1,12 +1,3 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns detached supervisor and job process creation"
-)]
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -23,7 +14,7 @@ use thiserror::Error;
 
 use crate::identity;
 use crate::platform;
-use crate::process::{self, Group, ProcessError, ReadyToken};
+use crate::process::{self, Group, ProcessError, ReadyToken, Stop as _};
 use crate::state_io as state_file;
 use crate::store::{ReceivedArchive, Store, StoreError};
 use crate::watch_event::{self, Notice};
@@ -131,7 +122,7 @@ impl CancellationWatch {
 }
 
 fn job_command(command: &Command, home: &std::path::Path) -> Process {
-    let mut process = Process::new(command.program());
+    let mut process = process::command(command.program());
     platform::prepare_job_environment(&mut process);
     process.args(command.arguments());
     process.current_dir(home);
@@ -356,7 +347,7 @@ pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppE
 #[cfg(test)]
 mod tests {
     use super::{relay_output, spawn_logged};
-    use crate::process;
+    use crate::process::{self, Stop as _};
     use crate::state_io as state_file;
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
@@ -389,10 +380,7 @@ mod tests {
 
     #[test]
     fn a_real_job_logs_both_streams_through_one_bounded_pipe() {
-        let reference = process::stdout_then_stderr()
-            .output()
-            .expect("reference run");
-        let combined = [reference.stdout, reference.stderr].concat();
+        let combined = b"0123456789abcdefghij";
         let mut expected = Vec::new();
         let counts = relay_output(combined.as_slice(), &mut expected, 4).expect("reference relay");
         assert!(counts.1 > 0, "the command must write past the limit");

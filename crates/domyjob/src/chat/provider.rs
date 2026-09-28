@@ -5,6 +5,8 @@
 use domyjob_core::chat::card::Tool;
 use serde_json::Value;
 
+use crate::process::chat::MAX_OUTPUT;
+
 /// The complete answer of one managed turn and the session that produced it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Answer {
@@ -29,12 +31,8 @@ pub(crate) fn valid_session(session: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "this bounded foreign-protocol ingress validates structured AI CLI output"
-)]
 fn json(bytes: &[u8]) -> Result<Value, Incomplete> {
-    serde_json::from_slice(bytes).map_err(|_invalid| Incomplete)
+    domyjob_core::ingress::json(bytes, MAX_OUTPUT).map_err(|_invalid| Incomplete)
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str, Incomplete> {

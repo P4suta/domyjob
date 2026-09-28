@@ -1,7 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
 //! The local MCP stdio server that gives AI clients the chat tools.
 //!
 //! Calls run concurrently so a long `chat_ask` never blocks `ping` or other tools,
@@ -13,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use domyjob_core::chat::card::Tool;
+use domyjob_core::ingress;
 use domyjob_core::wire::MAX_CONTROL_BYTES;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -66,20 +63,12 @@ fn empty_arguments() -> Value {
     json!({})
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "MCP JSON decoding is confined to this size-bounded transport boundary"
-)]
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
-    serde_json::from_value(value)
+    ingress::value(value)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "MCP JSON decoding is confined to this size-bounded transport boundary"
-)]
 fn parse(bytes: &[u8]) -> Result<Request, Value> {
-    let value: Value = serde_json::from_slice(bytes)
+    let value: Value = ingress::json(bytes, MAX_CONTROL_BYTES)
         .map_err(|_invalid| error(&Value::Null, -32700, "Parse error"))?;
     let request: Request =
         decode(value).map_err(|_invalid| error(&Value::Null, -32600, "Invalid Request"))?;

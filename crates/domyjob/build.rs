@@ -5,7 +5,6 @@ mod source_archive;
 #[path = "src/source_fingerprint.rs"]
 mod source_fingerprint;
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -19,10 +18,20 @@ fn source_archive(root: &Path, files: Vec<PathBuf>) -> io::Result<Vec<u8>> {
     archive.finish().map_err(io::Error::other)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the build script writes generated source only inside Cargo OUT_DIR"
-)]
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "the build script writes generated source only inside Cargo OUT_DIR"
+    )]
+
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+}
+
 fn main() -> io::Result<()> {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
         .ok_or_else(|| io::Error::other("CARGO_MANIFEST_DIR is missing"))?;
@@ -41,12 +50,13 @@ fn main() -> io::Result<()> {
     let output =
         std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is missing"))?;
     let generated = Path::new(&output).join("fingerprint.rs");
-    fs::write(
-        generated,
+    raw::write(
+        &generated,
         format!(
             "const COMPILED_FINGERPRINT: u64 = u64::from_be_bytes({:?});\n",
             fingerprint.to_be_bytes()
-        ),
+        )
+        .as_bytes(),
     )?;
     let archive = source_archive(checkout, files)?;
     if source_fingerprint::from_checkout(checkout, |_kind, _path| {})? != fingerprint {
@@ -54,6 +64,6 @@ fn main() -> io::Result<()> {
             "the source changed while building its archive",
         ));
     }
-    fs::write(Path::new(&output).join("source.tar"), archive)?;
+    raw::write(&Path::new(&output).join("source.tar"), &archive)?;
     Ok(())
 }

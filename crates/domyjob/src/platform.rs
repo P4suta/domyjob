@@ -1,21 +1,110 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
+//! What differs between operating systems, behind one interface.
+//!
+//! [`System`] lists what only an operating system's own interfaces can provide,
+//! and every system implements all of it, so a capability added for one cannot be missing on another.
+//! Everything else here compiles on every system and chooses with `cfg!`,
+//! so each system type-checks the others' paths too.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use domyjob_core::chat::card::{MachineCard, Os};
+use domyjob_core::chat::id::{Invalid, Line};
 
 pub(crate) use crate::file_kind::reparse_point;
 pub(crate) mod clock;
 pub(crate) mod service;
 pub(crate) mod user_files;
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 #[cfg(windows)]
 mod windows_acl;
+
+#[cfg(unix)]
+pub(crate) use unix::Mode as Exposure;
+#[cfg(unix)]
+use unix::Unix as Native;
+#[cfg(windows)]
+pub(crate) use windows::Acl as Exposure;
+#[cfg(windows)]
+use windows::Windows as Native;
+
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "the platform layer owns raw file options, permissions, and user file effects"
+    )]
+
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn options() -> OpenOptions {
+        OpenOptions::new()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn set_permissions(
+        path: &Path,
+        permissions: std::fs::Permissions,
+    ) -> io::Result<()> {
+        std::fs::set_permissions(path, permissions)
+    }
+
+    pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    pub(super) fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+        std::fs::copy(from, to)
+    }
+
+    pub(super) fn remove_file(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+}
+
+/// What only an operating system's own interfaces provide.
+trait System {
+    /// The operating system this machine's card names.
+    const OS: Os;
+    /// The environment variables a job keeps besides the common ones.
+    const JOB_ENVIRONMENT: &'static [&'static str];
+
+    /// This machine's host name.
+    fn host_name() -> String;
+    /// The numeric user ID that names this user's services, where the system has one.
+    fn user_id() -> Option<u32>;
+    /// Whether `metadata` describes a file this user may run.
+    fn executable(metadata: &fs::Metadata) -> bool;
+    /// Let the file at `path` be run.
+    fn make_executable(path: &Path) -> io::Result<()>;
+    /// The mode a copy of a file with `metadata` receives.
+    fn file_mode(metadata: &fs::Metadata) -> u32;
+    /// Create files through `options` as executable or not.
+    fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool);
+    /// Whether anyone but this user can reach an open file.
+    fn ownership(file: &fs::File) -> io::Result<Ownership>;
+    fn open_private_dir(path: &Path) -> io::Result<fs::File>;
+    fn create_private_dir(path: &Path) -> io::Result<()>;
+    /// Restrict the files `options` creates to this user.
+    fn owner_only(options: &mut fs::OpenOptions);
+    /// Open a link itself rather than what it points to.
+    fn no_follow(options: &mut fs::OpenOptions);
+}
+
+/// Whether anyone but this user can reach a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    Private,
+    Foreign,
+    Exposed(Exposure),
+}
 
 fn variable(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
@@ -32,8 +121,9 @@ pub(crate) fn state() -> io::Result<PathBuf> {
     if let Some(explicit) = variable("DOMYJOB_STATE") {
         return Ok(PathBuf::from(explicit));
     }
-    #[cfg(windows)]
-    if let Some(local) = variable("LOCALAPPDATA") {
+    if cfg!(windows)
+        && let Some(local) = variable("LOCALAPPDATA")
+    {
         return Ok(PathBuf::from(local).join("domyjob").join("state"));
     }
     if let Some(xdg) = variable("XDG_STATE_HOME") {
@@ -44,28 +134,17 @@ pub(crate) fn state() -> io::Result<PathBuf> {
 
 /// The OpenSSH control socket path for connection sharing, when this system supports it.
 ///
-/// Sockets have short path limits, so a state directory that is too deep disables sharing.
-#[cfg(unix)]
+/// Windows OpenSSH shares no connections, and a socket path must stay short,
+/// so a state directory that is too deep disables sharing.
 pub(crate) fn ssh_control_path(
     state: &Path,
 ) -> Result<Option<PathBuf>, crate::state_io::StateError> {
     let directory = state.join("ssh");
-    if directory.as_os_str().len().saturating_add(41) > 100 {
+    if cfg!(windows) || directory.as_os_str().len().saturating_add(41) > 100 {
         return Ok(None);
     }
     crate::state_io::private_dir(&directory)?;
     Ok(Some(directory.join("%C")))
-}
-
-#[cfg(windows)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the shared SSH options create the Unix socket directory fallibly"
-)]
-pub(crate) const fn ssh_control_path(
-    _state: &Path,
-) -> Result<Option<PathBuf>, crate::state_io::StateError> {
-    Ok(None)
 }
 
 /// Where this build's executable lives outside any checkout, beside the nodes other machines install.
@@ -79,72 +158,34 @@ pub(crate) fn stable_program(build: &str) -> io::Result<PathBuf> {
         .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX)))
 }
 
-#[cfg(unix)]
 pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "an installed executable needs its execute permission"
-    )]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    Native::make_executable(path)
 }
 
-#[cfg(windows)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the shared installer marks executables fallibly on Unix"
-)]
-pub(crate) const fn make_executable(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Macos;
-#[cfg(target_os = "linux")]
-const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Linux;
-#[cfg(windows)]
-const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Windows;
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-const OS: domyjob_core::chat::card::Os = domyjob_core::chat::card::Os::Other;
-
-#[cfg(unix)]
-fn host_name() -> String {
-    rustix::system::uname()
-        .nodename()
-        .to_string_lossy()
-        .into_owned()
-}
-
-#[cfg(windows)]
-fn host_name() -> String {
-    variable("COMPUTERNAME")
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+/// The numeric user ID that names this user's services, where the system has one.
+pub(crate) fn user_id() -> Option<u32> {
+    Native::user_id()
 }
 
 /// How this machine names itself to its peers.
-pub(crate) fn machine_card()
--> Result<domyjob_core::chat::card::MachineCard, domyjob_core::chat::id::Invalid> {
-    let name = host_name();
+pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
+    let name = Native::host_name();
     let label = name.split('.').next().unwrap_or_default().trim().to_owned();
-    Ok(domyjob_core::chat::card::MachineCard {
-        label: domyjob_core::chat::id::Line::try_from(if label.is_empty() {
+    Ok(MachineCard {
+        label: Line::try_from(if label.is_empty() {
             "machine".to_owned()
         } else {
             label.chars().take(64).collect()
         })?,
-        os: OS,
+        os: Native::OS,
     })
 }
 
 /// The runtime directory `systemctl --user` needs when a session did not set one.
-#[cfg(target_os = "linux")]
-pub(crate) fn user_runtime_dir() -> String {
-    variable("XDG_RUNTIME_DIR").map_or_else(
-        || format!("/run/user/{}", rustix::process::getuid().as_raw()),
-        |value| value.to_string_lossy().into_owned(),
-    )
+pub(crate) fn user_runtime_dir() -> Option<String> {
+    variable("XDG_RUNTIME_DIR")
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| user_id().map(|id| format!("/run/user/{id}")))
 }
 
 /// The executable a bare program name resolves to on `PATH`.
@@ -156,33 +197,18 @@ pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .filter(|directory| directory.is_absolute())
         .flat_map(|directory| candidates(&directory, name))
-        .find(|candidate| executable(candidate))
+        .find(|candidate| fs::metadata(candidate).is_ok_and(|found| Native::executable(&found)))
 }
 
-#[cfg(unix)]
 fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
-    vec![directory.join(name)]
-}
-
-#[cfg(windows)]
-fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
-    ["exe", "cmd", "bat"]
-        .iter()
-        .map(|extension| directory.join(format!("{name}.{extension}")))
-        .collect()
-}
-
-#[cfg(unix)]
-fn executable(candidate: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    fs::metadata(candidate)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn executable(candidate: &Path) -> bool {
-    fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
+    if cfg!(windows) {
+        ["exe", "cmd", "bat"]
+            .iter()
+            .map(|extension| directory.join(format!("{name}.{extension}")))
+            .collect()
+    } else {
+        vec![directory.join(name)]
+    }
 }
 
 pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
@@ -193,28 +219,19 @@ pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
     }
 }
 
-#[cfg(unix)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the shared Unix and Windows target selector is fallible on Windows"
-)]
-pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
-    Ok(target.to_path_buf())
-}
-
 /// Whether no running process holds the executable, so a build may replace it.
-#[cfg(windows)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "opening for write is how Windows reports that an executable is running"
-)]
 fn replaceable(executable: &Path) -> bool {
-    fs::OpenOptions::new().write(true).open(executable).is_ok()
+    raw::options().write(true).open(executable).is_ok()
 }
 
-/// The first target slot whose executable neither this process nor another one is running.
-#[cfg(windows)]
+/// Where the local client rebuilds itself.
+///
+/// Windows cannot replace a running executable,
+/// so there it picks the first target slot whose executable no process runs.
 pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(target.to_path_buf());
+    }
     let current = fs::canonicalize(std::env::current_exe()?)?;
     for slot in [
         target.to_path_buf(),
@@ -236,59 +253,65 @@ pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
 }
 
 pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
-    const COMMON: &[&str] = &["PATH", "HOME", "USERPROFILE", "TEMP", "TMP"];
-    #[cfg(unix)]
-    const PLATFORM: &[&str] = &[
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "SHELL",
-        "TMPDIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_STATE_HOME",
-    ];
-    #[cfg(windows)]
-    const PLATFORM: &[&str] = &[
-        "PATHEXT",
-        "SystemRoot",
-        "WINDIR",
-        "COMSPEC",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "PROGRAMDATA",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "USERNAME",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
+    const COMMON: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "MISE_DATA_DIR",
+        "MISE_CONFIG_DIR",
     ];
     command.env_clear();
-    for name in COMMON
-        .iter()
-        .chain(PLATFORM)
-        .chain(["MISE_DATA_DIR", "MISE_CONFIG_DIR"].iter())
-    {
+    for name in COMMON.iter().chain(Native::JOB_ENVIRONMENT) {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
 }
 
+pub(crate) fn file_mode(metadata: &fs::Metadata) -> u32 {
+    Native::file_mode(metadata)
+}
+
+pub(crate) fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool) {
+    Native::creation_mode(options, executable);
+}
+
+pub(crate) fn ownership(file: &fs::File) -> io::Result<Ownership> {
+    Native::ownership(file)
+}
+
+pub(crate) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
+    Native::open_private_dir(path)
+}
+
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    Native::create_private_dir(path)
+}
+
+pub(crate) fn private_options() -> fs::OpenOptions {
+    let mut options = raw::options();
+    Native::owner_only(&mut options);
+    Native::no_follow(&mut options);
+    options
+}
+
+/// Flush a directory's entries to disk; Windows cannot open a directory to flush it.
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    fs::File::open(path)?.sync_all()
+}
+
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the fixture inspects the environment of an unstarted process"
-)]
 mod tests {
     use super::prepare_job_environment;
 
     #[test]
     fn a_job_does_not_inherit_ssh_connection_credentials() {
-        let mut command = std::process::Command::new("unused");
+        let mut command = crate::process::command("unused");
         command.env("SSH_AUTH_SOCK", "should-not-be-forwarded");
         command.env("GIT_ASKPASS", "should-not-be-forwarded");
         prepare_job_environment(&mut command);
@@ -296,150 +319,4 @@ mod tests {
         assert!(!names.contains(&std::ffi::OsStr::new("SSH_AUTH_SOCK")));
         assert!(!names.contains(&std::ffi::OsStr::new("GIT_ASKPASS")));
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn file_mode(metadata: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    if metadata.permissions().mode() & 0o111 == 0 {
-        0o644
-    } else {
-        0o755
-    }
-}
-
-#[cfg(windows)]
-pub(crate) const fn file_mode(_metadata: &fs::Metadata) -> u32 {
-    0o644
-}
-
-#[cfg(unix)]
-pub(crate) fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    options.mode(if executable { 0o755 } else { 0o644 });
-}
-
-#[cfg(windows)]
-pub(crate) const fn creation_mode(_options: &mut cap_std::fs::OpenOptions, _executable: bool) {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Ownership {
-    Private,
-    Foreign,
-    #[cfg_attr(
-        windows,
-        expect(dead_code, reason = "Unix file modes use this classification")
-    )]
-    Exposed(u32),
-    #[cfg_attr(
-        unix,
-        expect(dead_code, reason = "Windows ACLs use this classification")
-    )]
-    ExposedAcl,
-}
-
-#[cfg(unix)]
-pub(crate) fn ownership(file: &fs::File) -> io::Result<Ownership> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = file.metadata()?;
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        return Ok(Ownership::Foreign);
-    }
-    let mode = metadata.mode() & 0o777;
-    if mode.trailing_zeros() >= 6 {
-        Ok(Ownership::Private)
-    } else {
-        Ok(Ownership::Exposed(mode))
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn ownership(file: &fs::File) -> io::Result<Ownership> {
-    windows_acl::ownership(file)
-}
-
-#[cfg(unix)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the state owner check opens a directory without following a link"
-)]
-pub(crate) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    no_follow(&mut options);
-    options.open(path)
-}
-
-#[cfg(windows)]
-pub(crate) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
-    windows_acl::open_private_dir(path)
-}
-
-#[cfg(unix)]
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-}
-
-#[cfg(windows)]
-pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
-    windows_acl::create_private_dir(path)
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "private state files are created only through these options"
-)]
-pub(crate) fn private_options() -> fs::OpenOptions {
-    let mut options = fs::OpenOptions::new();
-    owner_only(&mut options);
-    no_follow(&mut options);
-    options
-}
-
-#[cfg(unix)]
-fn owner_only(options: &mut fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    options.mode(0o600);
-}
-
-#[cfg(windows)]
-const fn owner_only(_options: &mut fs::OpenOptions) {}
-
-#[cfg(unix)]
-fn no_follow(options: &mut fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
-    options.custom_flags(flags.bits().cast_signed());
-}
-
-#[cfg(windows)]
-fn no_follow(options: &mut fs::OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(unix)]
-pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
-}
-
-#[cfg(windows)]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the shared state writer treats directory sync as a fallible platform operation"
-)]
-pub(crate) const fn sync_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
 }

@@ -13,15 +13,8 @@
 
 #![expect(
     clippy::disallowed_methods,
-    reason = "the harness creates processes and files and bounds its own waits"
-)]
-#![expect(
     clippy::disallowed_types,
-    reason = "every harness wait and timing has an explicit bound"
-)]
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the harness modules share items, but a test binary has no public API"
+    reason = "the harness drives real processes and files and bounds every wait"
 )]
 
 use std::ffi::{OsStr, OsString};

@@ -1,11 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns the user configuration files domyjob installs: service definitions, client settings, and the stable executable"
-)]
 //! Files outside domyjob's private state that setup installs for the user.
 
 use std::fs;
@@ -58,7 +50,7 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
     let directory = path
         .parent()
         .ok_or_else(|| failed("writing", path)(io::Error::other("the path has no directory")))?;
-    fs::create_dir_all(directory).map_err(failed("creating", directory))?;
+    super::raw::create_dir_all(directory).map_err(failed("creating", directory))?;
     let mut staged = tempfile::NamedTempFile::new_in(directory).map_err(failed("writing", path))?;
     staged.write_all(bytes).map_err(failed("writing", path))?;
     staged
@@ -72,15 +64,8 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
 }
 
 /// Remove a file; a missing file is already removed.
-#[cfg_attr(
-    windows,
-    expect(
-        dead_code,
-        reason = "Windows keeps its service definition in Task Scheduler"
-    )
-)]
 pub(crate) fn remove(path: &Path) -> Result<bool, UserFileError> {
-    match fs::remove_file(path) {
+    match super::raw::remove_file(path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(failed("removing", path)(error)),
@@ -97,10 +82,10 @@ pub(crate) fn install_executable(source: &Path, target: &Path) -> Result<(), Use
     let directory = target.parent().ok_or_else(|| {
         failed("installing", target)(io::Error::other("the path has no directory"))
     })?;
-    fs::create_dir_all(directory).map_err(failed("creating", directory))?;
+    super::raw::create_dir_all(directory).map_err(failed("creating", directory))?;
     let staged =
         tempfile::NamedTempFile::new_in(directory).map_err(failed("installing", target))?;
-    fs::copy(source, staged.path()).map_err(failed("copying", source))?;
+    super::raw::copy(source, staged.path()).map_err(failed("copying", source))?;
     crate::platform::make_executable(staged.path()).map_err(failed("installing", target))?;
     staged
         .persist(target)

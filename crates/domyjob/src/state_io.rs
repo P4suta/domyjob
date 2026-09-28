@@ -1,11 +1,4 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module exclusively owns private state creation, replacement, and deletion"
-)]
+//! Private state: files and directories only this user may read, replaced atomically.
 
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
@@ -15,6 +8,33 @@ use thiserror::Error;
 
 use crate::platform::{self, Ownership};
 
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "private state is created, replaced, and deleted only through `state_io`"
+    )]
+
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn exclusive(options: &mut OpenOptions) -> &mut OpenOptions {
+        options.create_new(true)
+    }
+
+    pub(super) fn remove_file(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    pub(super) fn remove_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::remove_dir_all(path)
+    }
+
+    pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+}
+
 const MAX_RECORD_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Error)]
@@ -23,10 +43,11 @@ pub(crate) enum StateError {
     Io(#[from] IoFailure),
     #[error("{path} belongs to another user")]
     Foreign { path: PathBuf },
-    #[error("{path} is accessible to other users (mode {mode:o})")]
-    Exposed { path: PathBuf, mode: u32 },
-    #[error("{path} has an exposed Windows ACL")]
-    ExposedAcl { path: PathBuf },
+    #[error("{path} is accessible to other users: {how}")]
+    Exposed {
+        path: PathBuf,
+        how: platform::Exposure,
+    },
     #[error("{path} is not a regular private file")]
     NotFile { path: PathBuf },
     #[error("{path} is not a private directory")]
@@ -58,12 +79,9 @@ fn check_owner(path: &Path, file: &File) -> Result<(), StateError> {
         Ownership::Foreign => Err(StateError::Foreign {
             path: path.to_path_buf(),
         }),
-        Ownership::Exposed(mode) => Err(StateError::Exposed {
+        Ownership::Exposed(how) => Err(StateError::Exposed {
             path: path.to_path_buf(),
-            mode,
-        }),
-        Ownership::ExposedAcl => Err(StateError::ExposedAcl {
-            path: path.to_path_buf(),
+            how,
         }),
     }
 }
@@ -215,7 +233,7 @@ fn open_created(path: &Path, kind: CreatedFile) -> Result<File, StateError> {
             options.read(true).write(true).create(true).truncate(false);
         }
         CreatedFile::Empty => {
-            options.write(true).create_new(true);
+            raw::exclusive(options.write(true));
         }
     }
     let file = options
@@ -249,7 +267,7 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
         Some(file) => drop(file),
         None => return Ok(()),
     }
-    match fs::remove_file(path) {
+    match raw::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_at(path, error)),
@@ -262,7 +280,13 @@ pub(crate) fn remove_dir_all(path: &Path) -> Result<(), StateError> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_at(path, error)),
     }
-    fs::remove_dir_all(path).map_err(|error| io_at(path, error))
+    raw::remove_dir_all(path).map_err(|error| io_at(path, error))
+}
+
+/// Move a private directory to a path that does not exist yet, publishing it in one step.
+pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
+    private_dir(from)?;
+    raw::rename(from, to).map_err(|error| io_at(to, error))
 }
 
 #[cfg(test)]

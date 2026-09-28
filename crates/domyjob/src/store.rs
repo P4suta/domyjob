@@ -1,12 +1,3 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns private job directories and their atomic publication"
-)]
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 use std::collections::BTreeSet;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -69,7 +60,7 @@ pub(crate) struct ReceivedArchive {
 
 impl Drop for ReceivedArchive {
     fn drop(&mut self) {
-        let _removed = std::fs::remove_file(&self.path);
+        let _removed = state_file::remove_file(&self.path);
     }
 }
 
@@ -209,16 +200,13 @@ impl Store {
                 .map_err(|_name| StoreError::Corrupt)?;
             JobId::try_from(name).map_err(|_invalid| StoreError::Corrupt)?;
             match kind {
-                OrphanKind::Staging => {
-                    state_file::private_dir(&entry.path())?;
-                    std::fs::remove_dir_all(entry.path())?;
-                }
+                OrphanKind::Staging => state_file::remove_dir_all(&entry.path())?,
                 OrphanKind::Incoming => {
                     let Some(file) = state_file::open_read(&entry.path())? else {
                         return Err(StoreError::Corrupt);
                     };
                     drop(file);
-                    std::fs::remove_file(entry.path())?;
+                    state_file::remove_file(&entry.path())?;
                 }
             }
         }
@@ -356,7 +344,7 @@ impl Store {
         state_file::write_bytes(&staged.join("request.json"), wire::payload(&encoded)?)?;
         let initial = serde_json::to_vec(&JobState::accepted()).map_err(WireError::from)?;
         state_file::write_bytes(&staged.join("state.json"), &initial)?;
-        std::fs::rename(&staged, self.paths(job).dir)?;
+        state_file::publish_dir(&staged, &self.paths(job).dir)?;
         Ok(())
     }
 

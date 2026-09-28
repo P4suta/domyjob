@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 use domyjob_core::wire::BuildId;
 
 use crate::source_fingerprint;

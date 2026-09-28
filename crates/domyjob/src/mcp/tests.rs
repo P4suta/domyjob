@@ -17,16 +17,12 @@ fn server(root: &tempfile::TempDir) -> Server<Vec<u8>> {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the test decodes the server's own JSON-RPC output"
-)]
 fn replies(server: Server<Vec<u8>>) -> Vec<Value> {
     let output = server.output.into_inner().unwrap();
     output
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
+        .map(|line| domyjob_core::ingress::json(line, usize::MAX).unwrap())
         .collect()
 }
 

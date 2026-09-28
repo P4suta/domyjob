@@ -1,16 +1,7 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns the single OpenSSH process boundary"
-)]
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the composition root needs these names but the binary has no public API"
-)]
-
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -21,7 +12,9 @@ use domyjob_core::domain::{
 };
 use domyjob_core::ingress;
 use domyjob_core::state::{JobState, Outcome, PhaseKind};
-use domyjob_core::wire::{self, CleanTarget, ErrorCode, Input, Reply, Request, WireError};
+use domyjob_core::wire::{
+    self, CleanTarget, ErrorCode, Input, Reply, Request, Unexpected, WireError,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -29,6 +22,7 @@ use crate::app::{self, AppError};
 use crate::identity;
 use crate::lock::{LockError, OsLock};
 use crate::platform::{self, clock};
+use crate::process;
 use crate::source::{self, SourceError};
 use crate::state_io::{self, StateError};
 use crate::store::{Store, StoreError};
@@ -76,7 +70,9 @@ pub(crate) enum TransportError {
     #[error("the remote call did not finish before its deadline")]
     Deadline,
     #[error("the shell cache is corrupt: {0}")]
-    Cache(#[from] serde_json::Error),
+    Cache(#[from] ingress::JsonError),
+    #[error("encoding the shell cache failed: {0}")]
+    CacheEncoding(#[from] serde_json::Error),
 }
 
 /// The shell OpenSSH runs remote commands with.
@@ -135,7 +131,7 @@ impl SshChild {
         remote_command: &str,
         stdout: Stdio,
     ) -> Result<Self, TransportError> {
-        let child = Command::new("ssh")
+        let child = process::command("ssh")
             .args(ssh_arguments()?)
             .args(["--", machine.as_str(), remote_command])
             .stdin(Stdio::piped())
@@ -166,7 +162,7 @@ impl Watchdog {
         let pid = child.id();
         std::thread::spawn(move || {
             if matches!(clock::receive(&receiver, deadline), clock::Waited::Expired) {
-                let _stopped = crate::process::terminate(pid);
+                let _stopped = process::terminate(pid);
             }
         });
         Self(Some(sender))
@@ -312,7 +308,7 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
     let checkout = source_checkout()?;
     let target = platform::local_refresh_target(&platform::cargo_target_dir(checkout))?;
     eprintln!("domyjob: rebuilding the local client from this checkout");
-    let built = Command::new("mise")
+    let built = process::command("mise")
         .current_dir(checkout)
         .env("CARGO_TARGET_DIR", &target)
         .env("RUSTC_WRAPPER", "")
@@ -325,16 +321,16 @@ pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
     let executable = target
         .join("debug")
         .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX));
-    let status = Command::new(executable)
+    let status = process::command(executable)
         .env("DOMYJOB_LOCAL_REFRESHED", "1")
         .args(std::env::args_os().skip(1))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
         .status()?;
-    Ok(Some(
-        match status.code().and_then(|code| u8::try_from(code).ok()) {
-            Some(code) => ExitCode::from(code),
-            None => ExitCode::FAILURE,
-        },
-    ))
+    Ok(Some(match status.code().map(u8::try_from) {
+        Some(Ok(code)) => ExitCode::from(code),
+        Some(Err(_)) | None => ExitCode::FAILURE,
+    }))
 }
 
 fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
@@ -368,12 +364,8 @@ fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
 /// The remote shell of `machine`, detected once and then cached in private state.
 fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
     let path = platform::state()?.join("v1").join("hosts.json");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the private shell cache is decoded after its bounded state read"
-    )]
     let mut hosts: BTreeMap<String, Shell> = match state_io::read_bytes(&path)? {
-        Some(bytes) => serde_json::from_slice(&bytes)?,
+        Some(bytes) => ingress::json(&bytes, wire::MAX_CONTROL_BYTES)?,
         None => BTreeMap::new(),
     };
     if let Some(shell) = hosts.get(machine.as_str()) {
@@ -465,11 +457,11 @@ fn call_with(
 }
 
 /// Take the one reply kind a request expects.
-fn pick<T>(reply: Reply, kind: fn(Reply) -> Result<T, Reply>) -> Result<T, TransportError> {
+fn pick<T>(reply: Reply, kind: fn(Reply) -> Result<T, Unexpected>) -> Result<T, TransportError> {
     match kind(reply) {
         Ok(value) => Ok(value),
-        Err(Reply::Error { code }) => Err(TransportError::Refused(code)),
-        Err(_unexpected) => Err(TransportError::UnexpectedReply),
+        Err(Unexpected::Refused(code)) => Err(TransportError::Refused(code)),
+        Err(Unexpected::Other) => Err(TransportError::UnexpectedReply),
     }
 }
 
@@ -477,7 +469,7 @@ fn expect<T>(
     machine: &MachineName,
     request: &Request,
     payload: &[u8],
-    kind: fn(Reply) -> Result<T, Reply>,
+    kind: fn(Reply) -> Result<T, Unexpected>,
 ) -> Result<T, TransportError> {
     pick(call_with(machine, request, payload, PLAIN)?, kind)
 }

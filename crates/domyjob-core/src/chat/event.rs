@@ -470,11 +470,11 @@ mod tests {
     use crate::chat::fixtures::{agent, ask, card, id, origin};
     use crate::chat::id::Conversation;
 
+    fn decode(text: &str) -> Result<Event, crate::ingress::JsonError> {
+        crate::ingress::json(text.as_bytes(), usize::MAX)
+    }
+
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "exercise the domain decoder with malformed ingress records"
-    )]
     fn decoding_rejects_unknown_fields_invalid_clocks_and_foreign_audiences() {
         let omitted = |extra: &str| {
             alloc::format!(
@@ -482,8 +482,8 @@ mod tests {
                 origin('a')
             )
         };
-        serde_json::from_str::<Event>(&omitted("")).unwrap();
-        serde_json::from_str::<Event>(&omitted(r#","extra":true"#)).unwrap_err();
+        decode(&omitted("")).unwrap();
+        decode(&omitted(r#","extra":true"#)).unwrap_err();
         for clock in [0, u64::MAX] {
             Event::new(id('a', 1), clock, Body::Omitted {}).unwrap_err();
         }

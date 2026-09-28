@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 #[derive(Debug)]
 pub(crate) enum Notice {
     Changed,

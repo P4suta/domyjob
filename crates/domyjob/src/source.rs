@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-
 use std::path::Path;
 
 use domyjob_core::wire::{Snapshot, WireError};
@@ -64,21 +59,15 @@ pub(crate) fn working_directory(root: &Path) -> Result<(Vec<u8>, Snapshot), Sour
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the fixture owns its temporary source directory"
-)]
 mod tests {
-    use std::fs;
-
     use super::working_directory;
+    use crate::testing;
 
     #[test]
     fn working_directory_includes_uncommitted_files_but_excludes_repository_metadata() {
         let source = tempfile::tempdir().expect("temporary source");
-        fs::create_dir_all(source.path().join(".git")).expect("metadata directory");
-        fs::write(source.path().join(".git/config"), b"private").expect("metadata file");
-        fs::write(source.path().join("new.txt"), b"uncommitted").expect("source file");
+        testing::write(&source.path().join(".git/config"), b"private");
+        testing::write(&source.path().join("new.txt"), b"uncommitted");
         let (bytes, descriptor) = working_directory(source.path()).expect("source archive");
         assert_eq!(
             usize::try_from(descriptor.bytes()).expect("archive length"),

@@ -1,8 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the source scanner is compiled into both the build script and the application"
-)]
-
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -126,47 +121,37 @@ pub(crate) fn from_checkout(
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the fixture owns its temporary checkout"
-)]
 mod tests {
-    use std::fs;
-
     use super::{FILES, ROOTS, from_checkout};
+    use crate::testing;
 
     fn fingerprint_changes() -> std::io::Result<[u64; 4]> {
         let checkout = tempfile::tempdir()?;
         for file in FILES {
-            fs::write(checkout.path().join(file), b"original")?;
+            testing::write(&checkout.path().join(file), b"original");
         }
         for directory in ROOTS {
-            let path = checkout.path().join(directory);
-            fs::create_dir_all(&path)?;
-            fs::write(path.join("Cargo.toml"), b"original")?;
+            testing::write(
+                &checkout.path().join(directory).join("Cargo.toml"),
+                b"original",
+            );
         }
         for directory in ["crates/domyjob", "crates/domyjob-core"] {
-            fs::create_dir_all(checkout.path().join(directory))?;
-            fs::write(
-                checkout.path().join(directory).join("Cargo.toml"),
+            testing::write(
+                &checkout.path().join(directory).join("Cargo.toml"),
                 b"original",
-            )?;
+            );
         }
         let original = from_checkout(checkout.path(), |_kind, _path| {})?;
         let added = checkout.path().join("crates/domyjob/src/extra.rs");
-        fs::create_dir_all(
-            added
-                .parent()
-                .ok_or_else(|| std::io::Error::other("no parent"))?,
-        )?;
-        fs::write(&added, b"added")?;
+        testing::write(&added, b"added");
         let with_addition = from_checkout(checkout.path(), |_kind, _path| {})?;
-        fs::remove_file(&added)?;
+        testing::remove(&added);
         let restored = from_checkout(checkout.path(), |_kind, _path| {})?;
-        fs::write(
-            checkout.path().join("crates/domyjob/Cargo.toml"),
+        testing::write(
+            &checkout.path().join("crates/domyjob/Cargo.toml"),
             b"changed",
-        )?;
+        );
         let with_change = from_checkout(checkout.path(), |_kind, _path| {})?;
         Ok([original, with_addition, restored, with_change])
     }

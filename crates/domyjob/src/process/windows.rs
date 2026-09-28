@@ -2,10 +2,6 @@
     unsafe_code,
     reason = "Windows Job Objects, suspended starts, and readiness events require raw kernel handles"
 )]
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this adapter owns direct Windows worker creation"
-)]
 
 use std::io;
 use std::os::windows::io::AsRawHandle as _;
@@ -28,7 +24,7 @@ use windows_sys::Win32::System::Threading::{
     THREAD_SUSPEND_RESUME, WaitForMultipleObjects, WaitForSingleObject,
 };
 
-use super::{ProcessError, ReadyToken};
+use super::{Guard, ProcessError, ReadyToken, Stop};
 
 const WATCH: u32 = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
 
@@ -78,7 +74,7 @@ pub(super) fn launch_worker(
     errors: Option<std::fs::File>,
 ) -> Result<(), ProcessError> {
     use std::os::windows::io::{AsHandle as _, IntoRawHandle as _};
-    use windows_spawn::{Command as WindowsCommand, CreationFlags, SpawnOptions, Stdio};
+    use windows_spawn::{CreationFlags, SpawnOptions, Stdio};
 
     let token = ReadyToken::fresh()?;
     let name = wide(&event_name(&token));
@@ -88,7 +84,7 @@ pub(super) fn launch_worker(
         what: "the worker",
         source,
     })?;
-    let mut command = WindowsCommand::new(executable);
+    let mut command = super::raw::detached(&executable);
     command
         .args(arguments)
         .arg("--ready-event")
@@ -218,20 +214,15 @@ impl Tree {
 #[derive(Debug)]
 pub(super) struct Reaper;
 
-impl Reaper {
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the same signature as the Unix reaper, whose start can fail"
-    )]
-    pub(super) const fn stand_guard(_tree: &Tree) -> Result<Self, ProcessError> {
+/// A Job Object already ends the whole tree with its supervisor, so no guard process is needed.
+impl Guard for Reaper {
+    fn stand_guard(_tree: &Tree) -> Result<Self, ProcessError> {
         Ok(Self)
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "the shared reaper contract consumes its guard when work finishes"
-    )]
-    pub(super) const fn stand_down(self) {}
+    fn stand_down(self) {}
+
+    fn reap(_group: i32) {}
 }
 
 /// The job output pipe; a Job Object ends every holder of its write end with the job.
@@ -245,20 +236,14 @@ pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputS
     Ok((reader, writer, OutputStop))
 }
 
-impl OutputStop {
-    #[expect(
-        clippy::unnecessary_wraps,
-        clippy::missing_const_for_fn,
-        clippy::unused_self,
-        reason = "the shared job output interface stops Unix readers fallibly"
-    )]
-    pub(crate) fn stop(self) -> io::Result<()> {
+impl Stop for OutputStop {
+    fn stop(self) -> io::Result<()> {
         Ok(())
     }
 }
 
 pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
-    let status = Command::new("taskkill.exe")
+    let status = super::command("taskkill.exe")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -273,5 +258,3 @@ pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
         ))))
     }
 }
-
-pub(super) const fn reap(_group: i32) {}

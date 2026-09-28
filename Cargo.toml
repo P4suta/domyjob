@@ -86,6 +86,8 @@ fallible_impl_from = "deny"
 shadow_unrelated = "deny"
 undocumented_unsafe_blocks = "allow"
 
+# `unreachable_pub` requires `pub(crate)` for crate-internal items, which this lint calls redundant.
+redundant_pub_crate = "allow"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
 option_if_let_else = "allow"

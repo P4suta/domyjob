@@ -149,12 +149,8 @@ mod tests {
         Batch::new(vec![event(1), event(2)], true).unwrap();
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "exercise the chat message decoders directly until the wire carries them"
-    )]
-    fn decode<T: serde::de::DeserializeOwned>(text: &str) -> serde_json::Result<T> {
-        serde_json::from_str(text)
+    fn decode<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, crate::ingress::JsonError> {
+        crate::ingress::json(text.as_bytes(), usize::MAX)
     }
 
     #[test]

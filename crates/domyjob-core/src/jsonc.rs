@@ -26,10 +26,10 @@ const INLINE: Layout<'static> = Layout {
 pub enum JsoncError {
     /// The document is neither empty nor valid JSON with comments.
     #[error("the document is not valid JSON with comments: {0}")]
-    Document(#[source] serde_json::Error),
+    Document(#[source] ingress::JsonError),
     /// The value to set is not valid JSON.
     #[error("the new value is not valid JSON: {0}")]
-    Value(#[source] serde_json::Error),
+    Value(#[source] ingress::JsonError),
     /// The path names no member.
     #[error("a member path needs at least one key")]
     EmptyPath,

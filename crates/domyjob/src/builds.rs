@@ -1,11 +1,3 @@
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "the binary composition root uses this private module"
-)]
-#![expect(
-    clippy::disallowed_methods,
-    reason = "this module owns the build-specific install directories and their removal"
-)]
 //! Build-specific install directories, their in-use locks, and pruning of unused ones.
 //!
 //! Every process started from an installed build holds a shared lock inside that build's directory, so a build is removed only when no process of it runs.
@@ -13,6 +5,34 @@
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
+
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "installed build directories are marked and removed only here"
+    )]
+
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn open_lock(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    }
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+
+    pub(super) fn remove_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::remove_dir_all(path)
+    }
+}
 
 const LOCK: &str = "in-use.lock";
 const LAST_USED: &str = "last-used";
@@ -28,12 +48,7 @@ fn installed_directory(executable: &Path) -> Option<PathBuf> {
 }
 
 fn lock_file(directory: &Path) -> io::Result<File> {
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(LOCK))
+    raw::open_lock(&directory.join(LOCK))
 }
 
 /// Mark this process as a user of its installed build for as long as the returned file lives.
@@ -44,17 +59,21 @@ pub(crate) fn hold_current() -> io::Result<Option<File>> {
     };
     let file = lock_file(&directory)?;
     file.lock_shared()?;
-    fs::write(
-        directory.join(LAST_USED),
-        crate::platform::clock::now_millis().to_string(),
+    raw::write(
+        &directory.join(LAST_USED),
+        crate::platform::clock::now_millis().to_string().as_bytes(),
     )?;
     Ok(Some(file))
 }
 
-/// When a build last started a process, in milliseconds since the Unix epoch.
+/// When a build last started a process, in milliseconds since the Unix epoch;
+/// an unreadable record counts as never, and the in-use lock still protects a running build.
 fn last_used(directory: &Path) -> io::Result<Option<u64>> {
     match fs::read_to_string(directory.join(LAST_USED)) {
-        Ok(text) => Ok(text.trim().parse().ok()),
+        Ok(text) => match text.trim().parse() {
+            Ok(millis) => Ok(Some(millis)),
+            Err(_unreadable) => Ok(None),
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -94,7 +113,7 @@ fn prune_before(versions: &Path, keep: &str, cutoff: u64) -> io::Result<Vec<Stri
         }
         // Windows cannot delete a file that is still open, and a running build's files stay locked.
         drop(lock);
-        match fs::remove_dir_all(&directory) {
+        match raw::remove_dir_all(&directory) {
             Ok(()) => removed.push(name),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
             Err(error) => return Err(error),
@@ -109,31 +128,31 @@ fn is_build_tag(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::{LAST_USED, LOCK, installed_directory, lock_file, prune_before};
+    use crate::testing;
 
     #[test]
     fn only_unused_builds_other_than_the_current_one_are_removed() {
         let root = tempfile::tempdir().unwrap();
         let versions = root.path().join("versions");
         for tag in ["0000000000000001", "0000000000000002", "0000000000000003"] {
-            fs::create_dir_all(versions.join(tag).join("bin")).unwrap();
+            testing::mkdir(&versions.join(tag).join("bin"));
         }
-        fs::create_dir_all(versions.join("notes")).unwrap();
-        fs::create_dir_all(versions.join("0000000000000004")).unwrap();
-        fs::write(versions.join("0000000000000004").join(LAST_USED), "900").unwrap();
+        testing::mkdir(&versions.join("notes"));
+        testing::write(&versions.join("0000000000000004").join(LAST_USED), "900");
         let running = lock_file(&versions.join("0000000000000002")).unwrap();
         running.lock_shared().unwrap();
         let removed = prune_before(&versions, "0000000000000003", 500).unwrap();
         assert_eq!(removed, ["0000000000000001"]);
-        assert!(versions.join("0000000000000002").join(LOCK).is_file());
-        assert!(versions.join("0000000000000003").is_dir());
+        assert!(testing::is_file(
+            &versions.join("0000000000000002").join(LOCK)
+        ));
+        assert!(testing::is_dir(&versions.join("0000000000000003")));
         assert!(
-            versions.join("0000000000000004").is_dir(),
+            testing::is_dir(&versions.join("0000000000000004")),
             "a recently used build stays"
         );
-        assert!(versions.join("notes").is_dir());
+        assert!(testing::is_dir(&versions.join("notes")));
         drop(running);
         assert_eq!(
             prune_before(&versions, "0000000000000003", 1000).unwrap(),
