@@ -13,7 +13,7 @@ use domyjob_core::chat::id::{AgentId, EventId};
 use super::{Group, ProcessError};
 
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
-const MAX_DIAGNOSTIC: u64 = 4096;
+const MAX_DIAGNOSTIC: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ChatProcessError {
@@ -211,14 +211,21 @@ fn command(invocation: &Invocation<'_>) -> Result<Command, ChatProcessError> {
     Ok(command)
 }
 
+/// The end of a client's diagnostic output as printable text.
+fn recent(bytes: &[u8]) -> String {
+    let start = bytes.len().saturating_sub(MAX_DIAGNOSTIC);
+    domyjob_core::domain::terminal_text(
+        String::from_utf8_lossy(bytes.get(start..).unwrap_or_default()).trim(),
+    )
+}
+
 fn tail(file: &mut std::fs::File) -> io::Result<String> {
+    let limit = u64::try_from(MAX_DIAGNOSTIC).map_err(io::Error::other)?;
     let length = file.seek(io::SeekFrom::End(0))?;
-    file.seek(io::SeekFrom::Start(length.saturating_sub(MAX_DIAGNOSTIC)))?;
+    file.seek(io::SeekFrom::Start(length.saturating_sub(limit)))?;
     let mut bytes = Vec::new();
-    file.take(MAX_DIAGNOSTIC).read_to_end(&mut bytes)?;
-    Ok(domyjob_core::domain::terminal_text(
-        String::from_utf8_lossy(&bytes).trim(),
-    ))
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(recent(&bytes))
 }
 
 /// Run one turn and return the client's complete standard output.
@@ -258,10 +265,12 @@ pub(crate) fn run(invocation: &Invocation<'_>) -> Result<Vec<u8>, ChatProcessErr
     let bytes = bytes??;
     let status = status?;
     if !status.success() {
-        return Err(ChatProcessError::Failed {
-            status,
-            detail: tail(&mut errors)?,
-        });
+        let mut detail = tail(&mut errors)?;
+        if detail.is_empty() {
+            // Clients in JSON mode may report their failure on standard output instead.
+            detail = recent(&bytes);
+        }
+        return Err(ChatProcessError::Failed { status, detail });
     }
     Ok(bytes)
 }
