@@ -312,7 +312,7 @@ fn attention(
             ui::paint(tone, ui::symbol(symbol)),
             ui::fit(&ui::label(last), 24),
             ui::paint(tone, last.state().as_str()),
-            ui::paint(Tone::Dim, &ui::ago(last.spec.submitted_at, now))
+            ui::paint(Tone::Dim, &last.spec.submitted_at.ago(now))
         )?;
     }
     if report.paused {
@@ -420,7 +420,7 @@ pub fn history(
         if let Some(typical) = one.typical {
             facts.push(format!("typically {typical}"));
         }
-        facts.push(ui::ago(one.last, now));
+        facts.push(one.last.ago(now));
         writeln!(
             out,
             "{}{}  {}{}  {}{}  {}",

@@ -270,7 +270,7 @@ pub struct Series<'a> {
     runs: usize,
     succeeded: usize,
     recent: Vec<&'static str>,
-    typical_millis: Option<i64>,
+    typical_millis: Option<crate::clock::Elapsed>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,7 +290,7 @@ impl<'a> HistoryView<'a> {
                     runs: one.runs,
                     succeeded: one.succeeded,
                     recent: one.recent.iter().map(|state| state.as_str()).collect(),
-                    typical_millis: one.typical.map(crate::clock::Elapsed::millis),
+                    typical_millis: one.typical,
                 })
                 .collect(),
         }

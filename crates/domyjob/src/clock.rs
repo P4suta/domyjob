@@ -26,6 +26,18 @@ impl Timestamp {
         Elapsed(later.0.saturating_sub(self.0))
     }
 
+    #[must_use]
+    pub fn ago(self, now: Self) -> String {
+        let seconds = self.until(now).0 / 1000;
+        match seconds {
+            ..10 => "just now".to_owned(),
+            10..60 => format!("{seconds}s ago"),
+            60..3600 => format!("{}m ago", seconds / 60),
+            3600..86_400 => format!("{}h ago", seconds / 3600),
+            _ => self.local_date(),
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub const fn at_millis(millis: i64) -> Self {
@@ -49,13 +61,15 @@ fn signed(millis: u128) -> i64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(transparent)]
 pub struct Elapsed(i64);
 
 impl Elapsed {
     #[must_use]
-    pub const fn millis(self) -> i64 {
-        self.0
+    pub fn upper_median(samples: &mut [Self]) -> Option<Self> {
+        samples.sort_unstable_by_key(|span| span.0);
+        samples.get(samples.len() / 2).copied()
     }
 }
 
@@ -124,5 +138,19 @@ mod tests {
                 .to_string(),
             "-5s"
         );
+    }
+
+    #[test]
+    fn presentation_keeps_elapsed_values_opaque() {
+        let start = Timestamp::at_millis(0);
+        let mut samples = [
+            start.until(Timestamp::at_millis(30_000)),
+            start.until(Timestamp::at_millis(10_000)),
+            start.until(Timestamp::at_millis(20_000)),
+        ];
+        let median = Elapsed::upper_median(&mut samples).unwrap();
+        assert_eq!(median.to_string(), "20s");
+        assert_eq!(serde_json::to_value(median).unwrap(), 20_000);
+        assert_eq!(start.ago(Timestamp::at_millis(10_000)), "10s ago");
     }
 }

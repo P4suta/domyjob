@@ -862,6 +862,7 @@ const LIVENESS_TIME: &[&str] = &["Instant", "Duration", "wait_timeout", "elapsed
 const TIME_TYPES: &[&str] = &["SystemTime", "Instant", "Duration", "UNIX_EPOCH"];
 const TIME_METHODS: &[&str] = &["sleep", "modified", "accessed", "elapsed"];
 const TIME_METHOD_PARTS: &[&str] = &["timeout", "deadline"];
+const OPAQUE_TIME_RULE: &str = "keep Timestamp and Elapsed opaque; time values may be recorded or displayed, never returned as numeric decision inputs";
 const UNBOUNDED_READ_RULE: &str = "read input only through bounded.rs with an explicit byte budget";
 const UNBOUNDED_CHILD_OUTPUT_RULE: &str =
     "capture child output only through bounded.rs with an explicit byte budget";
@@ -1124,6 +1125,35 @@ fn type_carries_bool(ty: &syn::Type) -> bool {
         type_carries_bool(inner)
     } else {
         false
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "syn::Type is non-exhaustive, so a foreign crate forces the default arm"
+)]
+fn type_carries_numeric(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            let name = segment.ident.to_string();
+            if [
+                "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128",
+                "isize", "f32", "f64",
+            ]
+            .contains(&name.as_str())
+            {
+                return true;
+            }
+            matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                if arguments.args.iter().any(|argument|
+                    matches!(argument, syn::GenericArgument::Type(inner)
+                        if type_carries_numeric(inner))))
+        }),
+        syn::Type::Reference(reference) => type_carries_numeric(&reference.elem),
+        syn::Type::Paren(paren) => type_carries_numeric(&paren.elem),
+        syn::Type::Group(group) => type_carries_numeric(&group.elem),
+        syn::Type::Tuple(tuple) => tuple.elems.iter().any(type_carries_numeric),
+        _ => false,
     }
 }
 
@@ -2051,6 +2081,61 @@ impl Gate {
         }
     }
 
+    fn check_opaque_time_impl(&mut self, item: &syn::ItemImpl) {
+        if !self.file_is(CLOCK_FILES)
+            || (!is_named_type(&item.self_ty, "Timestamp")
+                && !is_named_type(&item.self_ty, "Elapsed"))
+        {
+            return;
+        }
+        if let Some((trait_path, _)) = &item.trait_
+            && trait_path.segments.last().is_some_and(|segment| {
+                let name = segment.ident.to_string();
+                ["PartialOrd", "Ord", "Deref", "AsRef"].contains(&name.as_str())
+                    || (is_named_type(&item.self_ty, "Elapsed")
+                        && ["PartialEq", "Eq"].contains(&name.as_str()))
+            })
+        {
+            self.flag(item.impl_token.span, OPAQUE_TIME_RULE);
+        }
+        for member in &item.items {
+            if let syn::ImplItem::Fn(method) = member
+                && matches!(method.vis, syn::Visibility::Public(_))
+                && matches!(&method.sig.output, syn::ReturnType::Type(_, ty)
+                    if type_carries_numeric(ty))
+            {
+                self.flag(method.sig.ident.span(), OPAQUE_TIME_RULE);
+            }
+        }
+    }
+
+    fn check_opaque_time_struct(&mut self, item: &syn::ItemStruct) {
+        if !self.file_is(CLOCK_FILES) || (item.ident != "Timestamp" && item.ident != "Elapsed") {
+            return;
+        }
+        let private_i64 = matches!(&item.fields, syn::Fields::Unnamed(fields)
+            if fields.unnamed.len() == 1
+                && fields.unnamed.iter().all(|field|
+                    matches!(field.vis, syn::Visibility::Inherited)
+                        && is_named_type(&field.ty, "i64")));
+        let comparable = derives(&item.attrs, "PartialOrd")
+            || derives(&item.attrs, "Ord")
+            || (item.ident == "Elapsed"
+                && (derives(&item.attrs, "PartialEq") || derives(&item.attrs, "Eq")));
+        if !private_i64 || comparable {
+            self.flag(item.ident.span(), OPAQUE_TIME_RULE);
+        }
+    }
+
+    fn check_io_failure_struct(&mut self, item: &syn::ItemStruct) {
+        if carries_io_source(&item.fields) && !self.file_is(FAILURE_FILES) {
+            self.flag(
+                item.ident.span(),
+                "an I/O failure is failure::IoFailure, with the action and path it happened at",
+            );
+        }
+    }
+
     fn exclusive_create_allowed(&self) -> bool {
         EXCLUSIVE_CREATE.iter().any(|(file, function)| {
             self.file == *file && self.function.as_deref() == Some(*function)
@@ -2480,6 +2565,7 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        self.check_opaque_time_impl(item);
         if self.test_depth == 0
             && self.file.starts_with("crates/domyjob/src/")
             && let Some((trait_path, _)) = &item.trait_
@@ -2568,12 +2654,8 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        if carries_io_source(&item.fields) && !self.file_is(FAILURE_FILES) {
-            self.flag(
-                item.ident.span(),
-                "an I/O failure is failure::IoFailure, with the action and path it happened at",
-            );
-        }
+        self.check_opaque_time_struct(item);
+        self.check_io_failure_struct(item);
         self.check_input(
             &item.attrs,
             item.ident.span(),
@@ -4503,6 +4585,30 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    #[test]
+    fn clock_values_cannot_expose_numeric_decision_inputs() {
+        let file = "src/clock.rs";
+        for source in [
+            "pub struct Timestamp(pub i64);",
+            "pub struct Elapsed(i32);",
+            "#[derive(PartialOrd)] pub struct Timestamp(i64);",
+            "#[derive(PartialEq)] pub struct Elapsed(i64);",
+            "pub struct Elapsed(i64); impl Elapsed { pub fn millis(self) -> i64 { self.0 } }",
+            "pub struct Timestamp(i64); impl Timestamp { pub fn raw(&self) -> Option<&i64> { Some(&self.0) } }",
+            "pub struct Elapsed(i64); impl PartialOrd for Elapsed {}",
+        ] {
+            assert_rule(source, file, OPAQUE_TIME_RULE);
+        }
+        assert!(
+            check_file(
+                "pub struct Elapsed(i64); impl Elapsed { pub fn label(self) -> String { String::new() } }",
+                file
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

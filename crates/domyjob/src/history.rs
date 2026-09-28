@@ -6,7 +6,7 @@ use crate::protocol::{Job, State};
 
 const RECENT: usize = 12;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Series {
     pub machine: MachineName,
     pub label: String,
@@ -37,8 +37,7 @@ pub fn series(jobs: &[(MachineName, Job)]) -> Vec<Series> {
                 .filter(|job| job.state().has_timing_sample())
                 .filter_map(|job| job.took())
                 .collect();
-            took.sort_by_key(|span| span.millis());
-            let typical = took.get(took.len() / 2).copied();
+            let typical = Elapsed::upper_median(&mut took);
             Some(Series {
                 machine,
                 label,
@@ -123,6 +122,9 @@ mod tests {
             [State::Succeeded, State::Failed, State::Succeeded]
         );
         assert_eq!((tests.runs, tests.succeeded), (3, 2));
-        assert_eq!(tests.typical.map(Elapsed::millis), Some(20_000));
+        assert_eq!(
+            tests.typical.map(|span| span.to_string()).as_deref(),
+            Some("20s")
+        );
     }
 }

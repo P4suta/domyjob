@@ -157,18 +157,6 @@ pub fn short_id(id: &JobId, among: &[&str]) -> String {
     format!("{}{}", paint(Tone::Strong, head), paint(Tone::Dim, tail))
 }
 
-#[must_use]
-pub fn ago(then: Timestamp, now: Timestamp) -> String {
-    let seconds = then.until(now).millis() / 1000;
-    match seconds {
-        ..10 => "just now".to_owned(),
-        10..60 => format!("{seconds}s ago"),
-        60..3600 => format!("{}m ago", seconds / 60),
-        3600..86_400 => format!("{}h ago", seconds / 3600),
-        _ => then.local_date(),
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Columns {
     pub machine: usize,
@@ -280,7 +268,7 @@ pub fn job_line(
         ));
     }
     if let Some(now) = now {
-        facts.push(paint(Tone::Dim, &ago(job.spec.submitted_at, now)));
+        facts.push(paint(Tone::Dim, &job.spec.submitted_at.ago(now)));
     }
     format!(
         "{} {}{}{}  {}  {}",
