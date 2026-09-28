@@ -1,12 +1,12 @@
 //! Managed turns: claim the next ask, finish it, and recover abandoned claims, each atomically.
 
-use domyjob_core::chat::card::Card;
+use domyjob_core::chat::card::{Card, Mode};
 use domyjob_core::chat::event::{Body, Event, Intent, Outcome};
-use domyjob_core::chat::id::{AgentId, EventId, Text};
+use domyjob_core::chat::id::{AgentId, EventId, Origin, Text};
 use domyjob_core::chat::policy::Priority;
 use redb::ReadableTable;
 
-use super::tables::{LOCAL_AGENTS, TURNS, encode, event_key};
+use super::tables::{LOCAL_AGENTS, Reader, TURNS, encode, event_key};
 use super::views::{self, LocalAgent};
 use super::{Store, StoreError, Tx};
 
@@ -71,36 +71,53 @@ impl Tx<'_> {
     }
 }
 
+/// The open asks addressed to this machine's agents, sorted by who can answer them.
+#[derive(Debug, Default)]
+struct Triage {
+    /// Managed agents with waiting asks.
+    ready: Vec<AgentId>,
+    /// Asks to agents that are unknown here or not managed by this machine.
+    unavailable: Vec<(EventId, AgentId)>,
+}
+
+fn triage(reader: &impl Reader, origin: &Origin) -> Result<Triage, StoreError> {
+    let mut found = Triage::default();
+    for (request, responder) in views::open_asks(reader)? {
+        if responder.origin() != origin {
+            continue;
+        }
+        let card = views::profile(reader, &responder)?;
+        let config = views::agent_config(reader, responder.name())?;
+        match (card, config) {
+            (Some(card), Some(_)) if card.mode == Mode::Managed => {
+                if !found.ready.contains(&responder) {
+                    found.ready.push(responder);
+                }
+            }
+            (Some(_), Some(_)) => {}
+            (None, _) | (Some(_), None) => found.unavailable.push((request, responder)),
+        }
+    }
+    Ok(found)
+}
+
 impl Store {
     /// Resolve asks addressed to local agents that are unknown here or not managed by this machine.
     ///
     /// Returns the managed agents that have waiting asks.
     pub(crate) fn dispatchable(&self) -> Result<Vec<AgentId>, StoreError> {
+        let seen = self.read(|read| triage(read, self.origin()))?;
+        if seen.unavailable.is_empty() {
+            return Ok(seen.ready);
+        }
         self.write(|tx| {
-            let mut ready = Vec::new();
-            for (request, responder) in views::open_asks(tx.transaction())? {
-                if responder.origin() != self.origin() {
-                    continue;
-                }
-                let card = views::profile(tx.transaction(), &responder)?;
-                let config = views::agent_config(tx.transaction(), responder.name())?;
-                match (card, config) {
-                    (Some(card), Some(_))
-                        if card.mode == domyjob_core::chat::card::Mode::Managed =>
-                    {
-                        if !ready.contains(&responder) {
-                            ready.push(responder);
-                        }
-                    }
-                    (Some(_), Some(_)) => {}
-                    (None, _) | (Some(_), None) => {
-                        if let Some(event) = views::event(tx.transaction(), &request)? {
-                            tx.end(&event, &responder, Outcome::Unavailable)?;
-                        }
-                    }
+            let current = triage(tx.transaction(), self.origin())?;
+            for (request, responder) in current.unavailable {
+                if let Some(event) = views::event(tx.transaction(), &request)? {
+                    tx.end(&event, &responder, Outcome::Unavailable)?;
                 }
             }
-            Ok(ready)
+            Ok(current.ready)
         })
     }
 

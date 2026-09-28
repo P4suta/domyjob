@@ -1,6 +1,7 @@
 //! The doorbell: a generation number replaced after every commit that stores events.
 //!
 //! It lives alone in its directory, so watching it never observes database writes.
+//! Only [`super::Pulse`] watches it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -23,9 +24,7 @@ pub(crate) enum BellError {
     Broken(String),
 }
 
-/// The doorbell directory inside a chat store root.
-#[must_use]
-pub(crate) fn directory(root: &Path) -> PathBuf {
+fn directory(root: &Path) -> PathBuf {
     root.join("bell")
 }
 
@@ -34,12 +33,17 @@ fn file(root: &Path) -> PathBuf {
 }
 
 /// Announce that the store reached `generation`.
-pub(crate) fn ring(root: &Path, generation: u64) -> Result<(), StateError> {
+pub(super) fn ring(root: &Path, generation: u64) -> Result<(), StateError> {
     state_io::write_bytes(&file(root), generation.to_string().as_bytes())
 }
 
+/// Forget every announced generation.
+pub(super) fn forget(root: &Path) -> Result<(), StateError> {
+    state_io::remove_file(&file(root))
+}
+
 /// The last announced generation, or zero before the first commit.
-pub(crate) fn generation(root: &Path) -> Result<u64, BellError> {
+pub(super) fn generation(root: &Path) -> Result<u64, BellError> {
     match state_io::read_bytes(&file(root))? {
         None => Ok(0),
         Some(bytes) => match std::str::from_utf8(&bytes).map(|text| text.trim().parse::<u64>()) {
@@ -55,7 +59,7 @@ enum Wake {
 }
 
 /// A registered watch on one store's doorbell.
-pub(crate) struct Bell {
+pub(super) struct Bell {
     _watcher: notify::RecommendedWatcher,
     receiver: mpsc::Receiver<Wake>,
     root: PathBuf,
@@ -72,7 +76,7 @@ impl std::fmt::Debug for Bell {
 
 impl Bell {
     /// Start watching before the caller reads the state it waits to change.
-    pub(crate) fn watch(root: &Path) -> Result<Self, BellError> {
+    pub(super) fn watch(root: &Path) -> Result<Self, BellError> {
         let directory = directory(root);
         state_io::private_dir(&directory)?;
         let (sender, receiver) = mpsc::channel();
@@ -95,7 +99,7 @@ impl Bell {
     }
 
     /// Wait until the generation exceeds `known`; `None` when `deadline` passes first.
-    pub(crate) fn beyond(&self, known: u64, deadline: Deadline) -> Result<Option<u64>, BellError> {
+    pub(super) fn beyond(&self, known: u64, deadline: Deadline) -> Result<Option<u64>, BellError> {
         loop {
             let current = generation(&self.root)?;
             if current > known {

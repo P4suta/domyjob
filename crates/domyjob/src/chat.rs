@@ -7,10 +7,10 @@
 
 pub(crate) mod address;
 pub(crate) mod args;
-pub(crate) mod bell;
 pub(crate) mod cli;
 pub(crate) mod ops;
 pub(crate) mod provider;
+pub(crate) mod pulse;
 pub(crate) mod runner;
 pub(crate) mod serve;
 pub(crate) mod setup;

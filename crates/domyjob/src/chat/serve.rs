@@ -10,9 +10,8 @@ use std::thread::JoinHandle;
 use domyjob_core::chat::id::Origin;
 use domyjob_core::chat_wire::{ChatReply, ChatRequest};
 
-use super::bell::{self, Bell, BellError};
 use super::ops::{self, OpsError};
-use super::runner::{self, RunnerError};
+use super::pulse::{Pulse, PulseError};
 use super::store::{Store, StoreError};
 use super::sync::{self, Channel, HEARTBEAT_SECONDS, Ssh, SyncError};
 use crate::lock::{LockError, OsLock};
@@ -29,11 +28,9 @@ pub(crate) enum ServeError {
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
-    Bell(#[from] BellError),
+    Pulse(#[from] PulseError),
     #[error(transparent)]
     Ops(#[from] OpsError),
-    #[error(transparent)]
-    Runner(#[from] RunnerError),
 }
 
 enum Signal {
@@ -60,15 +57,11 @@ pub(crate) fn serve() -> Result<(), ServeError> {
     )
     .map_err(StoreError::from)?;
     ops::publish_machine(&store)?;
-    runner::dispatch(&store)?;
-    let doorbell = Bell::watch(store.root())?;
-    let mut generation = bell::generation(store.root())?;
+    let mut pulse = Pulse::new(&store, PEER_REFRESH_MILLIS)?;
     let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
     loop {
         reconcile(&store, &mut workers)?;
-        let deadline = Deadline::after_millis(PEER_REFRESH_MILLIS);
-        if let Some(next) = doorbell.beyond(generation, deadline)? {
-            generation = next;
+        if pulse.next(Deadline::after_millis(PEER_REFRESH_MILLIS))? {
             for worker in workers.values() {
                 let _delivered = worker.sender.send(Signal::Local);
             }

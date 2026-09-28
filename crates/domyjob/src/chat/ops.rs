@@ -17,7 +17,7 @@ use super::args::{
     AskArgs, DirectoryArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs,
     ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
 };
-use super::bell::{self, Bell, BellError};
+use super::pulse::{Pulse, PulseError};
 use super::store::{self, LocalAgent, Reader, Store, StoreError};
 use super::sync::{self, Report, SyncError};
 use super::view::{self, AskState, Outcome, Presence};
@@ -31,7 +31,7 @@ pub(crate) enum OpsError {
     #[error(transparent)]
     Sync(#[from] SyncError),
     #[error(transparent)]
-    Bell(#[from] BellError),
+    Pulse(#[from] PulseError),
     #[error(transparent)]
     Lock(#[from] crate::lock::LockError),
     #[error(transparent)]
@@ -778,8 +778,7 @@ fn ask_state(session: &Session, request: &EventId) -> Result<AskState, OpsError>
 /// Wait up to `timeout` seconds for an ask to end, pulling from peers when no service does.
 fn await_ending(session: &Session, request: &EventId, timeout: u64) -> Result<AskState, OpsError> {
     let deadline = Deadline::after_seconds(timeout);
-    let doorbell = Bell::watch(session.store.root())?;
-    let mut generation = bell::generation(session.store.root())?;
+    let mut pulse = Pulse::new(&session.store, 1000)?;
     loop {
         let state = ask_state(session, request)?;
         if state.ended() || deadline.expired() || session.cancelled.load(Ordering::Acquire) {
@@ -792,11 +791,7 @@ fn await_ending(session: &Session, request: &EventId, timeout: u64) -> Result<As
                 deadline.min(Deadline::after_seconds(SYNC_SECONDS)),
             )?;
         }
-        if let Some(next) =
-            doorbell.beyond(generation, deadline.min(Deadline::after_millis(1000)))?
-        {
-            generation = next;
-        }
+        pulse.next(deadline)?;
     }
 }
 

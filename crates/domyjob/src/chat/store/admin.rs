@@ -153,7 +153,7 @@ impl Store {
         state_io::private_dir(&root)?;
         let lock = OsLock::exclusive(&root.join("chat.lock"))?;
         state_io::remove_file(&root.join("chat.redb"))?;
-        state_io::remove_file(&super::super::bell::directory(&root).join("generation"))?;
+        super::super::pulse::forget(&root)?;
         drop(lock);
         Self::open_in(state)
     }

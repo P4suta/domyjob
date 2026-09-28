@@ -12,8 +12,8 @@ use super::args::{
     AskArgs, DirectoryArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs,
     ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
 };
-use super::bell::{self, Bell};
 use super::ops::{self, OpsError, RoomChange, Session};
+use super::pulse::{Pulse, PulseError};
 use super::setup::{self, Finding, SetupError};
 use super::store::{Store, StoreError};
 use super::sync;
@@ -164,7 +164,7 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Serve(#[from] super::serve::ServeError),
     #[error(transparent)]
-    Bell(#[from] bell::BellError),
+    Pulse(#[from] PulseError),
     #[error("writing output: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
@@ -440,8 +440,7 @@ fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError>
 
 /// Print a conversation and keep printing new events until interrupted.
 fn watch(session: &Session, args: &ThreadArgs, json_mode: bool) -> Result<ExitCode, CliError> {
-    let doorbell = Bell::watch(session.store.root())?;
-    let mut generation = bell::generation(session.store.root())?;
+    let mut pulse = Pulse::new(&session.store, 2000)?;
     let mut shown = std::collections::BTreeSet::new();
     loop {
         session.refresh()?;
@@ -456,9 +455,7 @@ fn watch(session: &Session, args: &ThreadArgs, json_mode: bool) -> Result<ExitCo
                 }
             }
         }
-        if let Some(next) = doorbell.beyond(generation, Deadline::after_millis(2000))? {
-            generation = next;
-        }
+        pulse.next(Deadline::after_millis(2000))?;
     }
 }
 

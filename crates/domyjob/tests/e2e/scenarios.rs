@@ -10,90 +10,68 @@ use crate::provider::CODEX_SESSION;
 use crate::world::{
     Machine, Run, World, calls, files_containing, same_directory, wait_for, wait_within,
 };
-use crate::{Failure, KnownFailure, Scenario};
-
-/// A worker that dies during a turn leaves its ask working until some later dispatch starts a new worker.
-///
-/// Only a new worker's `Store::recover` records the abandoned claim as interrupted, and only `runner::dispatch` starts one.
-/// The asker's `await_ending` never dispatches, so on a quiet machine nothing notices the dead worker while the asker waits.
-const DEAD_WORKER: KnownFailure = KnownFailure {
-    bug: "chat/ops.rs await_ending never dispatches, so no worker recovers a claim whose worker died",
-    symptom: &["KILL_PARENT", "\"state\":\"working\""],
-    always: true,
-};
+use crate::{Failure, Scenario};
 
 /// Every scenario, in the order the runner starts them.
 pub(crate) const ALL: [Scenario; 12] = [
     Scenario {
         name: "fake_ssh_stands_in_for_openssh",
         machines: &["alpha", "beta"],
-        known_failures: &[],
         run: fake_ssh_stands_in_for_openssh,
     },
     Scenario {
         name: "one_machine_answers_resumes_and_ranks",
         machines: &["alpha"],
-        known_failures: &[],
         run: one_machine_answers_resumes_and_ranks,
     },
     Scenario {
         name: "failures_never_become_answers",
         machines: &["alpha"],
-        known_failures: &[],
         run: failures_never_become_answers,
     },
     Scenario {
         name: "a_killed_worker_ends_the_asks_wait",
         machines: &["alpha"],
-        known_failures: &[DEAD_WORKER],
         run: a_killed_worker_ends_the_asks_wait,
     },
     Scenario {
         name: "asks_take_turns_per_agent_and_run_together_across_agents",
         machines: &["alpha", "beta"],
-        known_failures: &[],
         run: asks_take_turns_per_agent_and_run_together_across_agents,
     },
     Scenario {
         name: "mcp_serves_an_interactive_agent",
         machines: &["alpha"],
-        known_failures: &[],
         run: mcp_serves_an_interactive_agent,
     },
     Scenario {
         name: "three_machines_exchange_privately_and_converge",
         machines: &["alpha", "beta", "gamma"],
-        known_failures: &[],
         run: three_machines_exchange_privately_and_converge,
     },
     Scenario {
         name: "racing_answer_and_withdrawal_agree_everywhere",
         machines: &["alpha", "beta"],
-        known_failures: &[],
         run: racing_answer_and_withdrawal_agree_everywhere,
     },
     Scenario {
         name: "nested_asks_carry_the_chain_and_refuse_cycles",
         machines: &["alpha"],
-        known_failures: &[],
         run: nested_asks_carry_the_chain_and_refuse_cycles,
     },
     Scenario {
         name: "cleaned_and_reset_machines_keep_syncing",
         machines: &["alpha", "beta", "gamma"],
-        known_failures: &[],
         run: cleaned_and_reset_machines_keep_syncing,
     },
     Scenario {
         name: "background_service_delivers_without_commands",
         machines: &["alpha", "beta"],
-        known_failures: &[],
         run: background_service_delivers_without_commands,
     },
     Scenario {
         name: "jobs_run_through_the_node_wrapper",
         machines: &["alpha", "beta"],
-        known_failures: &[],
         run: jobs_run_through_the_node_wrapper,
     },
 ];

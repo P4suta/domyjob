@@ -206,7 +206,7 @@ impl Store {
         write.commit()?;
         drop(database);
         if appended {
-            super::bell::ring(&self.root, generation)?;
+            super::pulse::ring(&self.root, generation)?;
         }
         drop(lock);
         Ok(value)

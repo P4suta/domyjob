@@ -8,7 +8,7 @@ use domyjob_core::chat_wire::{ChatReply, ChatRequest};
 use domyjob_core::domain::MachineName;
 use serde::Serialize;
 
-use super::bell::{self, Bell, BellError};
+use super::pulse::{Pulse, PulseError};
 use super::runner::{self, RunnerError};
 use super::store::{Link, LinkState, Store, StoreError};
 use crate::platform::clock::{self, Deadline};
@@ -26,7 +26,7 @@ pub(crate) enum SyncError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error(transparent)]
-    Bell(#[from] BellError),
+    Pulse(#[from] PulseError),
     #[error(transparent)]
     Runner(#[from] RunnerError),
     #[error(transparent)]
@@ -282,8 +282,7 @@ fn wait(
     deadline: Deadline,
     abandoned: &AtomicBool,
 ) -> Result<ChatReply, SyncError> {
-    let doorbell = Bell::watch(store.root())?;
-    let mut generation = bell::generation(store.root())?;
+    let mut pulse = Pulse::new(store, 2000)?;
     loop {
         if store.local_seen()? > seen {
             return Ok(ChatReply::Changed {});
@@ -291,11 +290,7 @@ fn wait(
         if deadline.expired() || abandoned.load(Ordering::Acquire) {
             return Ok(ChatReply::Heartbeat {});
         }
-        if let Some(next) =
-            doorbell.beyond(generation, deadline.min(Deadline::after_millis(2000)))?
-        {
-            generation = next;
-        }
+        pulse.next(deadline)?;
     }
 }
 

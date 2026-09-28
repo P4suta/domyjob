@@ -109,28 +109,7 @@ impl<T, E: fmt::Display> Context<T> for Result<T, E> {
 struct Scenario {
     name: &'static str,
     machines: &'static [&'static str],
-    /// The product bugs that break this scenario on this platform today.
-    known_failures: &'static [KnownFailure],
     run: fn(&World) -> Result<(), Failure>,
-}
-
-/// A product bug that breaks a scenario today, reported without failing the run.
-#[derive(Debug, Clone, Copy)]
-struct KnownFailure {
-    /// What is wrong in the product, and where.
-    bug: &'static str,
-    /// Texts that together identify the bug in a scenario's failure; only a failure containing every one is excused.
-    symptom: &'static [&'static str],
-    /// Whether the bug shows on every run where the mark applies.
-    /// A pass then means it was fixed, and it fails the run until the mark is removed.
-    /// Otherwise the environment decides whether the bug shows, and a pass is a pass.
-    always: bool,
-}
-
-impl KnownFailure {
-    fn explains(&self, failure: &Failure) -> bool {
-        self.symptom.iter().all(|text| failure.0.contains(text))
-    }
 }
 
 /// Appends `value` as one JSON line and returns how many lines `path` then holds.
@@ -362,55 +341,33 @@ fn attempt(scenario: &Scenario, keep: bool) -> Result<(), Failure> {
 struct Tally {
     passed: usize,
     failed: usize,
-    known: usize,
 }
 
 impl Tally {
     fn record(&mut self, scenario: &Scenario, result: Result<(), Failure>, took: Duration) {
         let name = scenario.name;
         let seconds = took.as_secs_f64();
-        let marks = scenario.known_failures;
         match result {
-            Ok(()) => match marks.iter().find(|known| known.always) {
-                Some(fixed) => {
-                    self.failed = self.failed.saturating_add(1);
-                    println!(
-                        "e2e {name} ... passed although marked as a known failure ({seconds:.2}s)\n    remove the mark if this is fixed: {}",
-                        fixed.bug
-                    );
-                }
-                None => {
-                    self.passed = self.passed.saturating_add(1);
-                    println!("e2e {name} ... ok ({seconds:.2}s)");
-                }
-            },
-            Err(failure) => match marks.iter().find(|known| known.explains(&failure)) {
-                Some(known) => {
-                    self.known = self.known.saturating_add(1);
-                    println!(
-                        "e2e {name} ... known failure ({seconds:.2}s): {}\n{}",
-                        known.bug,
-                        indent(&failure.0)
-                    );
-                }
-                None => {
-                    self.failed = self.failed.saturating_add(1);
-                    println!(
-                        "e2e {name} ... FAILED ({seconds:.2}s)\n{}",
-                        indent(&failure.0)
-                    );
-                }
-            },
+            Ok(()) => {
+                self.passed = self.passed.saturating_add(1);
+                println!("e2e {name} ... ok ({seconds:.2}s)");
+            }
+            Err(failure) => {
+                self.failed = self.failed.saturating_add(1);
+                println!(
+                    "e2e {name} ... FAILED ({seconds:.2}s)\n{}",
+                    indent(&failure.0)
+                );
+            }
         }
     }
 
     fn finish(&self, took: Duration) -> ExitCode {
         let verdict = if self.failed == 0 { "ok" } else { "FAILED" };
         println!(
-            "\ne2e result: {verdict}. {} passed; {} failed; {} known failures; finished in {:.2}s\n",
+            "\ne2e result: {verdict}. {} passed; {} failed; finished in {:.2}s\n",
             self.passed,
             self.failed,
-            self.known,
             took.as_secs_f64()
         );
         if self.failed == 0 {
