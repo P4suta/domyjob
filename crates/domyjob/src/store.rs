@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{EnvName, Invalid, JobId, JobRef};
-use crate::lock::{LockError, OsLock, SlotIndex};
+use crate::lock::{LockError, OsLock, Probe, SlotIndex};
 use crate::paths::Dirs;
 use crate::protocol::{Change, Job, Phase, PhaseKind, Settings, Spec, Supervisor};
 
@@ -84,6 +84,21 @@ pub enum Publication {
 pub enum QueueMode {
     Immediate,
     Ordinary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QueuePredecessor {
+    Waiting(PathBuf),
+    AliveFallback(PathBuf),
+}
+
+impl QueuePredecessor {
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Waiting(path) | Self::AliveFallback(path) => path,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +304,24 @@ pub struct Store {
     root: PathBuf,
 }
 
+pub(crate) struct AdmissionGuard {
+    store: Store,
+    lock: OsLock,
+}
+
+impl AdmissionGuard {
+    pub(crate) fn earliest_waiter(
+        &self,
+        waiting: &Spec,
+    ) -> Result<Option<QueuePredecessor>, StoreError> {
+        self.store.earliest_waiter_unlocked(waiting)
+    }
+
+    pub(crate) fn release(self) -> Result<(), StoreError> {
+        Ok(self.lock.release()?)
+    }
+}
+
 impl Store {
     fn iter_ids(&self, area: IdArea) -> Result<JobIds, StoreError> {
         let name = match area {
@@ -341,16 +374,23 @@ impl Store {
     }
 
     pub fn configure(&self, change: Change) -> Result<(), StoreError> {
-        let admission = OsLock::exclusive(&self.admission_lock_path())?;
+        let admission = self.admission()?;
         self.settings_file()
             .replace(&self.settings()?.with(change))?;
         self.signal_queue()?;
-        Ok(admission.release()?)
+        admission.release()
     }
 
     #[must_use]
-    pub fn admission_lock_path(&self) -> PathBuf {
+    fn admission_lock_path(&self) -> PathBuf {
         self.root.join("queue.lock")
+    }
+
+    pub(crate) fn admission(&self) -> Result<AdmissionGuard, StoreError> {
+        Ok(AdmissionGuard {
+            store: self.clone(),
+            lock: OsLock::exclusive(&self.admission_lock_path())?,
+        })
     }
 
     #[must_use]
@@ -436,6 +476,11 @@ impl Store {
     #[must_use]
     pub fn alive_path(&self, id: &JobId) -> PathBuf {
         self.root.join("live").join(format!("{id}.lock"))
+    }
+
+    #[must_use]
+    pub(crate) fn queue_wait_path(&self, id: &JobId) -> PathBuf {
+        self.root.join("live").join(format!("{id}.queue.lock"))
     }
 
     #[must_use]
@@ -593,7 +638,8 @@ impl Store {
     pub fn remove_job(&self, id: &JobId) -> Result<(), StoreError> {
         crate::state_file::remove_dir_all(&self.job_dir(id))?;
         crate::state_file::remove_file(&self.control_path(id))?;
-        Ok(crate::state_file::remove_file(&self.alive_path(id))?)
+        crate::state_file::remove_file(&self.alive_path(id))?;
+        Ok(crate::state_file::remove_file(&self.queue_wait_path(id))?)
     }
 
     pub fn forget_staging_lock(&self, id: &JobId) -> Result<(), StoreError> {
@@ -721,13 +767,16 @@ impl Store {
 
     fn supervisor(&self, id: &JobId) -> Result<Supervisor, StoreError> {
         match OsLock::probe(&self.alive_path(id))? {
-            crate::lock::Probe::Held => Ok(Supervisor::Alive),
-            crate::lock::Probe::Absent | crate::lock::Probe::Free => Ok(Supervisor::Gone),
+            Probe::Held => Ok(Supervisor::Alive),
+            Probe::Absent | Probe::Free => Ok(Supervisor::Gone),
         }
     }
 
-    pub fn earliest_waiter(&self, waiting: &Spec) -> Result<Option<JobId>, StoreError> {
-        let mut earliest: Option<(u64, JobId)> = None;
+    fn earliest_waiter_unlocked(
+        &self,
+        waiting: &Spec,
+    ) -> Result<Option<QueuePredecessor>, StoreError> {
+        let mut earliest: Option<(u64, QueuePredecessor)> = None;
         for id in self.ids_iter()? {
             let id = id?;
             if id == waiting.id {
@@ -745,14 +794,20 @@ impl Store {
                 Supervisor::Alive => {}
                 Supervisor::Gone => continue,
             }
+            let predecessor = match OsLock::probe(&self.queue_wait_path(&id))? {
+                Probe::Held => QueuePredecessor::Waiting(self.queue_wait_path(&id)),
+                Probe::Absent | Probe::Free => {
+                    QueuePredecessor::AliveFallback(self.alive_path(&id))
+                }
+            };
             if earliest
                 .as_ref()
                 .is_none_or(|(sequence, _)| spec.sequence < *sequence)
             {
-                earliest = Some((spec.sequence, id));
+                earliest = Some((spec.sequence, predecessor));
             }
         }
-        Ok(earliest.map(|(_, id)| id))
+        Ok(earliest.map(|(_, predecessor)| predecessor))
     }
 
     pub fn job(&self, id: &JobId) -> Result<Job, StoreError> {
@@ -821,8 +876,8 @@ impl Store {
         for index in SlotIndex::all() {
             let lock = index.lock_path(&slots);
             let occupied = match OsLock::probe(&lock)? {
-                crate::lock::Probe::Held => true,
-                crate::lock::Probe::Absent | crate::lock::Probe::Free => false,
+                Probe::Held => true,
+                Probe::Absent | Probe::Free => false,
             };
             if occupied {
                 held.push(lock);
@@ -1315,6 +1370,7 @@ mod tests {
         );
 
         crate::state_file::write_bytes(&store.alive_path(&id), b"").unwrap();
+        crate::state_file::write_bytes(&store.queue_wait_path(&id), b"").unwrap();
         crate::state_file::write_bytes(&store.control_path(&id), b"").unwrap();
         store.remove_job(&id).unwrap();
         assert!(
@@ -1324,6 +1380,11 @@ mod tests {
         );
         assert!(
             crate::state_file::read_bytes(&store.control_path(&id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::state_file::read_bytes(&store.queue_wait_path(&id))
                 .unwrap()
                 .is_none()
         );
@@ -1432,19 +1493,20 @@ mod tests {
         .map(|id| id.parse().unwrap());
         let mut alive = Vec::new();
         for (id, sequence) in [(&waiting, 4), (&second, 2), (&first, 1), (&later, 5)] {
-            store
-                .stage(
-                    &spec(id, sequence),
-                    (&BTreeMap::new(), &LaunchEnv::default()),
-                )
-                .unwrap();
+            staged(&store, id, sequence);
             store.publish(id).unwrap();
             alive.push(OsLock::exclusive(&store.alive_path(id)).unwrap());
         }
         let requested = spec(&waiting, 4);
+        let predecessor = || {
+            let admission = store.admission().unwrap();
+            let earlier = admission.earliest_waiter(&requested).unwrap();
+            admission.release().unwrap();
+            earlier
+        };
         assert_eq!(
-            store.earliest_waiter(&requested).unwrap(),
-            Some(first.clone())
+            predecessor(),
+            Some(QueuePredecessor::AliveFallback(store.alive_path(&first)))
         );
         let finished = |millis| Phase::Finished {
             started_at: None,
@@ -1452,12 +1514,18 @@ mod tests {
             outcome: crate::protocol::Outcome::Succeeded,
         };
         store.force_phase(&first, &finished(1)).unwrap();
+        let queue_lock = OsLock::exclusive(&store.queue_wait_path(&second)).unwrap();
         assert_eq!(
-            store.earliest_waiter(&requested).unwrap(),
-            Some(second.clone())
+            predecessor(),
+            Some(QueuePredecessor::Waiting(store.queue_wait_path(&second)))
+        );
+        queue_lock.release().unwrap();
+        assert_eq!(
+            predecessor(),
+            Some(QueuePredecessor::AliveFallback(store.alive_path(&second)))
         );
         store.force_phase(&second, &finished(2)).unwrap();
-        assert_eq!(store.earliest_waiter(&requested).unwrap(), None);
+        assert_eq!(predecessor(), None);
         for lock in alive {
             lock.release().unwrap();
         }

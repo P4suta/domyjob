@@ -79,6 +79,9 @@ The MCP server accepts at most 1 MiB per input line and at most 32 active reques
 The syntax gate confines MCP worker spawning to a dispatch function that requires the permit and rejects unbounded line iteration in that module.
 `Store::JobIds` streams published and staged job IDs, and a queued supervisor retains only the earliest live predecessor plus at most 64 tracked slot watchers and one current predecessor path.
 Queue watch registration follows the exhaustive admission decision, avoiding slot watchers while an earlier queued job blocks admission and updating the watched predecessor when it changes.
+Each supervisor holds a separate queue lock only while queued, and a typed admission guard serializes predecessor selection with the preparing transition and queue-lock release.
+The successor's blocked watcher therefore wakes when the predecessor leaves the queue even if that job keeps running; an older or uncertain supervisor falls back to its alive lock.
+A restarted supervisor first claims the alive lock, then waits for any watcher briefly holding the queue lock to release it.
 Job and warm workspace lock scans both use a fixed 64-slot `OsLock::first_free` API, and an exhausted warm range fails without reusing a locked workspace.
 `SlotIndex` now owns the canonical 0–63 range and lock-path construction for allocation, status, and workspace cleanup.
 Queue admission and queued-job status share `Store::held_slots`, which generates exactly the canonical indices below `Concurrency::MOST`; unrelated directory entries no longer change the answer or its memory use.

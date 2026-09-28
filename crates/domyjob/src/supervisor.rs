@@ -16,7 +16,7 @@ use crate::node::NodeError;
 use crate::paths::Dirs;
 use crate::proc::{self, Group, Readiness};
 use crate::protocol::{Location, Outcome, Phase, Settings, Spec, Workspace};
-use crate::store::{Publication, QueueMode, Store};
+use crate::store::{Publication, QueueMode, QueuePredecessor, Store};
 use crate::terminal::RemoteText;
 
 pub(crate) struct WorkingDirectory(PathBuf);
@@ -103,9 +103,9 @@ impl QueueWatchers {
     fn observe(&mut self, decision: &Admission, held: &[PathBuf], mut watch: impl FnMut(PathBuf)) {
         match decision {
             Admission::Paused => {}
-            Admission::EarlierWaiter(path) => {
-                if self.register_earlier(path) == WatchRegistration::Start {
-                    watch(path.clone());
+            Admission::EarlierWaiter(predecessor) => {
+                if self.register_earlier(predecessor.path()) == WatchRegistration::Start {
+                    watch(predecessor.path().to_path_buf());
                 }
             }
             Admission::Full | Admission::Open => {
@@ -174,11 +174,15 @@ const LOG_TAIL: usize = 8 << 20;
 enum Admission {
     Open,
     Paused,
-    EarlierWaiter(PathBuf),
+    EarlierWaiter(QueuePredecessor),
     Full,
 }
 
-fn decide_admission(settings: Settings, held: usize, earlier: Option<PathBuf>) -> Admission {
+fn decide_admission(
+    settings: Settings,
+    held: usize,
+    earlier: Option<QueuePredecessor>,
+) -> Admission {
     if settings.paused {
         Admission::Paused
     } else if let Some(path) = earlier {
@@ -582,13 +586,35 @@ fn beside(root: &Path, suffix: &str) -> PathBuf {
 
 #[derive(Debug)]
 struct Held {
+    waiting: Option<OsLock>,
     slot: Option<OsLock>,
     workspace: Option<OsLock>,
     store: Store,
 }
 
+struct SupervisorLocks {
+    alive: OsLock,
+    waiting: OsLock,
+}
+
 impl Held {
-    fn release(self) -> Result<(), NodeError> {
+    fn left_queue(&mut self) -> Result<(), NodeError> {
+        if let Some(waiting) = self.waiting.take() {
+            waiting.release()?;
+        }
+        Ok(())
+    }
+
+    fn begin_preparing(&mut self, id: &JobId, started_at: Timestamp) -> Result<(), NodeError> {
+        let admission = self.store.admission()?;
+        self.store.set_phase(id, &Phase::Preparing { started_at })?;
+        self.left_queue()?;
+        admission.release()?;
+        Ok(self.store.signal_queue()?)
+    }
+
+    fn release(mut self) -> Result<(), NodeError> {
+        self.left_queue()?;
         if let Some(workspace) = self.workspace {
             workspace.release()?;
         }
@@ -637,15 +663,15 @@ pub fn supervise(
     stops: Stops,
 ) -> Result<(), NodeError> {
     let store = Store::open(&dirs)?;
-    let (supervisor, alive, events) = match take_charge(dirs, store.clone(), id, (readiness, stops))
-    {
-        Ok(taken) => taken,
-        Err(error) => {
-            store.record_start_failure(id, &error.to_string())?;
-            return Err(error);
-        }
-    };
-    let finished = supervisor.conclude(&events);
+    let (supervisor, SupervisorLocks { alive, waiting }, events) =
+        match take_charge(dirs, store.clone(), id, (readiness, stops)) {
+            Ok(taken) => taken,
+            Err(error) => {
+                store.record_start_failure(id, &error.to_string())?;
+                return Err(error);
+            }
+        };
+    let finished = supervisor.conclude(&events, waiting);
     let released = alive.release();
     let signaled = supervisor.store.signal_queue();
     finished?;
@@ -658,10 +684,8 @@ fn take_charge(
     store: Store,
     id: &JobId,
     (readiness, stops): (Readiness, Stops),
-) -> Result<(Supervisor, OsLock, Receiver<Event>), NodeError> {
-    let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
-        return Err(NodeError::AlreadySupervised(id.clone()));
-    };
+) -> Result<(Supervisor, SupervisorLocks, Receiver<Event>), NodeError> {
+    let locks = claim_supervisor_locks(&store, id)?;
     let control = store.control_path(id);
     crate::state_file::remove_file(&control)?;
     let listener = Listener::bind(&control).map_err(|source| {
@@ -728,12 +752,23 @@ fn take_charge(
         spec,
         shared,
     };
-    Ok((supervisor, alive, received))
+    Ok((supervisor, locks, received))
+}
+
+fn claim_supervisor_locks(store: &Store, id: &JobId) -> Result<SupervisorLocks, NodeError> {
+    let admission = store.admission()?;
+    let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
+        return Err(NodeError::AlreadySupervised(id.clone()));
+    };
+    let waiting = OsLock::exclusive(&store.queue_wait_path(id))?;
+    admission.release()?;
+    Ok(SupervisorLocks { alive, waiting })
 }
 
 impl Supervisor {
-    fn conclude(&self, events: &Receiver<Event>) -> Result<(), NodeError> {
+    fn conclude(&self, events: &Receiver<Event>, waiting: OsLock) -> Result<(), NodeError> {
         let mut held = Held {
+            waiting: Some(waiting),
             slot: None,
             workspace: None,
             store: self.store.clone(),
@@ -818,19 +853,16 @@ impl Supervisor {
             .map_err(|error| crate::node::watching(&watched, &error))?;
         let mut watchers = QueueWatchers::new();
         loop {
-            let admission_lock = OsLock::exclusive(&self.store.admission_lock_path())?;
+            let admission = self.store.admission()?;
             let settings = self.store.settings()?;
             let held = self.store.held_slots()?;
-            let predecessor = self
-                .store
-                .earliest_waiter(&self.spec)?
-                .map(|id| self.store.alive_path(&id));
+            let predecessor = admission.earliest_waiter(&self.spec)?;
             let decision = decide_admission(settings, held.len(), predecessor);
             let slot = match &decision {
                 Admission::Open => OsLock::first_free(&slots)?.map(|(_, lock)| lock),
                 Admission::Paused | Admission::EarlierWaiter(_) | Admission::Full => None,
             };
-            admission_lock.release()?;
+            admission.release()?;
             if slot.is_some() {
                 return Ok(slot);
             }
@@ -870,9 +902,7 @@ impl Supervisor {
         }
         let started_at = Timestamp::observe();
         *started = Some(started_at);
-        self.store
-            .set_phase(&self.spec.id, &Phase::Preparing { started_at })?;
-        self.store.signal_queue()?;
+        held.begin_preparing(&self.spec.id, started_at)?;
         let (root, workspace_lock) = match self.prepare() {
             Ok(prepared) => prepared,
             Err(NodeError::Workspace(crate::workspace::WorkspaceError::Stopped)) => {
@@ -1079,15 +1109,28 @@ impl Supervisor {
 mod tests {
     use super::*;
 
+    fn owner_spec(id: JobId, location: Location, sequence: u64) -> Spec {
+        Spec {
+            id,
+            name: None,
+            command: crate::protocol::Command::Script("true".into()),
+            location,
+            env_names: std::collections::BTreeSet::new(),
+            shell: None,
+            concurrency: crate::domain::Concurrency::DEFAULT,
+            sequence,
+            submitted_by: Submitter::Owner,
+            submitted_at: Timestamp::at_millis(0),
+        }
+    }
+
     #[test]
     fn warm_workspaces_are_separate_for_owner_and_each_peer_key() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&Dirs::for_test(tmp.path())).unwrap();
-        let owner = Spec {
-            id: "0123456789ABCDEF".parse().unwrap(),
-            name: None,
-            command: crate::protocol::Command::Script("true".into()),
-            location: Location::Snapshot {
+        let owner = owner_spec(
+            "0123456789ABCDEF".parse().unwrap(),
+            Location::Snapshot {
                 source: crate::protocol::Source {
                     project: "project".parse().unwrap(),
                     manifest: crate::domain::BlobId::of(b"manifest"),
@@ -1096,13 +1139,8 @@ mod tests {
                 subdir: None,
                 workspace: Workspace::Warm,
             },
-            env_names: std::collections::BTreeSet::new(),
-            shell: None,
-            concurrency: crate::domain::Concurrency::DEFAULT,
-            sequence: 1,
-            submitted_by: Submitter::Owner,
-            submitted_at: Timestamp::at_millis(0),
-        };
+            1,
+        );
         let peer = |byte, label: &str| Spec {
             submitted_by: Submitter::Peer {
                 key: crate::trust::PublicKey::from_slice(&[byte; 32]).unwrap(),
@@ -1160,7 +1198,7 @@ mod tests {
             ),
             Admission::Paused
         );
-        let predecessor = PathBuf::from("earlier.alive");
+        let predecessor = QueuePredecessor::Waiting(PathBuf::from("earlier.queue.lock"));
         assert_eq!(
             decide_admission(two, 0, Some(predecessor.clone())),
             Admission::EarlierWaiter(predecessor)
@@ -1222,10 +1260,13 @@ mod tests {
     #[test]
     fn a_queued_job_watches_only_the_event_that_can_change_its_admission() {
         let held = [PathBuf::from("0.lock"), PathBuf::from("1.lock")];
-        let earlier = PathBuf::from("first.alive");
+        let earlier = PathBuf::from("first.queue.lock");
         for (decision, expected) in [
             (Admission::Paused, Vec::new()),
-            (Admission::EarlierWaiter(earlier.clone()), vec![earlier]),
+            (
+                Admission::EarlierWaiter(QueuePredecessor::Waiting(earlier.clone())),
+                vec![earlier],
+            ),
             (Admission::Full, held.to_vec()),
             (Admission::Open, held.to_vec()),
         ] {
@@ -1234,6 +1275,102 @@ mod tests {
             watchers.observe(&decision, &held, |path| started.push(path));
             assert_eq!(started, expected, "{decision:?}");
         }
+    }
+
+    #[test]
+    fn a_predecessor_wakes_its_successor_when_it_leaves_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&Dirs::for_test(tmp.path())).unwrap();
+        let id: JobId = "0EEEEEEEEEEEEEEE".parse().unwrap();
+        let successor: JobId = "0FFFFFFFFFFFFFFF".parse().unwrap();
+        let spec = owner_spec(id.clone(), Location::Home, 1);
+        let later = Spec {
+            id: successor,
+            sequence: 2,
+            ..spec.clone()
+        };
+        for staged in [&spec, &later] {
+            store
+                .stage(
+                    staged,
+                    (
+                        &std::collections::BTreeMap::new(),
+                        &crate::store::LaunchEnv::default(),
+                    ),
+                )
+                .unwrap();
+            store.publish(&staged.id).unwrap();
+        }
+        let alive = OsLock::exclusive(&store.alive_path(&id)).unwrap();
+        let path = store.queue_wait_path(&id);
+        let waiting = OsLock::exclusive(&path).unwrap();
+        let before_admission = store.admission().unwrap();
+        assert_eq!(
+            before_admission.earliest_waiter(&later).unwrap(),
+            Some(QueuePredecessor::Waiting(path.clone()))
+        );
+        before_admission.release().unwrap();
+        let mut held = Held {
+            waiting: Some(waiting),
+            slot: None,
+            workspace: None,
+            store: store.clone(),
+        };
+        let (sender, events) = std::sync::mpsc::channel();
+        watch_lock_release(path.clone(), sender);
+        let started_at = Timestamp::at_millis(1);
+        held.begin_preparing(&id, started_at).unwrap();
+        match events.recv().unwrap() {
+            Event::Released(released) => assert_eq!(released, path),
+            Event::Changed => panic!("unexpected queue change"),
+            Event::LockFailed(error) => panic!("queue watch failed: {error}"),
+            Event::Kill => panic!("unexpected kill event"),
+        }
+        assert_eq!(
+            OsLock::probe(alive.path()).unwrap(),
+            crate::lock::Probe::Held
+        );
+        assert_eq!(store.phase(&id).unwrap(), Phase::Preparing { started_at });
+        let after_admission = store.admission().unwrap();
+        assert_eq!(after_admission.earliest_waiter(&later).unwrap(), None);
+        after_admission.release().unwrap();
+        held.release().unwrap();
+        alive.release().unwrap();
+    }
+
+    #[test]
+    fn a_restarting_supervisor_waits_for_a_watcher_to_pass_the_queue_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&Dirs::for_test(tmp.path())).unwrap();
+        let id: JobId = "0GGGGGGGGGGGGGGG".parse().unwrap();
+        let watcher = OsLock::exclusive(&store.queue_wait_path(&id)).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let claiming = {
+            let store = store.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                sent.send(claim_supervisor_locks(&store, &id)).unwrap();
+            })
+        };
+        loop {
+            match OsLock::probe(&store.alive_path(&id)).unwrap() {
+                crate::lock::Probe::Held => break,
+                crate::lock::Probe::Absent | crate::lock::Probe::Free => {}
+            }
+            match received.try_recv() {
+                Ok(Ok(_)) => panic!("the supervisor did not wait for the queue lock"),
+                Ok(Err(error)) => panic!("claiming the supervisor failed: {error}"),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("the supervisor stopped without a result")
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
+            }
+        }
+        watcher.release().unwrap();
+        let locks = received.recv().unwrap().unwrap();
+        claiming.join().unwrap();
+        locks.waiting.release().unwrap();
+        locks.alive.release().unwrap();
     }
 
     #[test]
