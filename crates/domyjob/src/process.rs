@@ -28,6 +28,12 @@ mod raw {
         std::process::Command::new(program)
     }
 
+    /// A worker announces its readiness to its launcher on standard output.
+    #[cfg(unix)]
+    pub(super) fn stdout() -> std::io::Stdout {
+        std::io::stdout()
+    }
+
     #[cfg(windows)]
     pub(super) fn detached(program: &std::path::Path) -> windows_spawn::Command {
         windows_spawn::Command::new(program)

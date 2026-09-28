@@ -24,7 +24,11 @@ const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
     ("crates/domyjob/src/process/windows.rs", &["unsafe_code"]),
     (
         "crates/domyjob/tests/e2e.rs",
-        &["clippy::disallowed_methods", "clippy::disallowed_types"],
+        &[
+            "clippy::disallowed_methods",
+            "clippy::disallowed_types",
+            "clippy::disallowed_macros",
+        ],
     ),
 ];
 

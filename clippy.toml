@@ -53,6 +53,7 @@ disallowed-methods = [
   { path = "std::process::Command::new", reason = "start children through process::command, whose standard streams start closed" },
   { path = "std::process::Command::output", reason = "captures without a bound into streams a caller may have closed; pipe and bound what you read" },
   { path = "windows_spawn::Command::new", reason = "worker creation belongs in process", allow-invalid = true },
+  { path = "std::io::stdout", reason = "standard output frames the MCP and node protocols; print through `Output`" },
   { path = "std::mem::forget", reason = "leaks destructors; use `ManuallyDrop` or explicit drop" },
   { path = "std::env::set_var", reason = "races with other threads; wire the value through Options instead" },
   { path = "std::env::remove_var", reason = "see std::env::set_var" },
@@ -87,6 +88,11 @@ disallowed-methods = [
   { path = "cap_std::fs::Metadata::modified", reason = "timestamps on files decide nothing here; compare content" },
   { path = "cap_std::fs::Metadata::accessed", reason = "timestamps on files decide nothing here; compare content" },
   { path = "cap_std::fs::Metadata::created", reason = "timestamps on files decide nothing here; compare content" },
+]
+
+disallowed-macros = [
+  { path = "std::println", reason = "print command results through `Output`, which only commands that print receive" },
+  { path = "std::print", reason = "print command results through `Output`, which only commands that print receive" },
 ]
 
 disallowed-types = [

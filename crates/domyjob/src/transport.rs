@@ -22,6 +22,7 @@ use crate::app::{self, AppError};
 use crate::identity;
 use crate::layout::State;
 use crate::lock::{LockError, OsLock};
+use crate::output::Output;
 use crate::platform::{self, clock};
 use crate::process;
 use crate::source::{self, SourceError};
@@ -470,12 +471,16 @@ fn expect<T>(
     pick(call_with(machine, request, payload, PLAIN)?, kind)
 }
 
-pub(crate) fn doctor(machine: &MachineName) -> Result<(), TransportError> {
+pub(crate) fn doctor(machine: &MachineName, output: &Output) -> Result<(), TransportError> {
     let build = expect(machine, &Request::Hello, &[], Reply::into_hello)?;
     if build != identity::current() {
         return Err(TransportError::BuildMismatch);
     }
-    println!("{}: ready (build {})", machine.as_str(), identity::tag());
+    output.line(format_args!(
+        "{}: ready (build {})",
+        machine.as_str(),
+        identity::tag()
+    ))?;
     Ok(())
 }
 
@@ -542,28 +547,36 @@ fn submit(
     expect(machine, &request, payload, Reply::into_accepted)
 }
 
+/// What a submitted job runs and whether the command waits for it.
+#[derive(Debug)]
+pub(crate) struct Submission {
+    pub(crate) id: Option<SubmissionId>,
+    pub(crate) command: JobCommand,
+    pub(crate) wait: bool,
+}
+
 pub(crate) fn on(
     machine: &MachineName,
-    submission: Option<SubmissionId>,
-    command: JobCommand,
-    wait_for_completion: bool,
+    submission: Submission,
+    output: &Output,
 ) -> Result<ExitCode, TransportError> {
-    let job = submit(machine, submission, command, Source::Home)?;
-    finish_submission(machine, job, wait_for_completion)
+    let job = submit(machine, submission.id, submission.command, Source::Home)?;
+    finish_submission(machine, job, submission.wait, output)
 }
 
 fn finish_submission(
     machine: &MachineName,
     job: JobId,
     wait_for_completion: bool,
+    output: &Output,
 ) -> Result<ExitCode, TransportError> {
-    println!("{}:{}", machine.as_str(), job.as_str());
+    output.line(format_args!("{}:{}", machine.as_str(), job.as_str()))?;
     if !wait_for_completion {
         return Ok(ExitCode::SUCCESS);
     }
     let reference = JobReference::new(machine.clone(), job);
-    let result = wait(&reference)?;
-    logs(&reference)?;
+    let result = wait(&reference, output)?;
+    logs(&reference, output)?;
     Ok(result)
 }
 
@@ -573,38 +586,44 @@ fn source_archive() -> Result<(Vec<u8>, wire::Snapshot), TransportError> {
 
 pub(crate) fn run(
     machine: &MachineName,
-    submission: Option<SubmissionId>,
-    command: JobCommand,
-    wait_for_completion: bool,
+    submission: Submission,
+    output: &Output,
 ) -> Result<ExitCode, TransportError> {
     let (archive, descriptor) = source_archive()?;
     let job = submit(
         machine,
-        submission,
-        command,
+        submission.id,
+        submission.command,
         Source::Snapshot {
             archive: &archive,
             descriptor,
         },
     )?;
-    finish_submission(machine, job, wait_for_completion)
+    finish_submission(machine, job, submission.wait, output)
 }
 
-pub(crate) fn ls(machine: &MachineName) -> Result<(), TransportError> {
+pub(crate) fn ls(machine: &MachineName, output: &Output) -> Result<(), TransportError> {
     for job in expect(machine, &Request::List, &[], Reply::into_jobs)? {
-        println!("{}:{}", machine.as_str(), job.as_str());
+        output.line(format_args!("{}:{}", machine.as_str(), job.as_str()))?;
     }
     Ok(())
 }
 
-pub(crate) fn clean(machine: &MachineName, target: CleanTarget) -> Result<(), TransportError> {
+pub(crate) fn clean(
+    machine: &MachineName,
+    target: CleanTarget,
+    output: &Output,
+) -> Result<(), TransportError> {
     let count = expect(
         machine,
         &Request::Clean { target },
         &[],
         Reply::into_cleaned,
     )?;
-    println!("{}: cleaned {count} finished jobs", machine.as_str());
+    output.line(format_args!(
+        "{}: cleaned {count} finished jobs",
+        machine.as_str()
+    ))?;
     Ok(())
 }
 
@@ -625,7 +644,7 @@ fn observe(reference: &JobReference, observation: Observation) -> Result<JobStat
     expect(reference.machine(), &request, &[], Reply::into_status)
 }
 
-fn print_state(reference: &JobReference, state: &JobState) {
+fn print_state(reference: &JobReference, state: &JobState, output: &Output) -> std::io::Result<()> {
     let phase = match state.kind() {
         PhaseKind::Accepted => "accepted",
         PhaseKind::Starting => "starting",
@@ -642,22 +661,22 @@ fn print_state(reference: &JobReference, state: &JobState) {
         Some(Outcome::Lost) => " lost".to_owned(),
         Some(Outcome::Killed) => " killed".to_owned(),
     };
-    println!(
+    output.line(format_args!(
         "{}:{} {phase}{result}",
         reference.machine().as_str(),
         reference.job().as_str()
-    );
+    ))
 }
 
-pub(crate) fn status(reference: &JobReference) -> Result<(), TransportError> {
+pub(crate) fn status(reference: &JobReference, output: &Output) -> Result<(), TransportError> {
     let state = observe(reference, Observation::Current)?;
-    print_state(reference, &state);
+    print_state(reference, &state, output)?;
     Ok(())
 }
 
-pub(crate) fn wait(reference: &JobReference) -> Result<ExitCode, TransportError> {
+pub(crate) fn wait(reference: &JobReference, output: &Output) -> Result<ExitCode, TransportError> {
     let state = observe(reference, Observation::Complete)?;
-    print_state(reference, &state);
+    print_state(reference, &state, output)?;
     match state.outcome() {
         Some(Outcome::Succeeded) => Ok(ExitCode::SUCCESS),
         Some(Outcome::Failed { code }) => match u8::try_from(code.get()) {
@@ -671,9 +690,9 @@ pub(crate) fn wait(reference: &JobReference) -> Result<ExitCode, TransportError>
     }
 }
 
-pub(crate) fn kill(reference: &JobReference) -> Result<ExitCode, TransportError> {
+pub(crate) fn kill(reference: &JobReference, output: &Output) -> Result<ExitCode, TransportError> {
     let state = observe(reference, Observation::Cancel)?;
-    print_state(reference, &state);
+    print_state(reference, &state, output)?;
     match state.outcome() {
         Some(Outcome::Killed) => Ok(ExitCode::SUCCESS),
         Some(
@@ -686,7 +705,7 @@ pub(crate) fn kill(reference: &JobReference) -> Result<ExitCode, TransportError>
     }
 }
 
-pub(crate) fn logs(reference: &JobReference) -> Result<(), TransportError> {
+pub(crate) fn logs(reference: &JobReference, output: &Output) -> Result<(), TransportError> {
     let request = Request::Logs {
         job: reference.job().clone(),
     };
@@ -694,7 +713,7 @@ pub(crate) fn logs(reference: &JobReference) -> Result<(), TransportError> {
     if omitted != 0 {
         eprintln!("{omitted} earlier log bytes omitted");
     }
-    std::io::stdout().write_all(text.for_terminal().as_bytes())?;
+    output.write(text.for_terminal().as_bytes())?;
     Ok(())
 }
 
@@ -754,7 +773,7 @@ fn prune_builds() {
     }
 }
 
-pub(crate) fn node() -> Result<(), TransportError> {
+pub(crate) fn node(output: &Output) -> Result<(), TransportError> {
     prune_builds();
     let mut input = std::io::stdin().lock();
     let request = ingress::request(&read_frame(&mut input)?)?;
@@ -792,9 +811,7 @@ pub(crate) fn node() -> Result<(), TransportError> {
             }
         }
     };
-    let mut output = std::io::stdout().lock();
-    output.write_all(&wire::frame(&reply)?)?;
-    output.flush()?;
+    output.write(&wire::frame(&reply)?)?;
     Ok(())
 }
 

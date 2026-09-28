@@ -14,7 +14,8 @@
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
-    reason = "the harness drives real processes and files and bounds every wait"
+    clippy::disallowed_macros,
+    reason = "the harness drives real processes and files, bounds every wait, and reports on its output"
 )]
 
 use std::ffi::{OsStr, OsString};

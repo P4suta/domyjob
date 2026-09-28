@@ -21,7 +21,9 @@ fn source_archive(root: &Path, files: Vec<PathBuf>) -> io::Result<Vec<u8>> {
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "the build script writes generated source only inside Cargo OUT_DIR"
+        clippy::disallowed_macros,
+        reason = "the build script writes generated source only inside Cargo OUT_DIR \
+                  and speaks to Cargo on standard output"
     )]
 
     use std::io;
@@ -29,6 +31,11 @@ mod raw {
 
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
+    }
+
+    /// Tell Cargo one `cargo:` instruction.
+    pub(super) fn instruct(instruction: &str) {
+        println!("cargo:{instruction}");
     }
 }
 
@@ -42,7 +49,7 @@ fn main() -> io::Result<()> {
         .ok_or_else(|| io::Error::other("the checkout root is missing"))?;
     let mut files = Vec::new();
     let fingerprint = source_fingerprint::from_checkout(checkout, |kind, path| {
-        println!("cargo:rerun-if-changed={}", path.display());
+        raw::instruct(&format!("rerun-if-changed={}", path.display()));
         if kind == source_fingerprint::SourceKind::File {
             files.push(path.to_path_buf());
         }

@@ -69,6 +69,8 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GateError> {
 #[derive(Debug, Default)]
 struct SourcePolicy {
     effect_module: bool,
+    /// Whether this file may take the process's standard output.
+    output_owner: bool,
     findings: Vec<String>,
 }
 
@@ -93,6 +95,26 @@ impl<'ast> Visit<'ast> for SourcePolicy {
             ));
         }
         syn::visit::visit_attribute(self, attribute);
+    }
+
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        let names: Vec<String> = expression
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        if !self.output_owner && names.ends_with(&["Output".to_owned(), "of_process".to_owned()]) {
+            let line = expression
+                .path
+                .segments
+                .first()
+                .map_or(1, |part| part.ident.span().start().line);
+            self.findings.push(format!(
+                "{line}: only `main` takes standard output; pass the `Output` it created"
+            ));
+        }
+        syn::visit::visit_expr_path(self, expression);
     }
 }
 
@@ -138,6 +160,7 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
         }
         let mut policy = SourcePolicy {
             effect_module: effect_module(&shown),
+            output_owner: shown == "crates/domyjob/src/main.rs",
             findings: Vec::new(),
         };
         policy.visit_file(&parsed);
@@ -163,6 +186,10 @@ mod tests {
         let mut policy = SourcePolicy::default();
         policy.visit_file(&source);
         assert_eq!(policy.findings.len(), 2);
+        let printing = syn::parse_file("fn f() { let output = Output::of_process(); }").unwrap();
+        let mut elsewhere = SourcePolicy::default();
+        elsewhere.visit_file(&printing);
+        assert_eq!(elsewhere.findings.len(), 1);
         assert!(effect_module("crates/domyjob/src/process/windows.rs"));
         assert!(!effect_module("crates/domyjob/src/store.rs"));
     }

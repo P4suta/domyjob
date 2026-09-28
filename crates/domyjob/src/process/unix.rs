@@ -46,7 +46,7 @@ pub(super) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
     if token.is_some() {
         return Err(ProcessError::InvalidReadyToken);
     }
-    let mut output = io::stdout().lock();
+    let mut output = super::raw::stdout().lock();
     output
         .write_all(b"R")
         .and_then(|()| output.flush())

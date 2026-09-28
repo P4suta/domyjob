@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use domyjob_core::chat::card::Tool;
 use domyjob_core::ingress;
+
+use crate::output::Output;
 use domyjob_core::wire::MAX_CONTROL_BYTES;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -524,10 +526,14 @@ fn notification<W>(server: &Server<W>, method: &str, params: &Value) {
 }
 
 /// Serve MCP on standard input and output, acting as `actor` within `turn` when given.
-pub(crate) fn serve(actor: Option<&str>, turn: Option<&str>) -> Result<(), McpError> {
+pub(crate) fn serve(
+    output: Output,
+    actor: Option<&str>,
+    turn: Option<&str>,
+) -> Result<(), McpError> {
     let session = Session::open(actor, turn)?;
     let server = Server {
-        output: Mutex::new(io::stdout()),
+        output: Mutex::new(output.into_stream()),
         phase: Mutex::new(Phase::New),
         session: Mutex::new(session),
         client: Mutex::new(None),

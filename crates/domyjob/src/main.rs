@@ -5,6 +5,8 @@ use clap::{Args, Parser, Subcommand};
 use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineName, SubmissionId};
 use domyjob_core::wire::CleanTarget;
 
+use crate::output::Output;
+
 mod app;
 mod builds;
 mod chat;
@@ -15,6 +17,7 @@ mod identity;
 mod layout;
 mod lock;
 mod mcp;
+mod output;
 mod platform;
 mod process;
 mod source;
@@ -124,15 +127,18 @@ fn submit_job(
     args: JobArgs,
     submit: fn(
         &MachineName,
-        Option<SubmissionId>,
-        JobCommand,
-        bool,
+        transport::Submission,
+        &Output,
     ) -> Result<ExitCode, transport::TransportError>,
+    output: &Output,
 ) -> Result<ExitCode, transport::TransportError> {
     let machine = MachineName::try_from(args.machine)?;
-    let command = JobCommand::try_from(args.command)?;
-    let submission = args.submission.map(SubmissionId::try_from).transpose()?;
-    submit(&machine, submission, command, args.wait)
+    let submission = transport::Submission {
+        id: args.submission.map(SubmissionId::try_from).transpose()?,
+        command: JobCommand::try_from(args.command)?,
+        wait: args.wait,
+    };
+    submit(&machine, submission, output)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -154,10 +160,11 @@ enum MainError {
 }
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
+    let output = Output::of_process();
     match command {
-        Command::Chat(args) => Ok(chat::cli::run(args)?),
+        Command::Chat(args) => Ok(chat::cli::run(args, &output)?),
         Command::Mcp { actor, turn } => {
-            mcp::serve(actor.as_deref(), turn.as_deref())?;
+            mcp::serve(output, actor.as_deref(), turn.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::ChatWorker { agent, ready_event } => {
@@ -169,13 +176,13 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { machine } => {
-            transport::doctor(&MachineName::try_from(machine)?)?;
+            transport::doctor(&MachineName::try_from(machine)?, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::On(args) => Ok(submit_job(args, transport::on)?),
-        Command::Run(args) => Ok(submit_job(args, transport::run)?),
+        Command::On(args) => Ok(submit_job(args, transport::on, &output)?),
+        Command::Run(args) => Ok(submit_job(args, transport::run, &output)?),
         Command::Ls { machine } => {
-            transport::ls(&MachineName::try_from(machine)?)?;
+            transport::ls(&MachineName::try_from(machine)?, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Clean { machine, job } => {
@@ -183,24 +190,24 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
                 Some(job) => CleanTarget::Job(JobId::try_from(job)?),
                 None => CleanTarget::Finished,
             };
-            transport::clean(&MachineName::try_from(machine)?, target)?;
+            transport::clean(&MachineName::try_from(machine)?, target, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Status { job } => {
-            transport::status(&JobReference::try_from(job)?)?;
+            transport::status(&JobReference::try_from(job)?, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait { job } => Ok(transport::wait(&JobReference::try_from(job)?)?),
-        Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?)?),
+        Command::Wait { job } => Ok(transport::wait(&JobReference::try_from(job)?, &output)?),
+        Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?, &output)?),
         Command::Logs { job } => {
-            transport::logs(&JobReference::try_from(job)?)?;
+            transport::logs(&JobReference::try_from(job)?, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Node { reap } => {
             if let Some(group) = reap {
                 process::reap(group.0.get());
             } else {
-                transport::node()?;
+                transport::node(&output)?;
             }
             Ok(ExitCode::SUCCESS)
         }

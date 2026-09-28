@@ -1,6 +1,5 @@
 //! The `domyjob chat` command line.
 
-use std::io::Write as _;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -18,6 +17,7 @@ use super::setup::{self, Finding, SetupError};
 use super::store::{Store, StoreError};
 use super::sync;
 use super::view::Outcome;
+use crate::output::Output;
 use crate::platform::clock::Deadline;
 
 #[derive(Debug, Args)]
@@ -181,17 +181,24 @@ fn environment(name: &str) -> Result<Option<String>, CliError> {
     }
 }
 
-fn print(json_mode: bool, value: &serde_json::Value, text: &str) -> Result<(), CliError> {
-    let mut output = std::io::stdout().lock();
-    if json_mode {
-        writeln!(output, "{value}")?;
-    } else if !text.is_empty() {
-        writeln!(output, "{text}")?;
-    }
-    Ok(())
+/// Where a chat command prints: one JSON document, or text lines.
+struct Printer<'out> {
+    output: &'out Output,
+    json: bool,
 }
 
-fn findings(json_mode: bool, findings: &[Finding]) -> Result<ExitCode, CliError> {
+impl Printer<'_> {
+    fn print(&self, value: &serde_json::Value, text: &str) -> Result<(), CliError> {
+        if self.json {
+            self.output.line(value)?;
+        } else if !text.is_empty() {
+            self.output.line(text)?;
+        }
+        Ok(())
+    }
+}
+
+fn findings(out: &Printer<'_>, findings: &[Finding]) -> Result<ExitCode, CliError> {
     let text = findings
         .iter()
         .map(|finding| {
@@ -204,7 +211,7 @@ fn findings(json_mode: bool, findings: &[Finding]) -> Result<ExitCode, CliError>
         })
         .collect::<Vec<_>>()
         .join("\n");
-    print(json_mode, &json!({"findings": findings}), &text)?;
+    out.print(&json!({"findings": findings}), &text)?;
     Ok(if findings.iter().all(|finding| finding.ok) {
         ExitCode::SUCCESS
     } else {
@@ -215,7 +222,7 @@ fn findings(json_mode: bool, findings: &[Finding]) -> Result<ExitCode, CliError>
 /// Run a command that works on the store without an acting agent, or hand the command back.
 fn machine(
     command: ChatCommand,
-    json_mode: bool,
+    out: &Printer<'_>,
 ) -> Result<Result<ExitCode, ChatCommand>, CliError> {
     Ok(Ok(match command {
         ChatCommand::Setup {
@@ -224,7 +231,7 @@ fn machine(
             no_service,
             no_clients,
         } => findings(
-            json_mode,
+            out,
             &setup::setup(
                 &machines,
                 setup::Steps {
@@ -234,7 +241,7 @@ fn machine(
                 },
             )?,
         )?,
-        ChatCommand::Doctor => findings(json_mode, &setup::doctor()?)?,
+        ChatCommand::Doctor => findings(out, &setup::doctor()?)?,
         ChatCommand::Serve => {
             super::serve::serve()?;
             ExitCode::SUCCESS
@@ -246,17 +253,17 @@ fn machine(
                 ServiceCommand::Uninstall => setup::service_uninstall(&store)?,
                 ServiceCommand::Status => setup::service_status(&store)?,
             };
-            findings(json_mode, &[finding])?
+            findings(out, &[finding])?
         }
-        ChatCommand::Sync { machine } => sync_now(machine.as_deref(), json_mode)?,
-        ChatCommand::Peer { command } => peer(command, json_mode)?,
+        ChatCommand::Sync { machine } => sync_now(machine.as_deref(), out)?,
+        ChatCommand::Peer { command } => peer(command, out)?,
         ChatCommand::Reset { yes: false } => {
             return Err(CliError::Usage(
                 "reset deletes this machine's chat history; confirm with --yes",
             ));
         }
-        ChatCommand::Reset { yes: true } => reset(json_mode)?,
-        ChatCommand::Clean { target } => clean(target, json_mode)?,
+        ChatCommand::Reset { yes: true } => reset(out)?,
+        ChatCommand::Clean { target } => clean(target, out)?,
         other @ (ChatCommand::Directory(_)
         | ChatCommand::Whoami
         | ChatCommand::Profile(_)
@@ -274,7 +281,7 @@ fn machine(
     }))
 }
 
-fn sync_now(machine: Option<&str>, json_mode: bool) -> Result<ExitCode, CliError> {
+fn sync_now(machine: Option<&str>, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let report = sync::sync(&Store::open()?, machine, Deadline::after_seconds(120))?;
     let text = report
         .peers
@@ -289,7 +296,7 @@ fn sync_now(machine: Option<&str>, json_mode: bool) -> Result<ExitCode, CliError
         })
         .collect::<Vec<_>>()
         .join("\n");
-    print(json_mode, &json!(report), &text)?;
+    out.print(&json!(report), &text)?;
     Ok(if report.complete() {
         ExitCode::SUCCESS
     } else {
@@ -297,35 +304,33 @@ fn sync_now(machine: Option<&str>, json_mode: bool) -> Result<ExitCode, CliError
     })
 }
 
-fn reset(json_mode: bool) -> Result<ExitCode, CliError> {
+fn reset(out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let store = Store::open()?;
     if matches!(setup::service_status(&store)?, Finding { ok: true, .. }) {
         setup::service_uninstall(&store)?;
     }
     let fresh = Store::reset(&crate::layout::State::here()?)?;
-    print(
-        json_mode,
+    out.print(
         &json!({"origin": fresh.origin()}),
         &format!("new chat identity {}", fresh.origin()),
     )?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn clean(target: String, json_mode: bool) -> Result<ExitCode, CliError> {
+fn clean(target: String, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let store = Store::open()?;
     let conversation = Conversation::try_from(target).map_err(|_invalid| {
         CliError::Usage("clean takes a conversation ID such as room:ORIGIN:NAME")
     })?;
     let removed = store.clean(&conversation)?;
-    print(
-        json_mode,
+    out.print(
         &json!({"cleaned": removed}),
         &format!("cleaned {removed} events"),
     )?;
     Ok(ExitCode::SUCCESS)
 }
 
-fn peer(command: PeerCommand, json_mode: bool) -> Result<ExitCode, CliError> {
+fn peer(command: PeerCommand, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let store = Store::open()?;
     match command {
         PeerCommand::List => {
@@ -342,12 +347,11 @@ fn peer(command: PeerCommand, json_mode: bool) -> Result<ExitCode, CliError> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            print(json_mode, &json!({"peers": peers, "links": links}), &text)?;
+            out.print(&json!({"peers": peers, "links": links}), &text)?;
         }
         PeerCommand::Remove { machine } => {
             let removed = store.unpin(&machine)?;
-            print(
-                json_mode,
+            out.print(
                 &json!({"removed": removed}),
                 if removed { "removed" } else { "not a peer" },
             )?;
@@ -356,8 +360,7 @@ fn peer(command: PeerCommand, json_mode: bool) -> Result<ExitCode, CliError> {
             let origin =
                 sync::identify(&mut sync::Ssh::new(&machine)?, Deadline::after_seconds(900))?;
             store.pin(&machine, &origin, true)?;
-            print(
-                json_mode,
+            out.print(
                 &json!({"machine": machine, "origin": origin}),
                 &format!("{machine} is now {origin}"),
             )?;
@@ -439,7 +442,7 @@ fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError>
 }
 
 /// Print a conversation and keep printing new events until interrupted.
-fn watch(session: &Session, args: &ThreadArgs, json_mode: bool) -> Result<ExitCode, CliError> {
+fn watch(session: &Session, args: &ThreadArgs, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let mut pulse = Pulse::new(&session.store, 2000)?;
     let mut shown = std::collections::BTreeSet::new();
     loop {
@@ -451,7 +454,7 @@ fn watch(session: &Session, args: &ThreadArgs, json_mode: bool) -> Result<ExitCo
                         events: vec![event],
                         unread: None,
                     };
-                    print(json_mode, &single.json(), &single.text())?;
+                    out.print(&single.json(), &single.text())?;
                 }
             }
         }
@@ -459,13 +462,14 @@ fn watch(session: &Session, args: &ThreadArgs, json_mode: bool) -> Result<ExitCo
     }
 }
 
-pub(crate) fn run(args: ChatArgs) -> Result<ExitCode, CliError> {
+pub(crate) fn run(args: ChatArgs, output: &Output) -> Result<ExitCode, CliError> {
     let ChatArgs {
         json,
         actor,
         command,
     } = args;
-    let command = match machine(command, json)? {
+    let out = Printer { output, json };
+    let command = match machine(command, &out)? {
         Ok(code) => return Ok(code),
         Err(command) => command,
     };
@@ -476,10 +480,10 @@ pub(crate) fn run(args: ChatArgs) -> Result<ExitCode, CliError> {
     let turn = environment("DOMYJOB_CHAT_TURN")?;
     let mut session = Session::open(actor.as_deref(), turn.as_deref())?;
     if let ChatCommand::Watch(thread) = &command {
-        return watch(&session, thread, json);
+        return watch(&session, thread, &out);
     }
     let read = reads(&command);
     let outcome = ops::around(&mut session, read, |session| act(session, command))?;
-    print(json, &outcome.json(), &outcome.text())?;
+    out.print(&outcome.json(), &outcome.text())?;
     Ok(ExitCode::from(outcome.exit_code()))
 }
