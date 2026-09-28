@@ -385,11 +385,11 @@ fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
 fn install_command(shell: Shell, build: &str) -> String {
     match shell {
         Shell::Unix => String::from(
-            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; install="$HOME/.cargo/domyjob/versions/@BUILD@"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root "$install" --force; cd "$HOME"; rm -rf -- "$work"'"#,
+            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; install="$HOME/.cargo/domyjob/versions/@BUILD@"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xmf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root "$install" --force; cd "$HOME"; rm -rf -- "$work"'"#,
         )
         .replace("@BUILD@", build),
         Shell::Windows => {
-            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $install=Join-Path $env:USERPROFILE ".cargo\domyjob\versions\@BUILD@"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root $install --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#.replace("@BUILD@", build);
+            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $install=Join-Path $env:USERPROFILE ".cargo\domyjob\versions\@BUILD@"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xmf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root $install --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#.replace("@BUILD@", build);
             let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             format!(
                 "powershell.exe -NoProfile -EncodedCommand {}",
@@ -400,6 +400,9 @@ fn install_command(shell: Shell, build: &str) -> String {
 }
 
 /// Build and install this build's node on `machine` from the embedded source.
+///
+/// The archive stores fixed modification times, and Cargo reuses a shared target directory,
+/// so extraction stamps files with the current time; otherwise Cargo could keep an older dependency.
 fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> {
     if u64::try_from(EMBEDDED_SOURCE.len()).map_err(|_size| WireError::Snapshot)?
         > wire::MAX_SNAPSHOT_BYTES
