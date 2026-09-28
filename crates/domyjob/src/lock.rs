@@ -71,6 +71,11 @@ mod tests {
                 .is_none()
         );
         drop(first);
-        assert_eq!(OsLock::probe(&path).expect("released lock"), Probe::Free);
+        // A child that another test thread forks holds a copy of the lock until it runs its program.
+        let released = (0..100_000).any(|_| {
+            std::thread::yield_now();
+            OsLock::probe(&path).expect("released lock") == Probe::Free
+        });
+        assert!(released, "a dropped lock is released");
     }
 }
