@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::ExitStatus;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {
@@ -47,13 +47,9 @@ fn workflow_files(root: &Path) -> Result<Vec<PathBuf>, WorkflowError> {
     Ok(files)
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "xtask invokes the pinned workflow linter from an explicit file list"
-)]
 pub fn check(root: &Path) -> Result<(), WorkflowError> {
     let files = workflow_files(root)?;
-    let status = Command::new("actionlint")
+    let status = crate::raw::command("actionlint")
         .current_dir(root)
         .args(files)
         .status()
@@ -70,16 +66,12 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the fixture creates ordinary files in a temporary directory"
-    )]
     fn workflows_are_discovered_without_git_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join(".github/workflows");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::raw::create_dir_all(&dir).unwrap();
         for name in ["a.yml", "b.yaml", "README.md"] {
-            std::fs::write(dir.join(name), "name: check\n").unwrap();
+            crate::raw::write(&dir.join(name), b"name: check\n").unwrap();
         }
         assert_eq!(
             workflow_files(temp.path()).unwrap(),

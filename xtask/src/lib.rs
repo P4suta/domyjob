@@ -3,7 +3,32 @@ use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
 pub mod dependencies;
-pub mod v1_core;
+pub mod exceptions;
+
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "repository tasks run their pinned tools and write only their caches and fixtures"
+    )]
+
+    use std::io;
+    use std::path::Path;
+    use std::process::Command;
+
+    pub(super) fn command(program: &str) -> Command {
+        Command::new(program)
+    }
+
+    pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        std::fs::write(path, bytes)
+    }
+}
+pub mod pure_core;
 pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +125,7 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
             source,
         })?;
         if shown.starts_with("crates/domyjob-core/src/") {
-            for finding in v1_core::check(&source, shown == "crates/domyjob-core/src/lib.rs")
+            for finding in pure_core::check(&source, shown == "crates/domyjob-core/src/lib.rs")
                 .map_err(|source| GateError::Parse {
                     path: path.clone(),
                     source,
@@ -115,6 +140,7 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
             findings: Vec::new(),
         };
         policy.visit_file(&parsed);
+        policy.findings.extend(exceptions::check(&shown, &parsed));
         for finding in policy.findings {
             eprintln!("{shown}:{finding}");
             findings = findings.saturating_add(1);

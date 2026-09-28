@@ -81,10 +81,23 @@ fn vet_args(command: &mut Command, manifest: &Path, root: &Path) {
         .arg(root.join("target/vet-cache"));
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the repository task launches Cargo checks for every dependency graph"
-)]
+/// The manifest beside a lockfile; an unreadable one is reported, not mistaken for a missing one.
+fn manifest_beside(lock: &Path) -> Result<PathBuf, DependencyError> {
+    let manifest = lock.with_file_name("Cargo.toml");
+    let missing = || DependencyError::MissingManifest {
+        lock: lock.to_path_buf(),
+    };
+    match std::fs::metadata(&manifest) {
+        Ok(metadata) if metadata.is_file() => Ok(manifest),
+        Ok(_) => Err(missing()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(missing()),
+        Err(source) => Err(DependencyError::Read {
+            path: manifest,
+            source,
+        }),
+    }
+}
+
 pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
     let root = root
         .canonicalize()
@@ -101,17 +114,16 @@ pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
     let database_parent = root.join("target");
     let database = database_parent.join("advisory-db");
     if matches!(check, Check::Audit) {
-        std::fs::create_dir_all(&database_parent).map_err(|source| DependencyError::Prepare {
-            path: database_parent,
-            source,
+        crate::raw::create_dir_all(&database_parent).map_err(|source| {
+            DependencyError::Prepare {
+                path: database_parent,
+                source,
+            }
         })?;
     }
     for (index, lock) in locks.into_iter().enumerate() {
-        let manifest = lock.with_file_name("Cargo.toml");
-        if !manifest.is_file() {
-            return Err(DependencyError::MissingManifest { lock });
-        }
-        let mut command = Command::new("cargo");
+        let manifest = manifest_beside(&lock)?;
+        let mut command = crate::raw::command("cargo");
         command.current_dir(&root);
         let name = match check {
             Check::Deny => {
@@ -166,19 +178,15 @@ pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
 mod tests {
     use super::*;
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the test creates a dependency graph fixture outside production state"
-    )]
     #[test]
     fn discovers_a_new_graph_without_a_task_list_edit() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(root.path().join("Cargo.lock"), "").unwrap();
-        std::fs::write(nested.join("Cargo.lock"), "").unwrap();
-        std::fs::create_dir_all(root.path().join("target")).unwrap();
-        std::fs::write(root.path().join("target/Cargo.lock"), "").unwrap();
+        crate::raw::create_dir_all(&nested).unwrap();
+        crate::raw::write(&root.path().join("Cargo.lock"), b"").unwrap();
+        crate::raw::write(&nested.join("Cargo.lock"), b"").unwrap();
+        crate::raw::create_dir_all(&root.path().join("target")).unwrap();
+        crate::raw::write(&root.path().join("target/Cargo.lock"), b"").unwrap();
         let mut found = Vec::new();
         lockfiles(root.path(), &mut found).unwrap();
         found.sort();
