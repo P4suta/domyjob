@@ -762,7 +762,7 @@ const RESTRICTIONS: &[Restriction] = &[
     },
     Restriction {
         path: &["serde_json", "from_slice"],
-        allowed_in: &["ingress.rs"],
+        allowed_in: &["ingress.rs", "crates/domyjob-core/src/ingress.rs"],
         rule: "decode input only in ingress.rs, into a type that implements Ingress",
     },
     Restriction {

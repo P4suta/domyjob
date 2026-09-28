@@ -779,6 +779,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "domyjob-core"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "domyjob-next"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "domyjob-core",
+ "thiserror",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

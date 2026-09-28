@@ -5,6 +5,7 @@ pub mod dependencies;
 pub mod proverif;
 pub mod release;
 pub mod syntax;
+pub mod v1_core;
 pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +105,17 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
     }
     let mut count = 0usize;
     for (path, shown, source) in sources {
+        if shown.starts_with("crates/domyjob-core/src/") {
+            for finding in v1_core::check(&source, shown == "crates/domyjob-core/src/lib.rs")
+                .map_err(|source| GateError::Parse {
+                    path: path.clone(),
+                    source,
+                })?
+            {
+                eprintln!("{shown}:{finding}");
+                count = count.saturating_add(1);
+            }
+        }
         let branches = syntax::os_branches(&source).map_err(|source| GateError::Parse {
             path: path.clone(),
             source,
