@@ -12,6 +12,7 @@ use std::path::PathBuf;
 pub(crate) use crate::file_kind::reparse_point;
 pub(crate) mod clock;
 pub(crate) mod service;
+pub(crate) mod user_files;
 
 #[cfg(windows)]
 mod windows_acl;

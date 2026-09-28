@@ -14,9 +14,9 @@ use super::sync::{self, Ssh, SyncError};
 use crate::lock::{OsLock, Probe};
 use crate::platform::clock::Deadline;
 use crate::platform::service::{self as manager, ServiceError};
+use crate::platform::user_files::{self, UserFileError};
 use crate::process::{Tool, ToolError, ToolOutput, run_tool};
 use crate::state_io::{self, StateError};
-use crate::user_files::{self, UserFileError};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SetupError {

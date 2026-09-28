@@ -20,7 +20,6 @@ mod source_fingerprint;
 mod state_io;
 mod store;
 mod transport;
-mod user_files;
 mod watch_event;
 mod workspace;
 

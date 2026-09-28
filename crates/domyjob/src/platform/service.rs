@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use domyjob_core::service as render;
 
+use crate::platform::user_files::UserFileError;
 use crate::process::{Tool, run_tool};
-use crate::user_files::{self, UserFileError};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServiceError {
@@ -87,7 +87,7 @@ pub(crate) fn install(program: &Path, log: &Path) -> Result<PathBuf, ServiceErro
         &["chat", "serve"],
         text(log)?,
     )?;
-    user_files::write(&path, plist.as_bytes())?;
+    crate::platform::user_files::write(&path, plist.as_bytes())?;
     let plist_path = text(&path)?.to_owned();
     step(
         "launchctl",
@@ -110,7 +110,7 @@ pub(crate) fn uninstall() -> Result<bool, ServiceError> {
         &[String::from("bootout"), domain(), text(&path)?.to_owned()],
         true,
     )?;
-    Ok(user_files::remove(&path)?)
+    Ok(crate::platform::user_files::remove(&path)?)
 }
 
 #[cfg(target_os = "linux")]
@@ -141,7 +141,7 @@ fn systemctl(arguments: &[&str], tolerated: bool) -> Result<(), ServiceError> {
 pub(crate) fn install(program: &Path, _log: &Path) -> Result<PathBuf, ServiceError> {
     let path = definition()?;
     let unit = render::systemd_unit("domyjob chat service", text(program)?, &["chat", "serve"])?;
-    user_files::write(&path, unit.as_bytes())?;
+    crate::platform::user_files::write(&path, unit.as_bytes())?;
     systemctl(&["daemon-reload"], false)?;
     systemctl(&["enable", "domyjob-chat.service"], false)?;
     systemctl(&["restart", "domyjob-chat.service"], false)?;
@@ -152,7 +152,7 @@ pub(crate) fn install(program: &Path, _log: &Path) -> Result<PathBuf, ServiceErr
 #[cfg(target_os = "linux")]
 pub(crate) fn uninstall() -> Result<bool, ServiceError> {
     systemctl(&["disable", "--now", "domyjob-chat.service"], true)?;
-    let removed = user_files::remove(&definition()?)?;
+    let removed = crate::platform::user_files::remove(&definition()?)?;
     systemctl(&["daemon-reload"], true)?;
     Ok(removed)
 }

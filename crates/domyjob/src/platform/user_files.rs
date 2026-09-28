@@ -72,6 +72,13 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
 }
 
 /// Remove a file; a missing file is already removed.
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "Windows keeps its service definition in Task Scheduler"
+    )
+)]
 pub(crate) fn remove(path: &Path) -> Result<bool, UserFileError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
