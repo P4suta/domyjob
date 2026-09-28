@@ -1,6 +1,6 @@
 use syn::visit::Visit;
 
-const EFFECT_MODULES: &[&str] = &["domain", "proc", "spawn", "template"];
+const EFFECT_MODULES: &[&str] = &[];
 
 #[derive(Default)]
 struct OldImports {
@@ -41,8 +41,14 @@ mod tests {
 
     #[test]
     fn application_logic_cannot_reenter_the_legacy_client() {
-        assert!(
+        assert_eq!(
             check("fn f() { domyjob::proc::terminate(1); }")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            check("fn f() { domyjob_core::wire::VERSION; }")
                 .unwrap()
                 .is_empty()
         );

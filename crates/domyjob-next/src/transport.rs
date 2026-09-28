@@ -650,7 +650,6 @@ pub(crate) fn node() -> Result<(), TransportError> {
                     | StoreError::Entropy(_),
                 )
                 | AppError::Proc(_)
-                | AppError::OldDomain(_)
                 | AppError::Notify(_)
                 | AppError::Io(_)
                 | AppError::InvalidErrorText => ErrorCode::Internal,

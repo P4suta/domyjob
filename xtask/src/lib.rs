@@ -58,7 +58,10 @@ const NOT_YET_ONE_PATH: &[(&str, usize)] = &[
 ];
 
 fn os_findings(shown: &str, branches: usize) -> Option<String> {
-    if shown == PLATFORM || shown == "crates/domyjob-next/src/platform.rs" {
+    if shown == PLATFORM
+        || shown == "crates/domyjob-next/src/platform.rs"
+        || shown == "crates/domyjob-next/src/process.rs"
+    {
         return None;
     }
     let allowed = NOT_YET_ONE_PATH

@@ -795,7 +795,6 @@ dependencies = [
  "cap-std",
  "clap",
  "data-encoding",
- "domyjob",
  "domyjob-core",
  "getrandom 0.3.4",
  "ignore",
@@ -806,6 +805,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "windows-spawn",
  "windows-sys 0.61.2",
 ]
 

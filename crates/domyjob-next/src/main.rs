@@ -9,6 +9,7 @@ mod app;
 mod identity;
 mod lock;
 mod platform;
+mod process;
 mod source;
 mod source_fingerprint;
 mod state_io;
@@ -148,7 +149,7 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
         }
         Command::Node { reap } => {
             if let Some(group) = reap {
-                domyjob::proc::reap(group.0.get());
+                process::reap(group.0.get());
             } else {
                 transport::node()?;
             }
@@ -157,7 +158,7 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
         Command::Worker { job, ready_event } => {
             let job = JobId::try_from(job)?;
             let ready_event = ready_event
-                .map(domyjob::domain::BlobId::try_from)
+                .map(process::ReadyToken::parse)
                 .transpose()
                 .map_err(app::AppError::from)?;
             app::worker(&job, ready_event.as_ref())?;

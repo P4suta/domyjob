@@ -1,13 +1,13 @@
 # First-release rewrite
 
 The first release has no compatibility requirement with the previous CLI, wire format, or stored jobs.
-The replacement is developed in `domyjob-core` and `domyjob-next` while the existing `domyjob` library supplies the remaining process adapter.
+The replacement is developed in `domyjob-core` and `domyjob-next` without importing the previous `domyjob` library.
 
 ## Enforced boundaries
 
 `domyjob-core` is always `no_std` and cannot import `std`.
 It owns validated identifiers, portable paths, commands, wire messages, ingress checks, and the total job state transition function.
-The `xtask gates` task checks that boundary and limits calls from `domyjob-next` into the old crate to the named effect adapters.
+The `xtask gates` task checks that boundary and rejects calls from `domyjob-next` into the old crate.
 Wire requests and replies use exhaustive enums, one framed JSON control message, explicit size limits, and a build fingerprint computed from every file under `crates/` and `xtask/`.
 The same source scanner runs at build time and client startup, so adding, changing, or deleting a source file invalidates the local and remote build automatically.
 
@@ -33,5 +33,5 @@ Automatic rebuild requires the development checkout and `mise` on the remote hos
 ## Cutover conditions
 
 The default binary is still the previous `domyjob` CLI, and `domyjob-next` is the replacement under test.
-Cutover requires extraction of the process adapter from the old application crate and a final review of the new command surface and storage limits.
+Cutover requires real-machine validation of the new process adapter and a final review of the new command surface and storage limits.
 The old CLI and its duplicated application logic can then be removed without weakening the process, filesystem, or transport boundaries.

@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::identity;
 use crate::platform;
+use crate::process::{self, Group, ProcessError, ReadyToken};
 use crate::state_io as state_file;
 use crate::store::{ReceivedArchive, Store, StoreError};
 use crate::watch_event::{self, Notice};
@@ -29,9 +30,7 @@ pub(crate) enum AppError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
-    Proc(#[from] domyjob::proc::ProcError),
-    #[error(transparent)]
-    OldDomain(#[from] domyjob::domain::Invalid),
+    Proc(#[from] ProcessError),
     #[error(transparent)]
     Notify(#[from] notify::Error),
     #[error("starting or running the job failed: {0}")]
@@ -74,12 +73,7 @@ impl CancellationWatch {
         })
     }
 
-    fn wait(
-        self,
-        store: &Store,
-        job: &JobId,
-        group: &domyjob::proc::Group,
-    ) -> Result<Event, AppError> {
+    fn wait(self, store: &Store, job: &JobId, group: &Group) -> Result<Event, AppError> {
         let cancelled = AtomicBool::new(false);
         let status = std::thread::scope(|scope| -> Result<_, AppError> {
             let cancelled_by_request = &cancelled;
@@ -142,16 +136,7 @@ fn start_worker(store: &Store, job: &JobId) -> Result<(), AppError> {
     if store.status(job)?.kind() != PhaseKind::Accepted {
         return Ok(());
     }
-    let executable = domyjob::proc::Executable::current()?;
-    let word = domyjob::domain::Nonce::try_from(job.as_str().to_owned())?;
-    let invocation = domyjob::spawn::Invocation::new(
-        domyjob::template::Arg::path(&executable),
-        vec![
-            domyjob::template::Arg::literal("worker"),
-            domyjob::template::Arg::word(&word),
-        ],
-    );
-    domyjob::proc::launch(&invocation)?;
+    process::launch_worker(job)?;
     Ok(())
 }
 
@@ -210,7 +195,7 @@ pub(crate) fn handle(
     }
 }
 
-fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Result<(), AppError> {
+fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppError> {
     let store = Store::open()?;
     let Some(_alive) = store.worker_lock(job)? else {
         return Ok(());
@@ -226,9 +211,7 @@ fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Res
     };
     let cancellation = CancellationWatch::start(&store, job)?;
     store.transition(job, &Event::Starting)?;
-    if let Some(readiness) = domyjob::proc::Readiness::from_parent(ready_event) {
-        readiness.announce()?;
-    }
+    process::announce_ready(ready_event)?;
     if store.cancel_requested(job)? {
         store.transition(job, &Event::Killed)?;
         return Ok(());
@@ -239,11 +222,7 @@ fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Res
     };
     let process = job_command(&command, &directory);
     let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
-    match domyjob::proc::Group::spawn_stdio(
-        process,
-        Stdio::from(log.try_clone()?),
-        Stdio::from(log),
-    ) {
+    match Group::spawn_stdio(process, Stdio::from(log.try_clone()?), Stdio::from(log)) {
         Ok(child) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
             let completion = cancellation.wait(&store, job, &child)?;
@@ -258,7 +237,7 @@ fn run_worker(job: &JobId, ready_event: Option<&domyjob::domain::BlobId>) -> Res
     Ok(())
 }
 
-pub(crate) fn worker(job: &JobId, event: Option<&domyjob::domain::BlobId>) -> Result<(), AppError> {
+pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppError> {
     let result = run_worker(job, event);
     if let Err(error) = &result
         && let Ok(store) = Store::open()
