@@ -382,7 +382,7 @@ fn agents(store: &Store) -> Result<Vec<Finding>, SetupError> {
             findings.push(Finding::problem(
                 "agent",
                 format!("{name} has no description, so others cannot tell what to ask it"),
-                format!("domyjob chat profile set --as {name} --description TEXT"),
+                format!("domyjob chat profile --as {name} --description TEXT"),
             ));
         }
         if card.mode == domyjob_core::chat::card::Mode::Managed

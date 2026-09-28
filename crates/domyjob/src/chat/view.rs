@@ -425,9 +425,13 @@ impl Outcome {
                 agent,
                 card,
                 presence,
-            } => format!("{agent}\n    {}", describe_card(card, presence)),
+            } => format!(
+                "{}@local\n    {}",
+                agent.name(),
+                describe_card(card, presence)
+            ),
             Self::Removed { agent, ended } => {
-                format!("removed {agent}; ended {ended} waiting asks")
+                format!("removed {}@local; ended {ended} waiting asks", agent.name())
             }
             Self::Directory(directory) => {
                 let mut text = String::new();
