@@ -281,22 +281,28 @@ impl fmt::Debug for RemoteText {
 impl RemoteText {
     #[must_use]
     pub fn for_terminal(&self) -> String {
-        let mut safe = String::with_capacity(self.0.len());
-        for character in self.0.chars() {
-            if (character.is_control() && character != '\n')
-                || matches!(
-                    character,
-                    '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}' | '\u{feff}'
-                )
-            {
-                safe.extend(character.escape_default());
-            } else {
-                safe.push(character);
-            }
-        }
-        safe
+        terminal_text(&self.0)
     }
+}
+
+/// Escape terminal controls without changing ordinary message content.
+#[must_use]
+pub fn terminal_text(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if (character.is_control() && character != '\n')
+            || matches!(
+                character,
+                '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}' | '\u{feff}'
+            )
+        {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 #[cfg(test)]

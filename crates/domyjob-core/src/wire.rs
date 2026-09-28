@@ -61,6 +61,7 @@ pub struct Envelope<T> {
 )]
 pub enum Request {
     Hello,
+    Chat(crate::chat_wire::ChatRequest),
     Run {
         submission: SubmissionId,
         command: Command,
@@ -176,6 +177,7 @@ impl Snapshot {
 )]
 pub enum Reply {
     Hello { build: BuildId },
+    Chat(crate::chat_wire::ChatReply),
     Accepted { job: JobId },
     Jobs { jobs: Vec<JobId> },
     Status { state: JobState },

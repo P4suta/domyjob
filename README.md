@@ -3,6 +3,9 @@
 Run persistent jobs on machines reachable through OpenSSH.
 The client sends a command to a remote node, records its state, and keeps it running after the SSH connection ends.
 
+Development is paused at the AI chat integration checkpoint.
+See [remaining work and verification status](docs/remaining-work.md) before resuming or treating the chat integration as complete.
+
 ## Develop from this checkout
 
 Rust 1.98 and `mise` are pinned in this repository.
@@ -50,6 +53,32 @@ The control message limit is 1 MiB, and a source snapshot is limited to 64 MiB.
 Source paths must be portable and unique across case insensitive filesystems.
 The core crate owns validated domain types, wire messages, and exhaustive state transitions without OS effects.
 The binary owns SSH, process isolation, private storage, and confined workspace extraction.
+
+## AI chat
+
+Exchange persistent messages with human participants and Claude Code, Codex, or OpenCode agents over the same SSH connection.
+Register managed agents with `agent start`, or attach existing interactive sessions with `agent attach`.
+
+```console
+$ target/debug/domyjob chat setup linux win
+$ target/debug/domyjob chat agent start reviewer --kind codex --cwd /absolute/project
+$ target/debug/domyjob chat agent attach assistant --kind claude --cwd /absolute/project --session SESSION_ID
+$ target/debug/domyjob chat send owner@linux "The build is ready."
+$ target/debug/domyjob chat ask reviewer "Review the current changes."
+$ target/debug/domyjob chat room create release reviewer owner@linux
+$ target/debug/domyjob chat ask release "Check the release." --to reviewer
+$ target/debug/domyjob chat inbox --json
+$ target/debug/domyjob chat reply MESSAGE_ID "Done." --from assistant
+$ target/debug/domyjob chat sync
+```
+
+Setup saves SSH peer identities and prints the configuration for `domyjob mcp`.
+Add that configuration to your AI client's MCP settings.
+`chat thread TARGET` reads a conversation, `chat watch TARGET` follows it, and `chat open TARGET` adds interactive input with `/quit` to leave.
+`chat doctor` checks local registrations and peer synchronization.
+Messages persist before transmission, so offline delivery can be retried with `chat sync`.
+`chat ask` returns an explicit answered, failed, interrupted, or pending result.
+See [chat architecture](docs/chat-architecture.md) for the synchronization and execution guarantees.
 
 Run `mise run lint` and `mise run test` before a change is reviewed.
 Use `mise run check:fleet` to run the same checks on Linux and Windows through domyjob.

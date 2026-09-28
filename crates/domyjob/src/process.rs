@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use domyjob_core::domain::JobId;
 use thiserror::Error;
 
+pub(crate) mod chat;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -74,7 +76,11 @@ impl ReadyToken {
 }
 
 pub(crate) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
-    os::launch_worker(job)
+    os::launch_worker(&["worker", job.as_str()])
+}
+
+fn launch_chat_worker(agent: &str) -> Result<(), ProcessError> {
+    os::launch_worker(&["chat-worker", "--agent", agent])
 }
 
 pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessError> {
@@ -108,11 +114,20 @@ pub(crate) struct Group {
 
 impl Group {
     pub(crate) fn spawn_stdio(
-        mut command: Command,
+        command: Command,
         output: Stdio,
         errors: Stdio,
     ) -> Result<Self, ProcessError> {
-        command.stdin(Stdio::null()).stdout(output).stderr(errors);
+        Self::spawn_io(command, Stdio::null(), output, errors)
+    }
+
+    pub(crate) fn spawn_io(
+        mut command: Command,
+        input: Stdio,
+        output: Stdio,
+        errors: Stdio,
+    ) -> Result<Self, ProcessError> {
+        command.stdin(input).stdout(output).stderr(errors);
         os::isolate(&mut command);
         let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
             what: "the job command",

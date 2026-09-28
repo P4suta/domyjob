@@ -639,6 +639,11 @@ criteria = "safe-to-run"
 version = "0.10.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.redb]]
+version = "4.3.0"
+criteria = "safe-to-deploy"
+notes = "Pinned database dependency imported from feature/chat; not independently audited."
+
 [[exemptions.redox_syscall]]
 version = "0.5.18"
 criteria = "safe-to-deploy"

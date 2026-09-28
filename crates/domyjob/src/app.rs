@@ -29,6 +29,8 @@ use crate::watch_event::{self, Notice};
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
     #[error(transparent)]
+    Chat(#[from] crate::chat_sync::ServerError),
+    #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
     Proc(#[from] ProcessError),
@@ -154,6 +156,7 @@ pub(crate) fn handle(
     archive: Option<&ReceivedArchive>,
 ) -> Result<Reply, AppError> {
     match request {
+        Request::Chat(request) => Ok(Reply::Chat(crate::chat_sync::handle(request)?)),
         Request::Hello => Ok(Reply::Hello {
             build: identity::current(),
         }),

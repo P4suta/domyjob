@@ -340,6 +340,7 @@ fn ensure_deployed(machine: &MachineName) -> Result<(), TransportError> {
         | Reply::Status { .. }
         | Reply::Logs { .. }
         | Reply::Cleaned { .. }
+        | Reply::Chat(_)
         | Reply::Error { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -361,6 +362,22 @@ pub(crate) fn doctor(machine: &MachineName) -> Result<(), TransportError> {
     ensure_deployed(machine)?;
     println!("{}: ready (wire {})", machine.as_str(), wire::VERSION);
     Ok(())
+}
+
+pub(crate) fn chat(
+    machine: &MachineName,
+    request: domyjob_core::chat_wire::ChatRequest,
+) -> Result<domyjob_core::chat_wire::ChatReply, TransportError> {
+    match call(machine, &Request::Chat(request))? {
+        Reply::Chat(reply) => Ok(reply),
+        Reply::Error { code } => Err(TransportError::Refused(code)),
+        Reply::Hello { .. }
+        | Reply::Accepted { .. }
+        | Reply::Jobs { .. }
+        | Reply::Status { .. }
+        | Reply::Logs { .. }
+        | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
+    }
 }
 
 fn new_submission() -> Result<SubmissionId, TransportError> {
@@ -414,6 +431,7 @@ fn submit(
         | Reply::Jobs { .. }
         | Reply::Status { .. }
         | Reply::Logs { .. }
+        | Reply::Chat(_)
         | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -479,6 +497,7 @@ pub(crate) fn ls(machine: &MachineName) -> Result<(), TransportError> {
         | Reply::Accepted { .. }
         | Reply::Status { .. }
         | Reply::Logs { .. }
+        | Reply::Chat(_)
         | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -494,6 +513,7 @@ pub(crate) fn clean(machine: &MachineName, target: CleanTarget) -> Result<(), Tr
         | Reply::Accepted { .. }
         | Reply::Jobs { .. }
         | Reply::Status { .. }
+        | Reply::Chat(_)
         | Reply::Logs { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -524,6 +544,7 @@ fn observe(reference: &JobReference, observation: Observation) -> Result<JobStat
         | Reply::Accepted { .. }
         | Reply::Jobs { .. }
         | Reply::Logs { .. }
+        | Reply::Chat(_)
         | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -606,6 +627,7 @@ pub(crate) fn logs(reference: &JobReference) -> Result<(), TransportError> {
         | Reply::Accepted { .. }
         | Reply::Jobs { .. }
         | Reply::Status { .. }
+        | Reply::Chat(_)
         | Reply::Cleaned { .. } => Err(TransportError::UnexpectedReply),
     }
 }
@@ -619,6 +641,7 @@ pub(crate) fn node() -> Result<(), TransportError> {
             ..
         } => Some(Store::open()?.receive_archive(&mut input, snapshot)?),
         Request::Hello
+        | Request::Chat(_)
         | Request::Run {
             input: Input::Home, ..
         }
@@ -639,13 +662,13 @@ pub(crate) fn node() -> Result<(), TransportError> {
                 AppError::Store(StoreError::Missing) => ErrorCode::MissingJob,
                 AppError::Store(StoreError::Conflict) => ErrorCode::ConflictingSubmission,
                 AppError::Store(StoreError::Capacity) => ErrorCode::ResourceLimit,
-                AppError::Store(StoreError::Active) => ErrorCode::InvalidRequest,
+                AppError::Chat(_)
+                | AppError::Store(
+                    StoreError::Active | StoreError::ArchiveEntry | StoreError::ArchiveMismatch,
+                ) => ErrorCode::InvalidRequest,
                 AppError::Store(
                     StoreError::Corrupt | StoreError::Transition(_) | StoreError::Wire(_),
                 ) => ErrorCode::CorruptState,
-                AppError::Store(StoreError::ArchiveEntry | StoreError::ArchiveMismatch) => {
-                    ErrorCode::InvalidRequest
-                }
                 AppError::Store(
                     StoreError::State(_)
                     | StoreError::Lock(_)

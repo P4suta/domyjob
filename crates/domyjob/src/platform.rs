@@ -10,6 +10,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub(crate) use crate::file_kind::reparse_point;
+pub(crate) mod chat_poll;
 
 #[cfg(windows)]
 mod windows_acl;

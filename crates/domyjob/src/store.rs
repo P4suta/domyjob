@@ -342,6 +342,7 @@ impl Store {
             )
             | (
                 Request::Hello
+                | Request::Chat(_)
                 | Request::List
                 | Request::Status { .. }
                 | Request::Logs { .. }

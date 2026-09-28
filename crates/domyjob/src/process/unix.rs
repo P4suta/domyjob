@@ -7,21 +7,19 @@ use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
 
-use domyjob_core::domain::JobId;
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group};
 
 use super::{ProcessError, ReadyToken};
 
-pub(super) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
+pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
     let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
         what: "the worker",
         source,
     })?;
     let mut command = Command::new(executable);
     command
-        .arg("worker")
-        .arg(job.as_str())
+        .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

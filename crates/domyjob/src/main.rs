@@ -6,10 +6,15 @@ use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineNa
 use domyjob_core::wire::CleanTarget;
 
 mod app;
+mod chat;
+mod chat_cli;
+mod chat_runner;
+mod chat_sync;
 #[path = "platform/file_kind.rs"]
 mod file_kind;
 mod identity;
 mod lock;
+mod mcp;
 mod platform;
 mod process;
 mod source;
@@ -46,6 +51,17 @@ impl FromStr for ReaperGroup {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Persistent conversations with local and remote AI agents.
+    Chat(chat_cli::ChatArgs),
+    /// Serve chat tools over the local MCP stdio transport.
+    Mcp,
+    #[command(hide = true)]
+    ChatWorker {
+        #[arg(long)]
+        agent: String,
+        #[arg(long, hide = true)]
+        ready_event: Option<String>,
+    },
     Doctor {
         machine: String,
     },
@@ -110,14 +126,43 @@ fn submit_job(
     submit(&machine, submission, command, args.wait)
 }
 
-fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
+#[derive(Debug, thiserror::Error)]
+enum MainError {
+    #[error(transparent)]
+    Transport(#[from] transport::TransportError),
+    #[error(transparent)]
+    Chat(#[from] chat_cli::ChatCliError),
+    #[error(transparent)]
+    Runner(#[from] chat_runner::RunnerError),
+    #[error(transparent)]
+    Invalid(#[from] domyjob_core::domain::Invalid),
+    #[error(transparent)]
+    App(#[from] app::AppError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+fn run(command: Command) -> Result<ExitCode, MainError> {
     match command {
+        Command::Chat(args) => Ok(chat_cli::run(args)?),
+        Command::Mcp => {
+            mcp::serve()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::ChatWorker { agent, ready_event } => {
+            let ready_event = ready_event
+                .map(process::ReadyToken::parse)
+                .transpose()
+                .map_err(app::AppError::from)?;
+            chat_runner::worker(&agent, ready_event.as_ref())?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Doctor { machine } => {
             transport::doctor(&MachineName::try_from(machine)?)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::On(args) => submit_job(args, transport::on),
-        Command::Run(args) => submit_job(args, transport::run),
+        Command::On(args) => Ok(submit_job(args, transport::on)?),
+        Command::Run(args) => Ok(submit_job(args, transport::run)?),
         Command::Ls { machine } => {
             transport::ls(&MachineName::try_from(machine)?)?;
             Ok(ExitCode::SUCCESS)
@@ -134,8 +179,8 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
             transport::status(&JobReference::try_from(job)?)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait { job } => transport::wait(&JobReference::try_from(job)?),
-        Command::Kill { job } => transport::kill(&JobReference::try_from(job)?),
+        Command::Wait { job } => Ok(transport::wait(&JobReference::try_from(job)?)?),
+        Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?)?),
         Command::Logs { job } => {
             transport::logs(&JobReference::try_from(job)?)?;
             Ok(ExitCode::SUCCESS)
@@ -165,7 +210,9 @@ fn main() -> ExitCode {
         .nth(1)
         .as_deref()
         .is_some_and(|command| {
-            command == std::ffi::OsStr::new("node") || command == std::ffi::OsStr::new("worker")
+            command == std::ffi::OsStr::new("node")
+                || command == std::ffi::OsStr::new("worker")
+                || command == std::ffi::OsStr::new("chat-worker")
         });
     if !internal {
         match transport::refresh_local() {

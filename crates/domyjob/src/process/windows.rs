@@ -12,7 +12,6 @@ use std::os::windows::io::AsRawHandle as _;
 use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command};
 
-use domyjob_core::domain::JobId;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -74,7 +73,7 @@ pub(super) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
     Ok(())
 }
 
-pub(super) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
+pub(super) fn launch_worker(arguments: &[&str]) -> Result<(), ProcessError> {
     use std::os::windows::io::{AsHandle as _, IntoRawHandle as _};
     use windows_spawn::{Command as WindowsCommand, CreationFlags, SpawnOptions, Stdio};
 
@@ -88,8 +87,7 @@ pub(super) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
     })?;
     let mut command = WindowsCommand::new(executable);
     command
-        .arg("worker")
-        .arg(job.as_str())
+        .args(arguments)
         .arg("--ready-event")
         .arg(token.as_str())
         .stdin(Stdio::null())
