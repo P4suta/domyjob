@@ -56,6 +56,29 @@ impl State {
         Chat(self.0.join("chat"))
     }
 
+    /// The job runner stores of other formats, which older or newer builds left.
+    pub(crate) fn other_runners(&self) -> io::Result<Vec<PathBuf>> {
+        let current = self.runner();
+        let entries = match std::fs::read_dir(&self.0) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with("runner-")
+                && entry.file_type()?.is_dir()
+                && path != current
+            {
+                found.push(path);
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
     /// Which shell each SSH alias runs, detected once.
     pub(crate) fn shells(&self) -> PathBuf {
         self.0.join("hosts.json")

@@ -4,6 +4,7 @@ path runner/incoming
 path runner/incoming.lock
 path runner/admission.lock
 path runner/sequence
+path runner/last-used
 path runner/jobs/00000000000000000000000000000000/request.json
 path runner/jobs/00000000000000000000000000000000/state.json
 path runner/jobs/00000000000000000000000000000000/state.lock

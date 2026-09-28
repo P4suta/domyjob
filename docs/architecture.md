@@ -26,7 +26,8 @@ Finished jobs may be removed; active jobs may not.
 Each admission removes the oldest finished jobs beyond the newest 32, so logs and workspaces never accumulate without bound.
 
 Every path under the state root is defined in `layout`.
-The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs,
+The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs;
+a node removes another format's store once no process of that format runs and none has opened it for a week,
 and a stored format is the digest of a checked-in specimen rather than a version number.
 State records have a 1 MiB size bound and are written through a private, synchronized replacement path.
 The storage adapter checks ownership and Unix mode or Windows ACL before reading existing state.

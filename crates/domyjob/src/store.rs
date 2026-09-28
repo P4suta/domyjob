@@ -128,6 +128,61 @@ impl JobPaths {
 /// How many finished jobs a store keeps; each admission removes the oldest beyond them.
 const KEEP_FINISHED: usize = 32;
 
+/// Whether any lock inside a job runner store is held, which means a process of its build still runs.
+///
+/// Every lock counts, whatever its name, so a store of another format is judged without reading it.
+fn in_use(root: &Path) -> Result<bool, StoreError> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        // A job's workspace holds the job's own files, whose lock files are not the store's.
+        let held = if kind.is_dir() && !kind.is_symlink() {
+            entry.file_name() != "workspace" && in_use(&path)?
+        } else {
+            kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                && OsLock::probe(&path)? == Probe::Held
+        };
+        if held {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Stores of other formats used this recently stay, so two builds in use never remove each other's jobs.
+const KEEP_OTHER_FORMATS_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Remove the job runner stores of other formats that no process uses and none used for a week.
+///
+/// This build can read none of their jobs, and once their own builds stop, nothing else can.
+pub(crate) fn prune_other_formats(
+    state: &crate::layout::State,
+) -> Result<Vec<PathBuf>, StoreError> {
+    prune_other_formats_before(
+        state,
+        platform::clock::now_millis().saturating_sub(KEEP_OTHER_FORMATS_MILLIS),
+    )
+}
+
+fn prune_other_formats_before(
+    state: &crate::layout::State,
+    cutoff: u64,
+) -> Result<Vec<PathBuf>, StoreError> {
+    let mut removed = Vec::new();
+    for root in state.other_runners()? {
+        let used = Store { root: root.clone() }.last_used()?;
+        if used <= cutoff && !in_use(&root)? {
+            state_file::remove_dir_all(&root)?;
+            removed.push(root);
+        }
+    }
+    Ok(removed)
+}
+
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
         let store = Self {
@@ -141,7 +196,21 @@ impl Store {
         ] {
             state_file::private_dir(&dir)?;
         }
+        state_file::write_bytes(
+            &store.last_used_path(),
+            platform::clock::now_millis().to_string().as_bytes(),
+        )?;
         Ok(store)
+    }
+
+    /// When a build of this format last opened the store, in milliseconds since the Unix epoch.
+    fn last_used_path(&self) -> PathBuf {
+        self.root.join("last-used")
+    }
+
+    /// When a build last opened the store; a store that never recorded it counts as never.
+    fn last_used(&self) -> Result<u64, StoreError> {
+        Self::read_number(&self.last_used_path())
     }
 
     /// Published jobs, one directory each.
@@ -648,6 +717,7 @@ mod tests {
             store.incoming_lock(),
             store.admission_lock(),
             store.sequence(),
+            store.last_used_path(),
         ]
         .iter()
         .map(|path| format!("path {}", shown(path)))
@@ -736,6 +806,52 @@ mod tests {
             .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
             .unwrap();
         job
+    }
+
+    #[test]
+    fn stores_of_other_formats_go_once_no_process_of_theirs_runs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = crate::layout::State::at(&temporary.path().join("state"));
+        let idle = temporary
+            .path()
+            .join("state")
+            .join("runner-0000000000000001");
+        let busy = temporary
+            .path()
+            .join("state")
+            .join("runner-0000000000000002");
+        for root in [&idle, &busy] {
+            state_file::private_dir(&root.join("jobs").join("a")).unwrap();
+            crate::testing::write(
+                &root
+                    .join("jobs")
+                    .join("a")
+                    .join("workspace")
+                    .join("Cargo.lock"),
+                "",
+            );
+        }
+        let recent = temporary
+            .path()
+            .join("state")
+            .join("runner-0000000000000003");
+        state_file::private_dir(&recent).unwrap();
+        state_file::write_bytes(&recent.join("last-used"), b"900").unwrap();
+        let running =
+            crate::lock::OsLock::exclusive(&busy.join("jobs").join("a").join("alive.lock"))
+                .unwrap();
+        let removed = super::prune_other_formats_before(&state, 500).unwrap();
+        assert_eq!(removed, [idle]);
+        assert!(crate::testing::is_dir(&busy));
+        assert!(
+            crate::testing::is_dir(&recent),
+            "a recently used store stays"
+        );
+        drop(running);
+        assert_eq!(
+            super::prune_other_formats_before(&state, 1000).unwrap(),
+            [busy, recent]
+        );
     }
 
     #[test]

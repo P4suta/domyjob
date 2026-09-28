@@ -774,8 +774,19 @@ fn prune_builds() {
     }
 }
 
+/// Remove job stores that other formats left and no process of theirs uses.
+fn prune_runner_stores() {
+    let removed = State::here()
+        .map_err(StoreError::from)
+        .and_then(|state| crate::store::prune_other_formats(&state));
+    if let Err(error) = removed {
+        eprintln!("domyjob node: removing job stores of other formats failed: {error}");
+    }
+}
+
 pub(crate) fn node(output: &Output) -> Result<(), TransportError> {
     prune_builds();
+    prune_runner_stores();
     let mut input = std::io::stdin().lock();
     let request = ingress::request(&read_frame(&mut input)?)?;
     let abandoned = Arc::new(AtomicBool::new(false));
