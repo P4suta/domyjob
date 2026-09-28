@@ -72,3 +72,34 @@ impl<'store> Pulse<'store> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use domyjob_core::chat::event::Body;
+    use domyjob_core::chat::policy::Priority;
+
+    use super::Pulse;
+    use crate::chat::store::Store;
+    use crate::layout::State;
+    use crate::platform::clock::Deadline;
+
+    #[test]
+    fn a_write_by_another_handle_wakes_a_waiting_pulse_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::at(&root.path().join("state"));
+        let store = Store::open_in(&state).unwrap();
+        let writer = Store::open_in(&state).unwrap();
+        let mut pulse = Pulse::new(&store, 60_000).unwrap();
+        let wrote = std::thread::spawn(move || {
+            crate::platform::clock::pause_millis(300);
+            writer
+                .write(|tx| tx.author(Priority::Ordinary, Body::Omitted {}))
+                .unwrap();
+        });
+        assert!(
+            pulse.next(Deadline::after_millis(10_000)).unwrap(),
+            "the doorbell woke the pulse before its deadline"
+        );
+        wrote.join().unwrap();
+    }
+}

@@ -100,7 +100,7 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
-notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 tar = { version = "0.4", default-features = false }
 cap-std = "4"
 data-encoding = "2.11"

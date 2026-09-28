@@ -943,6 +943,20 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
     beta.chat_as("ben", &["send", "ann@alpha", "delivered by the service"])?
         .exited(0)?;
     arrives(&alpha, "delivered by the service")?;
+    // alpha's own commands leave delivery to its service, and beta cannot reach alpha,
+    // so only the service pushing alpha's write can bring it to beta.
+    // Once the service rests in its long poll, only the doorbell makes it push before its next heartbeat, so a few seconds tell a working doorbell from one that never rings.
+    crate::pause(3000);
+    alpha
+        .chat_as("ann", &["send", "ben@beta", "pushed by the service"])?
+        .exited(0)?;
+    wait_within("the doorbell to make the service push", 60, || {
+        let thread = beta.chat_as("ben", &["thread", "ann@alpha"])?;
+        Ok(thread
+            .stdout
+            .contains("pushed by the service")
+            .then_some(()))
+    })?;
     beta.set_offline(true)?;
     beta.chat_as("ben", &["send", "ann@alpha", "sent during the outage"])?
         .exited(0)?;
