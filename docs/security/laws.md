@@ -106,6 +106,8 @@ Submission-time retirement and low-disk collection include the incoming source m
 Finished-job retention keeps only the requested newest identifiers, and finished-log and stored-blob traversal use batches of 256 that close each directory iterator before deletion.
 CAS collection retains at most 65,536 marked blob IDs per pass; when that budget fills, it partitions by hash prefix, rescans the roots, and removes orphaned blobs in empty partitions without retaining their IDs.
 Idle workspace maintenance visits projects in bounded sorted batches and probes only the 64 canonical slots in each project; clean reports retain eight largest details plus one aggregate item, with the wire type and schema rejecting longer lists.
+When an idle workspace cannot be removed after being moved to trash, low-disk reclamation continues to other workspaces and logs; an explicit clean reports the failed removal.
+Trash sweeping attempts every entry before reporting its first failure, so one unremovable entry cannot prevent other entries from being removed.
 `bounded::SortedScan::walk` now owns the fixed-size ordered batches and typed continue-or-stop decision used for CAS blobs, idle workspace projects, finished logs, pull journals, and legacy binary directories; each scan closes its iterator before mutating the selected entries.
 Its constructor fixes the 256-key batch capacity, so callers cannot enlarge the allocation.
 Pull history retains at most 31 existing entries while choosing the next journal and then removes older entries in sorted batches, preserving any journal whose lock is held.

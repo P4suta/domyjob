@@ -403,6 +403,25 @@ impl Reclamation {
     }
 }
 
+#[derive(Debug)]
+enum WorkspaceReclamation {
+    Busy,
+    Removed,
+    Quarantined(crate::state_file::StateError),
+}
+
+impl WorkspaceReclamation {
+    fn visit(
+        self,
+        pressure: &impl Fn() -> Result<DiskPressure, NodeError>,
+    ) -> Result<ScanFlow, NodeError> {
+        match self {
+            Self::Busy | Self::Quarantined(_) => Ok(ScanFlow::Continue),
+            Self::Removed => Reclamation::Done.visit(pressure),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum WorkspaceFreshness {
     Current,
@@ -1343,18 +1362,21 @@ impl Node {
         }
     }
 
-    fn evict(&self, workspace: &Path, lock: &Path) -> Result<Reclamation, NodeError> {
+    fn evict(&self, workspace: &Path, lock: &Path) -> Result<WorkspaceReclamation, NodeError> {
         let Some(idle) = crate::lock::OsLock::try_exclusive(lock)? else {
-            return Ok(Reclamation::Busy);
+            return Ok(WorkspaceReclamation::Busy);
         };
         let aside = self
             .store
             .area("trash")
             .join(format!("workspace-{}", JobId::generate()?));
         crate::state_file::move_aside(workspace, &aside)?;
-        crate::state_file::remove_tree_forcibly(&aside)?;
+        let removed = crate::state_file::remove_tree_forcibly(&aside);
         idle.release()?;
-        Ok(Reclamation::Done)
+        Ok(match removed {
+            Ok(()) => WorkspaceReclamation::Removed,
+            Err(error) => WorkspaceReclamation::Quarantined(error),
+        })
     }
 
     fn discard_log(&self, id: &JobId) -> Result<Reclamation, NodeError> {
@@ -1381,8 +1403,9 @@ impl Node {
             let bytes = size_of(workspace)?;
             if apply {
                 match self.evict(workspace, lock)? {
-                    Reclamation::Busy => return Ok(ScanFlow::Continue),
-                    Reclamation::Done => {}
+                    WorkspaceReclamation::Busy => return Ok(ScanFlow::Continue),
+                    WorkspaceReclamation::Removed => {}
+                    WorkspaceReclamation::Quarantined(error) => return Err(error.into()),
                 }
             }
             let shown = match workspace.strip_prefix(&work) {
@@ -1484,11 +1507,23 @@ impl Node {
         let Some(entries) = entries(&trash)? else {
             return Ok(());
         };
+        let mut first_error = None;
         for entry in entries {
-            let entry = entry.map_err(io("listing", &trash))?;
-            crate::state_file::remove_tree_forcibly(&entry.path())?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    first_error.get_or_insert_with(|| io("listing", &trash)(error));
+                    continue;
+                }
+            };
+            if let Err(error) = crate::state_file::remove_tree_forcibly(&entry.path()) {
+                first_error.get_or_insert_with(|| error.into());
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn visit_finished_logs(
@@ -4214,16 +4249,23 @@ mod tests {
         blob
     }
 
-    #[test]
-    fn every_step_of_making_room_that_fails_is_an_error_and_leaves_the_rest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (node, _) = published(tmp.path(), b"");
-        let store = Store::open(&dirs(tmp.path())).unwrap();
+    fn reclamation_fixture(root: &Path) -> (Node, Store, PathBuf, PathBuf) {
+        let (node, _) = published(root, b"");
+        let store = Store::open(&dirs(root)).unwrap();
         let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
         let log = store.log_path(&id);
         crate::state_file::write_bytes(&log, &[b'x'; 10_000]).unwrap();
-        let project = store.area("work").join("owner").join("proj");
-        crate::state_file::write_bytes(&project.join("0").join("file"), b"built").unwrap();
+        let workspace = store.area("work").join("owner").join("proj").join("0");
+        crate::state_file::write_bytes(&workspace.join("file"), b"built").unwrap();
+        (node, store, log, workspace)
+    }
+
+    #[test]
+    fn every_step_of_making_room_that_fails_is_an_error_and_leaves_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, store, log, workspace) = reclamation_fixture(tmp.path());
+        let id: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
+        let project = workspace.parent().unwrap();
         let text = |path: &Path| path.display().to_string();
         for (site, tag) in [
             (
@@ -4231,10 +4273,6 @@ mod tests {
                 text(&project.join("locks").join("0.lock")),
             ),
             ("state_file::rename", text(&project.join("0"))),
-            (
-                "state_file::remove",
-                text(&store.area("trash").join("workspace-")),
-            ),
             ("store::list", text(&store.area("jobs"))),
             ("state_file::lock", text(&store.alive_path(&id))),
             ("state_file::cut", text(&log)),
@@ -4244,6 +4282,62 @@ mod tests {
             node.make_room(&|| Ok(DiskPressure::Short), &commanded(), &Location::Home)
                 .unwrap_err();
         }
+    }
+
+    #[test]
+    fn an_unremovable_workspace_does_not_block_other_disk_reclamation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, store, log, workspace) = reclamation_fixture(tmp.path());
+        let trash = store.area("trash");
+        let tag = trash.join("workspace-").display().to_string();
+        let _faults = crate::faults::inject(&[("state_file::remove", &tag)]);
+        let until_log_is_discarded = || {
+            Ok(if std::fs::read(&log).unwrap() == DISCARDED {
+                DiskPressure::Enough
+            } else {
+                DiskPressure::Short
+            })
+        };
+        node.make_room(&until_log_is_discarded, &commanded(), &Location::Home)
+            .unwrap();
+        assert!(!workspace.try_exists().unwrap());
+        assert!(size_of(&trash).unwrap() > 0);
+        assert_eq!(std::fs::read(log).unwrap(), DISCARDED);
+    }
+
+    #[test]
+    fn explicit_clean_reports_an_unremovable_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, store, _log, workspace) = reclamation_fixture(tmp.path());
+        let trash = store.area("trash");
+        let tag = trash.join("workspace-").display().to_string();
+        let _faults = crate::faults::inject(&[("state_file::remove", &tag)]);
+        assert!(matches!(
+            node.clean(&authorized_clean((true, false, true))),
+            Err(NodeError::State(crate::state_file::StateError::Io(_)))
+        ));
+        assert!(!workspace.try_exists().unwrap());
+        assert!(size_of(&trash).unwrap() > 0);
+    }
+
+    #[test]
+    fn an_unremovable_trash_entry_does_not_block_other_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (node, _) = published(tmp.path(), b"");
+        let trash = node.store.area("trash");
+        let blocked = trash.join("blocked");
+        let removable = trash.join("removable");
+        crate::state_file::write_bytes(&blocked.join("file"), b"one").unwrap();
+        crate::state_file::write_bytes(&removable.join("file"), b"two").unwrap();
+        {
+            let tag = blocked.display().to_string();
+            let _faults = crate::faults::inject(&[("state_file::remove", &tag)]);
+            node.empty_trash().unwrap_err();
+        }
+        assert!(blocked.try_exists().unwrap());
+        assert!(!removable.try_exists().unwrap());
+        node.empty_trash().unwrap();
+        assert!(!blocked.try_exists().unwrap());
     }
 
     #[test]
