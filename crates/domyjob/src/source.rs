@@ -54,9 +54,7 @@ pub(crate) fn working_directory(root: &Path) -> Result<(Vec<u8>, Snapshot), Sour
         if kind.is_dir() {
             continue;
         }
-        archive.add(root, item.path(), |metadata| {
-            (!platform::reparse_point(metadata)).then(|| platform::file_mode(metadata))
-        })?;
+        archive.add(root, item.path(), platform::file_mode)?;
     }
     let bytes = archive.finish()?;
     let length = u64::try_from(bytes.len()).map_err(|_length| ArchiveError::Capacity)?;

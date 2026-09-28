@@ -12,6 +12,8 @@ use domyjob_core::domain::{Invalid, RelativePath};
 use domyjob_core::wire::MAX_SNAPSHOT_BYTES;
 use thiserror::Error;
 
+use crate::file_kind;
+
 const MAX_FILES: usize = 100_000;
 const MAX_PATH_BYTES: usize = 16_777_216;
 
@@ -76,7 +78,7 @@ impl Archive {
         &mut self,
         root: &Path,
         path: &Path,
-        mode: impl FnOnce(&fs::Metadata) -> Option<u32>,
+        mode: impl FnOnce(&fs::Metadata) -> u32,
     ) -> Result<(), ArchiveError> {
         let relative = path
             .strip_prefix(root)
@@ -99,10 +101,10 @@ impl Archive {
             return Err(ArchiveError::Collision);
         }
         let metadata = fs::symlink_metadata(path)?;
-        let mode = mode(&metadata).ok_or(ArchiveError::NonFile)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() || file_kind::reparse_point(&metadata) {
             return Err(ArchiveError::NonFile);
         }
+        let mode = mode(&metadata);
         let mut content = fs::File::open(path)?;
         if content.metadata()?.len() != metadata.len() {
             return Err(io::Error::other("a source file changed during archiving").into());

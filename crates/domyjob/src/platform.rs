@@ -9,6 +9,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+pub(crate) use crate::file_kind::reparse_point;
+
 #[cfg(windows)]
 mod windows_acl;
 
@@ -98,18 +100,6 @@ mod tests {
         assert!(!names.contains(&std::ffi::OsStr::new("SSH_AUTH_SOCK")));
         assert!(!names.contains(&std::ffi::OsStr::new("GIT_ASKPASS")));
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn reparse_point(metadata: &fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
-pub(crate) fn reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    metadata.file_attributes() & 0x400 != 0
 }
 
 #[cfg(unix)]

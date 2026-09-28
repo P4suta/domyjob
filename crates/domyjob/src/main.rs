@@ -6,6 +6,8 @@ use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineNa
 use domyjob_core::wire::CleanTarget;
 
 mod app;
+#[path = "platform/file_kind.rs"]
+mod file_kind;
 mod identity;
 mod lock;
 mod platform;

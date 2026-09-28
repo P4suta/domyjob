@@ -7,6 +7,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use crate::file_kind;
+
 const MAX_SOURCE_BYTES: u64 = 67_108_864;
 const ROOTS: &[&str] = &["crates", "xtask"];
 const FILES: &[&str] = &[
@@ -33,7 +35,7 @@ impl<F: FnMut(SourceKind, &Path)> Scan<'_, F> {
     fn file(&mut self, path: &Path) -> io::Result<()> {
         (self.changed)(SourceKind::File, path);
         let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() || file_kind::reparse_point(&metadata) {
             return Err(io::Error::other("a source path is not a regular file"));
         }
         self.bytes = self
@@ -73,7 +75,7 @@ impl<F: FnMut(SourceKind, &Path)> Scan<'_, F> {
     fn directory(&mut self, path: &Path) -> io::Result<()> {
         (self.changed)(SourceKind::Directory, path);
         let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir() || file_kind::reparse_point(&metadata) {
             return Err(io::Error::other("a source path is not a directory"));
         }
         let mut entries = fs::read_dir(path)?

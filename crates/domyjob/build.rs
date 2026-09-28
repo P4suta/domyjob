@@ -1,3 +1,5 @@
+#[path = "src/platform/file_kind.rs"]
+mod file_kind;
 #[path = "src/source_archive.rs"]
 mod source_archive;
 #[path = "src/source_fingerprint.rs"]
@@ -11,7 +13,7 @@ fn source_archive(root: &Path, files: Vec<PathBuf>) -> io::Result<Vec<u8>> {
     let mut archive = source_archive::Archive::new();
     for path in files {
         archive
-            .add(root, &path, |_metadata| Some(0o644))
+            .add(root, &path, |_metadata| 0o644)
             .map_err(io::Error::other)?;
     }
     archive.finish().map_err(io::Error::other)
