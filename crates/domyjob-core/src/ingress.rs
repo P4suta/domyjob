@@ -46,6 +46,17 @@ pub fn stored_job(bytes: &[u8]) -> Result<JobState, WireError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// Decodes JSON text that another program wrote, such as a client's configuration or command output.
+///
+/// Callers bound the text they read before handing it here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "JSON written by other programs is decoded only at this ingress boundary"
+)]
+pub fn foreign_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+    serde_json::from_str(text)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::wire::{self, Request, WireError};

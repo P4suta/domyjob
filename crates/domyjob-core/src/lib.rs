@@ -50,5 +50,8 @@ pub mod chat_wire;
 pub mod chat_wire_v0;
 pub mod domain;
 pub mod ingress;
+pub mod jsonc;
+pub mod mcp_clients;
+pub mod service;
 pub mod state;
 pub mod wire;
