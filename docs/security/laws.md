@@ -6,7 +6,7 @@ These laws are the kinds.
 Each one names the property it guarantees, the mechanism that guarantees it, and the check that fails the build when the mechanism is bypassed.
 
 These are design targets, not a claim that every mechanism and check below is implemented.
-The current code has no `effects::*` abstraction, `Labeled<T, L>` covers only repository job text, and the decision-signature gate admits 36 explicitly listed legacy boolean signatures across product modules.
+The current code has no `effects::*` abstraction, `Labeled<T, L>` covers only repository job text, and the decision-signature gate admits 35 explicitly listed legacy boolean signatures across product modules.
 CI runs `cargo vet` against locked imported audits, but 267 exact-version exemptions remain.
 Passing `mise run check` therefore does not establish all seven laws.
 
@@ -21,7 +21,7 @@ The remaining conditions below keep a green test run from being mistaken for com
 | 1. No ambient authority | Some workspace and snapshot paths use confined directory handles; process arguments use typed `Invocation`, and job spawning requires a prepared environment proof | Route all filesystem, process, network, and environment effects through explicit capabilities and reject ambient calls at the build gate |
 | 2. Every value carries its origin | Source-specific text types, an opaque inbound `PeerRequest`, and sealed argument traits protect some sinks | Label all peer and repository values and require a named validation or neutralization step at each sink |
 | 3. Parse once, at the border | `ingress` owns several JSON and TOML decoders; the node decodes requests only as `PeerRequest` | Audit every external input and make the gate reject decoding or parsing it outside its border |
-| 4. Decisions are total | Enum-match lints apply crate-wide, job phase transitions require exhaustive typed cases, production phase-tag checks use one exhaustive `Phase::kind` mapping, several lifecycle, authorization, presentation, and lock decisions use exhaustive matches, platform features use a typed capability matrix, revocation has a typed selector, remote version comparison separates invalid input, retry classification covers every remote error, and the decision-signature gate checks all product source files | Review and remove the 36 legacy boolean signature exceptions where they encode security decisions, and extend typed decisions to every remaining security decision and state transition |
+| 4. Decisions are total | Enum-match lints apply crate-wide, job phase transitions require exhaustive typed cases, production phase-tag checks use one exhaustive `Phase::kind` mapping, several lifecycle, authorization, presentation, and lock decisions use exhaustive matches, platform features use a typed capability matrix, revocation has a typed selector, remote version comparison separates invalid input, retry classification covers every remote error, and the decision-signature gate checks all product source files | Review and remove the 35 legacy boolean signature exceptions where they encode security decisions, and extend typed decisions to every remaining security decision and state transition |
 | 5. Time decides nothing | Clock and timeout gates exist, production time values and the records that carry them have no comparison traits, presentation passes one observed timestamp through its duration calculations, and the one silent-peer exception is documented | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
 | 6. Proof obligations | CI pins and runs fuzz, Kani, ProVerif, and authorization and trust mutations | Extend reproducible mutation runs and reviewed proof results to the remaining security-critical modules |
 | 7. Dependencies are audited | `cargo deny`, `cargo audit`, and a locked `cargo vet` import set check every Cargo lockfile, including fuzz; the vet gate rejects a new version without audit evidence or a new explicit exemption | Review and remove the 267 existing exact-version exemptions, especially cryptography, input parsers, and process-control crates, and require explicit review of any new exemption |
@@ -39,6 +39,7 @@ Peer revocation classifies a private selector as a name, fingerprint, or inferre
 The syntax gate requires that selector at the state-changing API and rejects public fields or construction outside its parser.
 One private `RoutedRequest<E>` representation carries the principal and request through separate query and command paths; node handlers and reply functions require the corresponding typed proof.
 Non-submission commands become distinct `AuthorizedConfigure`, `AuthorizedClean`, `AuthorizedRetry`, and `AuthorizedKill` proofs before their effects run, so a different command cannot supply the required argument.
+Clean command options also use named fields through the client and authorization proof, and the syntax gate rejects the former positional boolean triple at that proof boundary.
 An authorized submission stays in `AuthorizedSubmission` through admission and job specification creation; a different authorized command cannot be converted into that proof.
 The sealed `CommandAuthority` trait and syntax gate keep maintenance and admission signatures tied to those proofs.
 The ingress decoder wraps each received request in `PeerRequest`, and authorization extracts its raw request only after checking the principal's capability.
@@ -82,17 +83,19 @@ Queue watch registration follows the exhaustive admission decision, avoiding slo
 Each supervisor holds a separate queue lock only while queued, and a typed admission guard serializes predecessor selection with the preparing transition and queue-lock release.
 The successor's blocked watcher therefore wakes when the predecessor leaves the queue even if that job keeps running; an older or uncertain supervisor falls back to its alive lock.
 A restarted supervisor first claims the alive lock, then waits for any watcher briefly holding the queue lock to release it.
+The restart ordering test observes a signal emitted after the alive lock is held, so its observation cannot race the lock acquisition it is checking.
 Job and warm workspace lock scans both use a fixed 64-slot `OsLock::first_free` API, and an exhausted warm range fails without reusing a locked workspace.
 `SlotIndex` now owns the canonical 0–63 range and lock-path construction for allocation, status, and workspace cleanup.
 Queue admission and queued-job status share `Store::held_slots`, which generates exactly the canonical indices below `Concurrency::MOST`; unrelated directory entries no longer change the answer or its memory use.
 Remote version comparison now returns a `VersionRelation`; an unparsable peer version stops automatic installation instead of being treated as an older release.
 Client retry classification now exhaustively matches every `RemoteError`, so adding a remote error requires an explicit retry decision.
-The decision-signature gate now rejects boolean-returning functions outside 36 named legacy signatures throughout the product crate; a parsed `cfg` condition grants test-only exemptions only when it requires `test`.
+The decision-signature gate now rejects boolean-returning functions outside 35 named legacy signatures throughout the product crate; a parsed `cfg` condition grants test-only exemptions only when it requires `test`.
 Legacy exceptions are also tied to their owning type or free function, so a new type cannot inherit an old same-name exception.
 The repository gate counts every allowed boolean definition and fails when one disappears or is duplicated until its reviewed baseline is changed.
 It also checks trait method signatures and respects test-only conditions on whole implementations and traits rather than misclassifying their methods.
 Submission replies now retain the accepted job, the missing-content refusal, or the full unexpected reply in distinct typed outcomes; the client retries only the missing-content outcome, and both reply and refusal-code classification require exhaustive matches.
 Distribution failures now carry an explicit local-source or stop outcome; only the no-trust-root case permits automatic source fallback, and adding a failure variant requires revisiting that policy.
+Secure frame reads classify a cut connection separately from other failures and preserve the latter's full error, with an exhaustive match over every `SecureError` variant.
 Watch retries now also classify every `ClientError`, retrying transient remote transport failures while reporting local and invalid-input failures immediately.
 Job phase transitions now use an exhaustive `PhaseTransition` match; adding a `Phase` variant requires explicit decisions for every source and destination before the code compiles.
 Production phase-tag checks now use `Phase::kind`, whose exhaustive match requires every new phase to receive an explicit classification; the syntax gate rejects production `matches!` checks on phase, supervisor, queue, publication, blocker, and lock-probe states.

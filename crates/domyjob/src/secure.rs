@@ -42,21 +42,32 @@ pub enum SecureError {
     PostQuantum(#[from] crate::pq::PqError),
 }
 
+enum FrameReadFailure {
+    CutBeforeClose,
+    Other(SecureError),
+}
+
 impl SecureError {
     #[must_use]
-    fn is_disconnected(&self) -> bool {
+    fn frame_read_failure(self) -> FrameReadFailure {
         match self {
-            Self::Io(error) => matches!(
-                error.kind(),
-                std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-            ),
-            Self::Handshake
+            Self::Io(error) => {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                ) {
+                    FrameReadFailure::CutBeforeClose
+                } else {
+                    FrameReadFailure::Other(Self::Io(error))
+                }
+            }
+            other @ (Self::Handshake
             | Self::Unknown
             | Self::Frame(_)
             | Self::Invalid(_)
-            | Self::PostQuantum(_) => false,
+            | Self::PostQuantum(_)) => FrameReadFailure::Other(other),
         }
     }
 }
@@ -477,15 +488,17 @@ fn next_nonce(nonce: &mut u64) -> std::io::Result<u64> {
 
 impl<S: Duplex> Reader<S> {
     fn fill(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        let frame = match receive_frame(&mut self.stream) {
+        let frame = match receive_frame(&mut self.stream).map_err(SecureError::frame_read_failure) {
             Ok(frame) => frame,
-            Err(error) if error.is_disconnected() => {
+            Err(FrameReadFailure::CutBeforeClose) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "the connection was cut before it was closed",
                 ));
             }
-            Err(error) => return Err(std::io::Error::other(error.to_string())),
+            Err(FrameReadFailure::Other(error)) => {
+                return Err(std::io::Error::other(error.to_string()));
+            }
         };
         let mut plain = vec![0u8; frame.len()];
         let nonce = next_nonce(&mut self.nonce)?;

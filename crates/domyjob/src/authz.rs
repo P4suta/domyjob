@@ -230,7 +230,7 @@ pub struct AuthorizedCommand<K, P> {
 }
 
 pub type AuthorizedConfigure = AuthorizedCommand<ConfigureKind, Change>;
-pub type AuthorizedClean = AuthorizedCommand<CleanKind, (bool, bool, bool)>;
+pub type AuthorizedClean = AuthorizedCommand<CleanKind, crate::protocol::CleanOptions>;
 pub type AuthorizedRetry = AuthorizedCommand<RetryKind, JobRef>;
 pub type AuthorizedKill = AuthorizedCommand<KillKind, JobRef>;
 
@@ -354,9 +354,10 @@ impl RoutedRequest<CommandEffect> {
             Request::Configure { change } => {
                 CommandAction::Configure(AuthorizedCommand::new(principal, change))
             }
-            Request::Clean { apply, logs, idle } => {
-                CommandAction::Clean(AuthorizedCommand::new(principal, (apply, logs, idle)))
-            }
+            Request::Clean { apply, logs, idle } => CommandAction::Clean(AuthorizedCommand::new(
+                principal,
+                crate::protocol::CleanOptions { apply, logs, idle },
+            )),
             Request::Retry { job } => CommandAction::Retry(AuthorizedCommand::new(principal, job)),
             Request::Kill { job } => CommandAction::Kill(AuthorizedCommand::new(principal, job)),
             Request::Hello

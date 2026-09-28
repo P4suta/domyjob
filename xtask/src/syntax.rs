@@ -1077,7 +1077,6 @@ const LEGACY_BOOL_SIGNATURES: &[(&str, &str, &[&str])] = &[
     ("protocol.rs", "has_timing_sample", &["State"]),
     ("protocol.rs", "is_settled", &["Job"]),
     ("protocol.rs", "succeeded", &["Job"]),
-    ("secure.rs", "is_disconnected", &["SecureError"]),
     ("service.rs", "is_installed", &[]),
     ("shell.rs", "on_path", &[]),
     ("snapshot.rs", "metadata", &[]),
@@ -2973,13 +2972,11 @@ impl<'ast> Visit<'ast> for Gate {
             } else if item.ident == "AuthorizedKill" {
                 is_generic_of(&item.ty, "AuthorizedCommand", &["KillKind", "JobRef"])
             } else if item.ident == "AuthorizedClean" {
-                generic_types(&item.ty, "AuthorizedCommand").is_some_and(|types| {
-                    matches!(types.as_slice(), [kind, payload]
-                        if is_named_type(kind, "CleanKind")
-                            && matches!(payload, syn::Type::Tuple(triple)
-                                if triple.elems.len() == 3
-                                    && triple.elems.iter().all(|ty| is_named_type(ty, "bool"))))
-                })
+                is_generic_of(
+                    &item.ty,
+                    "AuthorizedCommand",
+                    &["CleanKind", "CleanOptions"],
+                )
             } else {
                 true
             };
@@ -3536,6 +3533,7 @@ mod tests {
             "fn f() { let _ = AuthorizedCommand::new(p, x); }",
             "type Queried = RoutedRequest<CommandEffect>;",
             "type AuthorizedRetry = AuthorizedCommand<KillKind, JobRef>;",
+            "type AuthorizedClean = AuthorizedCommand<CleanKind, (bool, bool, bool)>;",
             "impl<E> RoutedRequest<E> { fn into_parts(self) -> (Principal, Request) { todo!() } }",
             "enum Routed { Query(Request), Command(Commanded) }",
             "enum CommandAction { Configure(Change), Clean(AuthorizedClean), Retry(AuthorizedRetry), Kill(AuthorizedKill) }",

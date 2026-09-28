@@ -129,6 +129,13 @@ pub enum Follow {
     Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanOptions {
+    pub apply: bool,
+    pub logs: bool,
+    pub idle: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reply")]
 pub enum Reply {

@@ -687,7 +687,7 @@ fn take_charge(
     id: &JobId,
     (readiness, stops): (Readiness, Stops),
 ) -> Result<(Supervisor, SupervisorLocks, Receiver<Event>), NodeError> {
-    let locks = claim_supervisor_locks(&store, id)?;
+    let locks = claim_supervisor_locks(&store, id, || {})?;
     let control = store.control_path(id);
     crate::state_file::remove_file(&control)?;
     let listener = Listener::bind(&control).map_err(|source| {
@@ -757,11 +757,16 @@ fn take_charge(
     Ok((supervisor, locks, received))
 }
 
-fn claim_supervisor_locks(store: &Store, id: &JobId) -> Result<SupervisorLocks, NodeError> {
+fn claim_supervisor_locks(
+    store: &Store,
+    id: &JobId,
+    alive_claimed: impl FnOnce(),
+) -> Result<SupervisorLocks, NodeError> {
     let admission = store.admission()?;
     let Some(alive) = OsLock::try_exclusive(&store.alive_path(id))? else {
         return Err(NodeError::AlreadySupervised(id.clone()));
     };
+    alive_claimed();
     let waiting = OsLock::exclusive(&store.queue_wait_path(id))?;
     admission.release()?;
     Ok(SupervisorLocks { alive, waiting })
@@ -1342,6 +1347,10 @@ mod tests {
 
     #[test]
     fn a_restarting_supervisor_waits_for_a_watcher_to_pass_the_queue_lock() {
+        enum Claim {
+            Alive,
+            Done(Result<SupervisorLocks, NodeError>),
+        }
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&Dirs::for_test(tmp.path())).unwrap();
         let id: JobId = "0GGGGGGGGGGGGGGG".parse().unwrap();
@@ -1351,25 +1360,32 @@ mod tests {
             let store = store.clone();
             let id = id.clone();
             std::thread::spawn(move || {
-                sent.send(claim_supervisor_locks(&store, &id)).unwrap();
+                let claimed = sent.clone();
+                let result = claim_supervisor_locks(&store, &id, || {
+                    claimed.send(Claim::Alive).unwrap();
+                });
+                sent.send(Claim::Done(result)).unwrap();
             })
         };
-        loop {
-            match OsLock::probe(&store.alive_path(&id)).unwrap() {
-                crate::lock::Probe::Held => break,
-                crate::lock::Probe::Absent | crate::lock::Probe::Free => {}
-            }
-            match received.try_recv() {
-                Ok(Ok(_)) => panic!("the supervisor did not wait for the queue lock"),
-                Ok(Err(error)) => panic!("claiming the supervisor failed: {error}"),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    panic!("the supervisor stopped without a result")
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
-            }
+        match received.recv().unwrap() {
+            Claim::Alive => {}
+            Claim::Done(Ok(_)) => panic!("the supervisor did not claim the alive lock first"),
+            Claim::Done(Err(error)) => panic!("claiming the supervisor failed: {error}"),
         }
+        assert_eq!(
+            OsLock::probe(&store.alive_path(&id)).unwrap(),
+            crate::lock::Probe::Held
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         watcher.release().unwrap();
-        let locks = received.recv().unwrap().unwrap();
+        let locks = match received.recv().unwrap() {
+            Claim::Done(Ok(locks)) => locks,
+            Claim::Done(Err(error)) => panic!("claiming the supervisor failed: {error}"),
+            Claim::Alive => panic!("the supervisor claimed the alive lock twice"),
+        };
         claiming.join().unwrap();
         locks.waiting.release().unwrap();
         locks.alive.release().unwrap();

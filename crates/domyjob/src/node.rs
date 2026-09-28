@@ -1391,7 +1391,7 @@ impl Node {
     }
 
     fn clean(&self, authorized: &AuthorizedClean) -> Result<crate::protocol::Cleaned, NodeError> {
-        let (apply, logs, idle) = *authorized.payload();
+        let crate::protocol::CleanOptions { apply, logs, idle } = *authorized.payload();
         let work = self.store.area("work");
         let mut items = CleanItems::new();
         self.visit_idle_workspaces(|workspace, lock| {
@@ -2210,7 +2210,7 @@ mod tests {
     use super::*;
     use crate::authz::Commanded;
     use crate::domain::{Concurrency, Nonce as RetryNonce};
-    use crate::protocol::{Change, Command, Location, Spec, Submission};
+    use crate::protocol::{Change, CleanOptions, Command, Location, Spec, Submission};
     use crate::store::LaunchEnv;
 
     fn dirs(root: &Path) -> Dirs {
@@ -2247,8 +2247,7 @@ mod tests {
         authorized
     }
 
-    fn authorized_clean(options: (bool, bool, bool)) -> AuthorizedClean {
-        let (apply, logs, idle) = options;
+    fn authorized_clean(CleanOptions { apply, logs, idle }: CleanOptions) -> AuthorizedClean {
         let CommandAction::Clean(authorized) = command(Request::Clean { apply, logs, idle })
             .into_action()
             .unwrap()
@@ -3265,7 +3264,13 @@ mod tests {
             id.as_str().as_bytes(),
         )
         .unwrap();
-        let listed = node.clean(&authorized_clean((false, true, false))).unwrap();
+        let listed = node
+            .clean(&authorized_clean(CleanOptions {
+                apply: false,
+                logs: true,
+                idle: false,
+            }))
+            .unwrap();
         assert!(!listed.applied);
         assert!(
             listed.items.iter().any(|item| item.bytes == 5_000),
@@ -3274,14 +3279,25 @@ mod tests {
         assert!(project.join("0").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
 
-        let freed = node.clean(&authorized_clean((true, false, false))).unwrap();
+        let freed = node
+            .clean(&authorized_clean(CleanOptions {
+                apply: true,
+                logs: false,
+                idle: false,
+            }))
+            .unwrap();
         assert!(freed.applied);
         assert_eq!(freed.items.len(), 1, "{freed:?}");
         assert!(recent.join("out").try_exists().unwrap());
         assert!(!project.join("0").try_exists().unwrap());
         assert!(project.join("1").join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap().len(), 10_000);
-        node.clean(&authorized_clean((true, true, true))).unwrap();
+        node.clean(&authorized_clean(CleanOptions {
+            apply: true,
+            logs: true,
+            idle: true,
+        }))
+        .unwrap();
         assert!(!recent.join("out").try_exists().unwrap());
         assert_eq!(std::fs::read(store.log_path(&id)).unwrap(), DISCARDED);
         busy.release().unwrap();
@@ -3312,7 +3328,13 @@ mod tests {
         }
         let total = (1..=workspaces).map(crate::domain::len_u64).sum::<u64>();
         for apply in [false, true] {
-            let cleaned = node.clean(&authorized_clean((apply, false, true))).unwrap();
+            let cleaned = node
+                .clean(&authorized_clean(CleanOptions {
+                    apply,
+                    logs: false,
+                    idle: true,
+                }))
+                .unwrap();
             assert_eq!(cleaned.applied, apply);
             assert_eq!(cleaned.items.len(), crate::protocol::CLEAN_DETAIL_LIMIT + 1);
             assert_eq!(
@@ -3358,7 +3380,13 @@ mod tests {
         for name in ["0", "01", "64"] {
             crate::state_file::write_bytes(&project.join(name).join("out"), b"stale").unwrap();
         }
-        let cleaned = node.clean(&authorized_clean((true, false, true))).unwrap();
+        let cleaned = node
+            .clean(&authorized_clean(CleanOptions {
+                apply: true,
+                logs: false,
+                idle: true,
+            }))
+            .unwrap();
         assert_eq!(cleaned.items.len(), 1);
         assert!(!project.join("0").try_exists().unwrap());
         assert!(project.join("01").join("out").try_exists().unwrap());
@@ -3447,7 +3475,11 @@ mod tests {
             let tag = path.display().to_string();
             let _faults = crate::faults::inject(&[(site, &tag)]);
             assert!(matches!(
-                node.clean(&authorized_clean((false, false, true))),
+                node.clean(&authorized_clean(CleanOptions {
+                    apply: false,
+                    logs: false,
+                    idle: true,
+                })),
                 Err(NodeError::Io(_))
             ));
         }
@@ -4317,7 +4349,11 @@ mod tests {
         let tag = trash.join("workspace-").display().to_string();
         let _faults = crate::faults::inject(&[("state_file::remove", &tag)]);
         assert!(matches!(
-            node.clean(&authorized_clean((true, false, true))),
+            node.clean(&authorized_clean(CleanOptions {
+                apply: true,
+                logs: false,
+                idle: true,
+            })),
             Err(NodeError::State(crate::state_file::StateError::Io(_)))
         ));
         assert!(!workspace.try_exists().unwrap());

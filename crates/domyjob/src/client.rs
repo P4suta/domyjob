@@ -13,7 +13,8 @@ use crate::domain::{
 use crate::paths::Dirs;
 use crate::project::{self, ApprovedProjectJob, ApprovedProjectTargets, ProjectError};
 use crate::protocol::{
-    Command, Follow, Job, Location, Reply, Request, Source, Submission, SubmissionReply, Workspace,
+    CleanOptions, Command, Follow, Job, Location, Reply, Request, Source, Submission,
+    SubmissionReply, Workspace,
 };
 use crate::remote::{Link, RemoteError, cached_facts};
 use crate::snapshot::{self, Entry, Origin, Snapshot, SnapshotError};
@@ -924,7 +925,7 @@ pub fn known_machines(ctx: &Context) -> Result<Vec<Machine>, ClientError> {
 pub fn clean(
     ctx: &Context,
     machine: &Machine,
-    (apply, logs, idle): (bool, bool, bool),
+    CleanOptions { apply, logs, idle }: CleanOptions,
 ) -> Result<crate::protocol::Cleaned, RemoteError> {
     let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
     link.call(&Request::Clean { apply, logs, idle }, &[])?

@@ -2183,7 +2183,11 @@ fn clean(args: &CleanArgs) -> Result<ExitCode, CliError> {
         client::clean(
             &ctx,
             machine,
-            (!args.dry_run, args.more.logs, args.more.all_idle),
+            crate::protocol::CleanOptions {
+                apply: !args.dry_run,
+                logs: args.more.logs,
+                idle: args.more.all_idle,
+            },
         )
     });
     for (machine, result) in machines.iter().zip(results) {
