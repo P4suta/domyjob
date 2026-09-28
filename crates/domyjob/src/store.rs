@@ -413,6 +413,23 @@ impl Store {
         Ok(state)
     }
 
+    pub(crate) fn finish_launch_failure(
+        &self,
+        job: &JobId,
+        reason: RemoteText,
+    ) -> Result<(), StoreError> {
+        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let mut state = self.read_state(job)?;
+        match state.kind() {
+            PhaseKind::Accepted | PhaseKind::Starting => {
+                state.advance(&Event::LaunchFailed { reason })?;
+                self.write_state(job, &state)?;
+            }
+            PhaseKind::Running | PhaseKind::Finished => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn status(&self, job: &JobId) -> Result<JobState, StoreError> {
         let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
         let mut state = self.read_state(job)?;
@@ -528,6 +545,59 @@ impl Store {
                 }
                 Ok(count)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domyjob_core::domain::{Command, RemoteText, SubmissionId};
+    use domyjob_core::state::{Event, Outcome};
+    use domyjob_core::wire::{Input, Request};
+
+    use super::{Store, state_file};
+
+    #[test]
+    fn failed_supervisor_start_is_terminal_and_idempotent() {
+        for starting in [false, true] {
+            let temporary = tempfile::tempdir().expect("temporary state root");
+            let root = temporary.path().join("v1");
+            for directory in ["", "jobs", "staging", "incoming"] {
+                state_file::private_dir(&root.join(directory)).expect("private store directory");
+            }
+            let store = Store { root };
+            let submission = SubmissionId::try_from("1".repeat(32)).expect("submission ID");
+            let request = Request::Run {
+                submission: submission.clone(),
+                command: Command::try_from(vec!["missing".to_owned()]).expect("command"),
+                input: Input::Home,
+            };
+            let job = store
+                .reserve(&submission, &request, None)
+                .expect("reserved job");
+            if starting {
+                store.transition(&job, &Event::Starting).expect("start");
+            }
+            let reason = RemoteText::try_from("worker initialization failed".to_owned())
+                .expect("failure reason");
+            store
+                .finish_launch_failure(&job, reason.clone())
+                .expect("terminal launch failure");
+            let outcome = Outcome::LaunchFailed { reason };
+            assert_eq!(
+                store.wait(&job).expect("completed job").outcome(),
+                Some(&outcome)
+            );
+            store
+                .finish_launch_failure(
+                    &job,
+                    RemoteText::try_from("later failure".to_owned()).expect("later reason"),
+                )
+                .expect("repeat failure report");
+            assert_eq!(
+                store.status(&job).expect("stable state").outcome(),
+                Some(&outcome)
+            );
         }
     }
 }

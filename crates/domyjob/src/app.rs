@@ -7,6 +7,7 @@
     reason = "the binary composition root uses this private module"
 )]
 
+use std::fmt::Display;
 use std::io::Write;
 use std::process::{Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,12 +133,19 @@ fn job_command(command: &Command, home: &std::path::Path) -> Process {
     process
 }
 
+fn launch_failure_reason(error: &impl Display) -> Result<RemoteText, AppError> {
+    let detail: String = error.to_string().chars().take(4096).collect();
+    RemoteText::try_from(detail).map_err(|_invalid| AppError::InvalidErrorText)
+}
+
 fn start_worker(store: &Store, job: &JobId) -> Result<(), AppError> {
     let _launch = store.launch_lock(job)?;
     if store.status(job)?.kind() != PhaseKind::Accepted {
         return Ok(());
     }
-    process::launch_worker(job)?;
+    if let Err(error) = process::launch_worker(job) {
+        store.finish_launch_failure(job, launch_failure_reason(&error)?)?;
+    }
     Ok(())
 }
 
@@ -230,8 +238,7 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
             store.transition(job, &completion)?;
         }
         Err(error) => {
-            let reason = RemoteText::try_from(error.to_string())
-                .map_err(|_invalid| AppError::InvalidErrorText)?;
+            let reason = launch_failure_reason(&error)?;
             store.transition(job, &Event::LaunchFailed { reason })?;
         }
     }
@@ -242,11 +249,16 @@ pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppE
     let result = run_worker(job, event);
     if let Err(error) = &result
         && let Ok(store) = Store::open()
-        && let Ok(path) = store.supervisor_log_path(job)
-        && let Ok(mut file) = state_file::open_append(&path)
     {
-        let detail: String = error.to_string().chars().take(4096).collect();
-        let _recorded = writeln!(file, "{detail}");
+        if let Ok(path) = store.supervisor_log_path(job)
+            && let Ok(mut file) = state_file::open_append(&path)
+        {
+            let detail: String = error.to_string().chars().take(4096).collect();
+            let _recorded = writeln!(file, "{detail}");
+        }
+        if let Ok(reason) = launch_failure_reason(error) {
+            let _recorded = store.finish_launch_failure(job, reason);
+        }
     }
     result
 }
