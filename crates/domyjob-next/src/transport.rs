@@ -7,6 +7,7 @@
     reason = "the composition root needs these names but the binary has no public API"
 )]
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -21,6 +22,7 @@ use thiserror::Error;
 
 use crate::app::{self, AppError};
 use crate::identity;
+use crate::source_fingerprint::{self, SourceKind};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, Error)]
@@ -51,6 +53,8 @@ pub(crate) enum TransportError {
     BuildMismatch,
     #[error("the source contains a symlink, which the first release cannot transfer")]
     SourceLink,
+    #[error("the source contains paths that collide on a case-insensitive filesystem")]
+    SourceCollision,
     #[error("the remote host does not identify a supported shell")]
     RemoteShell,
 }
@@ -260,10 +264,10 @@ fn remote_shell(machine: &MachineName) -> Result<RemoteShell, TransportError> {
 fn install_command(shell: RemoteShell) -> String {
     match shell {
         RemoteShell::Unix => String::from(
-            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work" mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; cd "$HOME"; rm -rf -- "$work"'"#,
+            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo clean -p domyjob-next; mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; cd "$HOME"; rm -rf -- "$work"'"#,
         ),
         RemoteShell::Windows => {
-            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#;
+            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo clean -p domyjob-next; if ($LASTEXITCODE -ne 0) { throw "build cache cleanup failed" }; mise x -- cargo install --debug --locked --path crates/domyjob-next --bin domyjob-next --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#;
             let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             format!(
                 "powershell.exe -NoProfile -EncodedCommand {}",
@@ -273,8 +277,50 @@ fn install_command(shell: RemoteShell) -> String {
     }
 }
 
+fn checkout_archive(root: &Path) -> Result<Vec<u8>, TransportError> {
+    let mut files = Vec::new();
+    source_fingerprint::from_checkout(root, |kind, path| {
+        if kind == SourceKind::File {
+            files.push(path.to_path_buf());
+        }
+    })?;
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut names = BTreeSet::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(root)
+            .map_err(|_prefix| std::io::Error::other("source is outside the checkout"))?;
+        let mut parts = Vec::new();
+        for component in relative.components() {
+            parts.push(
+                component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("a source path is not UTF-8"))?,
+            );
+        }
+        let name = RelativePath::try_from(parts.join("/"))?;
+        if !names.insert(name.as_str().to_lowercase()) {
+            return Err(TransportError::SourceCollision);
+        }
+        let metadata = std::fs::symlink_metadata(&file)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(TransportError::SourceLink);
+        }
+        let mut content = std::fs::File::open(&file)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(metadata.len());
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        archive.append_data(&mut header, name.as_str(), &mut content)?;
+    }
+    Ok(archive.into_inner()?)
+}
+
 fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
-    let archive = archive_directory(source_checkout()?)?;
+    let archive = checkout_archive(source_checkout()?)?;
     if u64::try_from(archive.len()).map_err(|_size| WireError::Snapshot)? > wire::MAX_SNAPSHOT_BYTES
     {
         return Err(WireError::Snapshot.into());
@@ -316,6 +362,7 @@ fn stale(error: &TransportError) -> bool {
         | TransportError::Deployment(_)
         | TransportError::BuildMismatch
         | TransportError::SourceLink
+        | TransportError::SourceCollision
         | TransportError::RemoteShell => false,
     }
 }

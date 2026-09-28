@@ -28,5 +28,11 @@ serde_json.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 
+[build-dependencies]
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

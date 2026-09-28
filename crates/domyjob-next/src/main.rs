@@ -1,4 +1,5 @@
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::{Parser, Subcommand};
 use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineName, SubmissionId};
@@ -6,6 +7,7 @@ use domyjob_core::wire::CleanTarget;
 
 mod app;
 mod identity;
+mod source_fingerprint;
 mod store;
 mod transport;
 
@@ -14,6 +16,22 @@ mod transport;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReaperGroup(std::num::NonZeroI32);
+
+impl FromStr for ReaperGroup {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let group: i32 = text.parse().map_err(|_invalid| "invalid process group")?;
+        let group = std::num::NonZeroI32::new(group).ok_or("invalid process group")?;
+        if group.get() < 0 {
+            return Err("invalid process group");
+        }
+        Ok(Self(group))
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -60,7 +78,10 @@ enum Command {
         job: String,
     },
     #[command(hide = true)]
-    Node,
+    Node {
+        #[arg(long, hide = true)]
+        reap: Option<ReaperGroup>,
+    },
     #[command(hide = true)]
     Worker {
         job: String,
@@ -119,8 +140,12 @@ fn run(command: Command) -> Result<ExitCode, transport::TransportError> {
             transport::logs(&JobReference::try_from(job)?)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Node => {
-            transport::node()?;
+        Command::Node { reap } => {
+            if let Some(group) = reap {
+                domyjob::proc::reap(group.0.get());
+            } else {
+                transport::node()?;
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Worker { job, ready_event } => {
@@ -157,6 +182,28 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("domyjob: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn reaper_command_accepts_only_positive_groups() {
+        let parsed = Cli::try_parse_from(["domyjob-next", "node", "--reap", "17"]);
+        assert!(matches!(
+            parsed,
+            Ok(Cli {
+                command: Command::Node { reap: Some(_) }
+            })
+        ));
+        for value in ["0", "-1", "2147483648", "invalid"] {
+            let _error = Cli::try_parse_from(["domyjob-next", "node", "--reap", value])
+                .expect_err("invalid process group");
         }
     }
 }

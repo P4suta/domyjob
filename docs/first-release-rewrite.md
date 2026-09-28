@@ -8,7 +8,8 @@ The replacement is developed in `domyjob-core` and `domyjob-next` while the exis
 `domyjob-core` is always `no_std` and cannot import `std`.
 It owns validated identifiers, portable paths, commands, wire messages, ingress checks, and the total job state transition function.
 The `xtask gates` task checks that boundary and limits calls from `domyjob-next` into the old crate to the named effect adapters.
-Wire requests and replies use exhaustive enums, one framed JSON control message, explicit size limits, and a build fingerprint that changes with the implementation sources.
+Wire requests and replies use exhaustive enums, one framed JSON control message, explicit size limits, and a build fingerprint computed from every file under `crates/` and `xtask/`.
+The same source scanner runs at build time and client startup, so adding, changing, or deleting a source file invalidates the local and remote build automatically.
 
 ## Job model
 
