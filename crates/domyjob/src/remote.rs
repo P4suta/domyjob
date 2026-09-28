@@ -49,6 +49,8 @@ impl RemoteError {
             | Self::Start { .. }
             | Self::Exited { .. }
             | Self::Garbled { .. }
+            | Self::InvalidSurvey { .. }
+            | Self::IncompleteSurvey { .. }
             | Self::Refused { .. }
             | Self::Unreadable { .. }
             | Self::Silent { .. }
@@ -81,6 +83,8 @@ impl RemoteError {
             | Self::Pipe { machine, .. }
             | Self::Exited { machine, .. }
             | Self::Garbled { machine, .. }
+            | Self::InvalidSurvey { machine, .. }
+            | Self::IncompleteSurvey { machine }
             | Self::Refused { machine, .. }
             | Self::Unreadable { machine, .. }
             | Self::Silent { machine, .. }
@@ -370,6 +374,10 @@ pub enum RemoteError {
         detail: String,
         line: String,
     },
+    #[error("{machine}: sent an invalid watch survey: {detail}")]
+    InvalidSurvey { machine: String, detail: String },
+    #[error("{machine}: watch ended with an incomplete survey")]
+    IncompleteSurvey { machine: String },
     #[error("{machine}: {}", .refusal.detail)]
     Refused { machine: String, refusal: Refusal },
     #[error("{machine}: job {job} cannot be read ({why}); `domyjob doctor` checks the machine")]
@@ -1108,6 +1116,29 @@ struct Exchange {
     errors: std::thread::JoinHandle<String>,
     watchdog: crate::liveness::Watchdog,
     machine: String,
+}
+
+struct ObservedSink<'a> {
+    inner: &'a mut dyn Write,
+    failed: bool,
+}
+
+impl Write for ObservedSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let result = self.inner.write(bytes);
+        match &result {
+            Ok(0) if !bytes.is_empty() => self.failed = true,
+            Err(_) => self.failed = true,
+            Ok(_) => {}
+        }
+        result
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush();
+        self.failed |= result.is_err();
+        result
+    }
 }
 
 impl Exchange {
@@ -2094,7 +2125,16 @@ impl<'a> Link<'a> {
             .ok_or_else(|| pipe("sending")(std::io::Error::other("stdin was taken")))?;
         let result = std::thread::scope(|scope| {
             let writer = scope.spawn(move || send_request(stdin, &line, blobs));
-            let read = receive(&self.name(), &mut exchange.stdout, sink);
+            let mut observed = ObservedSink {
+                inner: sink,
+                failed: false,
+            };
+            let read = receive(&self.name(), &mut exchange.stdout, &mut observed);
+            if observed.failed {
+                match exchange.child.kill() {
+                    Ok(()) | Err(_) => {}
+                }
+            }
             match writer.join() {
                 Ok(Ok(held_open_until_the_reply_was_read)) => {
                     drop(held_open_until_the_reply_was_read);

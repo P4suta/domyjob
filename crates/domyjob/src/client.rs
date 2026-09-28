@@ -940,19 +940,48 @@ pub fn configure(
 }
 
 struct Surveys<'a> {
-    pending: Vec<u8>,
-    each: &'a mut dyn FnMut(crate::protocol::Survey),
+    lines: crate::bounded::LineBuffer,
+    each: &'a mut dyn FnMut(crate::protocol::Survey) -> std::io::Result<()>,
+    failure: Option<SurveyFailure>,
+}
+
+enum SurveyFailure {
+    InvalidJson(String),
+    TooLong,
+}
+
+impl std::fmt::Display for SurveyFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(reason) => write!(formatter, "invalid JSON: {reason}"),
+            Self::TooLong => write!(
+                formatter,
+                "a survey line exceeds {} bytes",
+                crate::bounded::SURVEY_LINE
+            ),
+        }
+    }
 }
 
 impl Write for Surveys<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.pending.extend_from_slice(bytes);
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            let survey = crate::ingress::json(&line).map_err(std::io::Error::other)?;
-            (self.each)(survey);
+        let each = &mut self.each;
+        let failure = &mut self.failure;
+        let result = self.lines.feed(bytes, |line| {
+            let survey = crate::ingress::json(line).map_err(|source| {
+                *failure = Some(SurveyFailure::InvalidJson(source.to_string()));
+                std::io::Error::other(source)
+            })?;
+            each(survey)
+        });
+        match result {
+            Ok(()) => Ok(bytes.len()),
+            Err(problem @ crate::bounded::LineFailure::TooLong(_)) => {
+                *failure = Some(SurveyFailure::TooLong);
+                Err(problem.into_io())
+            }
+            Err(crate::bounded::LineFailure::Io(error)) => Err(error),
         }
-        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -963,16 +992,30 @@ impl Write for Surveys<'_> {
 pub fn watch(
     ctx: &Context,
     machine: &Machine,
-    each: &mut dyn FnMut(crate::protocol::Survey),
+    each: &mut dyn FnMut(crate::protocol::Survey) -> std::io::Result<()>,
 ) -> Result<(), RemoteError> {
     let link = Link::open(&ctx.config, &ctx.dirs, machine)?;
     let mut surveys = Surveys {
-        pending: Vec::new(),
+        lines: crate::bounded::LineBuffer::survey(),
         each,
+        failure: None,
     };
-    link.stream(&Request::Watch, &mut surveys)?
+    let streamed = link.stream(&Request::Watch, &mut surveys);
+    if let Some(failure) = surveys.failure.take() {
+        return Err(RemoteError::InvalidSurvey {
+            machine: machine.name.to_string(),
+            detail: failure.to_string(),
+        });
+    }
+    streamed?
         .into_stream()
-        .map_err(|other| link.unexpected("a stream of surveys", *other))
+        .map_err(|other| link.unexpected("a stream of surveys", *other))?;
+    surveys
+        .lines
+        .finish()
+        .map_err(|_incomplete| RemoteError::IncompleteSurvey {
+            machine: machine.name.to_string(),
+        })
 }
 
 pub fn survey(
@@ -1104,6 +1147,8 @@ const fn retryability(error: &RemoteError) -> Retryability {
         | RemoteError::Empty { .. }
         | RemoteError::Start { .. }
         | RemoteError::Garbled { .. }
+        | RemoteError::InvalidSurvey { .. }
+        | RemoteError::IncompleteSurvey { .. }
         | RemoteError::Refused { .. }
         | RemoteError::Unreadable { .. }
         | RemoteError::Unexpected { .. }
@@ -1475,9 +1520,40 @@ mod tests {
                 },
                 Retryability::Final,
             ),
+            (
+                RemoteError::InvalidSurvey {
+                    machine: "peer".to_owned(),
+                    detail: "malformed".to_owned(),
+                },
+                Retryability::Final,
+            ),
+            (
+                RemoteError::IncompleteSurvey {
+                    machine: "peer".to_owned(),
+                },
+                Retryability::Final,
+            ),
         ] {
             assert_eq!(retryability(&error), expected, "{error}");
         }
+    }
+
+    #[test]
+    fn malformed_watch_json_is_recorded_as_a_peer_failure() {
+        let mut each = |_survey| panic!("an invalid survey was delivered");
+        let mut surveys = Surveys {
+            lines: crate::bounded::LineBuffer::survey(),
+            each: &mut each,
+            failure: None,
+        };
+        assert_eq!(
+            surveys.write(b"{}\n").unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+        assert!(matches!(
+            surveys.failure,
+            Some(SurveyFailure::InvalidJson(_))
+        ));
     }
 
     fn context(tmp: &tempfile::TempDir) -> Context {

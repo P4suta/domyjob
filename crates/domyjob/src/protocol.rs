@@ -277,10 +277,24 @@ pub enum RefusalCode {
 #[serde(deny_unknown_fields)]
 pub struct Survey {
     pub report: Report,
+    #[serde(deserialize_with = "bounded_watch_jobs")]
+    #[schemars(length(max = WATCH_JOB_LIMIT))]
     pub jobs: Vec<Job>,
 }
 
 impl crate::ingress::Ingress for Survey {}
+
+pub(crate) const WATCH_JOB_LIMIT: u32 = 50;
+
+fn bounded_watch_jobs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Job>, D::Error> {
+    crate::ingress::bounded_vec(
+        deserializer,
+        crate::domain::to_usize(WATCH_JOB_LIMIT),
+        "watch jobs",
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -328,40 +342,7 @@ impl std::ops::Deref for CleanReportItems {
 fn bounded_clean_items<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<Freeable>, D::Error> {
-    struct Bounded;
-
-    impl<'de> serde::de::Visitor<'de> for Bounded {
-        type Value = Vec<Freeable>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                formatter,
-                "at most {} cleanable items",
-                CLEAN_DETAIL_LIMIT + 1
-            )
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut sequence: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut items = Vec::with_capacity(CLEAN_DETAIL_LIMIT + 1);
-            while items.len() < CLEAN_DETAIL_LIMIT + 1 {
-                match sequence.next_element()? {
-                    Some(item) => items.push(item),
-                    None => return Ok(items),
-                }
-            }
-            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                return Err(<A::Error as serde::de::Error>::custom(
-                    "too many cleanable items",
-                ));
-            }
-            Ok(items)
-        }
-    }
-
-    deserializer.deserialize_seq(Bounded)
+    crate::ingress::bounded_vec(deserializer, CLEAN_DETAIL_LIMIT + 1, "cleanable items")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1077,12 +1058,8 @@ mod tests {
         assert!(!Reply::Stream.needs_content_retry());
     }
 
-    fn assert_phase_decision(
-        phase: Phase,
-        supervisor: Supervisor,
-        expected: (PhaseKind, State, bool, bool),
-    ) {
-        let job = Job {
+    fn job_with(phase: Phase, supervisor: Supervisor) -> Job {
+        Job {
             spec: Spec {
                 id: "0CCCCCCCCCCCCCCC".parse().unwrap(),
                 name: None,
@@ -1099,7 +1076,15 @@ mod tests {
             supervisor,
             behind: Vec::new(),
             notes: Vec::new(),
-        };
+        }
+    }
+
+    fn assert_phase_decision(
+        phase: Phase,
+        supervisor: Supervisor,
+        expected: (PhaseKind, State, bool, bool),
+    ) {
+        let job = job_with(phase, supervisor);
         assert_eq!(
             (
                 job.phase.kind(),
@@ -1109,6 +1094,43 @@ mod tests {
             ),
             expected
         );
+    }
+
+    #[test]
+    fn watch_surveys_refuse_more_jobs_than_the_sender_can_list() {
+        let report = Report {
+            host: RemoteText::new("host".into()),
+            os: RemoteText::new("unix".into()),
+            cores: 1,
+            load_hundredths: None,
+            memory_total: 1,
+            memory_available: 1,
+            disk: DiskSpace::Unavailable {
+                reason: RemoteText::new("unknown".into()),
+            },
+            uptime_seconds: 0,
+            paused: false,
+            max_jobs: Concurrency::DEFAULT,
+        };
+        let jobs = vec![
+            job_with(Phase::Queued, Supervisor::Gone);
+            crate::domain::to_usize(WATCH_JOB_LIMIT)
+        ];
+        let mut survey = serde_json::to_value(Survey { report, jobs }).unwrap();
+        let encoded = serde_json::to_vec(&survey).unwrap();
+        assert_eq!(
+            crate::ingress::json::<Survey>(&encoded).unwrap().jobs.len(),
+            crate::domain::to_usize(WATCH_JOB_LIMIT)
+        );
+        survey
+            .get_mut("jobs")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::Null);
+        let rejected =
+            crate::ingress::json::<Survey>(&serde_json::to_vec(&survey).unwrap()).unwrap_err();
+        assert!(rejected.to_string().contains("too many watch jobs"));
     }
 
     #[test]

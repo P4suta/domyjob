@@ -2105,7 +2105,7 @@ impl Node {
         output: &mut dyn Write,
     ) -> Result<(), NodeError> {
         let jobs = self.store.area("jobs");
-        let (wake, woken) = std::sync::mpsc::channel::<WatchWake>();
+        let (wake, woken) = std::sync::mpsc::sync_channel::<WatchWake>(1);
         let changed = wake.clone();
         let area = jobs.clone();
         let mut notifier =
@@ -2116,7 +2116,7 @@ impl Node {
                         WatchedPath::Other => false,
                     })
                 {
-                    match changed.send(WatchWake::Changed) {
+                    match changed.try_send(WatchWake::Changed) {
                         Ok(()) | Err(_) => {}
                     }
                 }
@@ -2137,15 +2137,19 @@ impl Node {
         });
         streamed(output, |framed| {
             loop {
-                let (listed, _unreadable) = self.list(principal, 50)?;
+                let (listed, _unreadable) =
+                    self.list(principal, crate::protocol::WATCH_JOB_LIMIT)?;
                 let survey = crate::protocol::Survey {
                     report: self.report()?,
                     jobs: listed,
                 };
-                let mut line =
-                    serde_json::to_vec(&survey).map_err(|e| NodeError::Output(e.into()))?;
-                line.push(b'\n');
-                framed.write_all(&line).map_err(NodeError::Output)?;
+                let mut line = crate::bounded::CappedVec::new(crate::bounded::SURVEY_LINE);
+                serde_json::to_writer(&mut line, &survey)
+                    .map_err(|error| NodeError::Output(error.into()))?;
+                line.write_all(b"\n").map_err(NodeError::Output)?;
+                framed
+                    .write_all(&line.into_vec())
+                    .map_err(NodeError::Output)?;
                 framed.flush().map_err(NodeError::Output)?;
                 match woken.recv() {
                     Ok(WatchWake::Changed) => {

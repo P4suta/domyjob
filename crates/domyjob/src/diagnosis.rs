@@ -137,6 +137,8 @@ fn remote_template(error: &RemoteError) -> Diagnosis {
             crate::framed::Unframed::Failed(refusal) => of_refusal(refusal.code),
         },
         RemoteError::Garbled { .. }
+        | RemoteError::InvalidSurvey { .. }
+        | RemoteError::IncompleteSurvey { .. }
         | RemoteError::Unexpected { .. }
         | RemoteError::Unsendable { .. }
         | RemoteError::Protocol { .. } => hinted(

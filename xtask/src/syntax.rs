@@ -947,6 +947,12 @@ const SNAPSHOT_BUDGET_RULE: &str =
     "snapshot file reads and worker counts must use fixed source budgets";
 const QUEUE_WATCH_RULE: &str =
     "queue lock watchers must be registered through bounded QueueWatchers";
+const SURVEY_BUFFER_RULE: &str =
+    "watch surveys must accumulate only through the bounded LineBuffer";
+const LIVE_UPDATE_RULE: &str = "live watch updates must use a one-item channel";
+const WATCH_WAKE_RULE: &str = "node watch wakes must use a one-item channel";
+const SUPERVISOR_EVENT_RULE: &str =
+    "supervisor events must use a bounded channel with a private sender";
 const CLI_FANOUT_RULE: &str = "short CLI fanout must use the shared sixteen-worker scheduler";
 const JOB_IDS_RULE: &str = "production job ID traversal must stream through JobIds";
 const SLOT_SCAN_RULE: &str =
@@ -1643,6 +1649,32 @@ impl Gate {
                             && matches!(field.vis, syn::Visibility::Inherited)))
         {
             self.flag(item.ident.span(), PEER_INGRESS_RULE);
+        }
+    }
+
+    fn check_survey_buffer(&mut self, item: &syn::ItemStruct) {
+        if self.file_is(&["client.rs"])
+            && item.ident == "Surveys"
+            && !item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == "lines")
+                    && is_named_type(&field.ty, "LineBuffer")
+                    && matches!(field.vis, syn::Visibility::Inherited)
+            })
+        {
+            self.flag(item.ident.span(), SURVEY_BUFFER_RULE);
+        }
+    }
+
+    fn check_supervisor_event_sender(&mut self, item: &syn::ItemStruct) {
+        if self.file_is(&["supervisor.rs"])
+            && item.ident == "Shared"
+            && !item.fields.iter().any(|field| {
+                field.ident.as_ref().is_some_and(|name| name == "events")
+                    && is_generic_of(&field.ty, "SyncSender", &["Event"])
+                    && matches!(field.vis, syn::Visibility::Inherited)
+            })
+        {
+            self.flag(item.ident.span(), SUPERVISOR_EVENT_RULE);
         }
     }
 
@@ -2695,6 +2727,8 @@ impl<'ast> Visit<'ast> for Gate {
         self.check_project_structure(item);
         self.check_editable_toml_type(item);
         self.check_origin_struct(item);
+        self.check_survey_buffer(item);
+        self.check_supervisor_event_sender(item);
         if self.file_is(&["provenance.rs"])
             && item.ident == "Labeled"
             && item
@@ -2901,6 +2935,26 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        let channel_rule = if self.file_is(&["cli.rs"]) && self.function.as_deref() == Some("live")
+        {
+            Some(LIVE_UPDATE_RULE)
+        } else if self.file_is(&["node.rs"]) && self.function.as_deref() == Some("watch") {
+            Some(WATCH_WAKE_RULE)
+        } else {
+            None
+        };
+        if self.test_depth == 0
+            && let Some(rule) = channel_rule
+            && let syn::Expr::Path(path) = call.func.as_ref()
+            && let Some(segment) = path.path.segments.last()
+            && (segment.ident == "channel" || segment.ident == "sync_channel")
+            && (segment.ident != "sync_channel"
+                || !matches!(call.args.first(), Some(syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(value), ..
+                })) if matches!(value.base10_parse::<usize>(), Ok(1))))
+        {
+            self.flag(call.paren_token.span.open(), rule);
+        }
         if self.file_is(&["node.rs"])
             && self.function.as_deref() == Some("visit_project_workspaces")
             && matches!(call.func.as_ref(), syn::Expr::Path(path)
@@ -3982,6 +4036,79 @@ mod tests {
                 Some(SNAPSHOT_BUDGET_RULE)
             );
         }
+    }
+
+    #[test]
+    fn watch_survey_accumulation_requires_a_bounded_type() {
+        assert_rule(
+            "struct Surveys { pending: Vec<u8> }",
+            "crates/domyjob/src/client.rs",
+            SURVEY_BUFFER_RULE,
+        );
+        assert!(
+            check_file(
+                "struct Surveys { lines: LineBuffer }",
+                "crates/domyjob/src/client.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_watch_updates_cannot_use_an_unbounded_channel() {
+        assert_rule(
+            "fn live() { std::sync::mpsc::channel(); }",
+            "crates/domyjob/src/cli.rs",
+            LIVE_UPDATE_RULE,
+        );
+        assert_rule(
+            "fn live() { std::sync::mpsc::sync_channel(64); }",
+            "crates/domyjob/src/cli.rs",
+            LIVE_UPDATE_RULE,
+        );
+        assert!(
+            check_file(
+                "fn live() { std::sync::mpsc::sync_channel(1); }",
+                "crates/domyjob/src/cli.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn node_watch_wakes_cannot_accumulate_without_a_limit() {
+        assert_rule(
+            "impl Node { fn watch(&self) { std::sync::mpsc::channel::<WatchWake>(); } }",
+            "crates/domyjob/src/node.rs",
+            WATCH_WAKE_RULE,
+        );
+        assert!(
+            check_file(
+                "impl Node { fn watch(&self) { std::sync::mpsc::sync_channel::<WatchWake>(1); } }",
+                "crates/domyjob/src/node.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn supervisor_events_require_a_bounded_sender() {
+        assert_rule(
+            "struct Shared { events: Sender<Event> }",
+            "crates/domyjob/src/supervisor.rs",
+            SUPERVISOR_EVENT_RULE,
+        );
+        assert!(
+            check_file(
+                "struct Shared { events: SyncSender<Event> }",
+                "crates/domyjob/src/supervisor.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

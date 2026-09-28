@@ -7,6 +7,7 @@ use std::sync::mpsc;
 
 pub const REQUEST_LINE: u64 = 1 << 20;
 pub const REPLY_LINE: u64 = 64 << 20;
+pub const SURVEY_LINE: u64 = REPLY_LINE;
 pub const BLOB: u64 = 8 << 30;
 pub const TAIL_WINDOW: u64 = 4 << 20;
 pub const IN_MEMORY_FILE: u64 = 64 << 20;
@@ -232,6 +233,75 @@ pub fn file_bytes(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
 pub fn text_file(path: &Path, limit: u64) -> std::io::Result<String> {
     let bytes = file_bytes(path, limit)?;
     String::from_utf8(bytes).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))
+}
+
+#[derive(Debug)]
+pub struct LineBuffer {
+    pending: Vec<u8>,
+    limit: u64,
+}
+
+#[derive(Debug)]
+pub enum LineFailure {
+    TooLong(u64),
+    Io(std::io::Error),
+}
+
+impl LineFailure {
+    #[must_use]
+    pub fn into_io(self) -> std::io::Error {
+        match self {
+            Self::TooLong(limit) => too_long(limit),
+            Self::Io(error) => error,
+        }
+    }
+}
+
+impl LineBuffer {
+    #[must_use]
+    pub const fn survey() -> Self {
+        Self::with_limit(SURVEY_LINE)
+    }
+
+    const fn with_limit(limit: u64) -> Self {
+        Self {
+            pending: Vec::new(),
+            limit,
+        }
+    }
+
+    pub fn feed(
+        &mut self,
+        bytes: &[u8],
+        mut line: impl FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<(), LineFailure> {
+        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if crate::domain::len_u64(self.pending.len().saturating_add(segment.len())) > self.limit
+            {
+                return Err(LineFailure::TooLong(self.limit));
+            }
+            self.pending
+                .try_reserve(segment.len())
+                .map_err(|error| LineFailure::Io(std::io::Error::other(error)))?;
+            self.pending.extend_from_slice(segment);
+            if segment.last() == Some(&b'\n') {
+                line(&self.pending).map_err(LineFailure::Io)?;
+                self.pending.clear();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(&self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "the last line ended without a newline",
+            ))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -521,6 +591,43 @@ mod tests {
             exactly(&mut short, 4, &mut |_| Ok(())).unwrap_err().kind(),
             ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn streamed_lines_limit_each_line_even_when_chunks_cross_boundaries() {
+        let mut lines = LineBuffer::with_limit(4);
+        let mut seen = Vec::new();
+        lines
+            .feed(b"ab", |line| {
+                seen.push(line.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        lines
+            .feed(b"\nxy\n", |line| {
+                seen.push(line.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, [b"ab\n".to_vec(), b"xy\n".to_vec()]);
+        lines.finish().unwrap();
+        lines.feed(b"1234", |_| Ok(())).unwrap();
+        assert_eq!(lines.pending.len(), 4);
+        assert!(matches!(
+            lines.feed(b"\n", |_| Ok(())),
+            Err(LineFailure::TooLong(4))
+        ));
+        assert_eq!(lines.pending.len(), 4);
+        assert_eq!(lines.finish().unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        let mut cancelled = LineBuffer::with_limit(4);
+        assert!(matches!(
+            cancelled.feed(b"a\n", |_| Err(ErrorKind::BrokenPipe.into())),
+            Err(LineFailure::Io(error)) if error.kind() == ErrorKind::BrokenPipe
+        ));
+        assert!(matches!(
+            cancelled.feed(b"a\n", |_| Err(ErrorKind::InvalidData.into())),
+            Err(LineFailure::Io(error)) if error.kind() == ErrorKind::InvalidData
+        ));
     }
 
     #[test]

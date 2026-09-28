@@ -2289,17 +2289,21 @@ fn live(json: bool) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     let redraw = !json && crate::view::stdout_is_a_person();
-    let (updates, arrivals) = std::sync::mpsc::channel();
+    let (updates, arrivals) = std::sync::mpsc::sync_channel(1);
     std::thread::scope(|scope| -> Result<(), CliError> {
+        let arrivals = arrivals;
         for machine in &machines {
             let updates = updates.clone();
             let ctx = &ctx;
             scope.spawn(move || {
                 let name = machine.name.clone();
-                let mut each = |survey: crate::protocol::Survey| match updates
-                    .send((name.clone(), Ok(survey)))
-                {
-                    Ok(()) | Err(_) => {}
+                let mut each = |survey: crate::protocol::Survey| {
+                    updates.send((name.clone(), Ok(survey))).map_err(|_closed| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "the live display stopped receiving updates",
+                        )
+                    })
                 };
                 let ended = match client::watch(ctx, machine, &mut each) {
                     Ok(()) => crate::output::MachineError::told(

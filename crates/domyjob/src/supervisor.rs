@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::authz::Submitter;
@@ -48,7 +48,9 @@ enum Event {
     Kill,
 }
 
-fn watch_lock_release(path: PathBuf, sender: Sender<Event>) {
+const EVENT_CAPACITY: usize = 130;
+
+fn watch_lock_release(path: PathBuf, sender: SyncSender<Event>) {
     std::thread::spawn(move || match OsLock::exclusive(&path) {
         Ok(lock) => {
             match lock.release() {
@@ -283,7 +285,7 @@ struct Shared {
     killed: AtomicBool,
     stop: OnceLock<Stop>,
     group: OnceLock<Arc<Group>>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     log_path: PathBuf,
     notes_path: PathBuf,
 }
@@ -338,12 +340,12 @@ impl Shared {
     }
 
     fn kill(&self, stop: Stop) -> Result<(), NodeError> {
-        match self.stop.set(stop) {
-            Ok(()) | Err(_) => {}
-        }
+        let first = self.stop.set(stop);
         self.killed.store(true, Ordering::SeqCst);
-        match self.events.send(Event::Kill) {
-            Ok(()) | Err(_) => {}
+        if first.is_ok() {
+            match self.events.send(Event::Kill) {
+                Ok(()) | Err(_) => {}
+            }
         }
         match self.group.get() {
             Some(group) => Ok(group.kill()?),
@@ -714,7 +716,7 @@ fn take_charge(
             })
         })?
         .len();
-    let (events, received) = std::sync::mpsc::channel();
+    let (events, received) = std::sync::mpsc::sync_channel(EVENT_CAPACITY);
     let shared = Arc::new(Shared {
         log: Mutex::new(Log::new(file, len)),
         grew: Condvar::new(),
@@ -843,7 +845,7 @@ impl Supervisor {
                         .iter()
                         .any(|path| path == &queue_changed || path == &settings_path)
                 {
-                    match changed.send(Event::Changed) {
+                    match changed.try_send(Event::Changed) {
                         Ok(()) | Err(_) => {}
                     }
                 }
@@ -1316,7 +1318,7 @@ mod tests {
             workspace: None,
             store: store.clone(),
         };
-        let (sender, events) = std::sync::mpsc::channel();
+        let (sender, events) = std::sync::mpsc::sync_channel(EVENT_CAPACITY);
         watch_lock_release(path.clone(), sender);
         let started_at = Timestamp::at_millis(1);
         held.begin_preparing(&id, started_at).unwrap();

@@ -6,6 +6,56 @@
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+pub(crate) fn bounded_vec<'de, D, T>(
+    deserializer: D,
+    limit: usize,
+    kind: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Bounded<T> {
+        limit: usize,
+        kind: &'static str,
+        marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Bounded<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "at most {} {}", self.limit, self.kind)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut items = Vec::with_capacity(self.limit);
+            while items.len() < self.limit {
+                match sequence.next_element()? {
+                    Some(item) => items.push(item),
+                    None => return Ok(items),
+                }
+            }
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(<A::Error as serde::de::Error>::custom(format!(
+                    "too many {}",
+                    self.kind
+                )));
+            }
+            Ok(items)
+        }
+    }
+
+    deserializer.deserialize_seq(Bounded {
+        limit,
+        kind,
+        marker: std::marker::PhantomData,
+    })
+}
+
 pub trait Ingress: DeserializeOwned {}
 
 #[derive(Debug, Deserialize)]
