@@ -671,7 +671,7 @@ fn report_missing(payload: &[(&BlobId, &Origin)], report: &dyn Fn(Stage<'_>)) {
     });
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum Stage<'a> {
     Connecting,
     Connected,

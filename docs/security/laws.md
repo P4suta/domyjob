@@ -22,7 +22,7 @@ The remaining conditions below keep a green test run from being mistaken for com
 | 2. Every value carries its origin | Source-specific text types, an opaque inbound `PeerRequest`, and sealed argument traits protect some sinks | Label all peer and repository values and require a named validation or neutralization step at each sink |
 | 3. Parse once, at the border | `ingress` owns several JSON and TOML decoders; the node decodes requests only as `PeerRequest` | Audit every external input and make the gate reject decoding or parsing it outside its border |
 | 4. Decisions are total | Enum-match lints apply crate-wide, job phase transitions require exhaustive typed cases, production phase-tag checks use one exhaustive `Phase::kind` mapping, several lifecycle, authorization, presentation, and lock decisions use exhaustive matches, platform features use a typed capability matrix, revocation has a typed selector, remote version comparison separates invalid input, retry classification covers every remote error, and the decision-signature gate covers the modules named above | Extend decision types and the signature gate to every security decision and state transition |
-| 5. Time decides nothing | Clock and timeout gates exist, `Elapsed` has no numeric getter or comparison traits, and the one silent-peer exception is documented | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
+| 5. Time decides nothing | Clock and timeout gates exist, production time values and the records that carry them have no comparison traits, and the one silent-peer exception is documented | Audit every remaining event decision and prove that no clock or elapsed time changes job or authorization state |
 | 6. Proof obligations | CI pins and runs fuzz, Kani, ProVerif, and authorization and trust mutations | Extend reproducible mutation runs and reviewed proof results to the remaining security-critical modules |
 | 7. Dependencies are audited | `cargo deny`, `cargo audit`, and a locked `cargo vet` import set check every Cargo lockfile, including fuzz; the vet gate rejects a new version without audit evidence or a new explicit exemption | Review and remove the 267 existing exact-version exemptions, especially cryptography, input parsers, and process-control crates, and require explicit review of any new exemption |
 
@@ -200,8 +200,9 @@ A supervisor reports that it started through a pipe or a kernel event, and its d
 Stopping a job kills its whole process tree at once.
 Files count as unchanged when their content hashes match.
 Pairing offers, grants, and connections are bounded by counts and by explicit revocation, never by an expiry.
-The wall clock is read in one place, `clock::Timestamp::observe`, and its value only records when something happened for a person to read: `Timestamp` has no ordering, so it cannot be compared to decide anything.
-`Elapsed` no longer exposes milliseconds or comparison traits; its median and relative age labels stay inside `clock`, while JSON output retains the existing numeric millisecond field.
+The wall clock is read in one place, `clock::Timestamp::observe`, and its value only records when something happened for a person to read.
+`Timestamp` and `Elapsed` have no comparison traits in production, and that restriction also reaches job, reply, trust, and audit records that carry timestamps.
+`Elapsed` exposes no numeric getter; its median and relative age labels stay inside `clock`, while JSON output retains the existing numeric millisecond field.
 
 **The one exception: whether a silent peer is still there.** No event can tell a peer that has stopped from one that is slow: a machine that accepts ssh but never starts the command, or a network that drops without a reset, produces no byte, no EOF, and no exit.
 So time decides exactly one thing, and only in `liveness.rs`.
@@ -212,7 +213,7 @@ It never touches a job: the job keeps running, its state stays whatever its lock
 
 **Check.** `clippy.toml` disallows `SystemTime`, `Instant`, `Duration`, `thread::sleep`, every timeout setter and timed receive, and file timestamps; the gate refuses those types and any method whose name is a sleep, a timeout, a deadline, or a file time, in tests as much as in code, everywhere but `clock.rs`.
 `liveness.rs` alone may use `Instant`, `Duration`, `elapsed`, and a condition variable's `wait_timeout`; it may not read the wall clock, sleep, or set a timeout on I/O, and the gate's own tests check both halves.
-The syntax gate also fixes `Timestamp` and `Elapsed` as private numeric wrappers and rejects public numeric getters and ordering implementations.
+The syntax gate also fixes `Timestamp` and `Elapsed` as private numeric wrappers and rejects public numeric getters, production comparison derives, and comparison implementations.
 
 ## 6. Proof obligations
 

@@ -2120,22 +2120,12 @@ impl<'a> Link<'a> {
 }
 
 fn unexpected_reply(machine: String, expected: &'static str, got: Reply) -> RemoteError {
-    match got {
-        Reply::Refused(refusal) => RemoteError::Refused { machine, refusal },
-        other @ (Reply::Hello(_)
-        | Reply::NeedBlobs { .. }
-        | Reply::Job(_)
-        | Reply::Jobs { .. }
-        | Reply::AuditAt { .. }
-        | Reply::AuditHead(_)
-        | Reply::Digest(_)
-        | Reply::Found(_)
-        | Reply::Report(_)
-        | Reply::Cleaned(_)
-        | Reply::Stream) => RemoteError::Unexpected {
+    match got.refusal().cloned() {
+        Some(refusal) => RemoteError::Refused { machine, refusal },
+        None => RemoteError::Unexpected {
             machine,
             expected,
-            got: Box::new(other),
+            got: Box::new(got),
         },
     }
 }
@@ -2210,23 +2200,33 @@ pub fn receive(
             });
         }
     };
-    if reply != Reply::Stream {
-        return Ok(reply);
-    }
-    match crate::framed::unframe(reader, sink) {
-        Ok(_bytes) => Ok(reply),
-        Err(crate::framed::Unframed::Failed(refusal)) => Ok(Reply::Refused(refusal)),
-        Err(
-            problem @ (crate::framed::Unframed::Truncated
-            | crate::framed::Unframed::Malformed(_)
-            | crate::framed::Unframed::Damaged(_)
-            | crate::framed::Unframed::Reading(_)
-            | crate::framed::Unframed::Writing(_)),
-        ) => Err(RemoteError::Stream {
-            machine: machine.to_owned(),
-            doing: "streaming",
-            problem,
-        }),
+    match reply {
+        Reply::Stream => match crate::framed::unframe(reader, sink) {
+            Ok(_bytes) => Ok(Reply::Stream),
+            Err(crate::framed::Unframed::Failed(refusal)) => Ok(Reply::Refused(refusal)),
+            Err(
+                problem @ (crate::framed::Unframed::Truncated
+                | crate::framed::Unframed::Malformed(_)
+                | crate::framed::Unframed::Damaged(_)
+                | crate::framed::Unframed::Reading(_)
+                | crate::framed::Unframed::Writing(_)),
+            ) => Err(RemoteError::Stream {
+                machine: machine.to_owned(),
+                doing: "streaming",
+                problem,
+            }),
+        },
+        other @ (Reply::Hello(_)
+        | Reply::NeedBlobs { .. }
+        | Reply::Job(_)
+        | Reply::Jobs { .. }
+        | Reply::AuditAt { .. }
+        | Reply::AuditHead(_)
+        | Reply::Digest(_)
+        | Reply::Found(_)
+        | Reply::Report(_)
+        | Reply::Cleaned(_)
+        | Reply::Refused(_)) => Ok(other),
     }
 }
 

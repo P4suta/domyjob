@@ -40,7 +40,7 @@ pub enum Verdict {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, from = "StoredEntry")]
 pub struct Entry {
     pub epoch: u64,

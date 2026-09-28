@@ -129,7 +129,7 @@ pub enum Follow {
     Snapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reply")]
 pub enum Reply {
     Hello(Hello),
@@ -217,7 +217,7 @@ impl Reply {
     into_variant!(into_found, Found, Self::Found(found) => found);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Digest {
     pub job: Job,
@@ -273,7 +273,7 @@ pub enum RefusalCode {
     Paused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Survey {
     pub report: Report,
@@ -608,7 +608,7 @@ pub enum Queue {
     Now,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub id: JobId,
@@ -630,7 +630,8 @@ impl Spec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 pub enum Phase {
     Queued,
@@ -691,7 +692,7 @@ pub enum Supervisor {
     Gone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
     pub spec: Spec,

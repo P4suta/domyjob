@@ -2,7 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(transparent)]
 pub struct Timestamp(i64);
 

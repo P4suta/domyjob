@@ -3623,7 +3623,7 @@ mod tests {
             let wire = ask(&node, &request);
             let mut got = Vec::new();
             let reply = crate::remote::receive("m", &mut wire.as_slice(), &mut got).unwrap();
-            assert_eq!(reply, Reply::Stream);
+            reply.into_stream().unwrap();
             assert_eq!(got, expected);
             let header = wire.iter().position(|b| *b == b'\n').unwrap();
             for cut in header.saturating_add(1)..wire.len() {

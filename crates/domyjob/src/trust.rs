@@ -166,7 +166,8 @@ impl Identity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(deny_unknown_fields)]
 pub struct Server {
     pub public_key: PublicKey,
@@ -174,7 +175,8 @@ pub struct Server {
     pub paired_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     label: MachineName,
@@ -216,7 +218,7 @@ impl Grant {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Trust {
     servers: BTreeMap<MachineName, Server>,

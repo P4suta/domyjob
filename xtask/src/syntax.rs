@@ -476,6 +476,26 @@ fn derives(attrs: &[syn::Attribute], name: &str) -> bool {
         })
 }
 
+fn conditionally_derives_time_comparison(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().filter(|attr| attr.path().is_ident("cfg_attr")).any(|attr| {
+        let Ok(arguments) = attr.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return true;
+        };
+        let mut arguments = arguments.iter();
+        let test_only = matches!(arguments.next(), Some(syn::Meta::Path(path)) if path.is_ident("test"));
+        !test_only && arguments.any(|argument| {
+            matches!(argument, syn::Meta::List(derive) if derive.path.is_ident("derive")
+                && derive.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated
+                ).is_ok_and(|traits| traits.iter().any(|name|
+                    name.segments.last().is_some_and(|segment|
+                        ["PartialEq", "Eq", "PartialOrd", "Ord"].contains(&segment.ident.to_string().as_str())))))
+        })
+    })
+}
+
 const fn has_named_fields(fields: &syn::Fields) -> bool {
     matches!(fields, syn::Fields::Named(_))
 }
@@ -2082,18 +2102,17 @@ impl Gate {
     }
 
     fn check_opaque_time_impl(&mut self, item: &syn::ItemImpl) {
-        if !self.file_is(CLOCK_FILES)
-            || (!is_named_type(&item.self_ty, "Timestamp")
-                && !is_named_type(&item.self_ty, "Elapsed"))
-        {
+        if !is_named_type(&item.self_ty, "Timestamp") && !is_named_type(&item.self_ty, "Elapsed") {
+            return;
+        }
+        if !self.file_is(CLOCK_FILES) {
+            self.flag(item.impl_token.span, OPAQUE_TIME_RULE);
             return;
         }
         if let Some((trait_path, _)) = &item.trait_
             && trait_path.segments.last().is_some_and(|segment| {
                 let name = segment.ident.to_string();
-                ["PartialOrd", "Ord", "Deref", "AsRef"].contains(&name.as_str())
-                    || (is_named_type(&item.self_ty, "Elapsed")
-                        && ["PartialEq", "Eq"].contains(&name.as_str()))
+                ["PartialEq", "Eq", "PartialOrd", "Ord", "Deref", "AsRef"].contains(&name.as_str())
             })
         {
             self.flag(item.impl_token.span, OPAQUE_TIME_RULE);
@@ -2118,10 +2137,10 @@ impl Gate {
                 && fields.unnamed.iter().all(|field|
                     matches!(field.vis, syn::Visibility::Inherited)
                         && is_named_type(&field.ty, "i64")));
-        let comparable = derives(&item.attrs, "PartialOrd")
-            || derives(&item.attrs, "Ord")
-            || (item.ident == "Elapsed"
-                && (derives(&item.attrs, "PartialEq") || derives(&item.attrs, "Eq")));
+        let comparable = ["PartialEq", "Eq", "PartialOrd", "Ord"]
+            .iter()
+            .any(|trait_name| derives(&item.attrs, trait_name))
+            || conditionally_derives_time_comparison(&item.attrs);
         if !private_i64 || comparable {
             self.flag(item.ident.span(), OPAQUE_TIME_RULE);
         }
@@ -4594,6 +4613,8 @@ mod tests {
             "pub struct Timestamp(pub i64);",
             "pub struct Elapsed(i32);",
             "#[derive(PartialOrd)] pub struct Timestamp(i64);",
+            "#[derive(PartialEq)] pub struct Timestamp(i64);",
+            "#[cfg_attr(not(test), derive(PartialEq, Eq))] pub struct Timestamp(i64);",
             "#[derive(PartialEq)] pub struct Elapsed(i64);",
             "pub struct Elapsed(i64); impl Elapsed { pub fn millis(self) -> i64 { self.0 } }",
             "pub struct Timestamp(i64); impl Timestamp { pub fn raw(&self) -> Option<&i64> { Some(&self.0) } }",
@@ -4603,11 +4624,16 @@ mod tests {
         }
         assert!(
             check_file(
-                "pub struct Elapsed(i64); impl Elapsed { pub fn label(self) -> String { String::new() } }",
+                "#[cfg_attr(test, derive(PartialEq, Eq))] pub struct Timestamp(i64); pub struct Elapsed(i64); impl Elapsed { pub fn label(self) -> String { String::new() } }",
                 file
             )
             .unwrap()
             .is_empty()
+        );
+        assert_rule(
+            "impl PartialEq for Timestamp {}",
+            "src/protocol.rs",
+            OPAQUE_TIME_RULE,
         );
     }
 
