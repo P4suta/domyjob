@@ -10,6 +10,7 @@ Build the client with `mise x -- cargo build --locked -p domyjob`, then run `tar
 The client compares the complete source fingerprint with its compiled fingerprint and rebuilds itself when the checkout changes.
 Before each remote request, it compares the remote fingerprint and builds and installs the matching node over SSH when needed.
 The binary embeds its build source, so an installed copy can perform the first remote installation without its checkout.
+Each build installs into its own remote executable path, allowing older jobs to keep running during an update.
 The remote machine needs `mise`, Rust, Cargo, and a working OpenSSH login.
 
 ```console

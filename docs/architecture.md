@@ -41,6 +41,7 @@ The build script fingerprints every source file under `crates/` and `xtask/`, th
 The client compares that fingerprint at startup and rebuilds from the checkout if necessary.
 Before a remote RPC, it compares the node fingerprint and installs a matching binary from a portable archive embedded in the client build.
 That archive remains available when the original checkout is unavailable.
+Nodes use build-specific executable paths under `~/.cargo/domyjob/versions/`, so installing a new build does not replace the executable of a running worker.
 A persistent Cargo target directory on each remote host reuses compiled dependencies.
 
 Automatic local rebuild requires a development checkout, while remote installation always uses the embedded source archive.

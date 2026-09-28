@@ -72,7 +72,14 @@ impl Drop for SshChild {
 
 impl SshChild {
     fn start(machine: &MachineName) -> Result<Self, TransportError> {
-        Self::start_command(machine, "~/.cargo/bin/domyjob node", Stdio::piped())
+        Self::start_command(
+            machine,
+            &format!(
+                "~/.cargo/domyjob/versions/{}/bin/domyjob node",
+                identity::tag()
+            ),
+            Stdio::piped(),
+        )
     }
 
     fn start_command(
@@ -250,13 +257,14 @@ fn remote_shell(machine: &MachineName) -> Result<RemoteShell, TransportError> {
     }
 }
 
-fn install_command(shell: RemoteShell) -> String {
+fn install_command(shell: RemoteShell, build: &str) -> String {
     match shell {
         RemoteShell::Unix => String::from(
-            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo clean -p domyjob; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --force; cd "$HOME"; rm -rf -- "$work"'"#,
-        ),
+            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; install="$HOME/.cargo/domyjob/versions/@BUILD@"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root "$install" --force; cd "$HOME"; rm -rf -- "$work"'"#,
+        )
+        .replace("@BUILD@", build),
         RemoteShell::Windows => {
-            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo clean -p domyjob; if ($LASTEXITCODE -ne 0) { throw "build cache cleanup failed" }; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#;
+            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $install=Join-Path $env:USERPROFILE ".cargo\domyjob\versions\@BUILD@"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root $install --force; $result=$LASTEXITCODE; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#.replace("@BUILD@", build);
             let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             format!(
                 "powershell.exe -NoProfile -EncodedCommand {}",
@@ -272,7 +280,7 @@ fn bootstrap(machine: &MachineName) -> Result<(), TransportError> {
     {
         return Err(WireError::Snapshot.into());
     }
-    let command = install_command(remote_shell(machine)?);
+    let command = install_command(remote_shell(machine)?, &identity::tag());
     eprintln!(
         "{}: updating remote binary from this build",
         machine.as_str()

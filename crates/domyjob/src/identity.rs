@@ -13,6 +13,10 @@ pub(crate) const fn current() -> BuildId {
     BuildId::from_fingerprint(COMPILED_FINGERPRINT)
 }
 
+pub(crate) fn tag() -> String {
+    format!("{COMPILED_FINGERPRINT:016x}")
+}
+
 pub(crate) fn checkout() -> Result<Option<BuildId>, std::io::Error> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
