@@ -1045,6 +1045,47 @@ const DECISION_FILES: &[&str] = &[
     "client.rs",
     "remote.rs",
 ];
+const DECISION_SIGNATURE_RULE: &str = "security decisions return an enum, never bool";
+const LEGACY_BOOL_SIGNATURES: &[(&str, &str)] = &[
+    ("board.rs", "is_quiet"),
+    ("board.rs", "is_live"),
+    ("build_stamp.rs", "source_dir"),
+    ("build_stamp.rs", "source_file"),
+    ("cas.rs", "has"),
+    ("cli.rs", "is_output_broken_pipe"),
+    ("cli.rs", "wants_json"),
+    ("dist.rs", "permits_source_fallback"),
+    ("dist.rs", "run"),
+    ("dist.rs", "fetch"),
+    ("domain.rs", "portable_component"),
+    ("domain.rs", "crockford"),
+    ("domain.rs", "matches"),
+    ("liveness.rs", "silenced"),
+    ("paths.rs", "enabled"),
+    ("paths.rs", "links"),
+    ("paths.rs", "modes"),
+    ("paths.rs", "load_average"),
+    ("paths.rs", "agent_socket"),
+    ("paths.rs", "replaces_running_executables"),
+    ("platform.rs", "is_reparse_point"),
+    ("platform.rs", "elevated"),
+    ("proc.rs", "inside_remote_session"),
+    ("protocol.rs", "needs_content_retry"),
+    ("protocol.rs", "counts_as_running"),
+    ("protocol.rs", "has_timing_sample"),
+    ("protocol.rs", "is_settled"),
+    ("protocol.rs", "succeeded"),
+    ("secure.rs", "is_disconnected"),
+    ("service.rs", "is_installed"),
+    ("shell.rs", "on_path"),
+    ("snapshot.rs", "metadata"),
+    ("template.rs", "is_empty"),
+    ("terminal.rs", "dangerous"),
+    ("ui.rs", "unicode"),
+    ("ui.rs", "stderr_is_live"),
+    ("user_files.rs", "present"),
+    ("view.rs", "stdout_is_a_person"),
+];
 const TERMINAL_FILES: &[&str] = &["view.rs", "ui.rs", "board.rs", "history.rs", "cli.rs"];
 const FAILURE_FILES: &[&str] = &[
     "failure.rs",
@@ -1123,13 +1164,34 @@ fn is_textual(ty: &syn::Type) -> bool {
     }
 }
 
+fn cfg_requires_test(condition: &syn::Meta) -> bool {
+    match condition {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let Ok(parts) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if parts.is_empty() {
+                return false;
+            }
+            if list.path.is_ident("all") {
+                parts.iter().any(cfg_requires_test)
+            } else {
+                parts.iter().all(cfg_requires_test)
+            }
+        }
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+    }
+}
+
 fn is_test_module(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
-            && match &attr.meta {
-                syn::Meta::List(list) => list.tokens.to_string().contains("test"),
-                syn::Meta::Path(_) | syn::Meta::NameValue(_) => false,
-            }
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|condition| cfg_requires_test(&condition))
     })
 }
 
@@ -2076,12 +2138,18 @@ impl Gate {
         }
     }
 
-    fn check_signature(&mut self, sig: &syn::Signature) {
-        if self.test_depth == 0 && self.file_is(DECISION_FILES) && returns_bool(&sig.output) {
-            self.flag(
-                sig.ident.span(),
-                "security decisions return an enum, never bool",
-            );
+    fn check_signature(&mut self, sig: &syn::Signature, attrs: &[syn::Attribute]) {
+        let legacy = !self.file_is(DECISION_FILES)
+            && LEGACY_BOOL_SIGNATURES
+                .iter()
+                .any(|(file, name)| self.file_is(&[file]) && sig.ident == *name);
+        if self.test_depth == 0
+            && !is_test_module(attrs)
+            && (self.file_is(DECISION_FILES) || self.file.starts_with("crates/domyjob/src/"))
+            && returns_bool(&sig.output)
+            && !legacy
+        {
+            self.flag(sig.ident.span(), DECISION_SIGNATURE_RULE);
         }
     }
 
@@ -2484,7 +2552,7 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        self.check_signature(&item.sig);
+        self.check_signature(&item.sig, &item.attrs);
         self.check_state_constructor(&item.sig);
         self.check_version_function(item);
         if self.file_is(&["store.rs"])
@@ -2535,7 +2603,7 @@ impl<'ast> Visit<'ast> for Gate {
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        self.check_signature(&item.sig);
+        self.check_signature(&item.sig, &item.attrs);
         self.check_state_constructor(&item.sig);
         self.check_workspace_project_order(&item.sig, &item.block);
         self.check_version_method(item);
@@ -3816,6 +3884,45 @@ mod tests {
     }
 
     #[test]
+    fn new_boolean_signatures_are_checked_across_product_modules() {
+        let file = "crates/domyjob/src/new_area.rs";
+        for source in [
+            "fn decision() -> bool { true }",
+            "fn decision() -> Result<bool, Error> { Ok(true) }",
+            "#[cfg(not(test))] fn decision() -> bool { true }",
+            "#[cfg(any(test, unix))] fn decision() -> bool { true }",
+        ] {
+            assert_rule(source, file, DECISION_SIGNATURE_RULE);
+        }
+        for source in [
+            "#[cfg(test)] fn fixture() -> bool { true }",
+            "#[cfg(all(test, unix))] fn fixture() -> bool { true }",
+            "#[cfg(any(all(test, unix), all(test, windows)))] fn fixture() -> bool { true }",
+        ] {
+            assert!(check_file(source, file).unwrap().is_empty(), "{source}");
+        }
+        assert!(
+            check_file(
+                "fn source_dir(path: &Path) -> bool { path.is_dir() }",
+                "crates/domyjob/src/build_stamp.rs"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_rule(
+            "fn source_dir(path: &Path) -> bool { path.is_dir() }",
+            file,
+            DECISION_SIGNATURE_RULE,
+        );
+        let names = enum_names(
+            "#[cfg(not(test))] enum Production { Ready } #[cfg(test)] enum Fixture { Ready }",
+        )
+        .unwrap();
+        assert!(names.contains("Production"));
+        assert!(!names.contains("Fixture"));
+    }
+
+    #[test]
     fn imports_cannot_hide_protected_decoders_or_file_reads() {
         let file = "crates/domyjob/src/node.rs";
         for (source, rule) in [
@@ -4247,7 +4354,13 @@ mod tests {
             ),
             ("impl Link { fn discover(&self) {} }", remote),
         ] {
-            assert_rule(source, file, VERSION_DECISION_RULE);
+            assert!(
+                check_file(source, file)
+                    .unwrap()
+                    .iter()
+                    .any(|finding| finding.rule == VERSION_DECISION_RULE),
+                "{source}"
+            );
         }
         for (source, file) in [
             (
