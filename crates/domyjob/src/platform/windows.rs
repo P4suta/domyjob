@@ -1,5 +1,3 @@
-//! Windows: access control lists, reparse points, and extensions instead of modes.
-
 use std::fs;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt as _;
@@ -13,7 +11,6 @@ use super::{Ownership, System, variable, windows_acl};
 #[derive(Debug)]
 pub(super) struct Windows;
 
-/// An access control list that lets other users reach a private file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Acl;
 

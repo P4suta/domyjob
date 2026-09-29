@@ -8,7 +8,6 @@ use core::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
-/// A chat value failed its structural validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("invalid chat {0}")]
 pub struct Invalid(pub &'static str);
@@ -24,12 +23,10 @@ const fn check(valid: bool, what: &'static str) -> Result<(), Invalid> {
     if valid { Ok(()) } else { Err(Invalid(what)) }
 }
 
-validated_string!(
-    /// The durable identity of one machine's chat ledger: 32 lowercase hexadecimal digits.
-    Origin,
-    Invalid,
-    |text| check(lower_hex(text, 32), "machine identity")
-);
+validated_string!(Origin, Invalid, |text| check(
+    lower_hex(text, 32),
+    "machine identity"
+));
 
 impl Origin {
     #[must_use]
@@ -47,18 +44,14 @@ fn valid_handle(text: &str) -> bool {
             .all(|byte| lower(byte) || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-validated_string!(
-    /// An agent handle of 1 to 64 lowercase ASCII letters, digits, `.`, `-`, or `_`, starting with a letter or digit.
-    AgentName,
-    Invalid,
-    |text| check(valid_handle(text), "agent name")
-);
-validated_string!(
-    /// A room handle with the same spelling rules as an agent handle.
-    RoomName,
-    Invalid,
-    |text| check(valid_handle(text), "room name")
-);
+validated_string!(AgentName, Invalid, |text| check(
+    valid_handle(text),
+    "agent name"
+));
+validated_string!(RoomName, Invalid, |text| check(
+    valid_handle(text),
+    "room name"
+));
 
 fn split_pair<A, B>(text: &str, separator: char, what: &'static str) -> Result<(A, B), Invalid>
 where
@@ -72,7 +65,6 @@ where
     ))
 }
 
-/// An AI agent: its handle on the machine whose ledger publishes it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct AgentId {
@@ -118,7 +110,6 @@ impl fmt::Display for AgentId {
     }
 }
 
-/// One event of one origin's ledger, written `ORIGIN:SEQUENCE` with 16 lowercase hexadecimal digits.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct EventId {
@@ -175,7 +166,6 @@ impl fmt::Display for EventId {
     }
 }
 
-/// A room is owned by the ledger that opened it; only that ledger may change it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoomId {
     origin: Origin,
@@ -205,7 +195,6 @@ impl fmt::Display for RoomId {
     }
 }
 
-/// Where a message belongs: a two-agent direct conversation or a room.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Conversation {
@@ -213,7 +202,6 @@ pub enum Conversation {
     Room(RoomId),
 }
 
-/// The two distinct agents of a direct conversation, in sorted order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirectPair {
     first: AgentId,
@@ -221,7 +209,6 @@ pub struct DirectPair {
 }
 
 impl DirectPair {
-    /// The conversation shared by two distinct agents, independent of their order.
     pub fn between(one: &AgentId, other: &AgentId) -> Result<Self, Invalid> {
         let (first, second) = match one.cmp(other) {
             core::cmp::Ordering::Less => (one, other),
@@ -239,7 +226,6 @@ impl DirectPair {
         self.first == *agent || self.second == *agent
     }
 
-    /// The participant that is not `agent`, when `agent` takes part.
     #[must_use]
     pub fn other(&self, agent: &AgentId) -> Option<&AgentId> {
         if self.first == *agent {
@@ -258,12 +244,10 @@ impl DirectPair {
 }
 
 impl Conversation {
-    /// The direct conversation of two distinct agents.
     pub fn direct(one: &AgentId, other: &AgentId) -> Result<Self, Invalid> {
         DirectPair::between(one, other).map(Self::Direct)
     }
 
-    /// Whether `agent` may author in this conversation without consulting room membership.
     #[must_use]
     pub fn admits_author(&self, agent: &AgentId) -> bool {
         match self {
@@ -350,32 +334,16 @@ fn valid_text(text: &str, max: usize, multiline: bool) -> bool {
             .any(|character| character.is_control() && !(multiline && character == '\n'))
 }
 
-bounded_text!(
-    /// One trimmed line without control characters.
-    Line,
-    false,
-    "single-line text"
-);
-bounded_text!(
-    /// Trimmed text whose only control character is a line break.
-    Paragraph,
-    true,
-    "paragraph"
-);
+bounded_text!(Line, false, "single-line text");
+bounded_text!(Paragraph, true, "paragraph");
 
 pub const MAX_TEXT: usize = 64 * 1024;
 
-validated_string!(
-    /// Message text: 1 byte to 64 KiB of UTF-8 with visible content and no NUL.
-    Text,
-    Invalid,
-    |text| check(
-        text.len() <= MAX_TEXT && !text.trim().is_empty() && !text.contains('\0'),
-        "message text"
-    )
-);
+validated_string!(Text, Invalid, |text| check(
+    text.len() <= MAX_TEXT && !text.trim().is_empty() && !text.contains('\0'),
+    "message text"
+));
 
-/// The machines allowed to receive an event's content, sorted and unique.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Origin>", into = "Vec<Origin>")]
 pub struct Audience(Vec<Origin>);

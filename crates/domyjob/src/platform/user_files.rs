@@ -1,5 +1,3 @@
-//! Files outside domyjob's private state that setup installs for the user.
-
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,7 +21,6 @@ fn failed(action: &'static str, path: &Path) -> impl FnOnce(io::Error) -> UserFi
     }
 }
 
-/// Read a configuration file of at most 4 MiB; a missing file reads as `None`.
 pub(crate) fn read(path: &Path) -> Result<Option<String>, UserFileError> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
@@ -38,10 +35,6 @@ pub(crate) fn read(path: &Path) -> Result<Option<String>, UserFileError> {
         .map_err(|error| failed("reading", path)(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
-/// Replace a file atomically, creating its directory when needed.
-///
-/// An existing file is replaced where it really lives, through any symbolic link, and keeps its permissions,
-/// so a configuration linked from a dotfiles repository stays linked and keeps its mode.
 pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
     let (target, permissions) = match fs::canonicalize(path) {
         Ok(real) => {
@@ -78,7 +71,6 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
     Ok(())
 }
 
-/// Remove a file; a missing file is already removed.
 pub(crate) fn remove(path: &Path) -> Result<bool, UserFileError> {
     match super::raw::remove_file(path) {
         Ok(()) => Ok(true),
@@ -87,7 +79,6 @@ pub(crate) fn remove(path: &Path) -> Result<bool, UserFileError> {
     }
 }
 
-/// Install an executable at a build-specific `target`; an existing target already holds that build.
 pub(crate) fn install_executable(source: &Path, target: &Path) -> Result<(), UserFileError> {
     match fs::metadata(target) {
         Ok(_) => return Ok(()),

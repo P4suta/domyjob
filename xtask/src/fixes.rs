@@ -1,9 +1,3 @@
-//! A fix is committed only together with a test that would have caught it.
-//!
-//! A commit of type `fix` that changes product code must also change a test:
-//! a test file or module, a fuzz seed, a format specimen, or a line that adds a test or an assertion.
-//! A fix that exists only as code is lost in the next rewrite, as an archive timestamp fix once was.
-
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,9 +5,7 @@ pub enum FixError {
     #[error("reading the commit message: {0}")]
     Message(std::io::Error),
     #[error("asking git for the staged change: {0}")]
-    Git(std::io::Error),
-    #[error("git failed: {0}")]
-    GitFailed(String),
+    Git(String),
     #[error(
         "a `fix` that changes product code needs a test that fails without it; \
          stage the test with the fix, or name the commit for what it is"
@@ -21,7 +13,6 @@ pub enum FixError {
     Untested,
 }
 
-/// Whether the commit message's subject has the type `fix`.
 fn is_fix(message: &str) -> bool {
     let subject = message
         .lines()
@@ -53,14 +44,12 @@ fn test_path(path: &str) -> bool {
         || path.starts_with("crates/domyjob/formats/")
 }
 
-/// Whether an added line of a staged diff adds a test or an assertion.
 fn adds_a_check(line: &str) -> bool {
     line.starts_with('+')
         && !line.starts_with("+++")
         && (line.contains("#[test]") || line.contains("assert"))
 }
 
-/// Refuse an untested fix, judged from the message and the staged change.
 pub fn check(message: &str, staged: &[&str], diff: &str) -> Result<(), FixError> {
     if !is_fix(message) || !staged.iter().any(|path| product(path)) {
         return Ok(());
@@ -72,24 +61,9 @@ pub fn check(message: &str, staged: &[&str], diff: &str) -> Result<(), FixError>
 }
 
 fn git(root: &Path, arguments: &[&str]) -> Result<String, FixError> {
-    let output = crate::raw::command("git")
-        .current_dir(root)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(std::process::Child::wait_with_output)
-        .map_err(FixError::Git)?;
-    if !output.status.success() {
-        return Err(FixError::GitFailed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    crate::git(root, arguments).map_err(FixError::Git)
 }
 
-/// The commit-msg hook: check the message at `path` against the staged change in `root`.
 pub fn commit_msg(root: &Path, path: &Path) -> Result<(), FixError> {
     let message = crate::raw::read_to_string(path).map_err(FixError::Message)?;
     if !is_fix(&message) {

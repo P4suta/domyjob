@@ -5,7 +5,6 @@ pub(crate) enum Notice {
     Failed(notify::Error),
 }
 
-/// Reads and opens of a watched file are not changes, so a watcher that reads never wakes itself.
 fn classify(event: notify::Result<notify::Event>) -> Notice {
     match event {
         Ok(event) if event.need_rescan() => Notice::Changed,

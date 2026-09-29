@@ -28,7 +28,6 @@ fn replies(server: Server<Vec<u8>>) -> Vec<Value> {
         .collect()
 }
 
-/// The value at a JSON pointer inside the reply with `id`.
 fn field<'a>(replies: &'a [Value], id: &Value, pointer: &str) -> &'a Value {
     replies
         .iter()

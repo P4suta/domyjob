@@ -1,8 +1,3 @@
-//! Resolving what people and agents type into agents, rooms, and conversations.
-//!
-//! An agent is `NAME` when unique or `NAME@MACHINE`, where MACHINE is an SSH alias,
-//! a machine's own label, `local`, or its 32-digit identity.
-
 use std::collections::BTreeMap;
 
 use domyjob_core::chat::card::MachineCard;
@@ -10,7 +5,6 @@ use domyjob_core::chat::id::{AgentId, AgentName, Conversation, Origin, RoomId, R
 
 use super::store::StoreError;
 
-/// Everything needed to resolve addresses, read once per operation.
 #[derive(Debug, Default)]
 pub(crate) struct Book {
     pub(crate) local: Option<Origin>,
@@ -36,7 +30,6 @@ fn unique<T: Clone + std::fmt::Display>(found: &[T], text: &str) -> Result<T, St
 }
 
 impl Book {
-    /// The machines a MACHINE part may name.
     fn machines_named(&self, text: &str) -> Vec<Origin> {
         let mut found: Vec<Origin> = Vec::new();
         let mut add = |origin: &Origin| {
@@ -63,7 +56,6 @@ impl Book {
         found
     }
 
-    /// Resolve `NAME` or `NAME@MACHINE` to one known agent.
     pub(crate) fn agent(&self, text: &str) -> Result<AgentId, StoreError> {
         let found: Vec<AgentId> = match text.rsplit_once('@') {
             Some((name, machine)) => {
@@ -86,7 +78,6 @@ impl Book {
         unique(&found, text)
     }
 
-    /// Resolve `NAME`, `NAME@MACHINE`, or `room:ORIGIN:NAME` to one known room.
     pub(crate) fn room(&self, text: &str) -> Result<RoomId, StoreError> {
         if let Ok(Conversation::Room(room)) = Conversation::try_from(text.to_owned()) {
             return unique(
@@ -117,7 +108,6 @@ impl Book {
         unique(&found, text)
     }
 
-    /// A conversation for `me` with `target`: a room, or the direct conversation with an agent.
     pub(crate) fn conversation(
         &self,
         me: &AgentId,
@@ -138,7 +128,6 @@ impl Book {
         }
     }
 
-    /// A readable name for a machine: its alias here, its own label, or its identity.
     #[must_use]
     pub(crate) fn machine_label(&self, origin: &Origin) -> String {
         if self.local.as_ref() == Some(origin) {
@@ -153,21 +142,18 @@ impl Book {
         )
     }
 
-    /// An agent as `NAME@MACHINE` with a readable machine.
     #[must_use]
     pub(crate) fn agent_label(&self, agent: &AgentId) -> String {
         format!("{}@{}", agent.name(), self.machine_label(agent.origin()))
     }
 }
 
-/// Parse a local agent or room handle typed by a person.
 pub(crate) fn handle<T: TryFrom<String, Error = domyjob_core::chat::id::Invalid>>(
     text: &str,
 ) -> Result<T, StoreError> {
     Ok(T::try_from(text.to_owned())?)
 }
 
-/// The local agent `NAME`, or `NAME@local`.
 pub(crate) fn local_agent(book: &Book, text: &str) -> Result<AgentId, StoreError> {
     let local = book
         .local
@@ -180,7 +166,6 @@ pub(crate) fn local_agent(book: &Book, text: &str) -> Result<AgentId, StoreError
     Ok(AgentId::new(handle::<AgentName>(name)?, local))
 }
 
-/// A room owned by this machine, by name.
 pub(crate) fn local_room(book: &Book, text: &str) -> Result<RoomId, StoreError> {
     let local = book
         .local

@@ -1,12 +1,9 @@
-# Mutants the tests cannot notice because they change nothing observable or can never run.
-# Every other surviving mutant is a gap in the tests to close, not to record here.
-
 [[mutation.expect]]
 path = "crates/domyjob-core/src/chat/exchange.rs"
 item = "Outgoing::offer"
 rule = "false-to-true"
 original = "false"
-line = 42
+line = 31
 reason = "a full batch refuses the event either way; answering true only lets the caller offer the remaining events, which are refused too, so the batch and its more flag are the same"
 outcome = "survived"
 
@@ -15,13 +12,13 @@ path = "crates/domyjob-core/src/chat/model.rs"
 item = "<Model as Outbox>::outgoing"
 rule = "break-to-continue"
 original = "break"
-line = 212
+line = 201
 reason = "once the batch is full every further offer is refused, so continuing leaves the batch and its more flag unchanged"
 outcome = "survived"
 
 [[mutation.skip]]
 path = "crates/domyjob-core/src/chat/ledger.rs"
-lines = "499-499"
+lines = "477-477"
 reason = "an event that decoded always seals within the event size limit, so the arm for an event that cannot seal is never reached"
 
 [[mutation.expect]]
@@ -47,7 +44,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "walk"
 rule = "question-to-unwrap"
 original = "?"
-line = 190
+line = 153
 reason = "the whole document was decoded before the walk, so reading an object on its path cannot fail"
 outcome = "survived"
 
@@ -56,7 +53,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "parse_object"
 rule = "question-to-unwrap"
 original = "?"
-line = 238
+line = 199
 reason = "every key string was decoded with the whole document before the walk"
 outcome = "survived"
 
@@ -65,19 +62,18 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "comment_end"
 rule = "question-to-unwrap"
 original = "?"
-line = 263
+line = 223
 reason = "callers pass positions inside the text, so the rest of the text always exists"
 outcome = "survived"
 
 [[mutation.expect]]
-# The first question mark of `rest.get(2..)?.windows(2).position(..)?` in comment_end.
-id = "9f07b846cdf76ef3a2fc"
+id = "3d2cae5bd09a3830f749"
 reason = "a block comment starts with the two bytes it matched, so the text after them always exists; an unterminated comment is tested through the other question mark on this line"
 outcome = "survived"
 
 [[mutation.skip]]
 path = "crates/domyjob-core/src/jsonc.rs"
-lines = "359-359"
+lines = "314-314"
 reason = "only an unterminated container runs to the end of the text, and documents are decoded whole before any container is measured"
 
 [[mutation.expect]]
@@ -85,7 +81,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "insert"
 rule = "range-to-inclusive"
 original = ".."
-line = 371
+line = 325
 reason = "the byte at the object's close is its closing brace, never a line break, so including it changes nothing"
 outcome = "survived"
 
@@ -94,7 +90,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "insert"
 rule = "condition-to-false"
 original = "inline"
-line = 384
+line = 338
 reason = "an inline layout renders members without indentation, so the indent is never used when the object is inline"
 outcome = "survived"
 
@@ -103,7 +99,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "whole_lines"
 rule = "question-to-unwrap"
 original = "?"
-line = 453
+line = 404
 reason = "the start is a member position inside the text"
 outcome = "survived"
 
@@ -112,7 +108,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "whole_lines"
 rule = "question-to-unwrap"
 original = "?"
-line = 458
+line = 409
 reason = "the line start was found inside the same head"
 outcome = "survived"
 
@@ -121,7 +117,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "whole_lines"
 rule = "question-to-unwrap"
 original = "?"
-line = 465
+line = 416
 reason = "the position after the member's blanks lies inside the text"
 outcome = "survived"
 
@@ -130,7 +126,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "whole_lines"
 rule = "question-to-unwrap"
 original = "?"
-line = 466
+line = 417
 reason = "a line comment was just found there, and a line comment always ends"
 outcome = "survived"
 
@@ -139,7 +135,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "line_indent"
 rule = "range-to-inclusive"
 original = ".."
-line = 475
+line = 425
 reason = "the byte at the position is the object's opening bracket, not a blank, so it never joins the indentation"
 outcome = "survived"
 
@@ -148,7 +144,7 @@ path = "crates/domyjob-core/src/jsonc.rs"
 item = "unit"
 rule = "question-to-unwrap"
 original = "?"
-line = 487
+line = 436
 reason = "a line always ends with the part left after trimming its leading blanks"
 outcome = "survived"
 
@@ -166,7 +162,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "payload"
 rule = "question-to-unwrap"
 original = "?"
-line = 262
+line = 258
 reason = "the header is exactly the first four bytes, so it always converts to an array of four"
 outcome = "survived"
 
@@ -175,7 +171,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "payload"
 rule = "question-to-unwrap"
 original = "?"
-line = 264
+line = 260
 reason = "a length of at most 1 MiB plus four cannot overflow a usize"
 outcome = "survived"
 
@@ -184,7 +180,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "frame"
 rule = "question-to-unwrap"
 original = "?"
-line = 275
+line = 271
 reason = "the wire's own types always serialize: they hold no maps with non-string keys"
 outcome = "survived"
 
@@ -193,6 +189,6 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "frame"
 rule = "question-to-unwrap"
 original = "?"
-line = 279
+line = 275
 reason = "the length was checked against MAX_CONTROL_BYTES, which fits a u32"
 outcome = "survived"

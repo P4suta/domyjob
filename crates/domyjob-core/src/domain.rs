@@ -239,7 +239,6 @@ impl RemoteText {
     }
 }
 
-/// Escape terminal controls without changing ordinary message content.
 #[must_use]
 pub fn terminal_text(text: &str) -> String {
     let mut safe = String::with_capacity(text.len());
@@ -317,7 +316,6 @@ mod tests {
         Command::try_from(vec!["cargo".to_owned(), "x".repeat(8193)]).unwrap_err();
     }
 
-    /// `make(limit)` is accepted and `make(limit + 1)` refused, so a limit holds exactly.
     fn boundary<T, E: core::fmt::Debug>(limit: usize, make: impl Fn(usize) -> Result<T, E>) {
         assert!(make(limit).is_ok(), "the limit {limit} itself is allowed");
         assert!(

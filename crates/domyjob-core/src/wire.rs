@@ -178,12 +178,9 @@ pub enum Reply {
     Error { code: ErrorCode },
 }
 
-/// A reply of another kind than the one its request expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unexpected {
-    /// The node refused the request.
     Refused(ErrorCode),
-    /// The node answered with a reply of another kind.
     Other,
 }
 
@@ -206,7 +203,6 @@ macro_rules! reply_variant {
     ($($method:ident: $pattern:pat => $value:expr, $output:ty;)+) => {
         impl Reply {
             $(
-                /// The reply's content when it is of this kind.
                 pub fn $method(self) -> Result<$output, Unexpected> {
                     if let $pattern = self {
                         Ok($value)
@@ -311,7 +307,6 @@ mod tests {
             payload(&header(MAX_CONTROL_BYTES.saturating_add(1))),
             Err(WireError::TooLarge)
         ));
-        // A JSON string is its text and two quotes.
         let fits = "x".repeat(MAX_CONTROL_BYTES.saturating_sub(2));
         assert_eq!(
             frame(&fits).unwrap().len(),

@@ -1,5 +1,3 @@
-//! The `domyjob chat` command line.
-
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -22,11 +20,11 @@ use crate::platform::clock::Deadline;
 
 #[derive(Debug, Args)]
 pub(crate) struct ChatArgs {
-    /// Print structured JSON.
     #[arg(long, global = true)]
+    #[arg(help = "Print structured JSON")]
     json: bool,
-    /// Act as this local agent; defaults to `DOMYJOB_CHAT_AGENT`.
     #[arg(long = "as", global = true, value_name = "AGENT")]
+    #[arg(help = "Act as this local agent; defaults to `DOMYJOB_CHAT_AGENT`")]
     actor: Option<String>,
     #[command(subcommand)]
     command: ChatCommand,
@@ -34,80 +32,82 @@ pub(crate) struct ChatArgs {
 
 #[derive(Debug, Subcommand)]
 enum ChatCommand {
-    /// Pin peers, start the background service, and register the MCP server with AI clients.
+    #[command(
+        about = "Pin peers, start the background service, and register the MCP server with AI clients"
+    )]
     Setup {
-        /// SSH aliases of the machines to exchange messages with.
+        #[arg(help = "SSH aliases of the machines to exchange messages with")]
         machines: Vec<String>,
-        /// Accept a peer whose chat identity changed.
         #[arg(long)]
+        #[arg(help = "Accept a peer whose chat identity changed")]
         replace: bool,
-        /// Do not install the background service.
         #[arg(long)]
+        #[arg(help = "Do not install the background service")]
         no_service: bool,
-        /// Do not register the MCP server with Claude Code, Codex, or OpenCode.
         #[arg(long)]
+        #[arg(help = "Do not register the MCP server with Claude Code, Codex, or OpenCode")]
         no_clients: bool,
     },
-    /// Check the service, peers, AI clients, and local agents.
+    #[command(about = "Check the service, peers, AI clients, and local agents")]
     Doctor,
-    /// Exchange messages with every peer, or one, now.
+    #[command(about = "Exchange messages with every peer, or one, now")]
     Sync { machine: Option<String> },
-    /// Manage pinned peers.
+    #[command(about = "Manage pinned peers")]
     Peer {
         #[command(subcommand)]
         command: PeerCommand,
     },
-    /// Manage the background service.
+    #[command(about = "Manage the background service")]
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
     },
     #[command(hide = true)]
     Serve,
-    /// Replace this machine's chat identity and delete its chat history.
+    #[command(about = "Replace this machine's chat identity and delete its chat history")]
     Reset {
-        /// Confirm the deletion.
         #[arg(long)]
+        #[arg(help = "Confirm the deletion")]
         yes: bool,
     },
-    /// Delete a conversation's content on this machine once its peers hold it.
+    #[command(about = "Delete a conversation's content on this machine once its peers hold it")]
     Clean { target: String },
-    /// Find agents and rooms by what they do.
+    #[command(about = "Find agents and rooms by what they do")]
     Directory(DirectoryArgs),
-    /// Show the acting agent.
+    #[command(about = "Show the acting agent")]
     Whoami,
-    /// Change the acting agent's profile.
+    #[command(about = "Change the acting agent's profile")]
     Profile(ProfileArgs),
-    /// Set or clear the acting agent's status.
+    #[command(about = "Set or clear the acting agent's status")]
     Status {
-        /// The status; omit it to clear.
+        #[arg(help = "The status; omit it to clear")]
         text: Option<String>,
     },
-    /// Register, change, or remove agents on this machine.
+    #[command(about = "Register, change, or remove agents on this machine")]
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Create and change rooms.
+    #[command(about = "Create and change rooms")]
     Room {
         #[command(subcommand)]
         command: RoomCommand,
     },
-    /// Send a message.
+    #[command(about = "Send a message")]
     Send(SendArgs),
-    /// Ask one agent and wait for its answer.
+    #[command(about = "Ask one agent and wait for its answer")]
     Ask(AskArgs),
-    /// Reply to an exact message ID.
+    #[command(about = "Reply to an exact message ID")]
     Reply(ReplyArgs),
-    /// Withdraw an ask you sent.
+    #[command(about = "Withdraw an ask you sent")]
     Withdraw(MessageArgs),
-    /// Show or wait for an ask's ending.
+    #[command(about = "Show or wait for an ask's ending")]
     Wait(MessageArgs),
-    /// Read unread messages addressed to the acting agent.
+    #[command(about = "Read unread messages addressed to the acting agent")]
     Inbox(InboxArgs),
-    /// Read a conversation.
+    #[command(about = "Read a conversation")]
     Thread(ThreadArgs),
-    /// Follow a conversation as it grows.
+    #[command(about = "Follow a conversation as it grows")]
     Watch(ThreadArgs),
 }
 
@@ -117,7 +117,7 @@ enum PeerCommand {
     Remove {
         machine: String,
     },
-    /// Accept a peer's new chat identity after it was reset.
+    #[command(about = "Accept a peer's new chat identity after it was reset")]
     Replace {
         machine: String,
     },
@@ -132,9 +132,9 @@ enum ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
-    /// Register a managed agent whose turns this machine runs.
+    #[command(about = "Register a managed agent whose turns this machine runs")]
     Start(StartArgs),
-    /// Register an interactive session's agent.
+    #[command(about = "Register an interactive session's agent")]
     Join(JoinArgs),
     Update(UpdateArgs),
     Remove(NameArgs),
@@ -181,7 +181,6 @@ fn environment(name: &str) -> Result<Option<String>, CliError> {
     }
 }
 
-/// Where a chat command prints: one JSON document, or text lines.
 struct Printer<'out> {
     output: &'out Output,
     json: bool,
@@ -219,7 +218,6 @@ fn findings(out: &Printer<'_>, findings: &[Finding]) -> Result<ExitCode, CliErro
     })
 }
 
-/// Run a command that works on the store without an acting agent, or hand the command back.
 fn machine(
     command: ChatCommand,
     out: &Printer<'_>,
@@ -304,10 +302,8 @@ fn sync_now(machine: Option<&str>, out: &Printer<'_>) -> Result<ExitCode, CliErr
     })
 }
 
-/// Stop the service and replace the chat store without opening the old one, which may be unreadable.
 fn replace_store(state: &crate::layout::State) -> Result<Store, CliError> {
     let paths = state.chat();
-    // A service of any build, running or not, would keep writing under the replaced identity.
     if setup::service_present(&paths)? {
         setup::service_uninstall(&paths)?;
     }
@@ -375,7 +371,6 @@ fn peer(command: PeerCommand, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Whether the command only reads, so synchronizing before it suffices.
 const fn reads(command: &ChatCommand) -> bool {
     matches!(
         command,
@@ -447,7 +442,6 @@ fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError>
     })
 }
 
-/// Print a conversation and keep printing new events until interrupted.
 fn watch(session: &Session, args: &ThreadArgs, out: &Printer<'_>) -> Result<ExitCode, CliError> {
     let mut pulse = Pulse::new(&session.store, 2000)?;
     let mut shown = std::collections::BTreeSet::new();

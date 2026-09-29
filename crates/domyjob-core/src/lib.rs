@@ -3,9 +3,6 @@
 
 extern crate alloc;
 
-/// A string newtype constructed only through a validating `TryFrom<String>`.
-///
-/// The caller imports `String`, `fmt`, `Serialize`, and `Deserialize`.
 macro_rules! validated_string {
     ($(#[$doc:meta])* $name:ident, $error:ty, $check:expr) => {
         $(#[$doc])*

@@ -1,8 +1,3 @@
-//! The background service: keeps every pinned peer synchronized while no command runs.
-//!
-//! Each peer has one worker.
-//! It exchanges when this machine stores events or when the peer's long-poll wait reports new events there, and backs off while the peer is unreachable.
-
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::JoinHandle;
@@ -44,7 +39,6 @@ struct Worker {
     thread: JoinHandle<()>,
 }
 
-/// Run until the process is stopped; a second service on the same machine exits at once.
 pub(crate) fn serve() -> Result<(), ServeError> {
     let store = Store::open()?;
     let Some(_running) = OsLock::try_exclusive(&store.paths().service_lock())? else {
@@ -63,14 +57,12 @@ pub(crate) fn serve() -> Result<(), ServeError> {
         reconcile(&store, &mut workers)?;
         if pulse.next(Deadline::after_millis(PEER_REFRESH_MILLIS))? {
             for worker in workers.values() {
-                // A pending local signal already makes the worker exchange.
                 let _delivered = worker.sender.try_send(Signal::Local);
             }
         }
     }
 }
 
-/// Start workers for new peers and stop those of removed or replaced peers.
 fn reconcile(store: &Store, workers: &mut BTreeMap<String, Worker>) -> Result<(), ServeError> {
     let peers = store.peers()?;
     let stale: Vec<String> = workers
@@ -106,7 +98,6 @@ fn reconcile(store: &Store, workers: &mut BTreeMap<String, Worker>) -> Result<()
     Ok(())
 }
 
-/// Hold one long-poll wait on the peer and report its result to the worker.
 fn start_wait(store: &Store, alias: &str, peer: &Origin, sender: &SyncSender<Signal>) {
     let request = store.read(|read| Ok(super::store::cursor(read, peer)?.seen));
     let (store_origin, alias, peer, sender) = (
@@ -132,13 +123,11 @@ fn start_wait(store: &Store, alias: &str, peer: &Origin, sender: &SyncSender<Sig
     });
 }
 
-/// One pinned peer, by SSH alias and chat identity.
 struct Peer<'a> {
     alias: &'a str,
     origin: &'a Origin,
 }
 
-/// One peer's loop: exchange, then wait for either side to change, backing off on failure.
 fn follow(
     store: &Store,
     peer: &Peer<'_>,

@@ -1,8 +1,3 @@
-//! Installing the per-user chat service with each operating system's service manager.
-//!
-//! Every manager compiles on every system, and [`MANAGER`] picks this system's,
-//! so each system type-checks the others' installers too.
-
 use std::path::{Path, PathBuf};
 
 use domyjob_core::service as render;
@@ -38,7 +33,6 @@ impl From<render::ServiceError> for ServiceError {
     }
 }
 
-/// A per-user service manager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Manager {
     Launchd,
@@ -47,7 +41,6 @@ enum Manager {
     Missing,
 }
 
-/// The service manager of the system this build runs on.
 const MANAGER: Manager = if cfg!(target_os = "macos") {
     Manager::Launchd
 } else if cfg!(target_os = "linux") {
@@ -62,8 +55,6 @@ const LABEL: &str = "dev.domyjob.chat";
 const UNIT: &str = "domyjob-chat.service";
 const TASK: &str = "domyjob-chat";
 
-/// Install the service that runs `program chat serve`, logging to `log` where the manager allows,
-/// and start it; returns where the definition lives.
 pub(crate) fn install(program: &Path, log: &Path) -> Result<PathBuf, ServiceError> {
     match MANAGER {
         Manager::Launchd => launchd_install(program, log),
@@ -73,7 +64,6 @@ pub(crate) fn install(program: &Path, log: &Path) -> Result<PathBuf, ServiceErro
     }
 }
 
-/// Stop and remove the service; returns whether a definition was removed.
 pub(crate) fn uninstall() -> Result<bool, ServiceError> {
     match MANAGER {
         Manager::Launchd => launchd_uninstall(),
@@ -91,7 +81,6 @@ fn owned(words: &[&str]) -> Vec<String> {
     words.iter().map(|word| (*word).to_owned()).collect()
 }
 
-/// Run a service-manager command; failures are errors unless `tolerated`.
 fn run(tool: &Tool<'_>, tolerated: bool) -> Result<(), ServiceError> {
     let output = run_tool(tool)?;
     if output.success || tolerated {

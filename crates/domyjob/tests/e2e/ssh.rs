@@ -1,10 +1,3 @@
-//! The fake OpenSSH client.
-//!
-//! It accepts `-T`, `--`, and any `-o` option, which it ignores, and reaches a machine by running the real `domyjob node` with that machine's state, home, and PATH.
-//! Standard input and output pass straight through, so a node sees the client leave as the end of its input, as it would over SSH.
-//! Every connection is logged to `ssh.jsonl` in the world's root with the machine that made it.
-//! Marker files in the machine directory simulate network trouble: `offline` refuses new connections and cuts open ones, and `drop-reply` lets the node finish but loses its reply.
-
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -13,14 +6,10 @@ use serde_json::json;
 
 use crate::{Context as _, Failure};
 
-/// What the client asked the remote side to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Remote {
-    /// The probe that tells a POSIX shell, which prints `:OS`, from PowerShell.
     ShellProbe,
-    /// `domyjob node` with the arguments that follow `node`.
     Node(Vec<String>),
-    /// Anything this fake cannot stand in for, such as a remote build.
     Unsupported,
 }
 
@@ -37,7 +26,6 @@ impl Remote {
     }
 }
 
-/// One parsed `ssh` command line.
 #[derive(Debug)]
 struct Invocation {
     options: Vec<String>,
@@ -156,7 +144,6 @@ fn valid_alias(alias: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-/// The machine whose client started this connection, read from the state directory it passed down.
 fn caller(root: &Path) -> Option<String> {
     let state = PathBuf::from(std::env::var_os("DOMYJOB_STATE")?);
     let machine = state.parent()?;
@@ -184,11 +171,6 @@ fn classify(command: &str) -> Remote {
     node_arguments(command).map_or(Remote::Unsupported, Remote::Node)
 }
 
-/// Finds `.../domyjob node [ARGUMENTS]` inside whatever shell wrapper carries it.
-///
-/// Words are split on whitespace and stripped of quotes and statement punctuation.
-/// The program is a word whose last path segment is `domyjob`, or a shell variable when the command also names such a path, as in `p=".../domyjob"; exec "$p" node`.
-/// The arguments end with the statement that holds them.
 fn node_arguments(command: &str) -> Option<Vec<String>> {
     let words: Vec<&str> = command.split_whitespace().collect();
     let names_domyjob = words.iter().any(|word| is_domyjob(assigned(word)));
@@ -234,13 +216,11 @@ fn is_domyjob(word: &str) -> bool {
         .is_some_and(|name| name == "domyjob" || name.eq_ignore_ascii_case("domyjob.exe"))
 }
 
-/// The value of a `name=value` word, or the bare word itself.
 fn assigned(word: &str) -> &str {
     let word = bare(word);
     bare(word.split_once('=').map_or(word, |(_name, value)| value))
 }
 
-/// Whether a word reads a shell variable, such as `$p` or `${p}`.
 fn is_variable(word: &str) -> bool {
     word.strip_prefix('$').is_some_and(|name| {
         let name = name.trim_start_matches('{').trim_end_matches('}');
@@ -251,7 +231,6 @@ fn is_variable(word: &str) -> bool {
     })
 }
 
-/// Runs the real node as the remote machine would, with its state, home, and PATH.
 fn node(
     root: &Path,
     machine: &Path,
@@ -291,7 +270,6 @@ fn node(
             return Ok(status);
         }
         if crate::present(&offline)? {
-            // The machine went offline mid-connection, the way a network outage cuts a live session.
             let _killed = child.kill();
             let _reaped = child.wait();
             return Err(Failure::new("Connection reset by peer"));
@@ -300,9 +278,6 @@ fn node(
     }
 }
 
-/// Checks the remote-command recognizer against the wrappers domyjob sends or is likely to send.
-///
-/// The first two are the wrappers `transport::node_command` builds for a POSIX shell and for PowerShell.
 pub(crate) fn check_recognizer() -> Result<(), Failure> {
     let cases = [
         (

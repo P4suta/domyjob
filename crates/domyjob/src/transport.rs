@@ -30,7 +30,6 @@ use crate::state_io::{self, StateError};
 use crate::store::{Store, StoreError};
 
 const EMBEDDED_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/source.tar"));
-/// The exit status a remote wrapper reports when this build's node is not installed.
 const MISSING_NODE: i32 = 97;
 
 #[derive(Debug, Error)]
@@ -77,7 +76,6 @@ pub(crate) enum TransportError {
     CacheEncoding(#[from] serde_json::Error),
 }
 
-/// The shell OpenSSH runs remote commands with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Shell {
@@ -152,7 +150,6 @@ impl SshChild {
     }
 }
 
-/// Stops an SSH child that outlives its deadline; dropping the guard cancels the watch.
 struct Watchdog(Option<mpsc::SyncSender<()>>);
 
 impl Watchdog {
@@ -200,7 +197,6 @@ fn require_end(input: &mut impl Read) -> Result<(), TransportError> {
     }
 }
 
-/// The remote command that runs this build's node, or reports it missing with status 97.
 fn node_command(shell: Shell, build: &str) -> String {
     match shell {
         Shell::Unix => format!(
@@ -212,11 +208,9 @@ fn node_command(shell: Shell, build: &str) -> String {
     }
 }
 
-/// The deadline of one call and whether it holds its input open until the reply.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     deadline: Option<clock::Deadline>,
-    /// A held input lets the node treat the end of input as the client's disconnect.
     hold_input: bool,
 }
 
@@ -293,7 +287,6 @@ fn source_checkout() -> Result<&'static Path, TransportError> {
         .ok_or_else(|| std::io::Error::other("the source checkout is unavailable").into())
 }
 
-/// Rebuild and rerun this client when its checkout changed, unless `DOMYJOB_REFRESH=never`.
 pub(crate) fn refresh_local() -> Result<Option<ExitCode>, TransportError> {
     if std::env::var_os("DOMYJOB_REFRESH").is_some_and(|value| value == "never") {
         return Ok(None);
@@ -362,7 +355,6 @@ fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
     }
 }
 
-/// The remote shell of `machine`, detected once and then cached in private state.
 fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
     let path = State::here()?.shells();
     let mut hosts: BTreeMap<String, Shell> = match state_io::read_bytes(&path)? {
@@ -395,12 +387,6 @@ fn install_command(shell: Shell, build: &str) -> String {
     }
 }
 
-/// Build and install this build's node on `machine` from the embedded source.
-///
-/// The archive stores fixed modification times, and Cargo reuses a shared target directory,
-/// so extraction stamps files with the current time; otherwise Cargo could keep an older dependency.
-/// Each build extracts to a new directory, so its own artifacts can never be reused,
-/// and they are cleaned afterwards; the shared target keeps only dependencies and stays bounded.
 fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> {
     if u64::try_from(EMBEDDED_SOURCE.len()).map_err(|_size| WireError::Snapshot)?
         > wire::MAX_SNAPSHOT_BYTES
@@ -428,10 +414,6 @@ fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> 
     }
 }
 
-/// Call this build's node, installing it first when the machine reports it missing.
-///
-/// Installations on one machine are serialized, and a caller that waited retries before installing,
-/// because another process may have installed the node meanwhile.
 fn call_with(
     machine: &MachineName,
     request: &Request,
@@ -454,7 +436,6 @@ fn call_with(
     }
 }
 
-/// Take the one reply kind a request expects.
 fn pick<T>(reply: Reply, kind: fn(Reply) -> Result<T, Unexpected>) -> Result<T, TransportError> {
     match kind(reply) {
         Ok(value) => Ok(value),
@@ -485,7 +466,6 @@ pub(crate) fn doctor(machine: &MachineName, output: &Output) -> Result<(), Trans
     Ok(())
 }
 
-/// One chat request with a deadline; a wait holds the connection until its reply.
 pub(crate) fn chat(
     machine: &MachineName,
     request: &ChatRequest,
@@ -548,7 +528,6 @@ fn submit(
     expect(machine, &request, payload, Reply::into_accepted)
 }
 
-/// What a submitted job runs and whether the command waits for it.
 #[derive(Debug)]
 pub(crate) struct Submission {
     pub(crate) id: Option<SubmissionId>,
@@ -718,7 +697,6 @@ pub(crate) fn logs(reference: &JobReference, output: &Output) -> Result<(), Tran
     Ok(())
 }
 
-/// Watch standard input after a held request; its end means the client disconnected.
 fn watch_disconnect(abandoned: &Arc<AtomicBool>) {
     let abandoned = Arc::clone(abandoned);
     std::thread::spawn(move || {
@@ -760,7 +738,6 @@ const fn error_code(error: &AppError) -> ErrorCode {
     }
 }
 
-/// Remove builds installed here that no process runs any more.
 fn prune_builds() {
     let versions = match platform::home() {
         Ok(home) => home.join(".cargo").join("domyjob").join("versions"),
@@ -774,7 +751,6 @@ fn prune_builds() {
     }
 }
 
-/// Remove job stores that other formats left and no process of theirs uses.
 fn prune_runner_stores() {
     let removed = State::here()
         .map_err(StoreError::from)

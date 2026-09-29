@@ -1,7 +1,3 @@
-//! An in-memory ledger with the same admission and exchange rules as the durable store.
-//!
-//! Tests and fuzzing use it as the reference for convergence properties.
-
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -13,7 +9,6 @@ use super::exchange::{Outbox, Outgoing, Progress, accept, offer, offer_event, re
 use super::id::{AgentId, EventId, Origin, RoomId};
 use super::ledger::{Admitted, Change, Cursor, Failure, Ledger, Parent, Resolution, Room, append};
 
-/// One machine's complete chat state held in memory.
 #[derive(Debug, Clone)]
 pub struct Model {
     origin: Origin,
@@ -47,12 +42,10 @@ impl Model {
         }
     }
 
-    /// Author the next local event.
     pub fn write(&mut self, body: Body) -> Result<Event, Failure<Infallible>> {
         append(self, body)
     }
 
-    /// Every stored event in the shared display order.
     #[must_use]
     pub fn ordered(&self) -> Vec<&Event> {
         let mut events: Vec<&Event> = self.events.values().map(Sealed::event).collect();
@@ -80,7 +73,6 @@ impl Model {
         &self.machines
     }
 
-    /// Unresolved asks by responder.
     #[must_use]
     pub const fn open_asks(&self) -> &BTreeSet<(AgentId, EventId)> {
         &self.open
@@ -91,9 +83,6 @@ impl Model {
         &self.started
     }
 
-    /// Run exchange rounds with `peer` until neither side has more to send or a round is refused.
-    ///
-    /// Returns the progress of the last round, or the rejection that ended the exchange.
     pub fn sync_with(
         &mut self,
         peer: &mut Self,

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
+pub mod comments;
 pub mod dependencies;
 pub mod exceptions;
 pub mod fixes;
@@ -20,7 +21,6 @@ mod raw {
         Command::new(program)
     }
 
-    /// Repository files are read whole; the repository bounds them.
     pub(super) fn read_to_string(path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
@@ -74,7 +74,6 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), GateError> {
 #[derive(Debug, Default)]
 struct SourcePolicy {
     effect_module: bool,
-    /// Whether this file may take the process's standard output.
     output_owner: bool,
     findings: Vec<String>,
 }
@@ -126,9 +125,105 @@ impl<'ast> Visit<'ast> for SourcePolicy {
 fn effect_module(path: &str) -> bool {
     matches!(
         path,
-        "crates/domyjob/src/platform.rs" | "crates/domyjob/src/process.rs"
+        "crates/domyjob/src/platform.rs"
+            | "crates/domyjob/src/process.rs"
+            | "crates/domyjob/tests/e2e/os.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
+        || path.starts_with("crates/domyjob/tests/e2e/os/")
+}
+
+const COMMENT: &str = "remove this comment; names and types say what the code does, and docs and commit messages say why";
+
+fn read(path: &Path) -> Result<String, GateError> {
+    raw::read_to_string(path).map_err(|source| GateError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+pub(crate) fn git(root: &Path, arguments: &[&str]) -> Result<String, String> {
+    let output = raw::command("git")
+        .current_dir(root)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(std::process::Child::wait_with_output)
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), GateError> {
+    let failed = |source| GateError::Read {
+        path: dir.to_path_buf(),
+        source,
+    };
+    for entry in std::fs::read_dir(dir).map_err(failed)? {
+        let entry = entry.map_err(failed)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let kind = entry.file_type().map_err(failed)?;
+        if kind.is_dir() {
+            let hidden = name.starts_with('.') && name != ".github" && name != ".config";
+            if !hidden && name != "target" && name != "node_modules" {
+                walk(root, &path, out)?;
+            }
+        } else if kind.is_file() {
+            let relative = match path.strip_prefix(root) {
+                Ok(relative) => relative,
+                Err(_outside) => &path,
+            };
+            out.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+fn listed(root: &Path) -> Result<Vec<String>, GateError> {
+    let mut files = Vec::new();
+    walk(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn present(root: &Path, file: &str) -> Result<Option<String>, GateError> {
+    let path = root.join(file);
+    match raw::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(GateError::Read { path, source }),
+    }
+}
+
+fn comment_findings(root: &Path) -> Result<usize, GateError> {
+    let mut findings = 0usize;
+    for file in listed(root)? {
+        let extension = Path::new(&file)
+            .extension()
+            .map(std::ffi::OsStr::to_ascii_lowercase);
+        let kind = extension.as_ref().and_then(|extension| extension.to_str());
+        if !matches!(kind, Some("rs" | "toml" | "yml" | "yaml")) {
+            continue;
+        }
+        let Some(source) = present(root, &file)? else {
+            continue;
+        };
+        let checked = if kind == Some("rs") {
+            comments::in_rust(&source)
+        } else {
+            comments::in_config(&file, &source)
+        };
+        for line in checked {
+            eprintln!("{file}:{line}: {COMMENT}");
+            findings = findings.saturating_add(1);
+        }
+    }
+    Ok(findings)
 }
 
 pub fn gates(root: &Path) -> Result<usize, GateError> {
@@ -137,12 +232,9 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
         rust_files(&root.join(directory), &mut files)?;
     }
     files.sort();
-    let mut findings = 0usize;
+    let mut findings = comment_findings(root)?;
     for path in files {
-        let source = raw::read_to_string(&path).map_err(|source| GateError::Read {
-            path: path.clone(),
-            source,
-        })?;
+        let source = read(&path)?;
         let relative = match path.strip_prefix(root) {
             Ok(relative) => relative,
             Err(_outside) => &path,

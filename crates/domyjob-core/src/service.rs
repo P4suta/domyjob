@@ -1,20 +1,12 @@
-//! Per-user service definitions that keep `<program> chat serve` running for each user session.
-//!
-//! The renderers are pure: callers choose the program, arguments, and paths, then write or run the result.
-//! Each renderer refuses text that its format cannot carry faithfully, instead of producing a definition that would start something else.
-
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::iter::{once, repeat_n};
 
-/// The program that manages Windows scheduled tasks.
 pub const SCHTASKS: &str = "schtasks";
 
-/// The longest command, in UTF-16 code units, that `schtasks /TR` accepts.
 pub const SCHTASKS_COMMAND_MAX: usize = 261;
 
-/// The predefined XML entities, which cover every character with a meaning in text or attributes.
 const XML: &[(char, &str)] = &[
     ('&', "&amp;"),
     ('<', "&lt;"),
@@ -23,31 +15,22 @@ const XML: &[(char, &str)] = &[
     ('\'', "&apos;"),
 ];
 
-/// The escapes in an `ExecStart=` word, where systemd unescapes quotes and expands `%` specifiers and `$` variables.
 const EXEC_START: &[(char, &str)] = &[('\\', "\\\\"), ('"', "\\\""), ('%', "%%"), ('$', "$$")];
 
-/// The escapes in a systemd setting that expands only `%` specifiers.
 const SPECIFIERS: &[(char, &str)] = &[('%', "%%")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ServiceError {
-    /// Some text contains a control character, such as NUL or a line break, or a noncharacter that XML forbids.
     #[error("service definitions cannot contain control characters such as NUL or line breaks")]
     ControlCharacter,
-    /// A label, program, or log path is empty.
     #[error("service labels, programs, and log paths cannot be empty")]
     Empty,
-    /// systemd reads a program that is not absolute as a name to search for or as a prefix such as `-`.
-    /// It would also expand `$` in the name the program sees but not in the path it starts.
     #[error("systemd needs an absolute program path without `$`")]
     SystemdProgram,
-    /// A trailing backslash would continue the description onto the next line of the unit.
     #[error("a systemd description cannot end with a backslash")]
     SystemdDescription,
-    /// The Task Scheduler expands `%` variables with no way to escape them, and a program path is quoted without escapes.
     #[error("a Windows task command cannot contain `%`, nor its program `\"`")]
     WindowsCommand,
-    /// `schtasks` refuses longer commands.
     #[error(
         "schtasks accepts at most {} characters after /TR",
         SCHTASKS_COMMAND_MAX
@@ -55,7 +38,6 @@ pub enum ServiceError {
     CommandTooLong,
 }
 
-/// Renders a `launchd` agent that starts `program` with `args` at login, restarts it whenever it exits, and appends its output to `log`.
 pub fn launchd_plist(
     label: &str,
     program: &str,
@@ -94,9 +76,6 @@ pub fn launchd_plist(
     ))
 }
 
-/// Renders a systemd user unit that starts `program` with `args` in the user's manager and restarts it after failures.
-///
-/// `KillMode=process` stops only the server itself, not the processes it started.
 pub fn systemd_unit(
     description: &str,
     program: &str,
@@ -130,9 +109,6 @@ WantedBy=default.target
     ))
 }
 
-/// Renders the command line of a scheduled task that starts `program` with `args`.
-///
-/// The program is quoted, and each argument follows the rules of `CommandLineToArgvW` and the Microsoft C runtime, so the program receives the arguments unchanged.
 pub fn windows_task_command(program: &str, args: &[&str]) -> Result<String, ServiceError> {
     check(&[program], args.iter().copied())?;
     if program.contains('"')
@@ -153,7 +129,6 @@ pub fn windows_task_command(program: &str, args: &[&str]) -> Result<String, Serv
     Ok(command)
 }
 
-/// Returns the `schtasks` arguments that create or replace `task`, which runs `command` with limited rights at each logon.
 #[must_use]
 pub fn schtasks_create(task: &str, command: &str) -> Vec<String> {
     [
@@ -163,31 +138,26 @@ pub fn schtasks_create(task: &str, command: &str) -> Vec<String> {
     .into()
 }
 
-/// Returns the `schtasks` arguments that start `task` now.
 #[must_use]
 pub fn schtasks_run(task: &str) -> Vec<String> {
     ["/Run", "/TN", task].map(String::from).into()
 }
 
-/// Returns the `schtasks` arguments that stop the running instance of `task`.
 #[must_use]
 pub fn schtasks_end(task: &str) -> Vec<String> {
     ["/End", "/TN", task].map(String::from).into()
 }
 
-/// Returns the `schtasks` arguments that delete `task` without asking.
 #[must_use]
 pub fn schtasks_delete(task: &str) -> Vec<String> {
     ["/Delete", "/F", "/TN", task].map(String::from).into()
 }
 
-/// Returns the `schtasks` arguments that succeed only when `task` exists.
 #[must_use]
 pub fn schtasks_query(task: &str) -> Vec<String> {
     ["/Query", "/TN", task].map(String::from).into()
 }
 
-/// Refuses empty `required` text, and control characters or XML noncharacters in any text.
 fn check<'a>(
     required: &[&'a str],
     optional: impl IntoIterator<Item = &'a str>,
@@ -207,7 +177,6 @@ fn check<'a>(
     Ok(())
 }
 
-/// Replaces each character listed in `table` with its escape.
 fn escape(text: &str, table: &[(char, &str)]) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
@@ -219,7 +188,6 @@ fn escape(text: &str, table: &[(char, &str)]) -> String {
     escaped
 }
 
-/// Writes one `ExecStart=` word, quoted when systemd would otherwise split, unquote, or unescape it.
 fn exec_start_word(word: &str) -> String {
     let escaped = escape(word, EXEC_START);
     if word.is_empty() || word.contains([' ', '"', '\'', '\\', ';']) {
@@ -229,7 +197,6 @@ fn exec_start_word(word: &str) -> String {
     }
 }
 
-/// Appends `argument` so that `CommandLineToArgvW` and the Microsoft C runtime read it back unchanged.
 fn push_windows_argument(command: &mut String, argument: &str) {
     let quoted = argument.is_empty() || argument.contains([' ', '\t']);
     if quoted {
@@ -240,7 +207,6 @@ fn push_windows_argument(command: &mut String, argument: &str) {
         match character {
             '\\' => backslashes = backslashes.saturating_add(1),
             '"' => {
-                // The backslashes before a quote are doubled, and one more escapes the quote.
                 command.extend(repeat_n('\\', backslashes.saturating_add(1)));
                 backslashes = 0;
             }
@@ -249,7 +215,6 @@ fn push_windows_argument(command: &mut String, argument: &str) {
         command.push(character);
     }
     if quoted {
-        // The backslashes before the closing quote are doubled so that they stay literal.
         command.extend(repeat_n('\\', backslashes));
         command.push('"');
     }
@@ -266,7 +231,6 @@ mod tests {
     use alloc::vec::Vec;
     use core::iter::repeat_n;
 
-    /// Splits a command line into arguments by the rules of `CommandLineToArgvW`.
     fn windows_argv(line: &str) -> Vec<String> {
         let mut rest = line.chars().peekable();
         let mut argv = Vec::new();

@@ -1,8 +1,3 @@
-//! Comment-preserving edits of JSON with comments, the format of `opencode.json` and `opencode.jsonc`.
-//!
-//! An edit rewrites only the text of the member it changes, so comments, formatting, and other members stay as they were.
-//! Each document is validated before it is edited, and the scanner relies on that validation for the document's structure.
-
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -13,10 +8,8 @@ use serde::de::IgnoredAny;
 
 use crate::ingress;
 
-/// The whitespace that JSON allows between tokens.
 const SPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 
-/// The layout that keeps a new member on the line of its neighbors.
 const INLINE: Layout<'static> = Layout {
     newline: "",
     unit: "",
@@ -24,27 +17,18 @@ const INLINE: Layout<'static> = Layout {
 
 #[derive(Debug, thiserror::Error)]
 pub enum JsoncError {
-    /// The document is neither empty nor valid JSON with comments.
     #[error("the document is not valid JSON with comments: {0}")]
     Document(#[source] ingress::JsonError),
-    /// The value to set is not valid JSON.
     #[error("the new value is not valid JSON: {0}")]
     Value(#[source] ingress::JsonError),
-    /// The path names no member.
     #[error("a member path needs at least one key")]
     EmptyPath,
-    /// A value on the path is not an object, so setting the member would have to replace it.
     #[error("{0} is not a JSON object")]
     NotObject(String),
-    /// A key on the path appears twice in its object, so the member it names is ambiguous.
     #[error("{0} appears more than once")]
     DuplicateKey(String),
 }
 
-/// Replaces comments and trailing commas outside strings with spaces, so that valid JSON with comments becomes plain JSON.
-///
-/// Line breaks stay in place, so parse errors in the result point at the lines of the original.
-/// An unterminated comment or string stays as it is, so the result fails to parse like the original.
 #[must_use]
 pub fn strip(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -89,12 +73,6 @@ pub fn strip(text: &str) -> String {
         .collect()
 }
 
-/// Sets the member at `path` to `value_json`, creating the objects on the way that are missing.
-///
-/// An existing value is replaced in place.
-/// A new member follows the last member of its object, in the indentation and line endings of the document.
-/// An empty document, or one with only comments, gains a root object.
-/// Setting the same text again returns the document unchanged.
 pub fn set_member(document: &str, path: &[&str], value_json: &str) -> Result<String, JsoncError> {
     ingress::foreign_json::<IgnoredAny>(value_json).map_err(JsoncError::Value)?;
     let value = value_json.trim_matches(SPACE);
@@ -114,9 +92,6 @@ pub fn set_member(document: &str, path: &[&str], value_json: &str) -> Result<Str
     }
 }
 
-/// Removes the member at `path` with its comma, and with its lines when it has them to itself.
-///
-/// A document without that member, including one where a value on the path is not an object, comes back unchanged.
 pub fn remove_member(document: &str, path: &[&str]) -> Result<String, JsoncError> {
     match walk(document, path) {
         Ok(Target::Found { previous, member }) => Ok(removal(document, previous, member)),
@@ -127,29 +102,21 @@ pub fn remove_member(document: &str, path: &[&str]) -> Result<String, JsoncError
     }
 }
 
-/// Where a member sits in the text of its object.
 #[derive(Clone, Copy)]
 struct Member {
-    /// The opening quote of the key.
     start: usize,
-    /// The first byte of the value.
     value: usize,
-    /// The byte after the value.
     end: usize,
-    /// The comma after the value.
     comma: Option<usize>,
-    /// Whether the key is the one being looked up.
     wanted: bool,
 }
 
-/// An object whose braces are at `open` and `close`.
 struct Object {
     open: usize,
     close: usize,
     members: Vec<Member>,
 }
 
-/// An object without the member `key`, whose new value nests the set value under the keys in `rest`.
 struct Missing<'p> {
     object: Object,
     key: &'p str,
@@ -157,24 +124,20 @@ struct Missing<'p> {
 }
 
 enum Target<'p> {
-    /// The document has no value yet.
     Empty,
     Missing(Missing<'p>),
-    /// The member exists, after `previous` unless it is the first.
     Found {
         previous: Option<Member>,
         member: Member,
     },
 }
 
-/// How new lines are broken and indented.
 #[derive(Clone, Copy)]
 struct Layout<'t> {
     newline: &'t str,
     unit: &'t str,
 }
 
-/// Validates `text` and follows `path` through its objects.
 fn walk<'p>(text: &str, path: &'p [&'p str]) -> Result<Target<'p>, JsoncError> {
     let plain = strip(text);
     if plain.trim_matches(SPACE).is_empty() {
@@ -216,7 +179,6 @@ fn walk<'p>(text: &str, path: &'p [&'p str]) -> Result<Target<'p>, JsoncError> {
     Err(JsoncError::EmptyPath)
 }
 
-/// Names the value at the first `count` keys of `path` for error messages.
 fn describe(path: &[&str], count: usize) -> String {
     match path.get(..count) {
         Some(keys @ [_, ..]) => format!("`{}`", keys.join(".")),
@@ -224,7 +186,6 @@ fn describe(path: &[&str], count: usize) -> String {
     }
 }
 
-/// Reads the members of the object that opens at `open`, marking those named `key`, or returns `None` when no object opens there.
 fn parse_object(text: &str, open: usize, key: &str) -> Result<Option<Object>, JsoncError> {
     let bytes = text.as_bytes();
     if bytes.get(open) != Some(&b'{') {
@@ -258,7 +219,6 @@ fn parse_object(text: &str, open: usize, key: &str) -> Result<Option<Object>, Js
     }))
 }
 
-/// Returns the end of the comment that starts at `at`, or `None` when no terminated comment starts there.
 fn comment_end(bytes: &[u8], at: usize) -> Option<usize> {
     let rest = bytes.get(at..)?;
     if rest.starts_with(b"//") {
@@ -275,7 +235,6 @@ fn comment_end(bytes: &[u8], at: usize) -> Option<usize> {
     }
 }
 
-/// Returns the first position from `at` that is neither whitespace nor a comment.
 fn skip_trivia(bytes: &[u8], mut at: usize) -> usize {
     loop {
         if let Some(end) = comment_end(bytes, at) {
@@ -291,7 +250,6 @@ fn skip_trivia(bytes: &[u8], mut at: usize) -> usize {
     }
 }
 
-/// Returns the first position from `at` that is neither a space nor a tab.
 fn blank_end(bytes: &[u8], at: usize) -> usize {
     let blanks = bytes
         .iter()
@@ -301,7 +259,6 @@ fn blank_end(bytes: &[u8], at: usize) -> usize {
     at.saturating_add(blanks)
 }
 
-/// Returns the position after the string whose opening quote is at `at`.
 fn string_end(bytes: &[u8], at: usize) -> usize {
     let mut escaped = false;
     for (offset, &byte) in bytes.iter().enumerate().skip(at.saturating_add(1)) {
@@ -315,7 +272,6 @@ fn string_end(bytes: &[u8], at: usize) -> usize {
     bytes.len()
 }
 
-/// Returns the position after the value that starts at `at`.
 fn value_end(bytes: &[u8], at: usize) -> usize {
     match bytes.get(at) {
         Some(b'"') => string_end(bytes, at),
@@ -333,7 +289,6 @@ fn value_end(bytes: &[u8], at: usize) -> usize {
     }
 }
 
-/// Returns the position after the object or array that opens at `at`.
 fn container_end(bytes: &[u8], at: usize) -> usize {
     let mut depth = 0_usize;
     let mut cursor = at;
@@ -359,7 +314,6 @@ fn container_end(bytes: &[u8], at: usize) -> usize {
     cursor
 }
 
-/// Adds the missing member after the last member of its object, in the layout around it.
 fn insert(text: &str, missing: &Missing<'_>, value: &str) -> String {
     let Missing { object, key, rest } = missing;
     let anchor = text
@@ -414,7 +368,6 @@ fn insert(text: &str, missing: &Missing<'_>, value: &str) -> String {
     splice(text, &edits)
 }
 
-/// Renders `value` inside one object per key, each object on its own lines unless the layout is inline.
 fn nest(keys: &[&str], value: &str, indent: &str, layout: Layout<'_>) -> String {
     match keys.split_first() {
         None => String::from(value),
@@ -430,7 +383,6 @@ fn nest(keys: &[&str], value: &str, indent: &str, layout: Layout<'_>) -> String 
     }
 }
 
-/// Deletes `member` with its comma, its lines when it has them to itself, and the comma it would leave trailing after `previous`.
 fn removal(text: &str, previous: Option<Member>, member: Member) -> String {
     let own = member
         .comma
@@ -447,7 +399,6 @@ fn removal(text: &str, previous: Option<Member>, member: Member) -> String {
     splice(text, &edits)
 }
 
-/// Returns the lines from `start` to `end` when they hold nothing else but blanks and a trailing line comment.
 fn whole_lines(text: &str, start: usize, end: usize) -> Option<Range<usize>> {
     let bytes = text.as_bytes();
     let head = text.get(..start)?;
@@ -469,7 +420,6 @@ fn whole_lines(text: &str, start: usize, end: usize) -> Option<Range<usize>> {
     (bytes.get(after) == Some(&b'\n')).then(|| line..after.saturating_add(1))
 }
 
-/// Returns the spaces and tabs that start the line containing `at`.
 fn line_indent(text: &str, at: usize) -> &str {
     let line = text
         .get(..at)
@@ -479,7 +429,6 @@ fn line_indent(text: &str, at: usize) -> &str {
         .unwrap_or_default()
 }
 
-/// Returns the indentation of the first indented line that starts with a key, or two spaces.
 fn unit(text: &str) -> &str {
     text.lines()
         .find_map(|line| {
@@ -490,12 +439,10 @@ fn unit(text: &str) -> &str {
         .unwrap_or("  ")
 }
 
-/// Returns the line ending of the document.
 fn newline(text: &str) -> &'static str {
     if text.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
-/// Applies `edits`, which are ordered by position and do not overlap, to `text`.
 fn splice(text: &str, edits: &[(Range<usize>, impl AsRef<str>)]) -> String {
     let mut spliced = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -523,7 +470,6 @@ mod tests {
         ingress::foreign_json(&strip(text)).unwrap()
     }
 
-    /// Returns `document` with `/mcp/domyjob` set to `server`, or removed without one.
     fn with_server(mut document: Value, server: Option<Value>) -> Value {
         let root = document.as_object_mut().unwrap();
         let mcp = root.entry("mcp").or_insert_with(|| json!({}));
@@ -536,7 +482,6 @@ mod tests {
         document
     }
 
-    /// Whether deleting characters from `outer` can leave `inner`.
     fn survives_in(inner: &str, outer: &str) -> bool {
         let mut rest = outer.chars();
         inner

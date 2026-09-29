@@ -1,5 +1,3 @@
-//! Private state: files and directories only this user may read, replaced atomically.
-
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -261,10 +259,6 @@ pub(crate) fn create_empty(path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Remove a regular file of this user's; a missing file is already removed.
-///
-/// A file that other users can read is still removed, because removing it trusts none of its content;
-/// that is how a store left with the wrong permissions is replaced.
 pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
     let mut options = platform::private_options();
     options.read(true);
@@ -294,11 +288,6 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
     }
 }
 
-/// Move a private directory into `trash` under a fresh name, which takes it out of its place in one step.
-///
-/// A tree removed in place can fail part way, for example on a file that a container wrote as root,
-/// and leave behind something that no reader understands;
-/// a tree set aside is either whole where it was or gone from there.
 pub(crate) fn set_aside(path: &Path, trash: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
         Ok(_metadata) => private_dir(path)?,
@@ -313,17 +302,14 @@ pub(crate) fn set_aside(path: &Path, trash: &Path) -> Result<(), StateError> {
     raw::rename(path, &trash.join(name)).map_err(|error| io_at(path, error))
 }
 
-/// A tree set aside that could not be removed yet.
 #[derive(Debug)]
 pub(crate) struct Leftover {
     pub(crate) path: PathBuf,
     pub(crate) error: io::Error,
 }
 
-/// How many set-aside trees one call tries to remove, which bounds how long it takes.
 const EMPTY_LIMIT: usize = 64;
 
-/// Remove the trees set aside in `trash`; a tree that cannot be removed yet stays for a later call.
 pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
     let entries = match fs::read_dir(trash) {
         Ok(entries) => entries,
@@ -340,7 +326,6 @@ pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
     Ok(leftovers)
 }
 
-/// Move a private directory to a path that does not exist yet, publishing it in one step.
 pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
     private_dir(from)?;
     raw::rename(from, to).map_err(|error| io_at(to, error))
@@ -369,13 +354,11 @@ mod tests {
     #[test]
     fn a_file_open_to_other_users_can_still_be_removed() {
         if cfg!(windows) {
-            // Windows access lists are exercised on Windows machines; this file mode is Unix.
             return;
         }
         let root = tempfile::tempdir().expect("temporary state root");
         let path = root.path().join("state").join("record");
         write_bytes(&path, b"record").expect("private record");
-        // Executable permissions let other users read the file too.
         crate::platform::make_executable(&path).expect("open the record to others");
         read_bytes(&path).expect_err("an exposed record is never read");
         remove_file(&path).expect("an exposed record of this user's is removed");

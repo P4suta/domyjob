@@ -1,5 +1,3 @@
-//! Reading with a limit: nothing reads more than it names.
-
 use std::io::{self, Read};
 
 mod raw {
@@ -19,7 +17,6 @@ mod raw {
     }
 }
 
-/// All of `reader` if it holds at most `limit` bytes, or `None` when it holds more.
 pub(crate) fn read(reader: impl Read, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let beyond = u64::try_from(limit)
         .map_err(io::Error::other)?
@@ -29,7 +26,6 @@ pub(crate) fn read(reader: impl Read, limit: usize) -> io::Result<Option<Vec<u8>
     Ok((bytes.len() <= limit).then_some(bytes))
 }
 
-/// The first `limit` bytes of `reader`; the rest stays unread.
 pub(crate) fn prefix(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     raw::read_limited(

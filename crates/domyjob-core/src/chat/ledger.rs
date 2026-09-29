@@ -1,5 +1,3 @@
-//! The single admission rule every event passes, whether written here or received from a peer.
-
 use alloc::boxed::Box;
 
 use serde::{Deserialize, Serialize};
@@ -8,23 +6,19 @@ use super::card::{Card, MachineCard};
 use super::event::{Body, Event, Intent, Members, Outcome, Sealed};
 use super::id::{AgentId, Audience, Conversation, EventId, Invalid, Line, Origin, RoomId};
 
-/// How far one origin's ledger has been stored here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub seen: u64,
     pub clock: u64,
 }
 
-/// What this ledger knows about an event that another event depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parent {
     Present(Box<Event>),
-    /// Stored only as a placeholder: outside this machine's audience, or cleaned.
     Opaque,
     Missing,
 }
 
-/// How an ask ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "outcome")]
 pub enum Ending {
@@ -32,7 +26,6 @@ pub enum Ending {
     Ended(Outcome),
 }
 
-/// The resolution every machine selects for an ask: the earliest candidate in display order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resolution {
@@ -50,7 +43,6 @@ impl Resolution {
     }
 }
 
-/// The public state of a room as its owner last published it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Room {
@@ -59,7 +51,6 @@ pub struct Room {
     pub members: Members,
 }
 
-/// Why an event cannot be stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reason")]
 pub enum Rejection {
@@ -85,7 +76,6 @@ pub enum Rejection {
     Inconsistent,
 }
 
-/// The projection changes caused by one admitted event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Nothing,
@@ -114,7 +104,6 @@ pub enum Change {
     },
 }
 
-/// The admitted state after one event: its origin's new cursor and the projection change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admitted {
     pub cursor: Cursor,
@@ -127,19 +116,15 @@ pub enum Decision {
     Append(Admitted),
 }
 
-/// Storage consulted and updated by admission, implemented by the durable store and the reference model.
 pub trait Ledger {
     type Error;
 
     fn local(&self) -> &Origin;
     fn cursor(&self, origin: &Origin) -> Result<Cursor, Self::Error>;
-    /// The digest of a stored or cleaned event, for duplicate detection.
     fn digest(&self, id: &EventId) -> Result<Option<super::event::Digest>, Self::Error>;
     fn parent(&self, id: &EventId) -> Result<Parent, Self::Error>;
     fn resolution(&self, request: &EventId) -> Result<Option<Resolution>, Self::Error>;
-    /// The highest logical clock stored here.
     fn clock(&self) -> Result<u64, Self::Error>;
-    /// Whether another received event fits the storage limit.
     fn has_room(&self) -> Result<bool, Self::Error>;
     fn commit(&mut self, sealed: &Sealed, admitted: Admitted) -> Result<(), Self::Error>;
 }
@@ -187,14 +172,12 @@ fn ask_of(parent: &Event) -> Option<(AgentId, &AgentId)> {
     }
 }
 
-/// A resolution candidate before it is compared with the current winner.
 struct Candidate {
     ending: Ending,
     author: AgentId,
 }
 
 impl Candidate {
-    /// Whether the author may end this ask: the responder answers or fails it, the asker withdraws it.
     fn authorized(&self, asker: &AgentId, responder: &AgentId) -> bool {
         match self.ending {
             Ending::Ended(Outcome::Withdrawn) => self.author == *asker,
@@ -263,7 +246,6 @@ fn resolve<L: Ledger + ?Sized>(
     })
 }
 
-/// A reply to something other than an ask carries no resolution; a non-answer ending needs an ask.
 fn plain_reply<E>(event: &Event, ending: Ending) -> Result<Change, Failure<E>> {
     match ending {
         Ending::Answered => Ok(Change::Nothing),
@@ -379,7 +361,6 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
     })
 }
 
-/// Decide whether `sealed` is the next event of its origin, a harmless duplicate, or rejected.
 pub fn admit<L: Ledger + ?Sized>(
     ledger: &L,
     sealed: &Sealed,
@@ -429,7 +410,6 @@ fn commit<L: Ledger + ?Sized>(ledger: &mut L, sealed: &Sealed) -> Result<bool, F
     }
 }
 
-/// Author `body` as the next event of this ledger.
 pub fn append<L: Ledger + ?Sized>(ledger: &mut L, body: Body) -> Result<Event, Failure<L::Error>> {
     let origin = ledger.local().clone();
     let cursor = ledger.cursor(&origin).map_err(Failure::Store)?;
@@ -456,7 +436,6 @@ pub fn append<L: Ledger + ?Sized>(ledger: &mut L, body: Body) -> Result<Event, F
     Ok(sealed.into_event())
 }
 
-/// The result of storing a peer's contiguous events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Received {
     pub seen: u64,
@@ -464,7 +443,6 @@ pub struct Received {
     pub rejected: Option<Rejection>,
 }
 
-/// Store `origin`'s events in order, keeping the admitted prefix when one is rejected.
 pub fn receive<L: Ledger + ?Sized>(
     ledger: &mut L,
     origin: &Origin,

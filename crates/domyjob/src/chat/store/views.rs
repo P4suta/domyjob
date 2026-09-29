@@ -1,5 +1,3 @@
-//! Read-only projections shared by read and write transactions.
-
 use std::collections::BTreeMap;
 
 use domyjob_core::chat::card::{Card, MachineCard};
@@ -17,7 +15,6 @@ use super::tables::{
     room_key, thread_bounds, thread_key,
 };
 
-/// What this machine keeps for one event ID.
 #[derive(Debug)]
 pub(crate) enum Stored {
     Event { event: Box<Event>, encoded: String },
@@ -46,7 +43,6 @@ pub(crate) fn stored(reader: &impl Reader, id: &EventId) -> Result<Option<Stored
     }))
 }
 
-/// The stored event with its content, if this machine holds it.
 pub(crate) fn event(reader: &impl Reader, id: &EventId) -> Result<Option<Event>, StoreError> {
     Ok(match stored(reader, id)? {
         Some(Stored::Event { event, .. }) => Some(*event),
@@ -88,7 +84,6 @@ pub(crate) fn usage(reader: &impl Reader) -> Result<Usage, StoreError> {
     })
 }
 
-/// Decode every `(key, value)` entry of a text table.
 fn entries<T: for<'de> Deserialize<'de>>(
     table: &impl ReadableTable<&'static str, &'static str>,
 ) -> Result<Vec<(String, T)>, StoreError> {
@@ -117,7 +112,6 @@ pub(crate) fn rooms(reader: &impl Reader) -> Result<Vec<(Conversation, Room)>, S
     parse_entries(&reader.table(ROOMS)?)
 }
 
-/// The private configuration of an agent registered on this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LocalAgent {
@@ -139,7 +133,6 @@ pub(crate) fn local_agents(
     parse_entries(&reader.table(LOCAL_AGENTS)?)
 }
 
-/// Every unresolved ask with its responder.
 pub(crate) fn open_asks(reader: &impl Reader) -> Result<Vec<(EventId, AgentId)>, StoreError> {
     let mut found = Vec::new();
     for entry in reader.table(OPEN)?.iter()? {
@@ -157,7 +150,6 @@ fn event_at(reader: &impl Reader, id: &str) -> Result<Option<Event>, StoreError>
     event(reader, &EventId::try_from(id.to_owned())?)
 }
 
-/// Up to `limit` events of a conversation, oldest first, ending before `before` when given.
 pub(crate) fn thread(
     reader: &impl Reader,
     conversation: &Conversation,
@@ -181,7 +173,6 @@ pub(crate) fn thread(
     Ok(events)
 }
 
-/// The conversations an agent takes part in: its direct conversations and rooms listing it.
 fn conversations_of(
     reader: &impl Reader,
     agent: &AgentId,
@@ -203,7 +194,6 @@ fn conversations_of(
     Ok(found)
 }
 
-/// Messages and endings addressed to `agent` after the order key `after`, oldest first.
 pub(crate) fn inbox(
     reader: &impl Reader,
     agent: &AgentId,
@@ -245,7 +235,6 @@ pub(crate) fn inbox(
     Ok(events)
 }
 
-/// Whether and on what an agent is working, as every machine can derive it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Presence {
     pub(crate) queued: usize,
@@ -253,7 +242,6 @@ pub(crate) struct Presence {
     pub(crate) working_on: Option<EventId>,
 }
 
-/// Every known agent with its card and presence, and every machine card.
 #[derive(Debug, Default)]
 pub(crate) struct Directory {
     pub(crate) agents: BTreeMap<AgentId, (Card, Presence)>,

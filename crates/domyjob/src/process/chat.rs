@@ -7,7 +7,6 @@ use domyjob_core::chat::id::{AgentId, EventId};
 
 use super::{Group, ProcessError};
 
-/// The most output a client may write in one turn.
 pub(crate) const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC: usize = 4096;
 
@@ -27,7 +26,6 @@ pub(crate) enum ChatProcessError {
     Session,
 }
 
-/// Everything one managed turn passes to its AI client.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Invocation<'a> {
     pub(crate) tool: Tool,
@@ -39,7 +37,6 @@ pub(crate) struct Invocation<'a> {
     pub(crate) turn: &'a EventId,
 }
 
-/// The `domyjob mcp` arguments that bind the client's chat tools to this agent and turn.
 fn bound_mcp(invocation: &Invocation<'_>) -> Vec<String> {
     vec![
         "mcp".to_owned(),
@@ -54,9 +51,6 @@ fn json_text(value: &serde_json::Value) -> String {
     value.to_string()
 }
 
-/// Whether `session` is a session ID this client resumes exactly.
-///
-/// Codex treats anything but a UUID as a thread name and silently starts a new thread when none matches.
 pub(crate) fn resumable(tool: Tool, session: &str) -> bool {
     let uuid = || {
         let groups: Vec<&str> = session.split('-').collect();
@@ -72,10 +66,8 @@ pub(crate) fn resumable(tool: Tool, session: &str) -> bool {
         }
 }
 
-/// The read-only agent injected into OpenCode, whose own permissions follow the user's.
 const OPENCODE_READ_AGENT: &str = "domyjob-read";
 
-/// The argument vector after the program, with the prompt read from standard input.
 fn arguments(invocation: &Invocation<'_>, domyjob: &str) -> Result<Vec<String>, ChatProcessError> {
     if invocation
         .session
@@ -155,7 +147,6 @@ fn arguments(invocation: &Invocation<'_>, domyjob: &str) -> Result<Vec<String>, 
     Ok(words)
 }
 
-/// Configuration a client reads from its environment instead of its arguments.
 fn environment(invocation: &Invocation<'_>, domyjob: &str) -> Vec<(&'static str, String)> {
     match invocation.tool {
         Tool::Claude | Tool::Codex => Vec::new(),
@@ -207,7 +198,6 @@ fn command(invocation: &Invocation<'_>) -> Result<Command, ChatProcessError> {
     Ok(command)
 }
 
-/// The end of a client's diagnostic output as printable text.
 fn recent(bytes: &[u8]) -> String {
     let start = bytes.len().saturating_sub(MAX_DIAGNOSTIC);
     domyjob_core::domain::terminal_text(
@@ -222,7 +212,6 @@ fn tail(file: &mut std::fs::File) -> io::Result<String> {
     Ok(recent(&crate::bounded::prefix(file, MAX_DIAGNOSTIC)?))
 }
 
-/// Run one turn and return the client's complete standard output.
 pub(crate) fn run(invocation: &Invocation<'_>) -> Result<Vec<u8>, ChatProcessError> {
     let command = command(invocation)?;
     let mut input = tempfile::tempfile()?;
@@ -255,7 +244,6 @@ pub(crate) fn run(invocation: &Invocation<'_>) -> Result<Vec<u8>, ChatProcessErr
     if !status.success() {
         let mut detail = tail(&mut errors)?;
         if detail.is_empty() {
-            // Clients in JSON mode may report their failure on standard output instead.
             detail = recent(&bytes);
         }
         return Err(ChatProcessError::Failed { status, detail });

@@ -1,10 +1,3 @@
-//! What differs between operating systems, behind one interface.
-//!
-//! [`System`] lists what only an operating system's own interfaces can provide,
-//! and every system implements all of it, so a capability added for one cannot be missing on another.
-//! Everything else here compiles on every system and chooses with `cfg!`,
-//! so each system type-checks the others' paths too.
-
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -69,36 +62,23 @@ mod raw {
     }
 }
 
-/// What only an operating system's own interfaces provide.
 trait System {
-    /// The operating system this machine's card names.
     const OS: Os;
-    /// The environment variables a job keeps besides the common ones.
     const JOB_ENVIRONMENT: &'static [&'static str];
 
-    /// This machine's host name.
     fn host_name() -> String;
-    /// The numeric user ID that names this user's services, where the system has one.
     fn user_id() -> Option<u32>;
-    /// Whether `metadata` describes a file this user may run.
     fn executable(metadata: &fs::Metadata) -> bool;
-    /// Let the file at `path` be run.
     fn make_executable(path: &Path) -> io::Result<()>;
-    /// The mode a copy of a file with `metadata` receives.
     fn file_mode(metadata: &fs::Metadata) -> u32;
-    /// Create files through `options` as executable or not.
     fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool);
-    /// Whether anyone but this user can reach an open file.
     fn ownership(file: &fs::File) -> io::Result<Ownership>;
     fn open_private_dir(path: &Path) -> io::Result<fs::File>;
     fn create_private_dir(path: &Path) -> io::Result<()>;
-    /// Restrict the files `options` creates to this user.
     fn owner_only(options: &mut fs::OpenOptions);
-    /// Open a link itself rather than what it points to.
     fn no_follow(options: &mut fs::OpenOptions);
 }
 
-/// Whether anyone but this user can reach a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ownership {
     Private,
@@ -106,7 +86,6 @@ pub(crate) enum Ownership {
     Exposed(Exposure),
 }
 
-/// An environment variable that is set and not empty.
 pub(crate) fn variable(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
@@ -118,10 +97,6 @@ pub(crate) fn home() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::other("the user home directory is unavailable"))
 }
 
-/// The OpenSSH control socket path for connection sharing, when this system supports it.
-///
-/// Windows OpenSSH shares no connections, and a socket path must stay short,
-/// so a state directory that is too deep disables sharing.
 pub(crate) fn ssh_control_path(
     directory: &Path,
 ) -> Result<Option<PathBuf>, crate::state_io::StateError> {
@@ -132,7 +107,6 @@ pub(crate) fn ssh_control_path(
     Ok(Some(directory.join("%C")))
 }
 
-/// Where this build's executable lives outside any checkout, beside the nodes other machines install.
 pub(crate) fn stable_program(build: &str) -> io::Result<PathBuf> {
     Ok(home()?
         .join(".cargo")
@@ -147,12 +121,10 @@ pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
     Native::make_executable(path)
 }
 
-/// The numeric user ID that names this user's services, where the system has one.
 pub(crate) fn user_id() -> Option<u32> {
     Native::user_id()
 }
 
-/// How this machine names itself to its peers.
 pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
     let name = Native::host_name();
     let label = name.split('.').next().unwrap_or_default().trim().to_owned();
@@ -166,16 +138,12 @@ pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
     })
 }
 
-/// The runtime directory `systemctl --user` needs when a session did not set one.
 pub(crate) fn user_runtime_dir() -> Option<String> {
     variable("XDG_RUNTIME_DIR")
         .map(|value| value.to_string_lossy().into_owned())
         .or_else(|| user_id().map(|id| format!("/run/user/{id}")))
 }
 
-/// The executable a bare program name resolves to on `PATH`.
-///
-/// Windows tries `.exe` before `.cmd`, the order npm and native installers leave behind.
 #[must_use]
 pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
     let path = variable("PATH")?;
@@ -189,7 +157,6 @@ fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     candidates_on(cfg!(windows), directory, name)
 }
 
-/// The files that may run `name` from `directory`; on Windows, a name that already has an extension, such as `powershell.exe`, is tried as written first.
 fn candidates_on(windows: bool, directory: &Path, name: &str) -> Vec<PathBuf> {
     if !windows {
         return vec![directory.join(name)];
@@ -214,15 +181,10 @@ pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
     }
 }
 
-/// Whether no running process holds the executable, so a build may replace it.
 fn replaceable(executable: &Path) -> bool {
     raw::options().write(true).open(executable).is_ok()
 }
 
-/// Where the local client rebuilds itself.
-///
-/// Windows cannot replace a running executable,
-/// so there it picks the first target slot whose executable no process runs.
 pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
     if !cfg!(windows) {
         return Ok(target.to_path_buf());
@@ -292,7 +254,6 @@ pub(crate) fn private_options() -> fs::OpenOptions {
     options
 }
 
-/// Flush a directory's entries to disk; Windows cannot open a directory to flush it.
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     if cfg!(windows) {
         return Ok(());

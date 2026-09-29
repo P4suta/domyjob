@@ -100,9 +100,6 @@ jobs:
             exit 1
           fi
 
-  # The one status check branch protection requires,
-  # named the same in every P4suta repository.
-  # It passes only when every job it needs succeeded or was skipped.
   required:
     name: required
     if: always()

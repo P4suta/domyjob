@@ -1,5 +1,3 @@
-//! Managed turns: one detached worker per busy agent runs its queue one ask at a time.
-
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -33,7 +31,6 @@ pub(crate) enum RunnerError {
     SessionChanged,
 }
 
-/// Start a worker for every managed local agent with waiting asks that has none running.
 pub(crate) fn dispatch(store: &Store) -> Result<(), RunnerError> {
     for agent in store.dispatchable()? {
         let _launch = store.launch_lock(&agent)?;
@@ -47,7 +44,6 @@ pub(crate) fn dispatch(store: &Store) -> Result<(), RunnerError> {
     Ok(())
 }
 
-/// Run `agent`'s queue until it is empty; a second worker for the same agent exits at once.
 pub(crate) fn worker(agent: &str, ready: Option<&ReadyToken>) -> Result<(), RunnerError> {
     let store = Store::open()?;
     let agent = AgentId::try_from(agent.to_owned())?;
@@ -116,7 +112,6 @@ fn describe(card: Option<&Card>, agent: &AgentId) -> String {
     text
 }
 
-/// The managed turn's instructions: who asks, where, and how the answer is stored.
 fn prompt(store: &Store, turn: &Turn) -> Result<String, RunnerError> {
     let Body::Message {
         conversation, text, ..

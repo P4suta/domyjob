@@ -33,7 +33,6 @@ mod raw {
         std::fs::write(path, bytes)
     }
 
-    /// Tell Cargo one `cargo:` instruction.
     pub(super) fn instruct(instruction: &str) {
         println!("cargo:{instruction}");
     }

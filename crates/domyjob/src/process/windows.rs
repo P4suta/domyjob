@@ -95,7 +95,6 @@ pub(super) fn launch_worker(
     let detached = CreationFlags::NEW_PROCESS_GROUP | CreationFlags::BREAKAWAY_FROM_JOB;
     let child = match command.spawn_with(SpawnOptions::new().creation_flags(detached)) {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            // A job that forbids breakaway, such as a domyjob job or CI, keeps the worker inside it.
             command.spawn_with(SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP))
         }
         other => other,
@@ -205,7 +204,6 @@ impl Tree {
         }
     }
 
-    /// Stop what remains of the job after its leader exited.
     pub(super) fn kill_remaining(&self) -> Result<(), ProcessError> {
         self.kill_all()
     }
@@ -214,7 +212,6 @@ impl Tree {
 #[derive(Debug)]
 pub(super) struct Reaper;
 
-/// A Job Object already ends the whole tree with its supervisor, so no guard process is needed.
 impl Guard for Reaper {
     fn stand_guard(_tree: &Tree) -> Result<Self, ProcessError> {
         Ok(Self)
@@ -225,7 +222,6 @@ impl Guard for Reaper {
     fn reap(_group: i32) {}
 }
 
-/// The job output pipe; a Job Object ends every holder of its write end with the job.
 pub(crate) type OutputReader = io::PipeReader;
 
 #[derive(Debug)]

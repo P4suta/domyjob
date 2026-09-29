@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use super::id::{AgentName, Invalid, Line, Paragraph};
 
-/// The AI command-line client that runs an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tool {
@@ -28,7 +27,6 @@ impl Tool {
     }
 }
 
-/// Whether domyjob runs the agent's turns or an interactive session answers by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -36,7 +34,6 @@ pub enum Mode {
     Interactive,
 }
 
-/// What an agent may change while it works.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
@@ -53,18 +50,12 @@ fn valid_tag(text: &str) -> bool {
             .all(|byte| plain(byte) || matches!(byte, b'+' | b'#' | b'.' | b'-'))
 }
 
-validated_string!(
-    /// A skill tag: 1 to 32 lowercase letters, digits, `+`, `#`, `.`, or `-`, starting with a letter or digit.
-    Tag,
-    Invalid,
-    |text| if valid_tag(text) {
-        Ok(())
-    } else {
-        Err(Invalid("skill tag"))
-    }
-);
+validated_string!(Tag, Invalid, |text| if valid_tag(text) {
+    Ok(())
+} else {
+    Err(Invalid("skill tag"))
+});
 
-/// At most 16 sorted, unique skill tags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Tag>", into = "Vec<Tag>")]
 pub struct Skills(Vec<Tag>);
@@ -91,7 +82,6 @@ impl From<Skills> for Vec<Tag> {
 }
 
 impl Skills {
-    /// Sort and deduplicate tags before validating their count.
     pub fn collect(tags: impl IntoIterator<Item = Tag>) -> Result<Self, Invalid> {
         let mut tags: Vec<Tag> = tags.into_iter().collect();
         tags.sort();
@@ -110,7 +100,6 @@ impl Skills {
     }
 }
 
-/// An agent's public profile, shown in the directory of every machine that knows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Card {
@@ -130,7 +119,6 @@ pub struct Card {
     pub access: Access,
 }
 
-/// How well a card matches a directory query; smaller ranks first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Relevance {
     Skill,
@@ -140,7 +128,6 @@ pub enum Relevance {
 }
 
 impl Card {
-    /// Rank a case-insensitive query against the card, or `None` when nothing matches.
     #[must_use]
     pub fn relevance(&self, name: &AgentName, query: &str) -> Option<Relevance> {
         let query = query.trim().to_lowercase();
@@ -175,7 +162,6 @@ impl Card {
     }
 }
 
-/// The operating system family a machine reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Os {
@@ -185,7 +171,6 @@ pub enum Os {
     Other,
 }
 
-/// How a machine names itself, so peers with different SSH aliases display it consistently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineCard {

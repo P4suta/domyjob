@@ -51,7 +51,6 @@ struct CancellationWatch {
 
 impl CancellationWatch {
     fn start(store: &Store, job: &JobId) -> Result<Self, AppError> {
-        // One pending wake covers any number of changes, so a full queue drops the rest.
         let (sender, receiver) = mpsc::sync_channel(1);
         let callback = sender.clone();
         let mut watcher = watch_event::watcher(move |notice| {
@@ -131,7 +130,6 @@ fn job_command(command: &Command, home: &std::path::Path) -> Process {
     process
 }
 
-/// Writes stored output and remembers whether it stops inside a line.
 #[derive(Debug)]
 struct Log<W> {
     file: W,
@@ -152,8 +150,6 @@ impl<W: Write> Write for Log<W> {
     }
 }
 
-/// Stores at most `limit` bytes of `output` in `log` and returns the bytes written and discarded.
-/// Output past the limit is still read, so the job never blocks on a full pipe, and one final line counts it.
 fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Result<(u64, u64)> {
     let mut log = Log {
         file: log,
@@ -161,7 +157,6 @@ fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Resu
     };
     let mut kept = output.take(limit);
     let stored = std::io::copy(&mut kept, &mut log);
-    // A failed log write must not cut the job off from its output, so draining continues and the failure is reported at the end.
     let discarded = std::io::copy(&mut kept.into_inner(), &mut std::io::sink())?;
     let written = stored?;
     if discarded != 0 {
@@ -176,7 +171,6 @@ fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Resu
 
 type Relay = JoinHandle<std::io::Result<(u64, u64)>>;
 
-/// Starts the job with standard output and standard error on one pipe, which a relay thread stores in `log`.
 fn spawn_logged(
     process: Process,
     log: File,
@@ -188,8 +182,6 @@ fn spawn_logged(
     };
     let (reader, writer, stop) = process::output_pipe().map_err(piping)?;
     let errors = writer.try_clone().map_err(piping)?;
-    // The command owns the only write ends and drops them once the job starts.
-    // The relay ends at end of file, or when stopped after the process tree exits.
     let group = Group::spawn_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
     Ok((
         group,
@@ -308,9 +300,6 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
         Ok((child, relay, stop)) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
             let completion = cancellation.wait(&store, job, &child)?;
-            // The process tree is gone, so the relay stores what is already in the pipe and ends,
-            // even when an escaped descendant still holds the write end.
-            // Its failure is reported after the transition so that the job keeps its own outcome.
             let stopped = stop.stop();
             let relayed = relay.join();
             stopped?;
@@ -390,7 +379,6 @@ mod tests {
         let log = state_file::open_append(&path).expect("job log");
         let (_group, relay, _stop) =
             spawn_logged(process::stdout_then_stderr(), log, 4).expect("started job");
-        // Nothing kills the job here, so the relay reaches EOF only if no write end outlives the job itself.
         let relayed = relay.join().expect("relay thread").expect("relayed output");
         assert_eq!(relayed, counts);
         assert_eq!(crate::testing::read(&path).into_bytes(), expected);
@@ -408,7 +396,6 @@ mod tests {
     #[test]
     fn a_stopped_relay_keeps_written_output_even_when_a_writer_outlives_the_job() {
         if cfg!(windows) {
-            // A Job Object ends every holder of the write end, so Windows needs no stop.
             return;
         }
         let (reader, writer, stop) = process::output_pipe().expect("output pipe");

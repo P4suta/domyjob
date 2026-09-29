@@ -12,7 +12,6 @@ use crate::file_kind;
 const MAX_FILES: usize = 100_000;
 const MAX_PATH_BYTES: usize = 16_777_216;
 
-/// Why the source could not be archived, naming the file where one is to blame.
 #[derive(Debug, Error)]
 pub(crate) enum ArchiveError {
     #[error("reading {path}: {source}")]
@@ -23,7 +22,6 @@ pub(crate) enum ArchiveError {
     Capacity,
 }
 
-/// Why one file of the source cannot be sent.
 #[derive(Debug, Error)]
 pub(crate) enum Rejection {
     #[error(transparent)]
@@ -135,7 +133,6 @@ impl Archive {
         Ok(())
     }
 
-    /// The finished archive; writing its end can only fail on the size limit.
     pub(crate) fn finish(self) -> Result<Vec<u8>, ArchiveError> {
         match self.builder.into_inner() {
             Ok(archive) => Ok(archive.0),

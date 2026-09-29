@@ -1,14 +1,9 @@
-//! Rules for events written on this machine.
-//!
-//! Admission accepts any well-formed history so every machine converges; these rules only refuse to author events that would be surprising locally.
-
 use alloc::collections::BTreeSet;
 
 use super::event::{Chain, MAX_CHAIN};
 use super::id::{AgentId, Audience, Invalid, Origin};
 use super::ledger::{Resolution, Room};
 
-/// Why this machine refuses to author an event.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     #[error("an agent cannot ask itself")]
@@ -27,7 +22,6 @@ pub enum Refusal {
     Invalid(#[from] Invalid),
 }
 
-/// The chain for an ask sent from inside the turn answering an ask of `waiting`.
 pub fn delegated(turn: &Chain, waiting: AgentId) -> Result<Chain, Refusal> {
     if turn.agents().len() >= MAX_CHAIN {
         return Err(Refusal::TooDeep);
@@ -35,7 +29,6 @@ pub fn delegated(turn: &Chain, waiting: AgentId) -> Result<Chain, Refusal> {
     Ok(turn.extended(waiting)?)
 }
 
-/// Refuse asks that would wait on the sender or on an agent already waiting on the sender.
 pub fn check_ask(sender: &AgentId, responder: &AgentId, chain: &Chain) -> Result<(), Refusal> {
     if sender == responder {
         return Err(Refusal::SelfAsk);
@@ -48,7 +41,6 @@ pub fn check_ask(sender: &AgentId, responder: &AgentId, chain: &Chain) -> Result
     Ok(())
 }
 
-/// Require that an agent belongs to the room it posts in or is asked in.
 pub fn check_member(room: &Room, agent: &AgentId) -> Result<(), Refusal> {
     if room.members.contains(agent) {
         Ok(())
@@ -59,7 +51,6 @@ pub fn check_member(room: &Room, agent: &AgentId) -> Result<(), Refusal> {
     }
 }
 
-/// Refuse a second ending of the same ask from this machine; other machines' endings may race.
 pub fn check_resolution(current: Option<&Resolution>, local: &Origin) -> Result<(), Refusal> {
     match current {
         Some(winner) if winner.event.origin() == local => Err(Refusal::AlreadyResolved),
@@ -67,7 +58,6 @@ pub fn check_resolution(current: Option<&Resolution>, local: &Origin) -> Result<
     }
 }
 
-/// The machines of a set of agents.
 pub fn audience<'a>(agents: impl IntoIterator<Item = &'a AgentId>) -> Result<Audience, Invalid> {
     Audience::try_from(
         agents
@@ -77,31 +67,26 @@ pub fn audience<'a>(agents: impl IntoIterator<Item = &'a AgentId>) -> Result<Aud
     )
 }
 
-/// Stored chat history, counted by events and encoded bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub events: u64,
     pub bytes: u64,
 }
 
-/// Whether a local write is ordinary or ends an ask that someone waits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
     Ordinary,
     Ending,
 }
 
-/// Ordinary local writes stop here so answers, failures, and withdrawals still fit.
 pub const ORDINARY_LIMIT: Usage = Usage {
     events: 200_000,
     bytes: 512 * 1024 * 1024,
 };
-/// Endings of asks may use the reserve up to this limit.
 pub const ENDING_LIMIT: Usage = Usage {
     events: 220_000,
     bytes: 576 * 1024 * 1024,
 };
-/// Events received from peers are always stored below this disk-protection limit.
 pub const RECEIVED_LIMIT: Usage = Usage {
     events: 400_000,
     bytes: 1024 * 1024 * 1024,

@@ -1,8 +1,3 @@
-//! The local MCP stdio server that gives AI clients the chat tools.
-//!
-//! Calls run concurrently so a long `chat_ask` never blocks `ping` or other tools,
-//! and `notifications/cancelled` stops a waiting call and suppresses its reply.
-
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,7 +120,6 @@ macro_rules! tools {
             })),+]
         }
 
-        /// Whether a tool only reads, so it synchronizes before rather than after.
         fn reads(name: &str) -> bool {
             match name {
                 $($name => $effect == Effect::Read,)+
@@ -316,7 +310,6 @@ enum Phase {
     Ready,
 }
 
-/// Shared state of one MCP connection.
 struct Server<W> {
     output: Mutex<W>,
     phase: Mutex<Phase>,
@@ -387,7 +380,6 @@ impl<W: Write + Send> Server<W> {
         )
     }
 
-    /// Run a tool call; `None` when the call was cancelled and must not be answered.
     fn call(&self, id: &Value, params: Value, cancelled: &Arc<AtomicBool>) -> Option<Value> {
         let Ok(call) = decode::<Call>(params) else {
             return Some(error(id, -32602, "Invalid tool parameters"));
@@ -452,7 +444,6 @@ fn read_line(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(line))
 }
 
-/// Serve one connection until its input closes.
 fn serve_io<W: Write + Send>(mut input: impl BufRead, server: &Server<W>) -> io::Result<()> {
     std::thread::scope(|scope| -> io::Result<()> {
         while let Some(line) = read_line(&mut input)? {
@@ -525,7 +516,6 @@ fn notification<W>(server: &Server<W>, method: &str, params: &Value) {
     }
 }
 
-/// Serve MCP on standard input and output, acting as `actor` within `turn` when given.
 pub(crate) fn serve(
     output: Output,
     actor: Option<&str>,

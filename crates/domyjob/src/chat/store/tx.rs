@@ -1,5 +1,3 @@
-//! The write transaction seen through the core ledger and outbox traits.
-
 use domyjob_core::chat::event::{Body, Digest, Event, Sealed};
 use domyjob_core::chat::exchange::{Outbox, Outgoing, offer_event};
 use domyjob_core::chat::id::{Conversation, EventId, Origin};
@@ -15,7 +13,6 @@ use super::tables::{
 };
 use super::views::{self, Stored};
 
-/// One write transaction of the chat store.
 pub(crate) struct Tx<'a> {
     write: &'a WriteTransaction,
     origin: &'a Origin,

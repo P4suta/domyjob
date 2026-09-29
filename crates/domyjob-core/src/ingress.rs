@@ -1,7 +1,3 @@
-//! The only JSON decoder: framed wire messages, stored records, and text other programs wrote.
-//!
-//! Every decoder refuses input above a stated number of bytes before parsing it.
-
 use serde::de::DeserializeOwned;
 
 use crate::state::JobState;
@@ -26,10 +22,8 @@ mod raw {
     }
 }
 
-/// The most bytes of text written by another program, such as a client's configuration, that are decoded.
 pub const MAX_FOREIGN_BYTES: usize = wire::MAX_CONTROL_BYTES;
 
-/// JSON that did not become the value it was decoded as.
 #[derive(Debug, thiserror::Error)]
 pub enum JsonError {
     #[error("the JSON input exceeds its {limit}-byte limit")]
@@ -38,7 +32,6 @@ pub enum JsonError {
     Invalid(#[from] serde_json::Error),
 }
 
-/// Decode at most `limit` bytes of JSON as `T`.
 pub fn json<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, JsonError> {
     if bytes.len() > limit {
         return Err(JsonError::TooLarge { limit });
@@ -46,7 +39,6 @@ pub fn json<T: DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<T, JsonEr
     Ok(raw::from_slice(bytes)?)
 }
 
-/// Convert JSON that was already decoded within its limit into `T`.
 pub fn value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, serde_json::Error> {
     raw::from_value(value)
 }
@@ -82,7 +74,6 @@ pub fn stored_job(bytes: &[u8]) -> Result<JobState, WireError> {
     Ok(raw::from_slice(bytes)?)
 }
 
-/// Decodes JSON text that another program wrote, such as a client's configuration or command output.
 pub fn foreign_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
     json(text.as_bytes(), MAX_FOREIGN_BYTES)
 }
@@ -95,7 +86,6 @@ mod tests {
     use crate::state::JobState;
     use crate::wire::{self, Request, WireError};
 
-    /// `text` padded with spaces, which JSON ignores, to exactly `length` bytes.
     fn padded(text: &[u8], length: usize) -> Vec<u8> {
         let mut bytes = text.to_vec();
         bytes.resize(length, b' ');

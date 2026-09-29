@@ -1,5 +1,3 @@
-//! Unix: file modes, owners, and descriptors.
-
 use std::fs;
 use std::io;
 use std::os::unix::fs::{
@@ -14,7 +12,6 @@ use super::{Ownership, System, raw};
 #[derive(Debug)]
 pub(super) struct Unix;
 
-/// The permission bits that let other users reach a private file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Mode(u32);
 

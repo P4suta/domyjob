@@ -1,7 +1,5 @@
 #![no_main]
 
-//! Random authoring and synchronization across three reference ledgers must converge.
-
 use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
 use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
 use domyjob_core::chat::id::{
@@ -86,12 +84,10 @@ struct World {
 }
 
 impl World {
-    /// Author an event that must be valid on its machine.
     fn write(&mut self, machine: usize, body: Body) -> Option<Event> {
         Some(self.models[machine].write(body).expect("a valid local write is admitted"))
     }
 
-    /// Author an event that may legitimately depend on events not yet received.
     fn try_write(&mut self, machine: usize, body: Body) -> Option<Event> {
         match self.models[machine].write(body) {
             Ok(event) => Some(event),

@@ -1,6 +1,3 @@
-//! The AI chat: one replicated ledger per machine, exchanged over SSH,
-//! with managed turns, a background service, and MCP tools.
-
 pub(crate) mod address;
 pub(crate) mod args;
 pub(crate) mod cli;

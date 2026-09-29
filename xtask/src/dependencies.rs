@@ -81,7 +81,6 @@ fn vet_args(command: &mut Command, manifest: &Path, root: &Path) {
         .arg(root.join("target/vet-cache"));
 }
 
-/// The manifest beside a lockfile; an unreadable one is reported, not mistaken for a missing one.
 fn manifest_beside(lock: &Path) -> Result<PathBuf, DependencyError> {
     let manifest = lock.with_file_name("Cargo.toml");
     let missing = || DependencyError::MissingManifest {

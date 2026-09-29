@@ -1,5 +1,3 @@
-//! Chat messages carried inside the framed SSH protocol.
-
 use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
@@ -8,10 +6,8 @@ use crate::chat::event::Event;
 use crate::chat::id::{Invalid, Origin};
 use crate::chat::ledger::Rejection;
 
-/// The most events one batch may carry; the frame limit bounds its bytes.
 pub const MAX_BATCH: usize = 256;
 
-/// Consecutive events of one origin with advancing clocks, and whether more follow.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawBatch", into = "RawBatch")]
 pub struct Batch {
@@ -76,7 +72,6 @@ impl Batch {
     }
 }
 
-/// The sender's events after `after`, its cursor of the receiver, and the receiver it expects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Offer {
@@ -87,7 +82,6 @@ pub struct Offer {
     pub batch: Batch,
 }
 
-/// The receiver's cursor of the sender after storing the offer, and its own events after the offer's cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Answer {
@@ -103,12 +97,7 @@ pub struct Answer {
 pub enum ChatRequest {
     Identity {},
     Exchange(Offer),
-    /// Wait until the receiver has events after `seen`, or until its heartbeat.
-    Wait {
-        from: Origin,
-        to: Origin,
-        seen: u64,
-    },
+    Wait { from: Origin, to: Origin, seen: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

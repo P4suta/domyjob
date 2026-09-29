@@ -89,10 +89,6 @@ impl Tree {
         }
     }
 
-    /// Stop what remains of the group after its leader exited but before the leader is reaped.
-    ///
-    /// macOS answers `EPERM` when the unreaped leader is the group's only member,
-    /// so that answer means nothing is left to stop.
     pub(super) fn kill_remaining(&self) -> Result<(), ProcessError> {
         match kill_process_group(self.group, Signal::KILL) {
             Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
@@ -153,10 +149,6 @@ impl Guard for Reaper {
     }
 }
 
-/// A job output pipe whose reader stops at the data already written once `OutputStop` fires.
-///
-/// A descendant that left the job's process group may keep the write end open forever,
-/// so waiting for end of file alone could keep a finished job from completing.
 #[derive(Debug)]
 pub(crate) struct OutputReader {
     pipe: io::PipeReader,
@@ -182,8 +174,6 @@ pub(super) fn output_pipe() -> io::Result<(OutputReader, io::PipeWriter, OutputS
 }
 
 impl Stop for OutputStop {
-    /// A reader that already reached the end of its output has closed the stop pipe,
-    /// and nothing is left to stop.
     fn stop(self) -> io::Result<()> {
         match rustix::io::write(&self.0, b"s") {
             Ok(_) | Err(Errno::PIPE) => Ok(()),

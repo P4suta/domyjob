@@ -1,8 +1,3 @@
-//! The doorbell: a generation number replaced after every commit that stores events.
-//!
-//! It lives alone in its directory, so watching it never observes database writes.
-//! Only [`super::Pulse`] watches it.
-
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -28,17 +23,14 @@ fn file(directory: &Path) -> PathBuf {
     directory.join("generation")
 }
 
-/// Announce that the store reached `generation`.
 pub(super) fn ring(directory: &Path, generation: u64) -> Result<(), StateError> {
     state_io::write_bytes(&file(directory), generation.to_string().as_bytes())
 }
 
-/// Forget every announced generation.
 pub(super) fn forget(directory: &Path) -> Result<(), StateError> {
     state_io::remove_file(&file(directory))
 }
 
-/// The last announced generation, or zero before the first commit.
 pub(super) fn generation(directory: &Path) -> Result<u64, BellError> {
     match state_io::read_bytes(&file(directory))? {
         None => Ok(0),
@@ -54,7 +46,6 @@ enum Wake {
     Broken(String),
 }
 
-/// A registered watch on one store's doorbell.
 pub(super) struct Bell {
     _watcher: notify::RecommendedWatcher,
     receiver: mpsc::Receiver<Wake>,
@@ -71,10 +62,8 @@ impl std::fmt::Debug for Bell {
 }
 
 impl Bell {
-    /// Start watching before the caller reads the state it waits to change.
     pub(super) fn watch(directory: &Path) -> Result<Self, BellError> {
         state_io::private_dir(directory)?;
-        // One pending wake covers any number of changes, so a full queue drops the rest.
         let (sender, receiver) = mpsc::sync_channel(1);
         let mut watcher = watch_event::watcher(move |notice| {
             let wake = match notice {
@@ -94,7 +83,6 @@ impl Bell {
         })
     }
 
-    /// Wait until the generation exceeds `known`; `None` when `deadline` passes first.
     pub(super) fn beyond(&self, known: u64, deadline: Deadline) -> Result<Option<u64>, BellError> {
         loop {
             let current = generation(&self.directory)?;

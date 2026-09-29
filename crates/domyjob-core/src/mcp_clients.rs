@@ -1,7 +1,3 @@
-//! Commands and checks that register `<program> mcp` as the stdio MCP server `domyjob` in AI clients.
-//!
-//! Each builder returns the arguments that follow the client's program name, for a process started without a shell.
-
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -10,25 +6,19 @@ use serde::Deserialize;
 
 use crate::ingress;
 
-/// The name under which every client knows the server.
 pub const SERVER: &str = "domyjob";
 
-/// The program of Claude Code.
 pub const CLAUDE: &str = "claude";
 
-/// The program of Codex.
 pub const CODEX: &str = "codex";
 
-/// The member path of the server in an `OpenCode` configuration, for [`set_member`](crate::jsonc::set_member) and [`remove_member`](crate::jsonc::remove_member).
 pub const OPENCODE_MEMBER: [&str; 2] = ["mcp", SERVER];
 
-/// Returns the Claude Code arguments that describe the registered server.
 #[must_use]
 pub fn claude_get() -> Vec<String> {
     ["mcp", "get", SERVER].map(String::from).into()
 }
 
-/// Returns the Claude Code arguments that remove the server from the user's configuration.
 #[must_use]
 pub fn claude_remove() -> Vec<String> {
     ["mcp", "remove", "--scope", "user", SERVER]
@@ -36,7 +26,6 @@ pub fn claude_remove() -> Vec<String> {
         .into()
 }
 
-/// Returns the Claude Code arguments that register `program mcp` for all of the user's projects.
 #[must_use]
 pub fn claude_add(program: &str) -> Vec<String> {
     [
@@ -55,7 +44,6 @@ pub fn claude_add(program: &str) -> Vec<String> {
     .into()
 }
 
-/// Whether the output of the arguments from [`claude_get`] shows a user-scoped stdio server that runs exactly `program mcp`.
 #[must_use]
 pub fn claude_registration_matches(get_output: &str, program: &str) -> bool {
     let lines: Vec<&str> = get_output.lines().map(str::trim).collect();
@@ -68,19 +56,16 @@ pub fn claude_registration_matches(get_output: &str, program: &str) -> bool {
             .all(|wanted| lines.contains(wanted))
 }
 
-/// Returns the Codex arguments that describe the registered server as JSON.
 #[must_use]
 pub fn codex_get() -> Vec<String> {
     ["mcp", "get", SERVER, "--json"].map(String::from).into()
 }
 
-/// Returns the Codex arguments that remove the server.
 #[must_use]
 pub fn codex_remove() -> Vec<String> {
     ["mcp", "remove", SERVER].map(String::from).into()
 }
 
-/// Returns the Codex arguments that register `program mcp`.
 #[must_use]
 pub fn codex_add(program: &str) -> Vec<String> {
     ["mcp", "add", SERVER, "--", program, "mcp"]
@@ -88,7 +73,6 @@ pub fn codex_add(program: &str) -> Vec<String> {
         .into()
 }
 
-/// The part of `codex mcp get --json` that decides whether a registration is current.
 #[derive(Deserialize)]
 struct CodexServer {
     enabled: bool,
@@ -103,7 +87,6 @@ struct CodexTransport {
     args: Vec<String>,
 }
 
-/// Whether the output of the arguments from [`codex_get`] shows an enabled stdio server that runs exactly `program mcp`.
 #[must_use]
 pub fn codex_registration_matches(get_json: &str, program: &str) -> bool {
     match ingress::foreign_json::<CodexServer>(get_json) {
@@ -117,7 +100,6 @@ pub fn codex_registration_matches(get_json: &str, program: &str) -> bool {
     }
 }
 
-/// Returns the JSON value that runs `program mcp` as a local `OpenCode` server, for the member at [`OPENCODE_MEMBER`].
 #[must_use]
 pub fn opencode_mcp_value(program: &str) -> String {
     format!(

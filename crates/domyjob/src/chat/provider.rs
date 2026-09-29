@@ -1,13 +1,8 @@
-//! Structured results of the Claude Code, Codex, and OpenCode command-line clients.
-//!
-//! A turn counts only when the client reports one complete, successful answer and one session.
-
 use domyjob_core::chat::card::Tool;
 use serde_json::Value;
 
 use crate::process::chat::MAX_OUTPUT;
 
-/// The complete answer of one managed turn and the session that produced it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Answer {
     pub(crate) text: String,
@@ -18,7 +13,6 @@ pub(crate) struct Answer {
 #[error("the AI CLI did not return one complete, valid answer")]
 pub(crate) struct Incomplete;
 
-/// A session identifier safe to pass back as one command-line argument.
 #[must_use]
 pub(crate) fn valid_session(session: &str) -> bool {
     (1..=256).contains(&session.len())
@@ -136,7 +130,6 @@ impl Stream {
     }
 }
 
-/// Parse a client's complete output into exactly one answer.
 pub(crate) fn parse(tool: Tool, output: &[u8]) -> Result<Answer, Incomplete> {
     if tool == Tool::Claude {
         return claude(output);
