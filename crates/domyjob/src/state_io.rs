@@ -294,13 +294,50 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
     }
 }
 
-pub(crate) fn remove_dir_all(path: &Path) -> Result<(), StateError> {
+/// Move a private directory into `trash` under a fresh name, which takes it out of its place in one step.
+///
+/// A tree removed in place can fail part way, for example on a file that a container wrote as root,
+/// and leave behind something that no reader understands;
+/// a tree set aside is either whole where it was or gone from there.
+pub(crate) fn set_aside(path: &Path, trash: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
         Ok(_metadata) => private_dir(path)?,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_at(path, error)),
     }
-    raw::remove_dir_all(path).map_err(|error| io_at(path, error))
+    private_dir(trash)?;
+    let mut entropy = [0_u8; 16];
+    getrandom::fill(&mut entropy)
+        .map_err(|error| io_at(trash, io::Error::other(error.to_string())))?;
+    let name = format!("{:032x}", u128::from_be_bytes(entropy));
+    raw::rename(path, &trash.join(name)).map_err(|error| io_at(path, error))
+}
+
+/// A tree set aside that could not be removed yet.
+#[derive(Debug)]
+pub(crate) struct Leftover {
+    pub(crate) path: PathBuf,
+    pub(crate) error: io::Error,
+}
+
+/// How many set-aside trees one call tries to remove, which bounds how long it takes.
+const EMPTY_LIMIT: usize = 64;
+
+/// Remove the trees set aside in `trash`; a tree that cannot be removed yet stays for a later call.
+pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
+    let entries = match fs::read_dir(trash) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_at(trash, error)),
+    };
+    let mut leftovers = Vec::new();
+    for entry in entries.take(EMPTY_LIMIT) {
+        let path = entry.map_err(|error| io_at(trash, error))?.path();
+        if let Err(error) = raw::remove_dir_all(&path) {
+            leftovers.push(Leftover { path, error });
+        }
+    }
+    Ok(leftovers)
 }
 
 /// Move a private directory to a path that does not exist yet, publishing it in one step.

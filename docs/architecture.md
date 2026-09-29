@@ -24,6 +24,8 @@ A worker lock is the evidence of liveness; a dead worker produces the explicit `
 Cancellation is persisted and delivered through a file change event before the process tree is terminated.
 Finished jobs may be removed; active jobs may not.
 Each admission removes the oldest finished jobs beyond the newest 32, so logs and workspaces never accumulate without bound.
+A job leaves the store with one rename into its trash, and its tree is then removed as far as it can be;
+a tree that cannot be removed yet, such as one holding files a container wrote as root, waits there and never stops an admission.
 
 Every path under the state root is defined in `layout`.
 The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs;

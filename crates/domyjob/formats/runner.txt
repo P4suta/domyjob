@@ -1,6 +1,7 @@
 path runner/jobs
 path runner/staging
 path runner/incoming
+path runner/trash
 path runner/incoming.lock
 path runner/admission.lock
 path runner/sequence

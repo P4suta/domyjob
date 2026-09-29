@@ -172,14 +172,31 @@ fn prune_other_formats_before(
     state: &crate::layout::State,
     cutoff: u64,
 ) -> Result<Vec<PathBuf>, StoreError> {
+    let current = Store {
+        root: state.runner(),
+    };
+    state_file::private_dir(&current.root)?;
     let mut removed = Vec::new();
     for root in state.other_runners()? {
-        let used = Store { root: root.clone() }.last_used()?;
-        if used <= cutoff && !in_use(&root)? {
-            state_file::remove_dir_all(&root)?;
-            removed.push(root);
+        // One store that cannot be judged or moved stays, and the others are still pruned.
+        let unused = Store { root: root.clone() }
+            .last_used()
+            .and_then(|used| Ok(used <= cutoff && !in_use(&root)?));
+        match unused.and_then(|unused| {
+            if unused {
+                state_file::set_aside(&root, &current.trash_dir())?;
+            }
+            Ok(unused)
+        }) {
+            Ok(true) => removed.push(root),
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "domyjob node: keeping the job store {} for now: {error}",
+                root.display()
+            ),
         }
     }
+    current.empty_trash();
     Ok(removed)
 }
 
@@ -193,6 +210,7 @@ impl Store {
             store.jobs_dir(),
             store.staging_dir(),
             store.incoming_dir(),
+            store.trash_dir(),
         ] {
             state_file::private_dir(&dir)?;
         }
@@ -228,6 +246,27 @@ impl Store {
         self.root.join("incoming")
     }
 
+    /// Trees set aside for removal; one that cannot be removed yet waits here and never stops new work.
+    fn trash_dir(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
+    /// Remove what earlier cleanups set aside, and say what has to wait for a later one.
+    fn empty_trash(&self) {
+        match state_file::empty(&self.trash_dir()) {
+            Ok(leftovers) => {
+                for leftover in leftovers {
+                    eprintln!(
+                        "domyjob node: {} cannot be removed yet: {}",
+                        leftover.path.display(),
+                        leftover.error
+                    );
+                }
+            }
+            Err(error) => eprintln!("domyjob node: the trash cannot be emptied yet: {error}"),
+        }
+    }
+
     fn incoming_lock(&self) -> PathBuf {
         self.root.join("incoming.lock")
     }
@@ -258,6 +297,10 @@ impl Store {
     }
 
     /// Remove the oldest finished jobs beyond [`KEEP_FINISHED`]; the caller holds the admission lock.
+    ///
+    /// Reclaiming space never stops new work:
+    /// a finished job that something still holds stays for a later admission,
+    /// and a tree that cannot be removed yet, such as one holding a container's files owned by root, stays in the trash.
     fn reclaim(&self) -> Result<(), StoreError> {
         let mut finished = Vec::new();
         for job in self.list()? {
@@ -268,8 +311,14 @@ impl Store {
         finished.sort();
         let excess = finished.len().saturating_sub(KEEP_FINISHED);
         for (_, job) in finished.into_iter().take(excess) {
-            self.clean_one(&job)?;
+            if let Err(error) = self.clean_one(&job) {
+                eprintln!(
+                    "domyjob node: keeping finished job {} for now: {error}",
+                    job.as_str()
+                );
+            }
         }
+        self.empty_trash();
         Ok(())
     }
 
@@ -344,7 +393,7 @@ impl Store {
                 .map_err(|_name| StoreError::Corrupt)?;
             JobId::try_from(name).map_err(|_invalid| StoreError::Corrupt)?;
             match kind {
-                OrphanKind::Staging => state_file::remove_dir_all(&entry.path())?,
+                OrphanKind::Staging => state_file::set_aside(&entry.path(), &self.trash_dir())?,
                 OrphanKind::Incoming => {
                     let Some(file) = state_file::open_read(&entry.path())? else {
                         return Err(StoreError::Corrupt);
@@ -660,7 +709,7 @@ impl Store {
         let alive = OsLock::exclusive(&paths.alive_lock())?;
         drop(alive);
         drop(launch);
-        state_file::remove_dir_all(&paths.dir)?;
+        state_file::set_aside(&paths.dir, &self.trash_dir())?;
         Ok(true)
     }
 
@@ -668,7 +717,9 @@ impl Store {
         let _admission = OsLock::exclusive(&self.admission_lock())?;
         match target {
             CleanTarget::Job(job) => {
-                if self.clean_one(job)? {
+                let cleaned = self.clean_one(job)?;
+                self.empty_trash();
+                if cleaned {
                     Ok(1)
                 } else {
                     Err(StoreError::Active)
@@ -681,6 +732,7 @@ impl Store {
                         count = count.checked_add(1).ok_or(StoreError::Capacity)?;
                     }
                 }
+                self.empty_trash();
                 Ok(count)
             }
         }
@@ -714,6 +766,7 @@ mod tests {
             store.jobs_dir(),
             store.staging_dir(),
             store.incoming_dir(),
+            store.trash_dir(),
             store.incoming_lock(),
             store.admission_lock(),
             store.sequence(),
@@ -788,7 +841,7 @@ mod tests {
 
     fn store(temporary: &tempfile::TempDir) -> Store {
         let root = temporary.path().join("state");
-        for directory in ["", "jobs", "staging", "incoming"] {
+        for directory in ["", "jobs", "staging", "incoming", "trash"] {
             state_file::private_dir(&root.join(directory)).expect("private store directory");
         }
         Store { root }
@@ -890,6 +943,46 @@ mod tests {
             kept.into_iter().collect::<std::collections::BTreeSet<_>>(),
             newest
         );
+    }
+
+    #[test]
+    fn a_finished_job_whose_files_cannot_be_removed_never_stops_admission() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = store(&temporary);
+        let admit = |index: usize| {
+            let submission = SubmissionId::try_from(format!("{index:032x}")).unwrap();
+            let request = Request::Run {
+                submission: submission.clone(),
+                command: Command::try_from(vec!["true".to_owned()]).unwrap(),
+                input: Input::Home,
+            };
+            let job = store.reserve(&submission, &request, None).unwrap();
+            store
+                .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
+                .unwrap();
+            job
+        };
+        let oldest = admit(0);
+        let protected = store.paths(&oldest).workspace().join("pkg");
+        crate::testing::write(&protected.join("package.json"), "{}");
+        let permissions = crate::testing::protect(&protected);
+        for index in 1..=super::KEEP_FINISHED {
+            admit(index);
+        }
+        // This admission reclaims the oldest job, whose tree this user cannot remove.
+        let newest = admit(super::KEEP_FINISHED.saturating_add(1));
+        let kept = store.list().unwrap();
+        assert!(!kept.contains(&oldest), "the oldest job left in one step");
+        assert!(kept.contains(&newest));
+        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
+        // A tree whose removal was refused waits in the trash until it can go.
+        for leftover in state_file::empty(&store.trash_dir()).unwrap() {
+            crate::testing::restore(
+                &leftover.path.join("workspace").join("pkg"),
+                permissions.clone(),
+            );
+        }
+        assert!(state_file::empty(&store.trash_dir()).unwrap().is_empty());
     }
 
     #[test]

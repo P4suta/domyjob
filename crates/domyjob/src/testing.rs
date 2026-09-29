@@ -34,6 +34,13 @@ mod raw {
     pub(super) fn read_to_string(path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
+
+    pub(super) fn set_permissions(
+        path: &Path,
+        permissions: std::fs::Permissions,
+    ) -> io::Result<()> {
+        std::fs::set_permissions(path, permissions)
+    }
 }
 
 /// Create a directory and its parents.
@@ -63,4 +70,20 @@ pub(crate) fn is_file(path: &Path) -> bool {
 
 pub(crate) fn read(path: &Path) -> String {
     raw::read_to_string(path).expect("read a fixture file")
+}
+
+/// Make a fixture read-only, as a container's files owned by root are to this user,
+/// and return the permissions that [`restore`] gives back.
+pub(crate) fn protect(path: &Path) -> std::fs::Permissions {
+    let original = std::fs::metadata(path)
+        .expect("read a fixture's permissions")
+        .permissions();
+    let mut readonly = original.clone();
+    readonly.set_readonly(true);
+    raw::set_permissions(path, readonly).expect("protect a fixture");
+    original
+}
+
+pub(crate) fn restore(path: &Path, permissions: std::fs::Permissions) {
+    raw::set_permissions(path, permissions).expect("restore a fixture's permissions");
 }
