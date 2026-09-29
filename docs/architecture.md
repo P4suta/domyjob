@@ -29,7 +29,7 @@ a tree that cannot be removed yet, such as one holding files a container wrote a
 
 Every path under the state root is defined in `layout`.
 The job runner keeps its store in a directory named by its format, so builds of different formats never read each other's jobs;
-a node removes another format's store once no process of that format runs and none has opened it for a week,
+a node removes another format's store once no process of that format runs and two other formats' stores were opened after it,
 and a stored format is the digest of a checked-in specimen rather than a version number.
 State records have a 1 MiB size bound and are written through a private, synchronized replacement path.
 The storage adapter checks ownership and Unix mode or Windows ACL before reading existing state.
