@@ -17,6 +17,7 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 | Every path under the state root comes from `layout` | Two modules spelling one file differently | `layout.rs`; review |
 | A stored format is named by the digest of its specimen, never by a hand-written version | Forgotten version bumps and stores misread after a change | The specimen tests in `formats/`; the store records and checks the digest |
 | Every wait drives this machine's progress at each wake-up | A wait that never ends because nothing reacts to a dead worker | `chat::pulse::Pulse` is the only way to watch the doorbell |
+| Setup changes a user's file where it lives, keeping its link and permissions | A dotfiles link replaced by a copy, or a configuration's mode changed behind the user's back | `platform::user_files`, the only writer of user files, and its test |
 | A stop or kill treats "already gone" as success | A finished process reported as a failure | Tests for each such case |
 | The chat protocol is safe and converges in every interleaving of an ask | Arrival-order bugs between machines | The exhaustive state search in `domyjob-core` |
 | A fix lands with a test that fails without it | The same bug returning in a rewrite | The `commit-msg` hook (`cargo xtask commit-msg`) |
