@@ -21,6 +21,7 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 | A stop or kill treats "already gone" as success | A finished process reported as a failure | Tests for each such case |
 | The chat protocol is safe and converges in every interleaving of an ask | Arrival-order bugs between machines | The exhaustive state search in `domyjob-core` |
 | A fix lands with a test that fails without it | The same bug returning in a rewrite | The `commit-msg` hook (`cargo xtask commit-msg`) |
+| Each test runs in its own process, and no test waits for time to pass | A lock that one test released still held by a child that another test forked, and checks that pass only when the machine is fast | `mise run test` runs `cargo nextest`, in CI too |
 
 ## Effects
 
@@ -64,7 +65,7 @@ The wire protocol has no format of its own, because a client only ever talks to 
 ## Verification
 
 - `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, spelling, workflows, and duplication.
-- `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and the end-to-end suite on one host.
+- `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and every end-to-end scenario on one host, each test in its own process.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
 - `mise run mutants` changes the core's code one mutation at a time and requires the tests to notice each change;
   `.rust-mutants.toml` lists the few mutations that change nothing observable, each with its reason.

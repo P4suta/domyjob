@@ -10,6 +10,7 @@ lefthook = "2.1.9"
 "aqua:crate-ci/committed" = "1.1.11"
 "npm:jscpd" = "5.3.2"
 "aqua:axodotdev/cargo-dist" = "0.33.0"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 
 [settings]
 cargo.binstall = false
@@ -52,8 +53,10 @@ depends = ["fmt:check", "clippy", "clippy:targets", "gates"]
 run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
-description = "Run the complete workspace test suite"
-run = "cargo test --locked --workspace --all-targets"
+description = "Run the complete workspace test suite, each test in its own process"
+# A child that another test in the same process forks holds that process's locks until it runs its program,
+# so tests that share a process see each other's locks; a process per test makes lock checks deterministic.
+run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
 [tasks.fuzz]
 description = "Fuzz the wire ingress, job state transitions, and chat ledger convergence"

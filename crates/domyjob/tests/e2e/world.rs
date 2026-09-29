@@ -17,7 +17,7 @@ use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tempfile::TempDir;
+use tempfile::NamedTempFile;
 
 use crate::{Context as _, FAKES, Failure};
 
@@ -28,21 +28,32 @@ const POLL_MILLISECONDS: u64 = 50;
 /// How many times a wait polls before it gives up by default: ten seconds in all.
 const POLLS: u32 = 200;
 
+/// The start of every world's root and of the lock file beside it.
+const PREFIX: &str = "domyjob-e2e-";
+
 #[derive(Debug)]
 pub(crate) struct World {
-    root: TempDir,
+    root: PathBuf,
+    /// Locked for as long as the world exists and kept beside its root, so no sweep removes a world in use.
+    lock: NamedTempFile,
     machines: Vec<String>,
     background: Mutex<Vec<(String, Child)>>,
 }
 
 impl World {
     pub(crate) fn create(machines: &[&str]) -> Result<Self, Failure> {
-        let root = tempfile::Builder::new()
-            .prefix("domyjob-e2e-")
-            .tempdir()
-            .context("creating the temporary root")?;
+        sweep()?;
+        let lock = tempfile::Builder::new()
+            .prefix(PREFIX)
+            .suffix(".lock")
+            .tempfile()
+            .context("creating the world's lock")?;
+        lock.as_file().lock().context("locking the world")?;
+        let root = lock.path().with_extension("");
+        fs::create_dir_all(&root).context("creating the temporary root")?;
         let world = Self {
             root,
+            lock,
             machines: machines.iter().map(|name| (*name).to_owned()).collect(),
             background: Mutex::new(Vec::new()),
         };
@@ -65,7 +76,7 @@ impl World {
     }
 
     pub(crate) fn root(&self) -> &Path {
-        self.root.path()
+        &self.root
     }
 
     fn bin(&self) -> PathBuf {
@@ -168,12 +179,33 @@ impl World {
     }
 
     /// Removes the temporary root, or keeps it and says where it is.
+    ///
+    /// Every process of the world has ended by now,
+    /// yet Windows can hold an ended program's image or a virus scanner's handle for a moment.
+    /// A root that cannot be removed now stays with its lock file unlocked, and a later world's sweep removes it.
     pub(crate) fn finish(self, keep: bool) -> Result<(), Failure> {
+        let Self { root, lock, .. } = self;
         if keep {
-            println!("    kept {}", self.root.keep().display());
+            // Without its lock file, no sweep ever removes the kept root.
+            drop(lock);
+            println!("    kept {}", root.display());
             return Ok(());
         }
-        self.root.close().context("removing the temporary root")
+        match fs::remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(error) if refused(&error) => {
+                println!(
+                    "    left {} for a later run to remove: {error}",
+                    root.display()
+                );
+                lock.keep().context("keeping the world's lock file")?;
+                Ok(())
+            }
+            Err(error) => Err(Failure::new(format!(
+                "removing the temporary root {}: {error}",
+                root.display()
+            ))),
+        }
     }
 
     /// The processes whose command line mentions this world, by PID with their command lines.
@@ -627,6 +659,70 @@ impl Mcp {
 }
 
 /// Polls `probe` every [`POLL_MILLISECONDS`] until it yields a value, at most [`POLLS`] times.
+/// Whether the system refused a removal only because something still holds a file.
+fn refused(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::DirectoryNotEmpty
+    )
+}
+
+/// Removes the roots that earlier worlds left, once no world holds their lock.
+fn sweep() -> Result<(), Failure> {
+    let temporary = std::env::temp_dir();
+    for entry in fs::read_dir(&temporary).context("listing the temporary directory")? {
+        let path = entry.context("listing the temporary directory")?.path();
+        let is_lock = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(PREFIX))
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "lock");
+        if !is_lock {
+            continue;
+        }
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            // Another world's sweep removed it first.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Failure::new(format!("opening {}: {error}", path.display())));
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => continue,
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(Failure::new(format!("locking {}: {error}", path.display())));
+            }
+        }
+        match fs::remove_dir_all(path.with_extension("")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // Still held; the lock file stays for a later sweep.
+            Err(error) if refused(&error) => continue,
+            Err(error) => {
+                return Err(Failure::new(format!(
+                    "removing an earlier root beside {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        drop(file);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound || refused(&error) => {}
+            Err(error) => {
+                return Err(Failure::new(format!(
+                    "removing {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn wait_for<T>(
     what: &str,
     probe: impl FnMut() -> Result<Option<T>, Failure>,
