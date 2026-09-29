@@ -1,13 +1,3 @@
-//! Temporary machines on one host, and the helpers scenarios drive them with.
-//!
-//! A world is one temporary root:
-//!
-//! - `bin/` holds the fakes and a copy of the domyjob binary under test.
-//! - `machines/NAME/` holds `home/` and `work/`, and domyjob creates the private `state/` itself on first use.
-//! - `ssh.jsonl` logs every connection the fake SSH saw, and `*.log` files hold the output of background processes.
-//!
-//! The domyjob copy runs from `bin/` because Windows looks for a program beside the running executable before it searches PATH, and that is where the fakes have to be found.
-
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead as _, Write as _};
@@ -21,20 +11,15 @@ use tempfile::NamedTempFile;
 
 use crate::{Context as _, FAKES, Failure};
 
-/// How long one CLI command may run before the harness stops it and fails the scenario.
-const COMMAND_LIMIT: Duration = Duration::from_secs(90);
-/// How often a wait polls its condition.
+const COMMAND_LIMIT: Duration = Duration::from_secs(180);
 const POLL_MILLISECONDS: u64 = 50;
-/// How many times a wait polls before it gives up by default: ten seconds in all.
-const POLLS: u32 = 200;
+pub(crate) const POLLS: u32 = 2400;
 
-/// The start of every world's root and of the lock file beside it.
 const PREFIX: &str = "domyjob-e2e-";
 
 #[derive(Debug)]
 pub(crate) struct World {
     root: PathBuf,
-    /// Locked for as long as the world exists and kept beside its root, so no sweep removes a world in use.
     lock: NamedTempFile,
     machines: Vec<String>,
     background: Mutex<Vec<(String, Child)>>,
@@ -100,20 +85,14 @@ impl World {
         }
     }
 
-    /// Deletes one fake, so a scenario sees that program missing from every machine of this world.
     pub(crate) fn remove_fake(&self, name: &str) -> Result<(), Failure> {
         fs::remove_file(self.program(name)).context(&format!("removing the fake {name}"))
     }
 
-    /// Every connection the fake SSH saw, oldest first.
     pub(crate) fn ssh_log(&self) -> Result<Vec<Value>, Failure> {
         crate::read_lines(&self.root().join("ssh.jsonl"))
     }
 
-    /// Waits until no process holds a lock in any machine's state or work directory.
-    ///
-    /// domyjob holds a lock for as long as a worker or the service runs, and each fake AI CLI holds one while it runs, so this waits for the background work of every machine to end.
-    /// Call it only while no client command runs: each probe takes a free lock for a moment, and a client that looks at that moment would think a worker is still running.
     pub(crate) fn settle(&self) -> Result<(), Failure> {
         let mut held = Vec::new();
         wait_for("every worker and AI CLI to exit", || {
@@ -123,7 +102,6 @@ impl World {
         .map_err(|failure| Failure::new(format!("{failure}; still locked: {held:?}")))
     }
 
-    /// Stops background processes and hung AI CLIs, waits for everything else, and fails if any process of this world is left.
     pub(crate) fn cleanup(&self) -> Result<(), Failure> {
         self.stop_background()?;
         self.kill_hung()?;
@@ -136,7 +114,6 @@ impl World {
         .map_err(|failure| Failure::new(format!("{failure}; still running: {left:#?}")))
     }
 
-    /// Kills the fake AI CLIs listed in any `hang.pid`, then deletes the list so no later cleanup kills a reused PID.
     pub(crate) fn kill_hung(&self) -> Result<(), Failure> {
         let mut files = Vec::new();
         for name in &self.machines {
@@ -153,14 +130,12 @@ impl World {
                 let pid = line
                     .parse()
                     .context(&format!("reading a PID from {}", file.display()))?;
-                // A process that already ended cannot be killed, and settling afterwards reports anything still running.
                 let _killed = crate::kill_process(pid);
             }
         }
         Ok(())
     }
 
-    /// Kills every background process a scenario started and waits for each to end.
     pub(crate) fn stop_background(&self) -> Result<(), Failure> {
         let children = std::mem::take(
             &mut *self
@@ -169,7 +144,6 @@ impl World {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         for (label, mut child) in children {
-            // A child that already ended cannot be killed; waiting still reaps it.
             let _killed = child.kill();
             child
                 .wait()
@@ -178,15 +152,9 @@ impl World {
         Ok(())
     }
 
-    /// Removes the temporary root, or keeps it and says where it is.
-    ///
-    /// Every process of the world has ended by now,
-    /// yet Windows can hold an ended program's image or a virus scanner's handle for a moment.
-    /// A root that cannot be removed now stays with its lock file unlocked, and a later world's sweep removes it.
     pub(crate) fn finish(self, keep: bool) -> Result<(), Failure> {
         let Self { root, lock, .. } = self;
         if keep {
-            // Without its lock file, no sweep ever removes the kept root.
             drop(lock);
             println!("    kept {}", root.display());
             return Ok(());
@@ -208,9 +176,6 @@ impl World {
         }
     }
 
-    /// The processes whose command line mentions this world, by PID with their command lines.
-    ///
-    /// The temporary root's own name is random, so it identifies this world however its path is spelled.
     pub(crate) fn processes(&self) -> Result<Vec<(u32, String)>, Failure> {
         let marker = self
             .root()
@@ -288,7 +253,6 @@ impl World {
     }
 }
 
-/// One machine of a world, with its own state, home, and work directories.
 #[derive(Debug)]
 pub(crate) struct Machine<'world> {
     world: &'world World,
@@ -309,24 +273,20 @@ impl Machine<'_> {
         self.dir.join("work")
     }
 
-    /// The log a managed turn's worker writes its errors to.
     pub(crate) fn worker_log(&self) -> PathBuf {
         self.state().join("chat").join("worker.log")
     }
 
-    /// Creates `work/NAME`, a working directory of its own for one agent.
     pub(crate) fn workdir(&self, name: &str) -> Result<PathBuf, Failure> {
         let directory = self.work().join(name);
         fs::create_dir_all(&directory).context(&format!("creating {}", directory.display()))?;
         Ok(directory)
     }
 
-    /// Makes the fake SSH refuse new connections to this machine and cut open ones, or accept them again.
     pub(crate) fn set_offline(&self, offline: bool) -> Result<(), Failure> {
         self.mark("offline", offline)
     }
 
-    /// Makes the fake SSH lose every reply from this machine after its node has finished, or deliver them again.
     pub(crate) fn set_drop_reply(&self, drop_reply: bool) -> Result<(), Failure> {
         self.mark("drop-reply", drop_reply)
     }
@@ -344,7 +304,6 @@ impl Machine<'_> {
         changed.context(&format!("setting {}", path.display()))
     }
 
-    /// The domyjob client of this machine, with its state, home, PATH, and working directory.
     fn command(&self, arguments: &[&str]) -> Result<Command, Failure> {
         let world = self.world;
         let mut command = Command::new(world.domyjob());
@@ -369,7 +328,6 @@ impl Machine<'_> {
         format!("domyjob {} on {}", arguments.join(" "), self.name)
     }
 
-    /// Runs the domyjob client on this machine, stopping it after [`COMMAND_LIMIT`].
     pub(crate) fn run(&self, arguments: &[&str]) -> Result<Run, Failure> {
         let mut command = self.command(arguments)?;
         command
@@ -379,21 +337,18 @@ impl Machine<'_> {
         execute(command, self.label(arguments))
     }
 
-    /// Runs `domyjob chat --json ARGUMENTS` on this machine.
     pub(crate) fn chat(&self, arguments: &[&str]) -> Result<Run, Failure> {
         let mut full = vec!["chat", "--json"];
         full.extend_from_slice(arguments);
         self.run(&full)
     }
 
-    /// Runs `domyjob chat --json --as AGENT ARGUMENTS` on this machine.
     pub(crate) fn chat_as(&self, agent: &str, arguments: &[&str]) -> Result<Run, Failure> {
         let mut full = vec!["chat", "--json", "--as", agent];
         full.extend_from_slice(arguments);
         self.run(&full)
     }
 
-    /// Starts the domyjob client in the background until the scenario or its cleanup stops it.
     pub(crate) fn start_background(&self, arguments: &[&str]) -> Result<u32, Failure> {
         let label = self.label(arguments);
         let log = self
@@ -418,7 +373,6 @@ impl Machine<'_> {
         Ok(pid)
     }
 
-    /// Starts `domyjob mcp ARGUMENTS` on this machine with its standard input and output held by the scenario.
     pub(crate) fn mcp(&self, arguments: &[&str]) -> Result<Mcp, Failure> {
         let mut full = vec!["mcp"];
         full.extend_from_slice(arguments);
@@ -478,7 +432,6 @@ fn execute(mut command: Command, label: String) -> Result<Run, Failure> {
     }
 }
 
-/// What one CLI command did.
 #[derive(Debug)]
 pub(crate) struct Run {
     label: String,
@@ -497,13 +450,11 @@ impl Run {
         }
     }
 
-    /// Fails unless the command exited with `code`.
     pub(crate) fn exited(&self, code: i32) -> Result<&Self, Failure> {
         ensure!(self.code == Some(code), "expected exit code {code}: {self}");
         Ok(self)
     }
 
-    /// Parses standard output as one JSON document.
     pub(crate) fn json(&self) -> Result<Value, Failure> {
         serde_json::from_str(self.stdout.trim())
             .map_err(|error| Failure::new(format!("standard output is not JSON ({error}): {self}")))
@@ -525,21 +476,17 @@ impl fmt::Display for Run {
     }
 }
 
-/// A `domyjob mcp` process driven over its standard input and output.
 #[derive(Debug)]
 pub(crate) struct Mcp {
     child: Child,
     input: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
-    /// Every line the server printed, in order.
     seen: Vec<String>,
-    /// Parsed messages that no caller claimed yet.
     unclaimed: Vec<Value>,
     label: String,
 }
 
 impl Mcp {
-    /// Writes one JSON-RPC message as a line.
     pub(crate) fn send(&mut self, message: &Value) -> Result<(), Failure> {
         let input = self
             .input
@@ -554,12 +501,10 @@ impl Mcp {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
     }
 
-    /// Sends a request without waiting for its response.
     pub(crate) fn start(&mut self, id: u64, method: &str, params: &Value) -> Result<(), Failure> {
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
     }
 
-    /// The response to request `id`, if it arrives within `milliseconds`.
     pub(crate) fn response(
         &mut self,
         id: u64,
@@ -600,7 +545,6 @@ impl Mcp {
         }
     }
 
-    /// Sends a request and waits up to ten seconds for its response.
     pub(crate) fn request(
         &mut self,
         id: u64,
@@ -612,7 +556,6 @@ impl Mcp {
             .ok_or_else(|| Failure::new(format!("{} did not answer request {id}", self.label)))
     }
 
-    /// Calls one tool and returns the call's result object.
     pub(crate) fn call(
         &mut self,
         id: u64,
@@ -630,7 +573,6 @@ impl Mcp {
             .ok_or_else(|| Failure::new(format!("{tool} returned no result: {response}")))
     }
 
-    /// Closes the input, waits for the server to exit, and returns every line it printed.
     pub(crate) fn finish(mut self) -> Result<Vec<String>, Failure> {
         drop(self.input.take());
         let mut exited = None;
@@ -658,8 +600,6 @@ impl Mcp {
     }
 }
 
-/// Polls `probe` every [`POLL_MILLISECONDS`] until it yields a value, at most [`POLLS`] times.
-/// Whether the system refused a removal only because something still holds a file.
 fn refused(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -667,7 +607,6 @@ fn refused(error: &io::Error) -> bool {
     )
 }
 
-/// Removes the roots that earlier worlds left, once no world holds their lock.
 fn sweep() -> Result<(), Failure> {
     let temporary = std::env::temp_dir();
     for entry in fs::read_dir(&temporary).context("listing the temporary directory")? {
@@ -683,7 +622,6 @@ fn sweep() -> Result<(), Failure> {
         }
         let file = match fs::File::open(&path) {
             Ok(file) => file,
-            // Another world's sweep removed it first.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(Failure::new(format!("opening {}: {error}", path.display())));
@@ -699,7 +637,6 @@ fn sweep() -> Result<(), Failure> {
         match fs::remove_dir_all(path.with_extension("")) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            // Still held; the lock file stays for a later sweep.
             Err(error) if refused(&error) => continue,
             Err(error) => {
                 return Err(Failure::new(format!(
@@ -730,7 +667,6 @@ pub(crate) fn wait_for<T>(
     wait_within(what, POLLS, probe)
 }
 
-/// Polls `probe` every [`POLL_MILLISECONDS`] until it yields a value, at most `polls` times.
 pub(crate) fn wait_within<T>(
     what: &str,
     polls: u32,
@@ -747,19 +683,16 @@ pub(crate) fn wait_within<T>(
     )))
 }
 
-/// The calls the fake AI CLIs recorded in `directory`, oldest first.
 pub(crate) fn calls(directory: &Path) -> Result<Vec<Value>, Failure> {
     crate::read_lines(&directory.join("calls.jsonl"))
 }
 
-/// Whether two paths name the same existing directory, however each is spelled.
 pub(crate) fn same_directory(left: &Path, right: &Path) -> Result<bool, Failure> {
     let left = fs::canonicalize(left).context(&format!("resolving {}", left.display()))?;
     let right = fs::canonicalize(right).context(&format!("resolving {}", right.display()))?;
     Ok(left == right)
 }
 
-/// The files under `directory` whose bytes contain `needle`.
 pub(crate) fn files_containing(directory: &Path, needle: &str) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
     files_under(

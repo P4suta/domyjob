@@ -1,27 +1,19 @@
-//! Lint exceptions are declarations of ownership, and they take one shape.
-//!
-//! An effect the lints reserve, such as writing a file or reading the clock, happens only inside a private inline module named `raw` whose inner attribute expects the reserved lints and whose functions each forward in one statement.
-//! Its owner wraps those functions with its policy, and every other line stays fully linted,
-//! so an exception can never hide an unrelated violation.
-//! Only foreign-function modules and the end-to-end harness declare exceptions for a whole file.
-
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 
-/// The lints a `raw` module may expect.
 const EFFECT_LINTS: &[&str] = &[
     "clippy::disallowed_methods",
     "clippy::disallowed_types",
     "clippy::disallowed_macros",
 ];
 
-/// The files that may expect lints for the whole file, and which lints.
 const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
     (
         "crates/domyjob/src/platform/windows_acl.rs",
         &["unsafe_code"],
     ),
     ("crates/domyjob/src/process/windows.rs", &["unsafe_code"]),
+    ("crates/domyjob/tests/e2e/os/windows.rs", &["unsafe_code"]),
     (
         "crates/domyjob/tests/e2e.rs",
         &[
@@ -40,7 +32,6 @@ fn line(attribute: &syn::Attribute) -> usize {
         .map_or(1, |part| part.ident.span().start().line)
 }
 
-/// The lints an `expect` attribute names, or `None` for any other attribute.
 fn expected(attribute: &syn::Attribute) -> Option<Vec<String>> {
     if !attribute.path().is_ident("expect") {
         return None;
@@ -76,7 +67,6 @@ fn conditional_exception(attribute: &syn::Attribute) -> bool {
         })
 }
 
-/// Whether an item of a `raw` module only imports, defines a constant, or forwards in one statement.
 fn thin(item: &syn::Item) -> bool {
     let restricted = |visibility: &syn::Visibility| match visibility {
         syn::Visibility::Inherited => true,
@@ -170,7 +160,6 @@ impl<'ast> Visit<'ast> for Exceptions {
     }
 }
 
-/// The misplaced or misshapen lint exceptions in the file at `path`.
 #[must_use]
 pub fn check(path: &str, file: &syn::File) -> Vec<String> {
     let mut exceptions = Exceptions::default();

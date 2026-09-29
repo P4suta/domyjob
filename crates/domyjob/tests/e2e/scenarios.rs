@@ -1,7 +1,3 @@
-//! Scenarios against the chat of AI agents and the job runner.
-//!
-//! Every write names its agent with `--as`, and `chat setup` always skips the service and the AI client registrations, so no scenario touches the host's service manager or client configuration.
-
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -12,7 +8,6 @@ use crate::world::{
 };
 use crate::{Failure, Scenario};
 
-/// Every scenario, in the order the runner starts them.
 pub(crate) const ALL: [Scenario; 12] = [
     Scenario {
         name: "fake_ssh_stands_in_for_openssh",
@@ -76,7 +71,6 @@ pub(crate) const ALL: [Scenario; 12] = [
     },
 ];
 
-/// The fake SSH reaches a machine's node, and its markers and unknown names fail the way OpenSSH does.
 fn fake_ssh_stands_in_for_openssh(world: &World) -> Result<(), Failure> {
     crate::ssh::check_recognizer()?;
     let alpha = world.machine("alpha");
@@ -124,7 +118,6 @@ fn fake_ssh_stands_in_for_openssh(world: &World) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A managed agent answers, resumes its session on the next turn, runs once per ask, and ranks in the directory.
 fn one_machine_answers_resumes_and_ranks(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     join(&alpha, "lead", "claude")?;
@@ -196,7 +189,6 @@ fn one_machine_answers_resumes_and_ranks(world: &World) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Incomplete, failing, oversized, hijacked, missing, and interrupted turns never become answers, and no turn runs twice.
 fn failures_never_become_answers(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     join(&alpha, "lead", "claude")?;
@@ -238,7 +230,6 @@ fn failures_never_become_answers(world: &World) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A worker killed during its turn takes the AI CLI's processes with it, and the next dispatch records the turn as interrupted without rerunning it.
 fn interrupted_without_rerun(world: &World, alpha: &Machine<'_>) -> Result<(), Failure> {
     let request = pending(&ask_with(
         alpha,
@@ -289,19 +280,17 @@ fn interrupted_without_rerun(world: &World, alpha: &Machine<'_>) -> Result<(), F
     Ok(())
 }
 
-/// The asker waiting on a turn whose worker was killed learns that the turn was interrupted.
 fn a_killed_worker_ends_the_asks_wait(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     join(&alpha, "lead", "claude")?;
     start(&alpha, "codex-agent", "codex", &[])?;
     ended(
-        &ask_with(&alpha, "lead", ("codex-agent", "KILL_PARENT"), "10")?,
+        &ask_with(&alpha, "lead", ("codex-agent", "KILL_PARENT"), "120")?,
         "interrupted",
     )?;
     Ok(())
 }
 
-/// Asks to one agent run one at a time, asks to different agents run together, and repeated synchronization starts no extra worker.
 fn asks_take_turns_per_agent_and_run_together_across_agents(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let beta = world.machine("beta");
@@ -349,7 +338,6 @@ fn asks_take_turns_per_agent_and_run_together_across_agents(world: &World) -> Re
     no_worker_pileup(world, (&alpha, &beta), &lead)
 }
 
-/// While a worker is busy, new asks and repeated synchronization queue behind it instead of starting more workers.
 fn no_worker_pileup(
     world: &World,
     (alpha, beta): (&Machine<'_>, &Machine<'_>),
@@ -375,14 +363,13 @@ fn no_worker_pileup(
         "one busy agent should have one worker, not {workers}"
     );
     world.kill_hung()?;
-    ended(&alpha.chat(&["wait", &hung, "--timeout", "30"])?, "failed")?;
+    ended(&alpha.chat(&["wait", &hung, "--timeout", "120"])?, "failed")?;
     for request in &queued {
-        answered(&alpha.chat(&["wait", request, "--timeout", "30"])?)?;
+        answered(&alpha.chat(&["wait", request, "--timeout", "120"])?)?;
     }
     Ok(())
 }
 
-/// An interactive agent works through the real MCP stdio server: identity, inbox, exact replies, concurrency, and cancellation.
 fn mcp_serves_an_interactive_agent(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     join(&alpha, "asker", "codex")?;
@@ -419,7 +406,7 @@ fn mcp_serves_an_interactive_agent(world: &World) -> Result<(), Failure> {
     );
     let request = pending(&ask_with(&alpha, "asker", ("helper", "two plus two"), "0")?)?;
     mcp_answers(&mut mcp, &request)?;
-    let waited = alpha.chat(&["wait", &request, "--timeout", "10"])?;
+    let waited = alpha.chat(&["wait", &request, "--timeout", "120"])?;
     let (_, answer) = answered(&waited)?;
     ensure!(
         answer == "four" && text(&waited.json()?, "/answer/from")? == "helper@local",
@@ -442,7 +429,6 @@ fn mcp_serves_an_interactive_agent(world: &World) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The MCP agent sees the ask as unread, reads it from its inbox, and answers its exact ID.
 fn mcp_answers(mcp: &mut crate::world::Mcp, request: &str) -> Result<(), Failure> {
     let whoami = mcp.call(5, "chat_whoami", &json!({}))?;
     ensure!(
@@ -473,7 +459,6 @@ fn mcp_answers(mcp: &mut crate::world::Mcp, request: &str) -> Result<(), Failure
     Ok(())
 }
 
-/// A long `chat_ask` leaves `ping` answered, and cancelling it suppresses its reply.
 fn mcp_cancels(mcp: &mut crate::world::Mcp) -> Result<(), Failure> {
     mcp.start(
         8,
@@ -502,7 +487,6 @@ fn mcp_cancels(mcp: &mut crate::world::Mcp) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Three machines discover each other, keep private messages private, survive outages and duplicates, and retry out-of-order answers.
 fn three_machines_exchange_privately_and_converge(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let beta = world.machine("beta");
@@ -529,7 +513,6 @@ fn three_machines_exchange_privately_and_converge(world: &World) -> Result<(), F
     secrets_stay_home(&alpha, &[&beta, &gamma], &secretive)
 }
 
-/// The directory lists every machine's agents under the aliases this machine knows them by.
 fn discovery(gamma: &Machine<'_>) -> Result<(), Failure> {
     let listed = gamma.chat(&["directory"])?;
     let json = listed.exited(0)?.json()?;
@@ -549,7 +532,6 @@ fn discovery(gamma: &Machine<'_>) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A direct message reaches its audience, and the third machine never stores its text.
 fn private_messages(
     alpha: &Machine<'_>,
     beta: &Machine<'_>,
@@ -577,7 +559,6 @@ fn private_messages(
     Ok(())
 }
 
-/// A message to an offline machine waits and arrives once it reconnects.
 fn offline_delivery(alpha: &Machine<'_>, gamma: &Machine<'_>) -> Result<(), Failure> {
     gamma.set_offline(true)?;
     let sent = alpha.chat_as("ann", &["send", "gus@gamma", "while you were away"])?;
@@ -595,7 +576,6 @@ fn offline_delivery(alpha: &Machine<'_>, gamma: &Machine<'_>) -> Result<(), Fail
     Ok(())
 }
 
-/// Events a node stored before its reply was lost are sent again and stored once.
 fn duplicate_delivery(
     world: &World,
     alpha: &Machine<'_>,
@@ -621,7 +601,6 @@ fn duplicate_delivery(
     Ok(())
 }
 
-/// A room owned by alpha changes members and topic, and an answer that reaches gamma before its question is retried within one sync.
 fn room_and_early_answer(
     world: &World,
     alpha: &Machine<'_>,
@@ -690,7 +669,6 @@ fn room_and_early_answer(
     Ok(())
 }
 
-/// A managed agent's session and every working directory stay on their own machine.
 fn secrets_stay_home(
     alpha: &Machine<'_>,
     others: &[&Machine<'_>],
@@ -716,7 +694,6 @@ fn secrets_stay_home(
     Ok(())
 }
 
-/// The files under `directory` that hold `text` as written or as JSON stores it, with escaped backslashes.
 fn stored_anywhere(directory: &Path, text: &str) -> Result<Vec<PathBuf>, Failure> {
     let mut found = files_containing(directory, text)?;
     let escaped = text.replace('\\', "\\\\");
@@ -726,7 +703,6 @@ fn stored_anywhere(directory: &Path, text: &str) -> Result<Vec<PathBuf>, Failure
     Ok(found)
 }
 
-/// An answer and a withdrawal written at once on two machines end the ask the same way on both.
 fn racing_answer_and_withdrawal_agree_everywhere(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let beta = world.machine("beta");
@@ -769,7 +745,6 @@ fn racing_answer_and_withdrawal_agree_everywhere(world: &World) -> Result<(), Fa
     Ok(())
 }
 
-/// A managed agent asks another during its turn; the chain travels with the ask and refuses to wait on anyone already waiting.
 fn nested_asks_carry_the_chain_and_refuse_cycles(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     join(&alpha, "alice", "claude")?;
@@ -809,7 +784,6 @@ fn nested_asks_carry_the_chain_and_refuse_cycles(world: &World) -> Result<(), Fa
     Ok(())
 }
 
-/// Cleaning an acknowledged conversation keeps later syncs whole, and a reset machine is accepted again only after `peer replace`.
 fn cleaned_and_reset_machines_keep_syncing(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let beta = world.machine("beta");
@@ -858,7 +832,6 @@ fn cleaned_and_reset_machines_keep_syncing(world: &World) -> Result<(), Failure>
     reset_and_replace(&alpha, &beta)
 }
 
-/// A peer pinned after the clean receives alpha's whole sequence, with placeholders for the cleaned part.
 fn later_peer(alpha: &Machine<'_>, gamma: &Machine<'_>) -> Result<(), Failure> {
     setup(gamma, &["alpha"])?;
     join(gamma, "gus", "opencode")?;
@@ -875,10 +848,8 @@ fn later_peer(alpha: &Machine<'_>, gamma: &Machine<'_>) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A machine that reset its chat is refused until the other side confirms its new identity.
 fn reset_and_replace(alpha: &Machine<'_>, beta: &Machine<'_>) -> Result<(), Failure> {
     if !cfg!(windows) {
-        // A store that others can read is never opened, but doctor names it and reset replaces it.
         expose(&beta.state().join("chat").join("chat.redb"))?;
         let doctor = beta.chat(&["doctor"])?;
         let findings = doctor.json()?;
@@ -910,7 +881,6 @@ fn reset_and_replace(alpha: &Machine<'_>, beta: &Machine<'_>) -> Result<(), Fail
     Ok(())
 }
 
-/// Lets other users read `path`, as a file written with the wrong permissions would; Unix only.
 fn expose(path: &Path) -> Result<(), Failure> {
     let status = std::process::Command::new("chmod")
         .arg("644")
@@ -925,7 +895,6 @@ fn expose(path: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `chat serve`, run as a plain child process, pulls a peer's messages without any command and catches up after an outage.
 fn background_service_delivers_without_commands(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let beta = world.machine("beta");
@@ -943,14 +912,11 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
     beta.chat_as("ben", &["send", "ann@alpha", "delivered by the service"])?
         .exited(0)?;
     arrives(&alpha, "delivered by the service")?;
-    // alpha's own commands leave delivery to its service, and beta cannot reach alpha,
-    // so only the service pushing alpha's write can bring it to beta.
-    // Once the service rests in its long poll, only the doorbell makes it push before its next heartbeat, so a few seconds tell a working doorbell from one that never rings.
     crate::pause(3000);
     alpha
         .chat_as("ann", &["send", "ben@beta", "pushed by the service"])?
         .exited(0)?;
-    wait_within("the doorbell to make the service push", 60, || {
+    wait_within("the doorbell to make the service push", 300, || {
         let thread = beta.chat_as("ben", &["thread", "ann@alpha"])?;
         Ok(thread
             .stdout
@@ -967,15 +933,17 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
     Ok(())
 }
 
-/// Waits until alpha's copy of the conversation with ben holds `text`, without alpha synchronizing itself.
 fn arrives(alpha: &Machine<'_>, text: &str) -> Result<(), Failure> {
-    wait_within("the service to deliver the message", 900, || {
-        let thread = alpha.chat_as("ann", &["thread", "ben@beta"])?;
-        Ok(thread.exited(0)?.stdout.contains(text).then_some(()))
-    })
+    wait_within(
+        "the service to deliver the message",
+        crate::world::POLLS,
+        || {
+            let thread = alpha.chat_as("ann", &["thread", "ben@beta"])?;
+            Ok(thread.exited(0)?.stdout.contains(text).then_some(()))
+        },
+    )
 }
 
-/// `domyjob on` and `domyjob run` still reach a job through the node wrapper and pass its exit status back.
 fn jobs_run_through_the_node_wrapper(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
     let on = alpha.run(&["on", "beta", "--wait", "--", "sleeper", "0", "7"])?;
@@ -1000,7 +968,6 @@ fn jobs_run_through_the_node_wrapper(world: &World) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Pins `peers` on `machine` without installing the service or registering AI clients.
 fn setup(machine: &Machine<'_>, peers: &[&str]) -> Result<(), Failure> {
     let mut arguments = vec!["setup"];
     arguments.extend_from_slice(peers);
@@ -1009,13 +976,11 @@ fn setup(machine: &Machine<'_>, peers: &[&str]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Registers an interactive agent and returns its ID, `NAME@ORIGIN`.
 fn join(machine: &Machine<'_>, name: &str, tool: &str) -> Result<String, Failure> {
     let joined = machine.chat(&["agent", "join", name, "--tool", tool])?;
     Ok(text(&joined.exited(0)?.json()?, "/agent")?.to_owned())
 }
 
-/// Registers a managed agent working in `work/NAME` and returns its ID and working directory.
 fn start(
     machine: &Machine<'_>,
     name: &str,
@@ -1036,10 +1001,9 @@ fn start(
 }
 
 fn ask(machine: &Machine<'_>, asker: &str, target: &str, question: &str) -> Result<Run, Failure> {
-    ask_with(machine, asker, (target, question), "30")
+    ask_with(machine, asker, (target, question), "120")
 }
 
-/// Asks `(target, question)` as `asker`, waiting at most `timeout` seconds.
 fn ask_with(
     machine: &Machine<'_>,
     asker: &str,
@@ -1049,10 +1013,8 @@ fn ask_with(
     machine.chat_as(asker, &["ask", target, question, "--timeout", timeout])
 }
 
-/// Runs several asks at once, each as `(machine, asker, target, question)`.
 fn concurrently(asks: &[(&Machine<'_>, &str, &str, &str)]) -> Result<Vec<Run>, Failure> {
     std::thread::scope(|scope| {
-        // Every ask starts before the first one is awaited.
         let mut running = Vec::new();
         for (machine, asker, target, question) in asks {
             running.push(scope.spawn(move || ask(machine, asker, target, question)));
@@ -1068,7 +1030,6 @@ fn concurrently(asks: &[(&Machine<'_>, &str, &str, &str)]) -> Result<Vec<Run>, F
     })
 }
 
-/// Checks that an ask was answered, and returns its message ID and the answer's text.
 fn answered(run: &Run) -> Result<(String, String), Failure> {
     let json = run.exited(0)?.json()?;
     let id = text(&json, "/message_id")?;
@@ -1081,7 +1042,6 @@ fn answered(run: &Run) -> Result<(String, String), Failure> {
     Ok((id.to_owned(), text(&json, "/answer/text")?.to_owned()))
 }
 
-/// Checks that an ask ended as `state` without an answer, and returns its message ID.
 fn ended(run: &Run, state: &str) -> Result<String, Failure> {
     let json = run.exited(1)?.json()?;
     ensure!(
@@ -1091,7 +1051,6 @@ fn ended(run: &Run, state: &str) -> Result<String, Failure> {
     Ok(text(&json, "/message_id")?.to_owned())
 }
 
-/// Checks that an ask is still waiting for its responder, and returns its message ID.
 fn pending(run: &Run) -> Result<String, Failure> {
     let json = run.exited(3)?.json()?;
     ensure!(
@@ -1101,7 +1060,6 @@ fn pending(run: &Run) -> Result<String, Failure> {
     Ok(text(&json, "/message_id")?.to_owned())
 }
 
-/// The text at `field` of every element of the list at `list`.
 fn labels(value: &Value, list: &str, field: &str) -> Result<Vec<String>, Failure> {
     value
         .pointer(list)

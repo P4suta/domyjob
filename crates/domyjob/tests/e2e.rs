@@ -1,16 +1,3 @@
-//! Deterministic multi-machine end-to-end scenarios for domyjob.
-//!
-//! One executable plays every part.
-//! Cargo starts it as the scenario runner.
-//! For each scenario the runner creates a temporary root and copies this executable into its `bin` directory as `ssh`, as the AI CLIs, and as a `sleeper`, and puts that directory first on PATH.
-//! Each copy picks its role from the name it was started under.
-//! The fake SSH runs the real `domyjob node` against the private directories of the machine it was asked to reach, so several machines share one host.
-//! The fake AI CLIs record every call and answer in their tool's structured format, and words in the prompt select their failures.
-//! No directory that holds a real `claude`, `codex`, or `opencode` stays on PATH, so a scenario can never start a real AI client.
-//!
-//! `cargo test --test e2e -- NAME` runs only the scenarios whose names contain NAME.
-//! `E2E_KEEP=1` keeps each temporary root and prints where it is, and `E2E_JOBS=N` runs N scenarios at a time.
-
 #![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -29,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// Returns a [`Failure`] from the enclosing function unless the condition holds.
 macro_rules! ensure {
     ($condition:expr, $($message:tt)+) => {
         if !$condition {
@@ -38,6 +24,8 @@ macro_rules! ensure {
     };
 }
 
+#[path = "e2e/os.rs"]
+mod os;
 #[path = "e2e/provider.rs"]
 mod provider;
 #[path = "e2e/scenarios.rs"]
@@ -49,9 +37,7 @@ mod world;
 
 use world::World;
 
-/// The programs the runner fakes, by the name each copy of this executable is started under.
 const FAKES: [&str; 5] = ["ssh", "claude", "codex", "opencode", "sleeper"];
-/// The AI clients whose real installations must never be reachable from a scenario.
 const AI_CLIENTS: [&str; 3] = ["claude", "codex", "opencode"];
 
 fn main() -> ExitCode {
@@ -72,7 +58,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Why a scenario step did not hold, with the evidence needed to diagnose it.
 #[derive(Debug)]
 struct Failure(String);
 
@@ -88,7 +73,6 @@ impl fmt::Display for Failure {
     }
 }
 
-/// Says what the harness was doing when a lower-level operation failed.
 trait Context<T> {
     fn context(self, doing: &str) -> Result<T, Failure>;
 }
@@ -99,17 +83,12 @@ impl<T, E: fmt::Display> Context<T> for Result<T, E> {
     }
 }
 
-/// One end-to-end scenario and the machines it needs.
 struct Scenario {
     name: &'static str,
     machines: &'static [&'static str],
     run: fn(&World) -> Result<(), Failure>,
 }
 
-/// Appends `value` as one JSON line and returns how many lines `path` then holds.
-///
-/// A sibling `.lock` file serializes concurrent writers.
-/// Locking the log itself would also block readers on Windows.
 fn append_line(path: &Path, value: &Value) -> io::Result<usize> {
     let lock = fs::OpenOptions::new()
         .create(true)
@@ -131,7 +110,6 @@ fn append_line(path: &Path, value: &Value) -> io::Result<usize> {
     Ok(lines.saturating_add(1))
 }
 
-/// Reads a JSON-lines file, treating a missing file as empty.
 fn read_lines(path: &Path) -> Result<Vec<Value>, Failure> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -146,7 +124,6 @@ fn read_lines(path: &Path) -> Result<Vec<Value>, Failure> {
         .collect()
 }
 
-/// Whether anything exists at `path`, telling absence apart from a failure to look.
 fn present(path: &Path) -> Result<bool, Failure> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -158,7 +135,6 @@ fn present(path: &Path) -> Result<bool, Failure> {
     }
 }
 
-/// Whether `directory` holds a real AI client that a scenario must never start.
 fn holds_ai_client(directory: &Path) -> bool {
     let suffixes: &[&str] = if cfg!(windows) {
         &[".exe", ".cmd", ".bat"]
@@ -172,7 +148,6 @@ fn holds_ai_client(directory: &Path) -> bool {
     })
 }
 
-/// This process's PATH with the fake `bin` directory first, without any other copy of it, and without directories that hold real AI clients.
 fn search_path(bin: &Path) -> Result<OsString, Failure> {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let others: Vec<PathBuf> = std::env::split_paths(&inherited)
@@ -185,7 +160,6 @@ fn pause(milliseconds: u64) {
     std::thread::sleep(Duration::from_millis(milliseconds));
 }
 
-/// Kills one process outright, the way an out-of-memory killer or an impatient operator would.
 fn kill_process(pid: u32) -> io::Result<ExitStatus> {
     let pid = pid.to_string();
     let mut command = if cfg!(windows) {
@@ -204,7 +178,6 @@ fn kill_process(pid: u32) -> io::Result<ExitStatus> {
         .status()
 }
 
-/// Passes a child's exit status on as `ssh` does, with 255 for a status an exit code cannot carry.
 fn exit_code(status: ExitStatus) -> ExitCode {
     match status.code().map(u8::try_from) {
         Some(Ok(code)) => ExitCode::from(code),
@@ -212,7 +185,6 @@ fn exit_code(status: ExitStatus) -> ExitCode {
     }
 }
 
-/// Command-line options, close enough to libtest for `cargo test` filters and `cargo nextest`.
 #[derive(Debug, Default)]
 struct Options {
     list: bool,
@@ -255,7 +227,6 @@ impl Options {
     }
 }
 
-/// How many scenarios run at once: `E2E_JOBS`, or four.
 fn jobs() -> usize {
     std::env::var("E2E_JOBS")
         .ok()
@@ -311,7 +282,6 @@ fn runner() -> ExitCode {
     tally.finish(started.elapsed())
 }
 
-/// Runs one scenario in a fresh world, then stops whatever it left running and removes the world.
 fn attempt(scenario: &Scenario, keep: bool) -> Result<(), Failure> {
     let world = World::create(scenario.machines)?;
     let outcome = (scenario.run)(&world);
