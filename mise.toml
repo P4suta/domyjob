@@ -9,7 +9,6 @@ lefthook = "2.1.9"
 "cargo:cargo-vet" = "0.10.2"
 "aqua:crate-ci/committed" = "1.1.11"
 "npm:jscpd" = "5.3.2"
-"aqua:axodotdev/cargo-dist" = "0.33.0"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 
 [settings]
@@ -35,7 +34,6 @@ run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
 [tasks."clippy:targets"]
 description = "Lint every target for Linux and Windows too, whatever the host"
-# BLAKE3 then builds without a C compiler for the foreign target.
 env = { CARGO_FEATURE_PURE = "1" }
 run = [
   "rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc",
@@ -54,8 +52,6 @@ run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
 description = "Run the complete workspace test suite, each test in its own process"
-# A child that another test in the same process forks holds that process's locks until it runs its program,
-# so tests that share a process see each other's locks; a process per test makes lock checks deterministic.
 run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
 [tasks.fuzz]
@@ -91,7 +87,6 @@ run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mis
 
 [tasks."check:linux"]
 description = "Lint and test this checkout on Linux through domyjob"
-# Each job builds from its own workspace path, so its workspace artifacts are cleaned afterwards.
 run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
 
 [tasks."check:win"]

@@ -11,6 +11,13 @@ semver_check = false
 name = "domyjob"
 changelog_path = "./CHANGELOG.md"
 changelog_update = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+version_group = "domyjob"
+
+[[package]]
+name = "domyjob-core"
+version_group = "domyjob"
 
 [[package]]
 name = "xtask"
