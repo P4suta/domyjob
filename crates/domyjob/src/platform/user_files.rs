@@ -65,9 +65,9 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
         .as_file()
         .sync_all()
         .map_err(failed("writing", &target))?;
-    staged
-        .persist(&target)
-        .map_err(|error| failed("replacing", &target)(error.error))?;
+    let mut staged = staged.into_temp_path();
+    super::raw::rename(&staged, &target).map_err(failed("replacing", &target))?;
+    staged.disable_cleanup(true);
     Ok(())
 }
 
@@ -93,9 +93,9 @@ pub(crate) fn install_executable(source: &Path, target: &Path) -> Result<(), Use
         tempfile::NamedTempFile::new_in(directory).map_err(failed("installing", target))?;
     super::raw::copy(source, staged.path()).map_err(failed("copying", source))?;
     crate::platform::make_executable(staged.path()).map_err(failed("installing", target))?;
-    staged
-        .persist(target)
-        .map_err(|error| failed("installing", target)(error.error))?;
+    let mut staged = staged.into_temp_path();
+    super::raw::rename(&staged, target).map_err(failed("installing", target))?;
+    staged.disable_cleanup(true);
     Ok(())
 }
 

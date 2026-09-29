@@ -49,6 +49,8 @@ Each of these was fixed with a test that fails without the fix.
 - Reset stopped the service only when it ran the current build, so a service of an older build kept running against the replaced store.
 - Setup rewrote the OpenCode configuration as a new private file, which changed its mode and would have replaced a symbolic link with a copy.
 - A finished job holding files this user cannot delete, as a container's files owned by root are, would have stopped every later job on that machine.
+- On Windows, replacing a state file failed while another process read it, which mutation testing's load exposed in the doorbell;
+  files are now replaced by the standard library's rename, which Windows performs even then.
 - Two tests passed only with lucky timing on CI:
   a lock that one test released could still be held by a child that another test forked,
   and Windows could still hold an end-to-end world's files after its processes ended.

@@ -60,6 +60,10 @@ mod raw {
     pub(super) fn remove_file(path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+
+    pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
 }
 
 trait System {

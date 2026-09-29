@@ -206,9 +206,9 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
         .as_file()
         .sync_all()
         .map_err(|error| io_at(path, error))?;
-    staged
-        .persist(path)
-        .map_err(|error| io_at(path, error.error))?;
+    let mut staged = staged.into_temp_path();
+    raw::rename(&staged, path).map_err(|error| io_at(path, error))?;
+    staged.disable_cleanup(true);
     platform::sync_dir(directory).map_err(|error| io_at(directory, error))?;
     Ok(())
 }
@@ -334,6 +334,21 @@ pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
 #[cfg(test)]
 mod tests {
     use super::{open_read, read_bytes, remove_file, write_bytes};
+
+    #[test]
+    fn a_state_file_is_replaced_while_another_handle_holds_it_open() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        let path = root.path().join("state").join("generation");
+        write_bytes(&path, b"1").expect("first generation");
+        let held = std::fs::File::open(&path).expect("a reader of the generation");
+        write_bytes(&path, b"2").expect("replacement while a reader holds the file");
+        write_bytes(&path, b"3").expect("replacement of a replacement");
+        drop(held);
+        assert_eq!(
+            read_bytes(&path).expect("latest generation").as_deref(),
+            Some(&b"3"[..])
+        );
+    }
 
     #[test]
     fn state_replacement_keeps_a_private_regular_file() {
