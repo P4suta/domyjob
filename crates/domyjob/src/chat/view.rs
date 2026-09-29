@@ -1,10 +1,8 @@
-//! What chat operations return, as JSON for tools and as text for people.
-
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 
 use domyjob_core::chat::card::{Access, Card, Mode, Os, Relevance, Tag};
-use domyjob_core::chat::event::{Body, Event, Intent};
+use domyjob_core::chat::event::{Body, Event, Intent, Stamp};
 use domyjob_core::chat::id::{AgentId, Conversation, EventId};
 use domyjob_core::chat::ledger::{Ending, Resolution, Room};
 use domyjob_core::domain::terminal_text;
@@ -16,7 +14,6 @@ pub(crate) use super::store::Presence;
 use super::store::{Directory, Link, LinkState};
 use crate::platform::clock;
 
-/// One agent as a directory lists it.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AgentView {
     pub(crate) agent: String,
@@ -44,7 +41,6 @@ pub(crate) struct DirectoryView {
     pub(crate) rooms: Vec<RoomView>,
 }
 
-/// One event of a conversation in reading form.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct MessageView {
     pub(crate) id: EventId,
@@ -58,10 +54,9 @@ pub(crate) struct MessageView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) request: Option<EventId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) at: Option<u64>,
+    pub(crate) at: Option<Stamp>,
 }
 
-/// Where an ask stands.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AskState {
     pub(crate) message_id: EventId,
@@ -79,7 +74,6 @@ impl AskState {
         !matches!(self.state, "pending" | "working")
     }
 
-    /// 0 when answered, 3 while pending or working, 1 for any other ending.
     #[must_use]
     pub(crate) fn exit_code(&self) -> u8 {
         match self.state {
@@ -90,7 +84,6 @@ impl AskState {
     }
 }
 
-/// The result of one chat operation.
 #[derive(Debug)]
 pub(crate) enum Outcome {
     Agent {
@@ -168,7 +161,6 @@ pub(crate) fn messages(book: &Book, events: &[Event]) -> Vec<MessageView> {
         .collect()
 }
 
-/// What this machine knows about one ask.
 #[derive(Debug)]
 pub(crate) struct AskFacts<'a> {
     pub(crate) request: &'a Event,
@@ -241,14 +233,8 @@ pub(crate) fn rooms(book: &Book, rooms: Vec<(Conversation, Room)>) -> Vec<RoomVi
         .collect()
 }
 
-fn age(at: u64) -> String {
-    let seconds = clock::now_millis().saturating_sub(at) / 1000;
-    match seconds {
-        0..60 => format!("{seconds}s ago"),
-        60..3600 => format!("{}m ago", seconds / 60),
-        3600..86_400 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86_400),
-    }
+fn age(at: Stamp) -> String {
+    at.age(clock::stamp()).to_string()
 }
 
 fn reachability(book: &Book, links: &BTreeMap<String, Link>, agent: &AgentId) -> String {
@@ -269,7 +255,6 @@ fn reachability(book: &Book, links: &BTreeMap<String, Link>, agent: &AgentId) ->
     }
 }
 
-/// The directory, ranked for `query`, most relevant and then alphabetical first.
 pub(crate) fn directory(
     (book, links): (&Book, &BTreeMap<String, Link>),
     directory: Directory,
@@ -399,7 +384,6 @@ fn message_line(message: &MessageView) -> String {
 }
 
 impl Outcome {
-    /// The structured result for `--json` and MCP.
     #[must_use]
     pub(crate) fn json(&self) -> Value {
         match self {
@@ -417,7 +401,6 @@ impl Outcome {
         }
     }
 
-    /// The same result for a terminal.
     #[must_use]
     pub(crate) fn text(&self) -> String {
         match self {
@@ -467,7 +450,6 @@ impl Outcome {
         }
     }
 
-    /// The process exit code of this result.
     #[must_use]
     pub(crate) fn exit_code(&self) -> u8 {
         match self {

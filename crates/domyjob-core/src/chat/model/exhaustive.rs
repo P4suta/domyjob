@@ -1,15 +1,3 @@
-//! Every interleaving of a small scenario, checked state by state.
-//!
-//! Three machines share a room.
-//! The asker asks the responder there, the responder starts, answers, or fails, the asker withdraws,
-//! and any machine runs one exchange round with any other, in every order up to [`DEPTH`] steps.
-//! Every reachable state must be safe: each machine ends the ask with the earliest ending it stores,
-//! a resolved ask is never open, and honest peers never refuse each other's events.
-//! From every reachable state, exchanging until nothing moves must converge:
-//! the same events everywhere, the same ending, and no rejection left.
-//! Most synchronization faults need only a few machines and steps to appear,
-//! so this bounded search stands in for a proof over small scopes.
-
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
@@ -17,7 +5,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use super::Model;
-use crate::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
+use crate::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Stamp};
 use crate::chat::exchange::Outbox as _;
 use crate::chat::fixtures::{agent, origin, text};
 use crate::chat::id::{AgentId, Conversation, RoomId, RoomName};
@@ -38,11 +26,9 @@ enum Step {
 
 #[derive(Debug, Clone)]
 struct World {
-    /// Whether the ask is direct rather than in the room.
     direct: bool,
     models: [Model; 3],
     ask: Option<Event>,
-    /// The steps that each happen at most once.
     taken: BTreeSet<Step>,
 }
 
@@ -65,7 +51,6 @@ fn members() -> Vec<AgentId> {
     alloc::vec![asker(), responder(), agent("watcher", 'c')]
 }
 
-/// A follow-up of the ask by `by`: an answer, or an ending with `outcome`.
 fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Result<Body, String> {
     let (conversation, audience) = request
         .body()
@@ -80,7 +65,7 @@ fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Result<
             intent: Intent::Reply {
                 request: request.id().clone(),
             },
-            at: 0,
+            at: Stamp::from_unix_millis(0),
         },
         Some(outcome) => Body::Resolved {
             request: request.id().clone(),
@@ -92,7 +77,6 @@ fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Result<
     })
 }
 
-/// Whether `event` is an ending of `ask`: the responder's answer, or a resolution.
 fn ends(event: &Event, ask: &Event) -> bool {
     match event.body() {
         Body::Message {
@@ -136,7 +120,6 @@ impl World {
         }
     }
 
-    /// Whether the responder's machine has stored the ask.
     fn responder_knows(&self) -> bool {
         self.ask.as_ref().is_some_and(|ask| {
             self.models
@@ -175,7 +158,6 @@ impl World {
             .map_err(|failure| format!("a valid local write was refused: {failure:?}"))
     }
 
-    /// One exchange round from `from` to `to`; only a missing dependency may stop events.
     fn exchange(&mut self, from: usize, to: usize) -> Result<bool, String> {
         let (low, high) = (from.min(to), from.max(to));
         let (left, right) = self.models.split_at_mut(high);
@@ -224,7 +206,7 @@ impl World {
                         responder: responder(),
                         chain: Chain::default(),
                     },
-                    at: 0,
+                    at: Stamp::from_unix_millis(0),
                 };
                 self.ask = Some(self.write(0, body)?);
             }
@@ -260,7 +242,6 @@ impl World {
         Ok(())
     }
 
-    /// Everything that distinguishes this state from another.
     fn key(&self) -> String {
         let mut key = String::new();
         for model in &self.models {
@@ -286,9 +267,6 @@ impl World {
         key
     }
 
-    /// Each machine ends the ask with the earliest ending it stores, and a resolved ask is never open.
-    ///
-    /// Machines may disagree until they exchange, because each sees only the endings it stores.
     fn check_safety(&self) -> Result<(), String> {
         let Some(ask) = &self.ask else {
             return Ok(());
@@ -312,7 +290,6 @@ impl World {
         Ok(())
     }
 
-    /// Exchange between every pair until nothing moves, then require one shared history.
     fn check_convergence(&self) -> Result<(), String> {
         let mut settled = self.clone();
         let mut rounds = 0_usize;
@@ -354,7 +331,6 @@ impl World {
                 .thread()
                 .map(|(_, audience)| audience.clone())
                 .ok_or_else(|| String::from("an ask is a message"))?;
-            // A machine outside the audience stores only placeholders and knows no ending.
             let endings: BTreeSet<_> = settled
                 .models
                 .iter()
@@ -376,7 +352,6 @@ impl World {
     }
 }
 
-/// Visit every state reachable from the start, checking each; returns how many there are.
 fn explore(direct: bool) -> usize {
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([(World::new(direct), Vec::new())]);

@@ -2,17 +2,16 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 
-use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
+use domyjob_core::chat::card::Mode;
 use domyjob_core::chat::event::{Body, Chain, Intent, Members};
-use domyjob_core::chat::id::{AgentId, AgentName, Conversation, Line, RoomId, RoomName, Text};
+use domyjob_core::chat::id::{AgentId, Conversation, RoomId, RoomName, Text};
 use domyjob_core::chat::policy::{Priority, audience};
 use domyjob_core::chat_wire::{ChatReply, ChatRequest};
 
 use super::{Channel, SyncError, serve, sync_with};
-use crate::chat::store::{LinkState, LocalAgent, Store};
+use crate::chat::store::{LinkState, Store};
 use crate::platform::clock::Deadline;
 
-/// A channel that serves requests with another store in this process.
 struct Local<'a> {
     node: &'a Store,
     offline: bool,
@@ -54,41 +53,10 @@ impl Net<'_> {
     }
 }
 
-fn store(root: &tempfile::TempDir, name: &str) -> Store {
-    Store::open_in(&crate::layout::State::at(&root.path().join(name))).unwrap()
-}
+use crate::chat::store::fixtures::store;
 
 fn register(store: &Store, name: &str) -> AgentId {
-    let agent = AgentName::try_from(name.to_owned()).unwrap();
-    store
-        .write(|tx| {
-            tx.configure(
-                &agent,
-                Some(&LocalAgent {
-                    cwd: "/work".to_owned(),
-                    session: None,
-                }),
-            )?;
-            tx.author(
-                Priority::Ordinary,
-                Body::Profile {
-                    agent: agent.clone(),
-                    card: Box::new(Card {
-                        display_name: Line::try_from(name.to_owned()).unwrap(),
-                        role: None,
-                        description: None,
-                        skills: Skills::default(),
-                        project: None,
-                        status: None,
-                        tool: Tool::Claude,
-                        mode: Mode::Interactive,
-                        access: Access::Read,
-                    }),
-                },
-            )
-        })
-        .unwrap();
-    AgentId::new(agent, store.origin().clone())
+    crate::chat::store::fixtures::register(store, name, Mode::Interactive)
 }
 
 fn states(report: &super::Report) -> Vec<(String, LinkState)> {
@@ -118,7 +86,7 @@ fn offline_peers_are_reported_and_catch_up_after_reconnecting() {
                 text: Text::try_from("while offline".to_owned()).unwrap(),
                 audience: audience([&alice, &bob]).unwrap(),
                 intent: Intent::Send {},
-                at: 0,
+                at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
             },
         )
     })
@@ -137,7 +105,6 @@ fn offline_peers_are_reported_and_catch_up_after_reconnecting() {
     assert_eq!(inbox.len(), 1);
 }
 
-/// Open a room on `owner` for `members` and ask `responder` there as `asker`.
 fn room_ask(
     owner: &Store,
     members: Members,
@@ -166,7 +133,7 @@ fn room_ask(
                         responder: responder.clone(),
                         chain: Chain::default(),
                     },
-                    at: 0,
+                    at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
                 },
             )
         })
@@ -187,7 +154,7 @@ fn answer(store: &Store, responder: &AgentId, question: &domyjob_core::chat::eve
                     intent: Intent::Reply {
                         request: question.id().clone(),
                     },
-                    at: 0,
+                    at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
                 },
             )
         })

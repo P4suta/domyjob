@@ -1,5 +1,3 @@
-//! Managed turns: claim the next ask, finish it, and recover abandoned claims, each atomically.
-
 use domyjob_core::chat::card::{Card, Mode};
 use domyjob_core::chat::event::{Body, Event, Intent, Outcome};
 use domyjob_core::chat::id::{AgentId, EventId, Origin, Text};
@@ -10,7 +8,6 @@ use super::tables::{LOCAL_AGENTS, Reader, TURNS, encode, event_key};
 use super::views::{self, LocalAgent};
 use super::{Store, StoreError, Tx};
 
-/// An ask claimed by its local responder, with everything needed to run it.
 #[derive(Debug, Clone)]
 pub(crate) struct Turn {
     pub(crate) request: Event,
@@ -19,7 +16,6 @@ pub(crate) struct Turn {
     pub(crate) config: LocalAgent,
 }
 
-/// How a managed turn ended.
 #[derive(Debug)]
 pub(crate) enum Completion {
     Answered { text: Text, session: String },
@@ -41,7 +37,6 @@ fn ending(request: &Event, by: &AgentId, outcome: Outcome) -> Result<Body, Store
 }
 
 impl Tx<'_> {
-    /// End an ask with `outcome` unless it already has an ending.
     pub(crate) fn end(
         &mut self,
         request: &Event,
@@ -71,12 +66,9 @@ impl Tx<'_> {
     }
 }
 
-/// The open asks addressed to this machine's agents, sorted by who can answer them.
 #[derive(Debug, Default)]
 struct Triage {
-    /// Managed agents with waiting asks.
     ready: Vec<AgentId>,
-    /// Asks to agents that are unknown here or not managed by this machine.
     unavailable: Vec<(EventId, AgentId)>,
 }
 
@@ -102,9 +94,6 @@ fn triage(reader: &impl Reader, origin: &Origin) -> Result<Triage, StoreError> {
 }
 
 impl Store {
-    /// Resolve asks addressed to local agents that are unknown here or not managed by this machine.
-    ///
-    /// Returns the managed agents that have waiting asks.
     pub(crate) fn dispatchable(&self) -> Result<Vec<AgentId>, StoreError> {
         let seen = self.read(|read| triage(read, self.origin()))?;
         if seen.unavailable.is_empty() {
@@ -121,7 +110,6 @@ impl Store {
         })
     }
 
-    /// Record every abandoned claim of `agent` as interrupted; the caller holds the agent's lock.
     pub(crate) fn recover(&self, agent: &AgentId) -> Result<usize, StoreError> {
         self.write(|tx| {
             let mut claimed = Vec::new();
@@ -143,7 +131,6 @@ impl Store {
         })
     }
 
-    /// Claim the oldest unresolved ask of `agent` and announce that its turn started.
     pub(crate) fn claim(&self, agent: &AgentId) -> Result<Option<Turn>, StoreError> {
         self.write(|tx| {
             let Some(request) = tx.open_for(agent)?.into_iter().next() else {
@@ -178,7 +165,6 @@ impl Store {
         })
     }
 
-    /// Store a turn's result, its session, and the end of its claim in one transaction.
     pub(crate) fn finish(&self, turn: &Turn, completion: Completion) -> Result<(), StoreError> {
         self.write(|tx| {
             match completion {
@@ -198,7 +184,7 @@ impl Store {
                             intent: Intent::Reply {
                                 request: turn.request.id().clone(),
                             },
-                            at: crate::platform::clock::now_millis(),
+                            at: crate::platform::clock::stamp(),
                         },
                     )?;
                     let config = LocalAgent {

@@ -1,8 +1,6 @@
-//! Peers, synchronization links, local configuration, read cursors, cleaning, and reset.
-
 use std::collections::BTreeMap;
 
-use domyjob_core::chat::event::{Digest, Event};
+use domyjob_core::chat::event::{Digest, Event, Stamp};
 use domyjob_core::chat::exchange::Outbox as _;
 use domyjob_core::chat::id::{AgentId, AgentName, Conversation, EventId, Origin};
 use redb::{ReadableTable, WriteTransaction};
@@ -17,7 +15,6 @@ use super::{Store, StoreError, Tx};
 use crate::lock::OsLock;
 use crate::state_io;
 
-/// The outcome of the last synchronization with a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LinkState {
@@ -26,15 +23,13 @@ pub(crate) enum LinkState {
     Failed,
 }
 
-/// What this machine last learned about reaching a peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Link {
     pub(crate) state: LinkState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
-    /// Milliseconds since the Unix epoch, for display only.
-    pub(crate) at: u64,
+    pub(crate) at: Stamp,
 }
 
 fn text_entries(
@@ -49,7 +44,6 @@ fn text_entries(
 }
 
 impl Store {
-    /// Pinned peers by SSH alias.
     pub(crate) fn peers(&self) -> Result<BTreeMap<String, Origin>, StoreError> {
         self.read(|read| {
             text_entries(&read.open_table(PEERS)?)?
@@ -59,7 +53,6 @@ impl Store {
         })
     }
 
-    /// Pin `alias` to `origin`; a different existing origin is replaced only when `replace` is set.
     pub(crate) fn pin(
         &self,
         alias: &str,
@@ -113,7 +106,6 @@ impl Store {
         })
     }
 
-    /// Publish this machine's name and operating system when they changed.
     pub(crate) fn publish_machine(&self) -> Result<(), StoreError> {
         let card = crate::platform::machine_card()?;
         self.write(|tx| {
@@ -131,7 +123,6 @@ impl Store {
         })
     }
 
-    /// Delete a conversation's content here once every peer in its audience holds this machine's part.
     pub(crate) fn clean(&self, conversation: &Conversation) -> Result<usize, StoreError> {
         let lock = OsLock::exclusive(&self.paths().lock())?;
         let mut database = super::open_database(self.paths())?;
@@ -147,7 +138,6 @@ impl Store {
         Ok(removed)
     }
 
-    /// Replace this machine's chat identity and history with an empty store.
     pub(crate) fn reset(state: &crate::layout::State) -> Result<Self, StoreError> {
         let paths = state.chat();
         state_io::private_dir(paths.root())?;
@@ -230,7 +220,6 @@ fn clean_in(tx: &Tx<'_>, conversation: &Conversation) -> Result<usize, StoreErro
     Ok(events.len())
 }
 
-/// Whether every other machine in the event's audience already stored this machine's event.
 fn acknowledged(tx: &Tx<'_>, event: &Event) -> Result<bool, StoreError> {
     if event.origin() != tx.local_origin() {
         return Ok(true);
@@ -255,7 +244,6 @@ impl Tx<'_> {
         domyjob_core::chat::ledger::Ledger::local(self)
     }
 
-    /// Store or remove the private configuration of a local agent.
     pub(crate) fn configure(
         &self,
         name: &AgentName,
@@ -273,7 +261,6 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// The order key of the last event `agent` read.
     pub(crate) fn read_cursor(&self, agent: &AgentId) -> Result<String, StoreError> {
         Ok(
             get_text(&self.transaction().open_table(READS)?, &agent.to_string())?

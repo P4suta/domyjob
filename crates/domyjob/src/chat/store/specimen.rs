@@ -1,13 +1,8 @@
-//! One specimen of everything the chat store keeps, whose digest is the store's format.
-//!
-//! Every table, every key encoding, every kind of event body, and every stored record appear here,
-//! so any change that would leave an existing store unreadable changes the specimen.
-
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use domyjob_core::chat::card::{Access, Card, MachineCard, Mode, Os, Skills, Tag, Tool};
-use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Sealed};
+use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Sealed, Stamp};
 use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, EventId, Line, Origin, Paragraph, RoomId, RoomName, Text,
 };
@@ -18,8 +13,6 @@ use super::admin::{Link, LinkState};
 use super::tables::{encode, event_key, joined_key, manifest, order_key, room_key, thread_key};
 use super::views::LocalAgent;
 
-/// The name of each kind of body; a new kind fails to compile here until it has a name,
-/// and the test fails until [`KINDS`] lists it and the specimen holds one.
 const fn kind(body: &Body) -> &'static str {
     match body {
         Body::Profile { .. } => "profile",
@@ -83,7 +76,6 @@ fn room() -> RoomId {
     )
 }
 
-/// Bodies that describe agents, machines, and rooms.
 fn directory_bodies() -> Vec<(char, Body)> {
     let members = Members::try_from(vec![agent("asker", 'a'), agent("responder", 'b')]).unwrap();
     vec![
@@ -126,7 +118,6 @@ fn directory_bodies() -> Vec<(char, Body)> {
     ]
 }
 
-/// Bodies of conversations: every intent, every outcome, and both kinds of conversation.
 fn thread_bodies() -> Vec<(char, Body)> {
     let (asker, responder) = (agent("asker", 'a'), agent("responder", 'b'));
     let direct = Conversation::direct(&asker, &responder).unwrap();
@@ -137,7 +128,7 @@ fn thread_bodies() -> Vec<(char, Body)> {
         text: Text::try_from("text".to_owned()).unwrap(),
         audience: pair.clone(),
         intent,
-        at: 1_700_000_000_000,
+        at: Stamp::from_unix_millis(1_700_000_000_000),
     };
     let chain = Chain::try_from(vec![agent("waiting", 'c')]).unwrap();
     let mut bodies = vec![
@@ -203,7 +194,6 @@ fn thread_bodies() -> Vec<(char, Body)> {
     bodies
 }
 
-/// Events of every kind, each with the next sequence and clock.
 fn events() -> Vec<Event> {
     directory_bodies()
         .into_iter()
@@ -275,7 +265,7 @@ fn specimen() -> String {
             encode(&Link {
                 state,
                 detail: Some("detail".to_owned()),
-                at: 1_700_000_000_000,
+                at: Stamp::from_unix_millis(1_700_000_000_000),
             })
             .unwrap()
         ));

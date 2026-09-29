@@ -21,6 +21,7 @@ mod mcp;
 mod output;
 mod platform;
 mod process;
+mod retention;
 mod source;
 mod source_archive;
 mod source_fingerprint;
@@ -57,15 +58,15 @@ impl FromStr for ReaperGroup {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Conversations between AI agents on this and other machines.
+    #[command(about = "Conversations between AI agents on this and other machines")]
     Chat(chat::cli::ChatArgs),
-    /// Serve the chat tools to an AI client over the MCP stdio transport.
+    #[command(about = "Serve the chat tools to an AI client over the MCP stdio transport")]
     Mcp {
-        /// Act as this local agent from the start.
         #[arg(long = "as", value_name = "AGENT")]
+        #[arg(help = "Act as this local agent from the start")]
         actor: Option<String>,
-        /// The managed turn this server works inside, for delegated asks.
         #[arg(long, hide = true)]
+        #[arg(help = "The managed turn this server works inside, for delegated asks")]
         turn: Option<String>,
     },
     #[command(hide = true)]
@@ -224,7 +225,6 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
     }
 }
 
-/// Commands that run as part of an installed node or service and never rebuild themselves.
 fn internal() -> bool {
     let words: Vec<std::ffi::OsString> = std::env::args_os().skip(1).take(2).collect();
     let word = |index: usize| words.get(index).and_then(|word| word.to_str());

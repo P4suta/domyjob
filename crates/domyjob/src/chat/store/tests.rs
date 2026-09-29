@@ -1,52 +1,12 @@
-use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
+use domyjob_core::chat::card::Mode;
 use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
-use domyjob_core::chat::id::{AgentId, AgentName, Audience, Conversation, Line, RoomName, Text};
+use domyjob_core::chat::id::{AgentId, AgentName, Audience, Conversation, RoomName, Text};
 use domyjob_core::chat::ledger::{Ending, Rejection};
 use domyjob_core::chat::policy::{Priority, audience};
 
-use super::views::LocalAgent;
 use super::{Completion, Store, StoreError};
 
-fn store(root: &tempfile::TempDir, name: &str) -> Store {
-    Store::open_in(&crate::layout::State::at(&root.path().join(name))).unwrap()
-}
-
-fn card(tool: Tool, mode: Mode) -> Box<Card> {
-    Box::new(Card {
-        display_name: Line::try_from("Agent".to_owned()).unwrap(),
-        role: None,
-        description: None,
-        skills: Skills::default(),
-        project: None,
-        status: None,
-        tool,
-        mode,
-        access: Access::Read,
-    })
-}
-
-fn register(store: &Store, name: &str, mode: Mode) -> AgentId {
-    let agent = AgentName::try_from(name.to_owned()).unwrap();
-    store
-        .write(|tx| {
-            tx.configure(
-                &agent,
-                Some(&LocalAgent {
-                    cwd: "/work".to_owned(),
-                    session: None,
-                }),
-            )?;
-            tx.author(
-                Priority::Ordinary,
-                Body::Profile {
-                    agent: agent.clone(),
-                    card: card(Tool::Codex, mode),
-                },
-            )
-        })
-        .unwrap();
-    AgentId::new(agent, store.origin().clone())
-}
+use super::fixtures::{register, store};
 
 fn direct(from: &AgentId, to: &AgentId, intent: Intent) -> Body {
     Body::Message {
@@ -55,7 +15,7 @@ fn direct(from: &AgentId, to: &AgentId, intent: Intent) -> Body {
         text: Text::try_from("hello".to_owned()).unwrap(),
         audience: audience([from, to]).unwrap(),
         intent,
-        at: 0,
+        at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
     }
 }
 
@@ -76,7 +36,6 @@ fn write(store: &Store, body: Body) -> Event {
         .unwrap()
 }
 
-/// Exchange rounds between two stores the way a client and a node do.
 fn exchange(client: &Store, node: &Store) {
     for _ in 0..16 {
         let offer = client.offer(node.origin()).unwrap().unwrap();
@@ -234,7 +193,7 @@ fn inboxes_follow_direct_conversations_and_room_membership() {
             text: Text::try_from("room note".to_owned()).unwrap(),
             audience: Audience::try_from(vec![a.origin().clone()]).unwrap(),
             intent: Intent::Send {},
-            at: 0,
+            at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
         },
     );
     let inbox = |agent: &AgentId| {

@@ -1,5 +1,3 @@
-//! The chat action interpreter shared by the CLI and the MCP server.
-
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +54,6 @@ impl From<domyjob_core::chat::ledger::Failure<StoreError>> for OpsError {
     }
 }
 
-/// Who acts, and how this process reaches the ledger.
 #[derive(Debug)]
 pub(crate) struct Session {
     pub(crate) store: Store,
@@ -70,7 +67,6 @@ pub(crate) const MAX_WAIT_SECONDS: u64 = 600;
 const MAX_LIMIT: usize = 500;
 
 impl Session {
-    /// Open the local store and bind `actor`, which must be a registered local agent.
     pub(crate) fn open(actor: Option<&str>, turn: Option<&str>) -> Result<Self, OpsError> {
         let store = Store::open()?;
         let mut session = Self {
@@ -87,7 +83,6 @@ impl Session {
         Ok(session)
     }
 
-    /// A session over an already opened store, for tests of the interfaces above it.
     #[cfg(test)]
     pub(crate) fn with_store(store: Store) -> Self {
         Self {
@@ -98,7 +93,6 @@ impl Session {
         }
     }
 
-    /// Bind this session to an existing local agent.
     pub(crate) fn bind(&mut self, actor: &str) -> Result<AgentId, OpsError> {
         let book = self.book()?;
         let agent = address::local_agent(&book, actor)?;
@@ -109,7 +103,6 @@ impl Session {
         Ok(agent)
     }
 
-    /// A copy for one concurrent call, stopped by its own cancellation flag.
     #[must_use]
     pub(crate) fn clone_for(&self, cancelled: Arc<AtomicBool>) -> Self {
         Self {
@@ -120,7 +113,6 @@ impl Session {
         }
     }
 
-    /// Take over the identity another copy of this session bound.
     pub(crate) fn adopt(&mut self, other: &Self) {
         self.actor.clone_from(&other.actor);
     }
@@ -129,7 +121,6 @@ impl Session {
         self.actor.as_ref().ok_or(OpsError::Anonymous)
     }
 
-    /// Whether the background service holds its lock and keeps this machine synchronized.
     pub(crate) fn live(&self) -> Result<bool, OpsError> {
         Ok(OsLock::probe(&self.store.paths().service_lock())? == Probe::Held)
     }
@@ -154,7 +145,6 @@ impl Session {
         })?)
     }
 
-    /// Exchange with peers unless the service already does; failures are reported, not fatal.
     pub(crate) fn refresh(&self) -> Result<Option<Report>, OpsError> {
         if self.live()? {
             return Ok(None);
@@ -167,7 +157,6 @@ impl Session {
     }
 }
 
-/// Run one operation, synchronizing before a read or after a write unless the service does.
 pub(crate) fn around(
     session: &mut Session,
     read: bool,
@@ -284,7 +273,6 @@ fn clamp(limit: usize) -> usize {
     limit.clamp(1, MAX_LIMIT)
 }
 
-/// Register or update an interactive session's agent and bind it.
 pub(crate) fn join(
     session: &mut Session,
     args: &JoinArgs,
@@ -338,7 +326,6 @@ pub(crate) fn join(
     })
 }
 
-/// Register a managed agent whose turns this machine runs.
 pub(crate) fn start(session: &Session, args: &StartArgs) -> Result<Outcome, OpsError> {
     let name = address::handle::<AgentName>(&args.name)?;
     let cwd = absolute_directory(&args.cwd)?;
@@ -383,7 +370,6 @@ pub(crate) fn start(session: &Session, args: &StartArgs) -> Result<Outcome, OpsE
     })
 }
 
-/// Change a local agent's private configuration.
 pub(crate) fn update(session: &Session, args: &UpdateArgs) -> Result<Outcome, OpsError> {
     let name = address::handle::<AgentName>(&args.name)?;
     let cwd = args.cwd.as_deref().map(absolute_directory).transpose()?;
@@ -408,7 +394,6 @@ pub(crate) fn update(session: &Session, args: &UpdateArgs) -> Result<Outcome, Op
     })
 }
 
-/// Remove a local agent, ending the asks still waiting on it.
 pub(crate) fn remove(session: &Session, args: &NameArgs) -> Result<Outcome, OpsError> {
     let name = address::handle::<AgentName>(&args.name)?;
     let agent = AgentId::new(name.clone(), session.store.origin().clone());
@@ -436,7 +421,6 @@ pub(crate) fn remove(session: &Session, args: &NameArgs) -> Result<Outcome, OpsE
     Ok(Outcome::Removed { agent, ended })
 }
 
-/// Update the acting agent's own card.
 pub(crate) fn profile(session: &Session, args: &ProfileArgs) -> Result<Outcome, OpsError> {
     let agent = session.me()?.clone();
     let card = session.store.write(|tx| {
@@ -538,7 +522,6 @@ pub(crate) fn create_room(session: &Session, args: &RoomArgs) -> Result<Outcome,
     )))
 }
 
-/// How a room owned here changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoomChange {
     Add,
@@ -618,7 +601,6 @@ pub(crate) fn close_room(session: &Session, args: &NameArgs) -> Result<Outcome, 
     Ok(Outcome::Rooms(Vec::new()))
 }
 
-/// Where a message goes and who may read it.
 fn route(
     reader: &impl Reader,
     conversation: &Conversation,
@@ -647,7 +629,7 @@ fn message(
         text,
         audience,
         intent,
-        at: clock::now_millis(),
+        at: clock::stamp(),
     }
 }
 
@@ -665,7 +647,6 @@ pub(crate) fn send(session: &Session, args: &SendArgs) -> Result<Outcome, OpsErr
     Ok(Outcome::Posted(event))
 }
 
-/// The chain an ask inherits when it is sent from inside a managed turn of this agent.
 fn delegation(session: &Session, me: &AgentId) -> Result<Chain, OpsError> {
     let Some(turn) = &session.turn else {
         return Ok(Chain::default());
@@ -746,7 +727,6 @@ pub(crate) fn wait(session: &Session, args: &MessageArgs) -> Result<Outcome, Ops
     )?))
 }
 
-/// The current state of an ask as this machine knows it.
 fn ask_state(session: &Session, request: &EventId) -> Result<AskState, OpsError> {
     let book = session.book()?;
     Ok(session.store.read(|read| {
@@ -775,7 +755,6 @@ fn ask_state(session: &Session, request: &EventId) -> Result<AskState, OpsError>
     })?)
 }
 
-/// Wait up to `timeout` seconds for an ask to end, pulling from peers when no service does.
 fn await_ending(session: &Session, request: &EventId, timeout: u64) -> Result<AskState, OpsError> {
     let deadline = Deadline::after_seconds(timeout);
     let mut pulse = Pulse::new(&session.store, 1000)?;
@@ -888,7 +867,6 @@ pub(crate) fn inbox(session: &Session, args: &InboxArgs) -> Result<Outcome, OpsE
     })
 }
 
-/// The number of messages waiting for the acting agent, for status lines and MCP results.
 pub(crate) fn unread(session: &Session) -> Result<Option<usize>, OpsError> {
     let Some(me) = session.actor.clone() else {
         return Ok(None);
@@ -924,7 +902,6 @@ pub(crate) fn thread(session: &Session, args: &ThreadArgs) -> Result<Outcome, Op
     })
 }
 
-/// Publish this machine's name and operating system when they changed.
 pub(crate) fn publish_machine(store: &Store) -> Result<(), OpsError> {
     Ok(store.publish_machine()?)
 }

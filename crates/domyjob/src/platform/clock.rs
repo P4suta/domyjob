@@ -1,9 +1,6 @@
-//! Wall-clock time for display and for bounding waits on other machines.
-//!
-//! No job, turn, or ledger decision reads the clock; it only limits how long a caller waits.
-//! Times are whole milliseconds, and only [`raw`] touches the standard library's time types.
-
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+
+use domyjob_core::chat::event::Stamp;
 
 mod raw {
     #![expect(
@@ -18,12 +15,10 @@ mod raw {
 
     static START: OnceLock<Instant> = OnceLock::new();
 
-    /// Milliseconds since this process first read the monotonic clock.
     pub(super) fn monotonic_millis() -> u128 {
         START.get_or_init(Instant::now).elapsed().as_millis()
     }
 
-    /// Milliseconds since the Unix epoch, or `None` before it.
     pub(super) fn wall_millis() -> Option<u128> {
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(elapsed) => Some(elapsed.as_millis()),
@@ -51,13 +46,11 @@ fn monotonic() -> u64 {
     saturate(raw::monotonic_millis())
 }
 
-/// Milliseconds since the Unix epoch, shown beside messages and link states.
 #[must_use]
-pub(crate) fn now_millis() -> u64 {
-    raw::wall_millis().map_or(0, saturate)
+pub(crate) fn stamp() -> Stamp {
+    Stamp::from_unix_millis(raw::wall_millis().map_or(0, saturate))
 }
 
-/// A point in time after which a caller stops waiting; a deadline too far away never comes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deadline(u64);
 
@@ -77,7 +70,6 @@ impl Deadline {
         monotonic() >= self.0
     }
 
-    /// The earlier of two deadlines.
     #[must_use]
     pub(crate) fn min(self, other: Self) -> Self {
         Self(self.0.min(other.0))
@@ -88,7 +80,6 @@ impl Deadline {
     }
 }
 
-/// What waiting on a channel until a deadline produced.
 #[derive(Debug)]
 pub(crate) enum Waited<T> {
     Received(T),
@@ -96,7 +87,6 @@ pub(crate) enum Waited<T> {
     Closed,
 }
 
-/// Block on `receiver` until it yields a value, closes, or `deadline` passes.
 pub(crate) fn receive<T>(receiver: &Receiver<T>, deadline: Deadline) -> Waited<T> {
     match raw::receive(receiver, deadline.left_millis()) {
         Ok(value) => Waited::Received(value),
@@ -105,7 +95,6 @@ pub(crate) fn receive<T>(receiver: &Receiver<T>, deadline: Deadline) -> Waited<T
     }
 }
 
-/// Pause between retries of an unreachable peer.
 pub(crate) fn pause_millis(millis: u64) {
     raw::sleep(millis);
 }

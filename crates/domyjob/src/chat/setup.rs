@@ -1,8 +1,3 @@
-//! Preparing this machine for chat and diagnosing it.
-//!
-//! Setup pins peers, installs this build at a stable path, starts the background service,
-//! and registers the MCP server with every installed AI client; each step is idempotent.
-
 use std::path::{Path, PathBuf};
 
 use domyjob_core::{jsonc, mcp_clients};
@@ -51,7 +46,6 @@ pub(crate) enum SetupError {
     Encode(#[from] serde_json::Error),
 }
 
-/// What setup and doctor report, one line per step or finding.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Finding {
     pub(crate) area: &'static str,
@@ -81,7 +75,6 @@ impl Finding {
     }
 }
 
-/// What the installed service runs, recorded when it was installed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Installed {
@@ -98,10 +91,10 @@ fn installed(paths: &layout::Chat) -> Result<Option<Installed>, SetupError> {
     }
 }
 
-/// This build's executable at its stable, build-specific path.
 fn stable_program() -> Result<PathBuf, SetupError> {
     let target = crate::platform::stable_program(&crate::identity::tag())?;
     user_files::install_executable(&std::env::current_exe()?, &target)?;
+    crate::builds::pin(&target)?;
     Ok(target)
 }
 
@@ -141,12 +134,10 @@ pub(crate) fn service_uninstall(paths: &layout::Chat) -> Result<Finding, SetupEr
     ))
 }
 
-/// Whether a chat service is installed or running, whatever its build or health.
 pub(crate) fn service_present(paths: &layout::Chat) -> Result<bool, SetupError> {
     Ok(installed(paths)?.is_some() || OsLock::probe(&paths.service_lock())? == Probe::Held)
 }
 
-/// Whether the service is installed, current, and running.
 pub(crate) fn service_status(paths: &layout::Chat) -> Result<Finding, SetupError> {
     let running = OsLock::probe(&paths.service_lock())? == Probe::Held;
     let current = crate::platform::stable_program(&crate::identity::tag())?;
@@ -193,7 +184,6 @@ fn opencode_config() -> Result<PathBuf, SetupError> {
     })
 }
 
-/// Whether each installed client runs `program mcp` as its `domyjob` server; `repair` fixes it.
 fn clients(program: &str, repair: bool) -> Result<Vec<Finding>, SetupError> {
     let mut findings = Vec::new();
     let fix = "domyjob chat setup";
@@ -259,7 +249,6 @@ fn clients(program: &str, repair: bool) -> Result<Vec<Finding>, SetupError> {
     Ok(findings)
 }
 
-/// What `chat setup` does besides pinning its machines.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Steps {
     pub(crate) replace: bool,
@@ -267,7 +256,6 @@ pub(crate) struct Steps {
     pub(crate) clients: bool,
 }
 
-/// Pin peers, publish this machine, start the service, and register the AI clients.
 pub(crate) fn setup(machines: &[String], steps: Steps) -> Result<Vec<Finding>, SetupError> {
     let Steps {
         replace,
@@ -329,7 +317,6 @@ fn logged_in(
     }))
 }
 
-/// Check the service, the links, the client registrations and logins, and the local agents.
 pub(crate) fn doctor() -> Result<Vec<Finding>, SetupError> {
     let mut findings = vec![service_status(&layout::State::here()?.chat())?];
     match Store::open() {
@@ -361,7 +348,6 @@ pub(crate) fn doctor() -> Result<Vec<Finding>, SetupError> {
     Ok(findings)
 }
 
-/// What the readable chat store says about peers and local agents.
 fn store_findings(store: &Store) -> Result<Vec<Finding>, SetupError> {
     let mut findings = Vec::new();
     for (alias, link) in store.links()? {

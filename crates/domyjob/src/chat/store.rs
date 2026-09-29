@@ -1,5 +1,3 @@
-//! The durable chat ledger: one redb file per machine, opened only under its OS lock.
-
 use domyjob_core::chat::event::{Body, Event};
 use domyjob_core::chat::exchange::{self, Progress};
 use domyjob_core::chat::id::{AgentId, Invalid, Origin};
@@ -84,7 +82,6 @@ impl From<Failure<Self>> for StoreError {
     }
 }
 
-/// A handle on this machine's chat ledger; every operation opens the file under the lock.
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     paths: layout::Chat,
@@ -102,7 +99,6 @@ fn new_origin() -> Result<Origin, StoreError> {
     Ok(Origin::from_entropy(entropy))
 }
 
-/// Read or create the store's identity, refusing a store written in another format.
 fn initialize(database: &Database) -> Result<Origin, StoreError> {
     let write = database.begin_write()?;
     tables::create_all(&write)?;
@@ -113,7 +109,6 @@ fn initialize(database: &Database) -> Result<Origin, StoreError> {
         match tables::get_text(&meta, "format")? {
             Some(found) if found != format => return Err(StoreError::Format(found)),
             Some(_) => {}
-            // A store with an identity but no format was written before formats were recorded.
             None if known => return Err(StoreError::Format("unrecorded".to_owned())),
             None => {
                 meta.insert("format", format.as_str())?;
@@ -136,7 +131,6 @@ impl Store {
         Self::open_in(&layout::State::here()?)
     }
 
-    /// Open or create the chat store inside a private state directory.
     pub(crate) fn open_in(state: &layout::State) -> Result<Self, StoreError> {
         let paths = state.chat();
         state_io::private_dir(paths.root())?;
@@ -151,7 +145,6 @@ impl Store {
         &self.origin
     }
 
-    /// Remove the recorded format, as a store written before formats were recorded has none.
     #[cfg(test)]
     pub(crate) fn forget_format_for_test(&self) -> Result<(), StoreError> {
         let database = open_database(&self.paths)?;
@@ -161,20 +154,17 @@ impl Store {
         Ok(())
     }
 
-    /// Where this store's files live.
     #[must_use]
     pub(crate) const fn paths(&self) -> &layout::Chat {
         &self.paths
     }
 
-    /// Serialize worker launches and final queue scans of one agent.
     pub(crate) fn launch_lock(&self, agent: &AgentId) -> Result<OsLock, StoreError> {
         Ok(OsLock::exclusive(
             &self.paths.agent_lock(agent, AgentLock::Launch),
         )?)
     }
 
-    /// The lock a running worker holds for its agent's whole queue.
     pub(crate) fn try_agent_lock(&self, agent: &AgentId) -> Result<Option<OsLock>, StoreError> {
         Ok(OsLock::try_exclusive(
             &self.paths.agent_lock(agent, AgentLock::Queue),
@@ -204,7 +194,6 @@ impl Store {
         value
     }
 
-    /// Run `work` in one write transaction; ring the doorbell when it stored events.
     pub(crate) fn write<T>(
         &self,
         work: impl FnOnce(&mut Tx<'_>) -> Result<T, StoreError>,
@@ -242,7 +231,6 @@ impl Store {
         self.write(|tx| exchange::accept(tx, offer, answer))
     }
 
-    /// The last sequence this machine authored.
     pub(crate) fn local_seen(&self) -> Result<u64, StoreError> {
         self.read(|read| Ok(cursor(read, &self.origin)?.seen))
     }
@@ -255,6 +243,8 @@ impl Tx<'_> {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod specimen;
 #[cfg(test)]

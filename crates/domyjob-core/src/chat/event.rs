@@ -10,9 +10,7 @@ use super::id::{
     AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
 };
 
-/// The encoded size limit of one event, leaving room for a batch inside a 1 MiB frame.
 pub const MAX_EVENT_BYTES: usize = 400 * 1024;
-/// The deepest chain of agents that may wait on each other through nested asks.
 pub const MAX_CHAIN: usize = 8;
 
 macro_rules! agent_list {
@@ -63,23 +61,10 @@ macro_rules! agent_list {
     };
 }
 
-agent_list!(
-    /// Agents whose turns already wait on an ask, outermost first; the sender is implicit.
-    Chain,
-    0,
-    MAX_CHAIN,
-    "delegation chain"
-);
-agent_list!(
-    /// The unique agents of a room.
-    Members,
-    1,
-    64,
-    "room members"
-);
+agent_list!(Chain, 0, MAX_CHAIN, "delegation chain");
+agent_list!(Members, 1, 64, "room members");
 
 impl Chain {
-    /// The chain carried by an ask sent while `waiting` is blocked on the turn of this chain.
     pub fn extended(&self, waiting: AgentId) -> Result<Self, Invalid> {
         let mut agents = self.0.clone();
         agents.push(waiting);
@@ -87,7 +72,6 @@ impl Chain {
     }
 }
 
-/// What a message asks of its audience.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Intent {
@@ -102,7 +86,6 @@ pub enum Intent {
     },
 }
 
-/// A terminal state of an ask other than an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -124,7 +107,37 @@ impl Outcome {
     }
 }
 
-/// The content of an event; every agent or room it names belongs to the event's origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Stamp(u64);
+
+impl Stamp {
+    #[must_use]
+    pub const fn from_unix_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    #[must_use]
+    pub const fn age(self, now: Self) -> Age {
+        Age(now.0.saturating_sub(self.0) / 1000)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Age(u64);
+
+impl core::fmt::Display for Age {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let seconds = self.0;
+        match seconds {
+            0..60 => write!(formatter, "{seconds}s ago"),
+            60..3600 => write!(formatter, "{}m ago", seconds / 60),
+            3600..86_400 => write!(formatter, "{}h ago", seconds / 3600),
+            _ => write!(formatter, "{}d ago", seconds / 86_400),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "kind")]
 pub enum Body {
@@ -153,7 +166,7 @@ pub enum Body {
         text: Text,
         audience: Audience,
         intent: Intent,
-        at: u64,
+        at: Stamp,
     },
     TurnStarted {
         request: EventId,
@@ -172,7 +185,6 @@ pub enum Body {
 }
 
 impl Body {
-    /// The conversation and audience of a message or of an ask's progress.
     #[must_use]
     pub const fn thread(&self) -> Option<(&Conversation, &Audience)> {
         match self {
@@ -210,7 +222,6 @@ impl Body {
         self.thread().map(|(conversation, _)| conversation)
     }
 
-    /// The earlier event this one depends on.
     #[must_use]
     pub const fn request(&self) -> Option<&EventId> {
         if let Self::Message {
@@ -226,7 +237,6 @@ impl Body {
         }
     }
 
-    /// The local agent that authored the event, if one did.
     #[must_use]
     pub const fn author(&self) -> Option<&AgentName> {
         match self {
@@ -243,7 +253,6 @@ impl Body {
     }
 }
 
-/// One validated entry of an origin's ordered ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawEvent", into = "RawEvent")]
 pub struct Event {
@@ -296,7 +305,6 @@ fn valid_ask(
         }
 }
 
-/// A direct conversation belongs to exactly its two agents and their machines.
 fn valid_thread(conversation: &Conversation, audience: &Audience, author: &AgentId) -> bool {
     match conversation {
         Conversation::Direct(pair) => {
@@ -361,7 +369,6 @@ impl Event {
         &self.body
     }
 
-    /// The agent that authored the event, qualified by the event's machine.
     #[must_use]
     pub fn author(&self) -> Option<AgentId> {
         self.body
@@ -369,13 +376,11 @@ impl Event {
             .map(|name| AgentId::new(name.clone(), self.origin().clone()))
     }
 
-    /// The deterministic display order shared by every machine.
     #[must_use]
     pub const fn order(&self) -> (u64, &Origin, NonZeroU64) {
         (self.clock, self.origin(), self.id.seq())
     }
 
-    /// The same event as `peer` may store it: content outside its audience becomes an empty placeholder.
     #[must_use]
     pub fn export(&self, peer: &Origin) -> Self {
         match self.body.audience() {
@@ -384,7 +389,6 @@ impl Event {
         }
     }
 
-    /// An empty placeholder that keeps this event's position in its origin's sequence.
     #[must_use]
     pub fn omitted(&self) -> Self {
         Self {
@@ -395,7 +399,6 @@ impl Event {
     }
 }
 
-/// An event with its canonical encoding and content digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sealed {
     event: Event,
@@ -403,7 +406,6 @@ pub struct Sealed {
     digest: Digest,
 }
 
-/// The BLAKE3 digest of an event's canonical encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Digest([u8; 32]);
 
@@ -466,7 +468,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use super::{Body, Chain, Event, Intent, Sealed};
+    use super::{Body, Chain, Event, Intent, Sealed, Stamp};
     use crate::chat::fixtures::{agent, ask, card, id, origin};
     use crate::chat::id::Conversation;
 
@@ -510,7 +512,7 @@ mod tests {
             text: text.clone(),
             audience: audience.clone(),
             intent: Intent::Ask { responder, chain },
-            at: 1,
+            at: Stamp::from_unix_millis(1),
         };
         let bob = agent("bob", 'b');
         let cycle = Chain::try_from(vec![bob.clone()]).unwrap();
@@ -523,7 +525,7 @@ mod tests {
             text: text.clone(),
             audience: audience.clone(),
             intent: Intent::Send {},
-            at: 1,
+            at: Stamp::from_unix_millis(1),
         };
         Event::new(id('a', 1), 1, outsider).unwrap_err();
         Chain::try_from(vec![agent("x", 'a'), agent("x", 'a')]).unwrap_err();

@@ -1,12 +1,10 @@
-//! Values shared by the chat test modules.
-
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
 
 use super::card::{Access, Card, Mode, Skills, Tag, Tool};
-use super::event::{Body, Chain, Intent};
+use super::event::{Body, Chain, Intent, Stamp};
 use super::id::{AgentId, AgentName, Conversation, EventId, Line, Origin, Paragraph, Text};
 use super::policy::audience;
 
@@ -47,7 +45,6 @@ pub(crate) fn text(value: &str) -> Text {
     Text::try_from(value.to_owned()).unwrap()
 }
 
-/// A direct ask from `from` to `to`.
 pub(crate) fn ask(from: &AgentId, to: &AgentId) -> Body {
     Body::Message {
         conversation: Conversation::direct(from, to).unwrap(),
@@ -58,6 +55,6 @@ pub(crate) fn ask(from: &AgentId, to: &AgentId) -> Body {
             responder: to.clone(),
             chain: Chain::default(),
         },
-        at: 1,
+        at: Stamp::from_unix_millis(1),
     }
 }

@@ -76,7 +76,6 @@ enum OrphanKind {
 }
 
 impl JobPaths {
-    /// The files of `job` inside `parent`, the directory of live or staged jobs.
     fn at(parent: &Path, job: &JobId) -> Self {
         Self {
             dir: parent.join(job.as_str()),
@@ -119,24 +118,18 @@ impl JobPaths {
         self.dir.join("workspace")
     }
 
-    /// When the job was admitted, as the store's admission sequence.
     fn order(&self) -> PathBuf {
         self.dir.join("order")
     }
 }
 
-/// How many finished jobs a store keeps; each admission removes the oldest beyond them.
 const KEEP_FINISHED: usize = 32;
 
-/// Whether any lock inside a job runner store is held, which means a process of its build still runs.
-///
-/// Every lock counts, whatever its name, so a store of another format is judged without reading it.
 fn in_use(root: &Path) -> Result<bool, StoreError> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let kind = entry.file_type()?;
-        // A job's workspace holds the job's own files, whose lock files are not the store's.
         let held = if kind.is_dir() && !kind.is_symlink() {
             entry.file_name() != "workspace" && in_use(&path)?
         } else {
@@ -153,43 +146,37 @@ fn in_use(root: &Path) -> Result<bool, StoreError> {
     Ok(false)
 }
 
-/// Stores of other formats used this recently stay, so two builds in use never remove each other's jobs.
-const KEEP_OTHER_FORMATS_MILLIS: u64 = 7 * 24 * 60 * 60 * 1000;
+const KEEP_OTHER_FORMATS: usize = 2;
 
-/// Remove the job runner stores of other formats that no process uses and none used for a week.
-///
-/// This build can read none of their jobs, and once their own builds stop, nothing else can.
 pub(crate) fn prune_other_formats(
     state: &crate::layout::State,
-) -> Result<Vec<PathBuf>, StoreError> {
-    prune_other_formats_before(
-        state,
-        platform::clock::now_millis().saturating_sub(KEEP_OTHER_FORMATS_MILLIS),
-    )
-}
-
-fn prune_other_formats_before(
-    state: &crate::layout::State,
-    cutoff: u64,
 ) -> Result<Vec<PathBuf>, StoreError> {
     let current = Store {
         root: state.runner(),
     };
     state_file::private_dir(&current.root)?;
-    let mut removed = Vec::new();
+    let mut idle = Vec::new();
     for root in state.other_runners()? {
-        // One store that cannot be judged or moved stays, and the others are still pruned.
-        let unused = Store { root: root.clone() }
-            .last_used()
-            .and_then(|used| Ok(used <= cutoff && !in_use(&root)?));
-        match unused.and_then(|unused| {
-            if unused {
-                state_file::set_aside(&root, &current.trash_dir())?;
+        let judged = in_use(&root).and_then(|busy| {
+            if busy {
+                Ok(None)
+            } else {
+                Ok(Some(Store { root: root.clone() }.opened()?))
             }
-            Ok(unused)
-        }) {
-            Ok(true) => removed.push(root),
-            Ok(false) => {}
+        });
+        match judged {
+            Ok(Some(place)) => idle.push((place, root)),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "domyjob node: keeping the job store {} for now: {error}",
+                root.display()
+            ),
+        }
+    }
+    let mut removed = Vec::new();
+    for (_, root) in crate::retention::beyond_newest(idle, KEEP_OTHER_FORMATS) {
+        match state_file::set_aside(&root, &current.trash_dir()) {
+            Ok(()) => removed.push(root),
             Err(error) => eprintln!(
                 "domyjob node: keeping the job store {} for now: {error}",
                 root.display()
@@ -197,13 +184,22 @@ fn prune_other_formats_before(
         }
     }
     current.empty_trash();
+    removed.sort();
     Ok(removed)
+}
+
+fn next_opening(state: &crate::layout::State) -> Result<u64, StoreError> {
+    let _order = OsLock::exclusive(&state.runner_order_lock())?;
+    let next = Store::read_number(&state.runner_order())?.saturating_add(1);
+    state_file::write_bytes(&state.runner_order(), next.to_string().as_bytes())?;
+    Ok(next)
 }
 
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
+        let state = crate::layout::State::here()?;
         let store = Self {
-            root: crate::layout::State::here()?.runner(),
+            root: state.runner(),
         };
         for dir in [
             store.root.clone(),
@@ -214,44 +210,35 @@ impl Store {
         ] {
             state_file::private_dir(&dir)?;
         }
-        state_file::write_bytes(
-            &store.last_used_path(),
-            platform::clock::now_millis().to_string().as_bytes(),
-        )?;
+        let place = next_opening(&state)?;
+        state_file::write_bytes(&store.opened_path(), place.to_string().as_bytes())?;
         Ok(store)
     }
 
-    /// When a build of this format last opened the store, in milliseconds since the Unix epoch.
-    fn last_used_path(&self) -> PathBuf {
-        self.root.join("last-used")
+    fn opened_path(&self) -> PathBuf {
+        self.root.join("opened")
     }
 
-    /// When a build last opened the store; a store that never recorded it counts as never.
-    fn last_used(&self) -> Result<u64, StoreError> {
-        Self::read_number(&self.last_used_path())
+    fn opened(&self) -> Result<u64, StoreError> {
+        Self::read_number(&self.opened_path())
     }
 
-    /// Published jobs, one directory each.
     fn jobs_dir(&self) -> PathBuf {
         self.root.join("jobs")
     }
 
-    /// Jobs being assembled before they are published.
     fn staging_dir(&self) -> PathBuf {
         self.root.join("staging")
     }
 
-    /// Source archives being received.
     fn incoming_dir(&self) -> PathBuf {
         self.root.join("incoming")
     }
 
-    /// Trees set aside for removal; one that cannot be removed yet waits here and never stops new work.
     fn trash_dir(&self) -> PathBuf {
         self.root.join("trash")
     }
 
-    /// Remove what earlier cleanups set aside, and say what has to wait for a later one.
     fn empty_trash(&self) {
         match state_file::empty(&self.trash_dir()) {
             Ok(leftovers) => {
@@ -271,7 +258,6 @@ impl Store {
         self.root.join("incoming.lock")
     }
 
-    /// The last admission sequence handed out.
     fn sequence(&self) -> PathBuf {
         self.root.join("sequence")
     }
@@ -287,7 +273,6 @@ impl Store {
         }
     }
 
-    /// The next admission sequence; the caller holds the admission lock.
     fn next_sequence(&self) -> Result<u64, StoreError> {
         let next = Self::read_number(&self.sequence())?
             .checked_add(1)
@@ -296,11 +281,6 @@ impl Store {
         Ok(next)
     }
 
-    /// Remove the oldest finished jobs beyond [`KEEP_FINISHED`]; the caller holds the admission lock.
-    ///
-    /// Reclaiming space never stops new work:
-    /// a finished job that something still holds stays for a later admission,
-    /// and a tree that cannot be removed yet, such as one holding a container's files owned by root, stays in the trash.
     fn reclaim(&self) -> Result<(), StoreError> {
         let mut finished = Vec::new();
         for job in self.list()? {
@@ -756,7 +736,6 @@ mod tests {
             .join("/")
     }
 
-    /// One specimen of every path, stored request, and job state, whose digest is the store's format.
     fn specimen() -> String {
         let store = Store {
             root: PathBuf::from("runner"),
@@ -770,7 +749,7 @@ mod tests {
             store.incoming_lock(),
             store.admission_lock(),
             store.sequence(),
-            store.last_used_path(),
+            store.opened_path(),
         ]
         .iter()
         .map(|path| format!("path {}", shown(path)))
@@ -847,8 +826,8 @@ mod tests {
         Store { root }
     }
 
-    fn admit_finished(store: &Store, digit: char) -> JobId {
-        let submission = SubmissionId::try_from(digit.to_string().repeat(32)).unwrap();
+    fn admit_finished(store: &Store, submission: String) -> JobId {
+        let submission = SubmissionId::try_from(submission).unwrap();
         let request = Request::Run {
             submission: submission.clone(),
             command: Command::try_from(vec!["true".to_owned()]).unwrap(),
@@ -862,18 +841,23 @@ mod tests {
     }
 
     #[test]
-    fn stores_of_other_formats_go_once_no_process_of_theirs_runs() {
+    fn stores_of_other_formats_go_once_idle_and_older_than_the_last_opened() {
         let temporary = tempfile::tempdir().unwrap();
         let state = crate::layout::State::at(&temporary.path().join("state"));
-        let idle = temporary
-            .path()
-            .join("state")
-            .join("runner-0000000000000001");
-        let busy = temporary
-            .path()
-            .join("state")
-            .join("runner-0000000000000002");
-        for root in [&idle, &busy] {
+        let other = |digit: u64| {
+            temporary
+                .path()
+                .join("state")
+                .join(format!("runner-{digit:016}"))
+        };
+        for (digit, opened) in [
+            (1, Some(1)),
+            (2, Some(2)),
+            (3, Some(3)),
+            (4, Some(4)),
+            (5, None),
+        ] {
+            let root = other(digit);
             state_file::private_dir(&root.join("jobs").join("a")).unwrap();
             crate::testing::write(
                 &root
@@ -883,28 +867,23 @@ mod tests {
                     .join("Cargo.lock"),
                 "",
             );
+            if let Some(place) = opened {
+                state_file::write_bytes(&root.join("opened"), format!("{place}").as_bytes())
+                    .unwrap();
+            }
         }
-        let recent = temporary
-            .path()
-            .join("state")
-            .join("runner-0000000000000003");
-        state_file::private_dir(&recent).unwrap();
-        state_file::write_bytes(&recent.join("last-used"), b"900").unwrap();
         let running =
-            crate::lock::OsLock::exclusive(&busy.join("jobs").join("a").join("alive.lock"))
+            crate::lock::OsLock::exclusive(&other(1).join("jobs").join("a").join("alive.lock"))
                 .unwrap();
-        let removed = super::prune_other_formats_before(&state, 500).unwrap();
-        assert_eq!(removed, [idle]);
-        assert!(crate::testing::is_dir(&busy));
-        assert!(
-            crate::testing::is_dir(&recent),
-            "a recently used store stays"
-        );
-        drop(running);
         assert_eq!(
-            super::prune_other_formats_before(&state, 1000).unwrap(),
-            [busy, recent]
+            super::prune_other_formats(&state).unwrap(),
+            [other(2), other(5)]
         );
+        for kept in [1, 3, 4] {
+            assert!(crate::testing::is_dir(&other(kept)));
+        }
+        drop(running);
+        assert_eq!(super::prune_other_formats(&state).unwrap(), [other(1)]);
     }
 
     #[test]
@@ -915,21 +894,13 @@ mod tests {
         let mut admitted = Vec::new();
         for first in &digits {
             for second in digits.iter().take(3) {
-                let submission = format!("{first}{second}").repeat(16);
-                let submission = SubmissionId::try_from(submission).unwrap();
-                let request = Request::Run {
-                    submission: submission.clone(),
-                    command: Command::try_from(vec!["true".to_owned()]).unwrap(),
-                    input: Input::Home,
-                };
-                let job = store.reserve(&submission, &request, None).unwrap();
-                store
-                    .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
-                    .unwrap();
-                admitted.push(job);
+                admitted.push(admit_finished(
+                    &store,
+                    format!("{first}{second}").repeat(16),
+                ));
             }
         }
-        let last = admit_finished(&store, 'f');
+        let last = admit_finished(&store, "f".repeat(32));
         admitted.push(last);
         let kept = store.list().unwrap();
         assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
@@ -949,19 +920,7 @@ mod tests {
     fn a_finished_job_whose_files_cannot_be_removed_never_stops_admission() {
         let temporary = tempfile::tempdir().unwrap();
         let store = store(&temporary);
-        let admit = |index: usize| {
-            let submission = SubmissionId::try_from(format!("{index:032x}")).unwrap();
-            let request = Request::Run {
-                submission: submission.clone(),
-                command: Command::try_from(vec!["true".to_owned()]).unwrap(),
-                input: Input::Home,
-            };
-            let job = store.reserve(&submission, &request, None).unwrap();
-            store
-                .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
-                .unwrap();
-            job
-        };
+        let admit = |index: usize| admit_finished(&store, format!("{index:032x}"));
         let oldest = admit(0);
         let protected = store.paths(&oldest).workspace().join("pkg");
         crate::testing::write(&protected.join("package.json"), "{}");
@@ -969,13 +928,11 @@ mod tests {
         for index in 1..=super::KEEP_FINISHED {
             admit(index);
         }
-        // This admission reclaims the oldest job, whose tree this user cannot remove.
         let newest = admit(super::KEEP_FINISHED.saturating_add(1));
         let kept = store.list().unwrap();
         assert!(!kept.contains(&oldest), "the oldest job left in one step");
         assert!(kept.contains(&newest));
         assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
-        // A tree whose removal was refused waits in the trash until it can go.
         for leftover in state_file::empty(&store.trash_dir()).unwrap() {
             crate::testing::restore(
                 &leftover.path.join("workspace").join("pkg"),

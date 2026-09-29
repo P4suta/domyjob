@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::Model;
-use crate::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
+use crate::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Stamp};
 use crate::chat::exchange::respond;
 use crate::chat::fixtures::{agent, ask, card, id, origin, text};
 use crate::chat::id::{AgentId, Audience, Conversation, EventId, Origin, RoomId, RoomName};
@@ -27,7 +27,7 @@ fn message(
         text: text("hello"),
         audience: audience(members.iter().copied()).unwrap(),
         intent,
-        at: 0,
+        at: Stamp::from_unix_millis(0),
     }
 }
 
@@ -61,7 +61,6 @@ fn room(members: &[&AgentId]) -> Body {
     }
 }
 
-/// Open a room of `members` on `owner` and ask `responder` there as its first member.
 fn room_question(owner: &mut Model, members: &[&AgentId], responder: &AgentId) -> Event {
     owner.write(room(members)).unwrap();
     let asker = members.first().copied().unwrap();
@@ -95,7 +94,7 @@ fn reply(request: &Event, from: &AgentId) -> Body {
         intent: Intent::Reply {
             request: request.id().clone(),
         },
-        at: 0,
+        at: Stamp::from_unix_millis(0),
     }
 }
 

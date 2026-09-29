@@ -1,5 +1,3 @@
-//! Exchanging events with pinned peers, and answering their exchanges and waits.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use domyjob_core::chat::id::Origin;
@@ -14,9 +12,7 @@ use super::store::{Link, LinkState, Store, StoreError};
 use crate::platform::clock::{self, Deadline};
 use crate::transport::{self, TransportError};
 
-/// Rounds of one exchange with one peer before reporting partial progress.
 const MAX_ROUNDS: usize = 64;
-/// How long a node holds a wait before answering with a heartbeat.
 pub(crate) const HEARTBEAT_SECONDS: u64 = 25;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,12 +35,10 @@ pub(crate) enum SyncError {
     UnknownPeer(String),
 }
 
-/// A way to send one chat request to a peer.
 pub(crate) trait Channel {
     fn call(&mut self, request: ChatRequest, deadline: Deadline) -> Result<ChatReply, SyncError>;
 }
 
-/// The OpenSSH channel to a machine alias.
 #[derive(Debug)]
 pub(crate) struct Ssh(MachineName);
 
@@ -60,12 +54,10 @@ impl Channel for Ssh {
     }
 }
 
-/// How one peer's exchange ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
     Synced,
     Partial,
-    /// The peer or this machine waits for an event from a third machine.
     Deferred(Rejection),
     Failed(String),
 }
@@ -88,7 +80,6 @@ fn classify(rejection: Rejection) -> Outcome {
     }
 }
 
-/// Exchange rounds with one peer until neither side has more to send.
 fn exchange(
     store: &Store,
     peer: &Origin,
@@ -117,7 +108,6 @@ fn exchange(
     Ok((Outcome::Partial, appended))
 }
 
-/// One peer's line of a synchronization report.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PeerReport {
     pub(crate) machine: String,
@@ -152,7 +142,7 @@ fn record(store: &Store, alias: &str, outcome: &Outcome) -> Result<PeerReport, S
         &Link {
             state,
             detail: detail.clone(),
-            at: clock::now_millis(),
+            at: clock::stamp(),
         },
     )?;
     Ok(PeerReport {
@@ -162,7 +152,6 @@ fn record(store: &Store, alias: &str, outcome: &Outcome) -> Result<PeerReport, S
     })
 }
 
-/// Synchronize with every pinned peer, or only `only`, retrying dependency waits while others progress.
 pub(crate) fn sync_with<C: Channel>(
     store: &Store,
     only: Option<&str>,
@@ -219,7 +208,6 @@ pub(crate) fn sync_with<C: Channel>(
     Ok(report)
 }
 
-/// Synchronize over OpenSSH.
 pub(crate) fn sync(
     store: &Store,
     only: Option<&str>,
@@ -228,7 +216,6 @@ pub(crate) fn sync(
     sync_with(store, only, deadline, &mut |alias: &str| Ssh::new(alias))
 }
 
-/// Ask a machine for its chat identity.
 pub(crate) fn identify(
     channel: &mut impl Channel,
     deadline: Deadline,
@@ -242,7 +229,6 @@ pub(crate) fn identify(
     }
 }
 
-/// Answer one chat request as this machine's node; a wait ends early once `abandoned` is set.
 pub(crate) fn serve(
     store: &Store,
     request: ChatRequest,
@@ -275,7 +261,6 @@ pub(crate) fn serve(
     })
 }
 
-/// Hold until this machine authored an event after `seen`, the heartbeat, or the client leaving.
 fn wait(
     store: &Store,
     seen: u64,

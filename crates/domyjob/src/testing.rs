@@ -1,5 +1,3 @@
-//! Test fixtures: files that tests create, change, and inspect directly.
-
 use std::path::Path;
 
 mod raw {
@@ -27,10 +25,6 @@ mod raw {
         path.is_dir()
     }
 
-    pub(super) fn is_file(path: &Path) -> bool {
-        path.is_file()
-    }
-
     pub(super) fn read_to_string(path: &Path) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
@@ -43,12 +37,10 @@ mod raw {
     }
 }
 
-/// Create a directory and its parents.
 pub(crate) fn mkdir(path: &Path) {
     raw::create_dir_all(path).expect("create a fixture directory");
 }
 
-/// Write a file, creating its directories.
 pub(crate) fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     if let Some(parent) = path.parent() {
         mkdir(parent);
@@ -64,16 +56,10 @@ pub(crate) fn is_dir(path: &Path) -> bool {
     raw::is_dir(path)
 }
 
-pub(crate) fn is_file(path: &Path) -> bool {
-    raw::is_file(path)
-}
-
 pub(crate) fn read(path: &Path) -> String {
     raw::read_to_string(path).expect("read a fixture file")
 }
 
-/// Make a fixture read-only, as a container's files owned by root are to this user,
-/// and return the permissions that [`restore`] gives back.
 pub(crate) fn protect(path: &Path) -> std::fs::Permissions {
     let original = std::fs::metadata(path)
         .expect("read a fixture's permissions")
