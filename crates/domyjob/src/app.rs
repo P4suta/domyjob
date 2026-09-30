@@ -49,11 +49,24 @@ struct CancellationWatch {
     receiver: mpsc::Receiver<Wake>,
 }
 
+type WatchSignal = Box<dyn FnMut(Notice) + Send>;
+
 impl CancellationWatch {
     fn start(store: &Store, job: &JobId) -> Result<Self, AppError> {
+        Self::start_using(store, job, watch_event::watcher, |watcher, directory| {
+            watcher.watch(directory, notify::RecursiveMode::NonRecursive)
+        })
+    }
+
+    fn start_using(
+        store: &Store,
+        job: &JobId,
+        create: impl FnOnce(WatchSignal) -> notify::Result<notify::RecommendedWatcher>,
+        register: impl FnOnce(&mut notify::RecommendedWatcher, &std::path::Path) -> notify::Result<()>,
+    ) -> Result<Self, AppError> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let callback = sender.clone();
-        let mut watcher = watch_event::watcher(move |notice| {
+        let mut watcher = create(Box::new(move |notice| {
             let wake = match notice {
                 Notice::Changed => Some(Wake::Changed),
                 Notice::Unrelated => None,
@@ -62,8 +75,8 @@ impl CancellationWatch {
             if let Some(wake) = wake {
                 let _sent = callback.try_send(wake);
             }
-        })?;
-        watcher.watch(&store.watch_dir(job)?, notify::RecursiveMode::NonRecursive)?;
+        }))?;
+        register(&mut watcher, &store.watch_dir(job)?)?;
         Ok(Self {
             _watcher: watcher,
             sender,
@@ -269,8 +282,12 @@ pub(crate) fn handle(
     }
 }
 
-fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppError> {
-    let store = Store::open()?;
+fn run_worker_using(
+    store: &Store,
+    job: &JobId,
+    ready_event: Option<&ReadyToken>,
+    start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+) -> Result<(), AppError> {
     let Some(_alive) = store.worker_lock(job)? else {
         return Ok(());
     };
@@ -283,7 +300,7 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
             "stored request is not a run",
         )));
     };
-    let cancellation = CancellationWatch::start(&store, job)?;
+    let cancellation = start_watch(store, job)?;
     store.transition(job, &Event::Starting)?;
     process::announce_ready(ready_event)?;
     if store.cancel_requested(job)? {
@@ -299,7 +316,7 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
     match spawn_logged(process, log, MAX_LOG_BYTES) {
         Ok((child, relay, stop)) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
-            let completion = cancellation.wait(&store, job, &child)?;
+            let completion = cancellation.wait(store, job, &child)?;
             let stopped = stop.stop();
             let relayed = relay.join();
             stopped?;
@@ -317,9 +334,21 @@ fn run_worker(job: &JobId, ready_event: Option<&ReadyToken>) -> Result<(), AppEr
 }
 
 pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppError> {
-    let result = run_worker(job, event);
+    worker_using(job, event, Store::open, CancellationWatch::start)
+}
+
+fn worker_using(
+    job: &JobId,
+    event: Option<&ReadyToken>,
+    open_store: impl Fn() -> Result<Store, StoreError>,
+    start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+) -> Result<(), AppError> {
+    let result = (|| {
+        let store = open_store()?;
+        run_worker_using(&store, job, event, start_watch)
+    })();
     if let Err(error) = &result
-        && let Ok(store) = Store::open()
+        && let Ok(store) = open_store()
     {
         if let Ok(path) = store.supervisor_log_path(job)
             && let Ok(mut file) = state_file::open_append(&path)
@@ -336,11 +365,83 @@ pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppE
 
 #[cfg(test)]
 mod tests {
-    use super::{relay_output, spawn_logged};
+    use domyjob_core::domain::{Command, JobId, SubmissionId};
+    use domyjob_core::state::Outcome;
+    use domyjob_core::wire::{Input, Request};
+
+    use super::{AppError, CancellationWatch, relay_output, spawn_logged, worker_using};
     use crate::process::{self, Stop as _};
     use crate::state_io as state_file;
+    use crate::store::{Store, StoreError};
+    use crate::watch_event;
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
+
+    #[test]
+    fn cancellation_watch_returns_a_missing_job_before_registration() {
+        let temporary = tempfile::tempdir().expect("temporary state root");
+        let store = Store::fixture(temporary.path().join("state")).expect("private store");
+        let job = JobId::try_from("0".repeat(32)).expect("job ID");
+        let result = CancellationWatch::start_using(
+            &store,
+            &job,
+            watch_event::watcher,
+            |_watcher, _directory| panic!("a missing job cannot be registered"),
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn failed_watcher_setup_finishes_the_job_and_keeps_its_diagnostic() {
+        for creating in [true, false] {
+            let temporary = tempfile::tempdir().expect("temporary state root");
+            let root = temporary.path().join("state");
+            let store = Store::fixture(root.clone()).expect("private store");
+            let submission = SubmissionId::try_from("1".repeat(32)).expect("submission ID");
+            let request = Request::Run {
+                submission: submission.clone(),
+                command: Command::try_from(vec!["never-launched".to_owned()]).expect("command"),
+                input: Input::Home,
+            };
+            let job = store
+                .reserve(&submission, &request, None)
+                .expect("reserved job");
+            let message = if creating {
+                "watcher initialization failed"
+            } else {
+                "watch registration failed"
+            };
+            let error = worker_using(
+                &job,
+                None,
+                || Store::fixture(root.clone()),
+                |working_store, reserved_job| {
+                    CancellationWatch::start_using(
+                        working_store,
+                        reserved_job,
+                        |signal| {
+                            if creating {
+                                Err(notify::Error::generic(message))
+                            } else {
+                                watch_event::watcher(signal)
+                            }
+                        },
+                        |_watcher, _directory| Err(notify::Error::generic(message)),
+                    )
+                },
+            )
+            .expect_err("watcher failure remains an error");
+            assert!(matches!(error, AppError::Notify(_)));
+            let state = store.wait(&job).expect("terminal job");
+            let Some(Outcome::LaunchFailed { reason }) = state.outcome() else {
+                panic!("watcher failure must finish admission: {state:?}");
+            };
+            assert!(reason.for_terminal().contains(message));
+            let diagnostic = store.supervisor_log_path(&job).expect("supervisor log");
+            assert!(crate::testing::read(&diagnostic).contains(message));
+            assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+        }
+    }
 
     #[test]
     fn output_past_the_limit_is_drained_counted_and_marked_on_its_own_line() {

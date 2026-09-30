@@ -198,9 +198,14 @@ fn next_opening(state: &crate::layout::State) -> Result<u64, StoreError> {
 impl Store {
     pub(crate) fn open() -> Result<Self, StoreError> {
         let state = crate::layout::State::here()?;
-        let store = Self {
-            root: state.runner(),
-        };
+        let store = Self::open_directory(state.runner())?;
+        let place = next_opening(&state)?;
+        state_file::write_bytes(&store.opened_path(), place.to_string().as_bytes())?;
+        Ok(store)
+    }
+
+    fn open_directory(root: PathBuf) -> Result<Self, StoreError> {
+        let store = Self { root };
         for dir in [
             store.root.clone(),
             store.jobs_dir(),
@@ -210,9 +215,12 @@ impl Store {
         ] {
             state_file::private_dir(&dir)?;
         }
-        let place = next_opening(&state)?;
-        state_file::write_bytes(&store.opened_path(), place.to_string().as_bytes())?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(root: PathBuf) -> Result<Self, StoreError> {
+        Self::open_directory(root)
     }
 
     fn opened_path(&self) -> PathBuf {
