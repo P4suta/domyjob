@@ -175,6 +175,14 @@ impl Drop for SecurityDescriptor {
 }
 
 pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
+    ownership_using(file, current_user_sid, sid_text)
+}
+
+fn ownership_using(
+    file: &fs::File,
+    current_user: impl FnOnce() -> io::Result<Sid>,
+    owner_sid: impl FnOnce(PSID) -> io::Result<Sid>,
+) -> io::Result<Ownership> {
     use std::os::windows::io::AsRawHandle as _;
 
     const SYSTEM: &str = "S-1-5-18";
@@ -199,8 +207,8 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
         return Err(io::Error::from_raw_os_error(status.cast_signed()));
     }
     let _descriptor = SecurityDescriptor(descriptor);
-    let user = current_user_sid()?;
-    let owner = sid_text(owner)?;
+    let user = current_user()?;
+    let owner = owner_sid(owner)?;
     if owner != user && owner.as_str() != ADMINISTRATORS {
         return Ok(Ownership::Foreign);
     }
@@ -274,13 +282,21 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_MEMORY, SetLastError};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_ENOUGH_MEMORY, SetLastError,
+    };
     use windows_sys::Win32::Security::{
         SECURITY_MAX_SID_SIZE, SID, SID_IDENTIFIER_AUTHORITY, TOKEN_USER,
     };
 
-    use super::{converted_sid, token_user, validated_sid};
+    use super::{
+        SecurityDescriptor, converted_sid, current_user_sid, ownership, ownership_using,
+        token_user, validated_sid,
+    };
 
     #[test]
     fn a_missing_sid_is_rejected_before_conversion() {
@@ -362,6 +378,96 @@ mod tests {
         })
         .expect_err("token query failure");
         assert_eq!(error.to_string(), "the token has no user");
+    }
+
+    #[test]
+    fn a_directory_name_with_nul_never_creates_its_truncated_prefix() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let user = current_user_sid().expect("current user");
+        let descriptor = SecurityDescriptor::for_user(&user).expect("security descriptor");
+        let prefix = root.path().join("should-not-exist");
+        let mut name = prefix.as_os_str().to_os_string();
+        name.push("\0ignored");
+        let error = descriptor
+            .create_dir(Path::new(&name))
+            .expect_err("interior NUL");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let absent = fs::symlink_metadata(&prefix).expect_err("prefix was not created");
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn an_existing_directory_preserves_the_creation_error() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let user = current_user_sid().expect("current user");
+        let descriptor = SecurityDescriptor::for_user(&user).expect("security descriptor");
+        let error = descriptor
+            .create_dir(root.path())
+            .expect_err("directory already exists");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ALREADY_EXISTS.cast_signed())
+        );
+        assert!(
+            fs::symlink_metadata(root.path())
+                .expect("owned directory")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn a_security_query_preserves_the_handle_access_denial() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let owned = tempfile::NamedTempFile::new_in(root.path()).expect("owned file");
+        let file = super::super::raw::options()
+            .access_mode(0)
+            .open(owned.path())
+            .expect("metadata-only handle");
+        let error = ownership(&file).expect_err("READ_CONTROL is required");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED.cast_signed())
+        );
+    }
+
+    #[test]
+    fn a_failed_user_lookup_stops_before_converting_the_owner() {
+        let file = tempfile::NamedTempFile::new().expect("owned file");
+        let called = Cell::new(false);
+        let error = ownership_using(
+            file.as_file(),
+            || {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED.cast_signed(),
+                ))
+            },
+            |_sid| {
+                called.set(true);
+                Err(std::io::Error::other("owner conversion was not requested"))
+            },
+        )
+        .expect_err("user lookup failed");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED.cast_signed())
+        );
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn a_failed_owner_conversion_preserves_its_error() {
+        let file = tempfile::NamedTempFile::new().expect("owned file");
+        let error = ownership_using(file.as_file(), current_user_sid, |sid| {
+            assert!(!sid.is_null());
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_NOT_ENOUGH_MEMORY.cast_signed(),
+            ))
+        })
+        .expect_err("owner conversion failed");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_NOT_ENOUGH_MEMORY.cast_signed())
+        );
     }
 
     #[test]

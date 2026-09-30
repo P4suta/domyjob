@@ -126,3 +126,23 @@ original = "?"
 line = 450
 reason = "launch_failure_reason takes at most 4096 Unicode scalar values, producing at most 16384 UTF-8 bytes, while RemoteText rejects only strings larger than 65536 bytes, so this conversion cannot fail; the recorded observation remains native and unproven."
 outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "SecurityDescriptor::create_dir"
+rule = "question-to-unwrap"
+original = "?"
+line = 158
+where = { cfg = 'all(windows, any(target_pointer_width = "32", target_pointer_width = "64"))' }
+reason = "The pinned windows-sys 0.61.2 SECURITY_ATTRIBUTES is a fixed repr(C) structure containing u32, a pointer, and BOOL, so its 12-byte or 24-byte size fits u32 on supported 32-bit and 64-bit Windows targets; this records a native size-bound argument without assigning a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "ownership_using"
+rule = "question-to-unwrap"
+original = "?"
+line = 219
+where = { cfg = 'all(windows, any(target_pointer_width = "32", target_pointer_width = "64"))' }
+reason = "The pinned windows-sys 0.61.2 ACL_SIZE_INFORMATION is a fixed repr(C) structure of three u32 fields with a 12-byte size, so converting its size to u32 cannot fail on supported Windows targets; this records a native size-bound argument without assigning a sealed verdict."
+outcome = "survived"
