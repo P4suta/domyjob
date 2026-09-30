@@ -330,6 +330,18 @@ impl Group {
 }
 
 #[cfg(all(test, unix))]
+pub(crate) fn signal_termination_fixture() -> (Command, bool) {
+    let mut command = command("/bin/sh");
+    command.args(["-c", "kill -TERM $$"]);
+    (command, true)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn signal_termination_fixture() -> (Command, bool) {
+    (stdout_then_stderr(), false)
+}
+
+#[cfg(all(test, unix))]
 pub(crate) const STDOUT_THEN_STDERR: &[u8] = b"0123456789abcdefghij";
 #[cfg(all(test, windows))]
 pub(crate) const STDOUT_THEN_STDERR: &[u8] = b"0123456789\r\nabcdefghij\r\n";

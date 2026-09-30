@@ -198,12 +198,30 @@ fn spawn_logged(
     log: File,
     limit: u64,
 ) -> Result<(Group, Relay, process::OutputStop), ProcessError> {
+    spawn_logged_using(
+        (process, log),
+        limit,
+        process::output_pipe,
+        std::io::PipeWriter::try_clone,
+    )
+}
+
+fn spawn_logged_using(
+    (process, log): (Process, File),
+    limit: u64,
+    pipe: impl FnOnce() -> std::io::Result<(
+        process::OutputReader,
+        std::io::PipeWriter,
+        process::OutputStop,
+    )>,
+    clone: impl FnOnce(&std::io::PipeWriter) -> std::io::Result<std::io::PipeWriter>,
+) -> Result<(Group, Relay, process::OutputStop), ProcessError> {
     let piping = |source: std::io::Error| ProcessError::Spawn {
         what: "the job output pipe",
         source,
     };
-    let (reader, writer, stop) = process::output_pipe().map_err(piping)?;
-    let errors = writer.try_clone().map_err(piping)?;
+    let (reader, writer, stop) = pipe().map_err(piping)?;
+    let errors = clone(&writer).map_err(piping)?;
     let group = Group::spawn_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
     Ok((
         group,
@@ -218,11 +236,19 @@ fn launch_failure_reason(error: &impl Display) -> Result<RemoteText, AppError> {
 }
 
 fn start_worker(store: &Store, job: &JobId) -> Result<(), AppError> {
+    start_worker_using(store, job, process::launch_worker)
+}
+
+fn start_worker_using(
+    store: &Store,
+    job: &JobId,
+    launch: impl FnOnce(&JobId) -> Result<(), ProcessError>,
+) -> Result<(), AppError> {
     let _launch = store.launch_lock(job)?;
     if store.status(job)?.kind() != PhaseKind::Accepted {
         return Ok(());
     }
-    if let Err(error) = process::launch_worker(job) {
+    if let Err(error) = launch(job) {
         store.finish_launch_failure(job, launch_failure_reason(&error)?)?;
     }
     Ok(())
@@ -381,7 +407,10 @@ mod tests {
     use domyjob_core::state::{Event, Outcome};
     use domyjob_core::wire::{Input, Request};
 
-    use super::{AppError, CancellationWatch, Wake, relay_output, spawn_logged, worker_using};
+    use super::{
+        AppError, CancellationWatch, Wake, relay_output, spawn_logged, spawn_logged_using,
+        start_worker_using, worker_using,
+    };
     use crate::process::{self, ProcessError, Stop as _};
     use crate::state_io as state_file;
     use crate::store::{Store, StoreError};
@@ -389,7 +418,7 @@ mod tests {
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
 
-    fn requested_cancellation() -> (tempfile::TempDir, Store, JobId, CancellationWatch) {
+    fn controlled_watch(cancel: bool) -> (tempfile::TempDir, Store, JobId, CancellationWatch) {
         let temporary = tempfile::tempdir().expect("temporary state root");
         let store = Store::fixture(temporary.path().join("state")).expect("private store");
         let submission = SubmissionId::try_from("2".repeat(32)).expect("submission ID");
@@ -403,7 +432,9 @@ mod tests {
         store
             .transition(&job, &Event::Spawned { pid: 42 })
             .expect("running");
-        store.request_cancel(&job).expect("cancel request");
+        if cancel {
+            store.request_cancel(&job).expect("cancel request");
+        }
         let watcher = CancellationWatch::start_using(
             &store,
             &job,
@@ -411,7 +442,9 @@ mod tests {
             |_watcher, _directory| Ok(()),
         )
         .expect("controlled watcher");
-        watcher.sender.send(Wake::Changed).expect("cancel notice");
+        if cancel {
+            watcher.sender.send(Wake::Changed).expect("cancel notice");
+        }
         (temporary, store, job, watcher)
     }
 
@@ -423,23 +456,31 @@ mod tests {
             .expect("completed command")
     }
 
-    #[test]
-    fn a_requested_cancellation_remains_killed_when_the_process_exits_successfully() {
-        let (_temporary, store, job, watcher) = requested_cancellation();
+    fn wait_for_cancellation(
+        watcher: CancellationWatch,
+        store: &Store,
+        job: &JobId,
+        signal: impl Fn() -> Result<(), ProcessError> + Send,
+    ) -> Result<Event, AppError> {
         let status = successful_exit();
         let (stopped, observed) = mpsc::sync_channel(1);
-        let completion = watcher
-            .wait_using(
-                (&store, &job),
-                || {
-                    observed.recv().expect("process was stopped");
-                    Ok(status)
-                },
-                || {
-                    stopped.send(()).expect("report the stop");
-                    Ok(())
-                },
-            )
+        watcher.wait_using(
+            (store, job),
+            || {
+                observed.recv().expect("signal was attempted");
+                Ok(status)
+            },
+            move || {
+                stopped.send(()).expect("report the signal");
+                signal()
+            },
+        )
+    }
+
+    #[test]
+    fn a_requested_cancellation_remains_killed_when_the_process_exits_successfully() {
+        let (_temporary, store, job, watcher) = controlled_watch(true);
+        let completion = wait_for_cancellation(watcher, &store, &job, || Ok(()))
             .expect("cancellation completion");
         let state = store.transition(&job, &completion).expect("terminal state");
         assert!(matches!(state.outcome(), Some(Outcome::Killed)));
@@ -447,31 +488,74 @@ mod tests {
 
     #[test]
     fn a_failed_cancellation_signal_preserves_its_process_error() {
-        let (_temporary, store, job, watcher) = requested_cancellation();
-        let status = successful_exit();
-        let (stopped, observed) = mpsc::sync_channel(1);
-        let error = watcher
-            .wait_using(
-                (&store, &job),
-                || {
-                    observed.recv().expect("signal was attempted");
-                    Ok(status)
-                },
-                || {
-                    stopped.send(()).expect("report the signal");
-                    Err(ProcessError::Signal(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "signal refused",
-                    )))
-                },
-            )
-            .expect_err("signal error");
+        let (_temporary, store, job, watcher) = controlled_watch(true);
+        let error = wait_for_cancellation(watcher, &store, &job, || {
+            Err(ProcessError::Signal(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "signal refused",
+            )))
+        })
+        .expect_err("signal error");
         assert!(
             matches!(error, AppError::Proc(ProcessError::Signal(ref cause))
                 if cause.kind() == std::io::ErrorKind::PermissionDenied
                     && cause.to_string() == "signal refused"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn a_failed_process_wait_is_returned_after_the_watcher_stops() {
+        let (_temporary, store, job, watcher) = controlled_watch(false);
+        let error = watcher
+            .wait_using(
+                (&store, &job),
+                || Err(ProcessError::Wait(std::io::Error::other("wait refused"))),
+                || panic!("a completed wait does not request a stop"),
+            )
+            .expect_err("wait error");
+        assert!(
+            matches!(error, AppError::Proc(ProcessError::Wait(ref cause))
+                if cause.to_string() == "wait refused"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_panicked_cancellation_thread_becomes_a_diagnostic_error() {
+        let (_temporary, store, job, watcher) = controlled_watch(true);
+        let error = wait_for_cancellation(watcher, &store, &job, || {
+            panic!("signal callback panicked");
+        })
+        .expect_err("watcher panic");
+        assert!(
+            matches!(error, AppError::Io(ref cause)
+                if cause.to_string() == "cancellation watcher panicked"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_uncancelled_process_terminated_by_a_signal_has_no_exit_code() {
+        let (mut command, supported) = process::signal_termination_fixture();
+        if !supported {
+            return;
+        }
+        let status = command.status().expect("signal-terminated child");
+        let (_temporary, store, job, watcher) = controlled_watch(false);
+        assert_eq!(status.code(), None);
+        let completion = watcher
+            .wait_using(
+                (&store, &job),
+                || Ok(status),
+                || panic!("no cancellation was requested"),
+            )
+            .expect("process completion");
+        let state = store.transition(&job, &completion).expect("terminal state");
+        assert!(matches!(
+            state.outcome(),
+            Some(Outcome::Failed { code }) if code.get() == -1
+        ));
     }
 
     #[test]
@@ -564,6 +648,126 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
         assert!(output.is_empty());
         assert_eq!(&log, b"0123");
+    }
+
+    struct FailedLog {
+        remaining: usize,
+        written: Vec<u8>,
+    }
+
+    impl std::io::Write for FailedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "log refused",
+                ));
+            }
+            let count = bytes.len().min(self.remaining);
+            self.written
+                .extend_from_slice(bytes.get(..count).expect("bounded write"));
+            self.remaining = self.remaining.checked_sub(count).expect("write budget");
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn errors_writing_output_or_its_discard_marker_are_preserved() {
+        for remaining in [0, 4] {
+            let mut output: &[u8] = b"0123abc";
+            let mut log = FailedLog {
+                remaining,
+                written: Vec::new(),
+            };
+            let error = relay_output(&mut output, &mut log, 4).expect_err("log error");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "log refused");
+            assert!(output.is_empty(), "failed logging must still drain output");
+            assert_eq!(log.written, b"0123".get(..remaining).expect("kept prefix"));
+        }
+    }
+
+    struct FailedTail<'a>(&'a [u8]);
+
+    impl std::io::Read for FailedTail<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                Err(std::io::Error::other("discarded output refused"))
+            } else {
+                std::io::Read::read(&mut self.0, buffer)
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_read_after_the_output_limit_preserves_the_kept_log() {
+        let mut log = Vec::new();
+        let error = relay_output(FailedTail(b"0123"), &mut log, 4).expect_err("drain error");
+        assert_eq!(error.to_string(), "discarded output refused");
+        assert_eq!(log, b"0123");
+    }
+
+    #[test]
+    fn failed_pipe_creation_or_cloning_returns_its_spawn_error() {
+        for creating in [true, false] {
+            let temporary = tempfile::tempdir().expect("temporary job directory");
+            let log = state_file::open_append(&temporary.path().join("job").join("output.log"))
+                .expect("job log");
+            let refused = || std::io::Error::other("pipe refused");
+            let result = spawn_logged_using(
+                (process::stdout_then_stderr(), log),
+                4,
+                || {
+                    if creating {
+                        Err(refused())
+                    } else {
+                        process::output_pipe()
+                    }
+                },
+                |_writer| Err(refused()),
+            );
+            assert!(
+                matches!(result, Err(ProcessError::Spawn { what: "the job output pipe", ref source })
+                    if source.to_string() == "pipe refused"),
+                "pipe failure must remain a typed spawn error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_cannot_start_returns_a_spawn_error_without_a_relay() {
+        let temporary = tempfile::tempdir().expect("temporary job directory");
+        let log = state_file::open_append(&temporary.path().join("job").join("output.log"))
+            .expect("job log");
+        let result = spawn_logged(process::command(""), log, 4);
+        assert!(matches!(result, Err(ProcessError::Spawn { .. })));
+    }
+
+    #[test]
+    fn a_missing_job_cannot_start_a_worker() {
+        let temporary = tempfile::tempdir().expect("temporary state root");
+        let store = Store::fixture(temporary.path().join("state")).expect("private store");
+        let job = JobId::try_from("0".repeat(32)).expect("job ID");
+        let result = start_worker_using(&store, &job, |_job| {
+            panic!("a missing job cannot launch a worker");
+        });
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_finished_job_cannot_launch_another_worker() {
+        let (_temporary, store, job, _watcher) = controlled_watch(false);
+        store
+            .transition(&job, &Event::Killed)
+            .expect("finished job");
+        start_worker_using(&store, &job, |_job| {
+            panic!("a finished job cannot launch a worker");
+        })
+        .expect("finished jobs need no worker");
     }
 
     #[test]
