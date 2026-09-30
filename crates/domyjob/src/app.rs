@@ -192,6 +192,19 @@ fn relay_output(output: impl Read, log: impl Write, limit: u64) -> std::io::Resu
 }
 
 type Relay = JoinHandle<std::io::Result<(u64, u64)>>;
+type RelayResult = std::thread::Result<std::io::Result<(u64, u64)>>;
+
+fn finish_logged(
+    (store, job): (&Store, &JobId),
+    completion: &Event,
+    (stopped, relayed): (std::io::Result<()>, RelayResult),
+) -> Result<(), AppError> {
+    stopped?;
+    store.transition(job, completion)?;
+    relayed
+        .map_err(|_panic| AppError::Io(std::io::Error::other("the job output relay panicked")))??;
+    Ok(())
+}
 
 fn spawn_logged(
     process: Process,
@@ -249,7 +262,8 @@ fn start_worker_using(
         return Ok(());
     }
     if let Err(error) = launch(job) {
-        store.finish_launch_failure(job, launch_failure_reason(&error)?)?;
+        let reason = launch_failure_reason(&error)?;
+        store.finish_launch_failure(job, reason)?;
     }
     Ok(())
 }
@@ -328,7 +342,10 @@ fn handle_using(
 fn run_worker_using(
     store: &Store,
     job: &JobId,
-    ready_event: Option<&ReadyToken>,
+    (ready_event, announce): (
+        Option<&ReadyToken>,
+        impl FnOnce(Option<&ReadyToken>) -> Result<(), ProcessError>,
+    ),
     start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
 ) -> Result<(), AppError> {
     let Some(_alive) = store.worker_lock(job)? else {
@@ -345,7 +362,7 @@ fn run_worker_using(
     };
     let cancellation = start_watch(store, job)?;
     store.transition(job, &Event::Starting)?;
-    process::announce_ready(ready_event)?;
+    announce(ready_event)?;
     if store.cancel_requested(job)? {
         store.transition(job, &Event::Killed)?;
         return Ok(());
@@ -362,11 +379,7 @@ fn run_worker_using(
             let completion = cancellation.wait(store, job, &child)?;
             let stopped = stop.stop();
             let relayed = relay.join();
-            stopped?;
-            store.transition(job, &completion)?;
-            relayed.map_err(|_panic| {
-                AppError::Io(std::io::Error::other("the job output relay panicked"))
-            })??;
+            finish_logged((store, job), &completion, (stopped, relayed))?;
         }
         Err(error) => {
             let reason = launch_failure_reason(&error)?;
@@ -388,7 +401,7 @@ fn worker_using(
 ) -> Result<(), AppError> {
     let result = (|| {
         let store = open_store()?;
-        run_worker_using(&store, job, event, start_watch)
+        run_worker_using(&store, job, (event, process::announce_ready), start_watch)
     })();
     if let Err(error) = &result
         && let Ok(store) = open_store()
@@ -413,12 +426,12 @@ mod tests {
     use std::sync::mpsc;
 
     use domyjob_core::domain::{Command, JobId, SubmissionId};
-    use domyjob_core::state::{Event, Outcome};
+    use domyjob_core::state::{Event, Outcome, PhaseKind};
     use domyjob_core::wire::{CleanTarget, Input, Reply, Request};
 
     use super::{
-        AppError, CancellationWatch, Wake, handle_using, relay_output, spawn_logged,
-        spawn_logged_using, start_worker_using, worker_using,
+        AppError, CancellationWatch, Wake, finish_logged, handle_using, relay_output,
+        run_worker_using, spawn_logged, spawn_logged_using, start_worker_using, worker_using,
     };
     use crate::process::{self, ProcessError, Stop as _};
     use crate::state_io as state_file;
@@ -427,16 +440,42 @@ mod tests {
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
 
-    fn controlled_watch(cancel: bool) -> (tempfile::TempDir, Store, JobId, CancellationWatch) {
+    fn accepted_job() -> (tempfile::TempDir, Store, JobId) {
+        accepted_job_using(|temporary| {
+            Command::try_from(vec![
+                temporary
+                    .path()
+                    .join("nonexistent-command")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+            .expect("command")
+        })
+    }
+
+    fn accepted_job_using(
+        command: impl FnOnce(&tempfile::TempDir) -> Command,
+    ) -> (tempfile::TempDir, Store, JobId) {
         let temporary = tempfile::tempdir().expect("temporary state root");
         let store = Store::fixture(temporary.path().join("state")).expect("private store");
         let submission = SubmissionId::try_from("2".repeat(32)).expect("submission ID");
         let request = Request::Run {
             submission: submission.clone(),
-            command: Command::try_from(vec!["controlled-job".to_owned()]).expect("command"),
+            command: command(&temporary),
             input: Input::Home,
         };
         let job = store.reserve(&submission, &request, None).expect("job");
+        (temporary, store, job)
+    }
+
+    fn controlled_watcher(store: &Store, job: &JobId) -> Result<CancellationWatch, AppError> {
+        CancellationWatch::start_using(store, job, watch_event::watcher, |_watcher, _directory| {
+            Ok(())
+        })
+    }
+
+    fn controlled_watch(cancel: bool) -> (tempfile::TempDir, Store, JobId, CancellationWatch) {
+        let (temporary, store, job) = accepted_job();
         store.transition(&job, &Event::Starting).expect("starting");
         store
             .transition(&job, &Event::Spawned { pid: 42 })
@@ -444,17 +483,31 @@ mod tests {
         if cancel {
             store.request_cancel(&job).expect("cancel request");
         }
-        let watcher = CancellationWatch::start_using(
-            &store,
-            &job,
-            watch_event::watcher,
-            |_watcher, _directory| Ok(()),
-        )
-        .expect("controlled watcher");
+        let watcher = controlled_watcher(&store, &job).expect("controlled watcher");
         if cancel {
             watcher.sender.send(Wake::Changed).expect("cancel notice");
         }
         (temporary, store, job, watcher)
+    }
+
+    fn job_fixture_file(
+        temporary: &tempfile::TempDir,
+        job: &JobId,
+        name: &str,
+    ) -> std::path::PathBuf {
+        temporary
+            .path()
+            .join("state/jobs")
+            .join(job.as_str())
+            .join(name)
+    }
+
+    fn assert_killed(store: &Store, job: &JobId) {
+        let state = store.status(job).expect("job state");
+        assert!(
+            matches!(state.outcome(), Some(Outcome::Killed)),
+            "{state:?}"
+        );
     }
 
     fn successful_exit() -> std::process::ExitStatus {
@@ -922,13 +975,7 @@ mod tests {
     #[test]
     fn killing_a_job_with_a_missing_state_preserves_the_record_error() {
         let (temporary, store, job, _watcher) = controlled_watch(false);
-        crate::testing::remove(
-            &temporary
-                .path()
-                .join("state/jobs")
-                .join(job.as_str())
-                .join("state.json"),
-        );
+        crate::testing::remove(&job_fixture_file(&temporary, &job, "state.json"));
         let abandoned = AtomicBool::new(false);
         let result = handle_using(
             (Request::Kill { job }, None, &abandoned),
@@ -971,6 +1018,301 @@ mod tests {
         );
         assert!(matches!(result, Err(AppError::Store(StoreError::Active))));
         assert!(!store.cancel_requested(&job).expect("cancellation marker"));
+    }
+
+    #[test]
+    fn a_missing_worker_job_fails_before_starting_a_watcher() {
+        let temporary = tempfile::tempdir().expect("temporary state root");
+        let store = Store::fixture(temporary.path().join("state")).expect("private store");
+        let job = JobId::try_from("0".repeat(32)).expect("job ID");
+        let result = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |_store, _job| {
+                panic!("a missing worker job cannot start a watcher");
+            },
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_finished_worker_job_does_not_start_a_watcher_or_a_command() {
+        let (_temporary, store, job) = accepted_job();
+        store
+            .transition(&job, &Event::Killed)
+            .expect("finished job");
+        run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |_store, _job| {
+                panic!("a finished worker job cannot start a watcher");
+            },
+        )
+        .expect("nothing remains to launch");
+        assert_killed(&store, &job);
+    }
+
+    #[test]
+    fn a_missing_stored_request_preserves_the_record_error() {
+        let (temporary, store, job) = accepted_job();
+        crate::testing::remove(&job_fixture_file(&temporary, &job, "request.json"));
+        let result = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |_store, _job| {
+                panic!("a missing request cannot start a watcher");
+            },
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_missing_state_cannot_start_a_worker_or_a_command() {
+        let (temporary, store, job) = accepted_job();
+        crate::testing::remove(&job_fixture_file(&temporary, &job, "state.json"));
+        let started = start_worker_using(&store, &job, |_job| {
+            panic!("an incomplete record cannot start a worker");
+        });
+        assert!(matches!(started, Err(AppError::Store(StoreError::Missing))));
+        let running = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |_store, _job| {
+                panic!("an incomplete record cannot start a watcher");
+            },
+        );
+        assert!(matches!(running, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_stored_non_run_request_is_rejected_before_a_command_starts() {
+        let (temporary, store, job) = accepted_job();
+        let encoded = domyjob_core::wire::frame(&Request::Hello).expect("encoded hello");
+        let payload = domyjob_core::wire::payload(&encoded).expect("hello payload");
+        state_file::write_bytes(&job_fixture_file(&temporary, &job, "request.json"), payload)
+            .expect("replaced request fixture");
+        let error = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |_store, _job| {
+                panic!("a non-run request cannot start a watcher");
+            },
+        )
+        .expect_err("invalid stored request");
+        assert!(
+            matches!(error, AppError::Io(ref cause) if cause.to_string() == "stored request is not a run")
+        );
+    }
+
+    #[test]
+    fn cancellation_before_command_launch_finishes_the_job_as_killed() {
+        let (_temporary, store, job) = accepted_job();
+        store.request_cancel(&job).expect("cancel request");
+        run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            controlled_watcher,
+        )
+        .expect("cancelled worker");
+        assert_killed(&store, &job);
+        assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+    }
+
+    #[test]
+    fn cancellation_while_a_watcher_starts_preserves_the_transition_error() {
+        let (_temporary, store, job) = accepted_job();
+        let result = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |working_store, watched_job| {
+                let watcher = controlled_watcher(working_store, watched_job)?;
+                working_store.transition(watched_job, &Event::Killed)?;
+                Ok(watcher)
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::Store(StoreError::Transition(_)))
+        ));
+        assert_killed(&store, &job);
+    }
+
+    #[test]
+    fn a_cancel_marker_with_the_wrong_file_kind_preserves_its_state_error() {
+        let (temporary, store, job) = accepted_job();
+        crate::testing::mkdir(&job_fixture_file(&temporary, &job, "cancel"));
+        let result = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            controlled_watcher,
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::State(_)))));
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_opened_prevents_command_launch() {
+        let (_temporary, store, job) = accepted_job();
+        let path = store.log_path(&job);
+        state_file::write_bytes(&path, b"").expect("empty log fixture");
+        let permissions = crate::testing::protect(&path);
+        let result = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            controlled_watcher,
+        );
+        crate::testing::restore(&path, permissions);
+        assert!(matches!(result, Err(AppError::Store(StoreError::State(_)))));
+    }
+
+    #[test]
+    fn failed_readiness_prevents_command_launch_and_preserves_its_error() {
+        let (_temporary, store, job) = accepted_job();
+        let error = run_worker_using(
+            &store,
+            &job,
+            (None, |_event| {
+                Err(ProcessError::Ready(std::io::Error::other(
+                    "readiness refused",
+                )))
+            }),
+            controlled_watcher,
+        )
+        .expect_err("readiness error");
+        assert!(
+            matches!(error, AppError::Proc(ProcessError::Ready(ref cause))
+            if cause.to_string() == "readiness refused")
+        );
+        assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+    }
+
+    #[test]
+    fn a_broken_cancellation_watch_preserves_its_error_after_a_real_command() {
+        let (_temporary, store, job) = accepted_job_using(|_temporary| {
+            let command = process::stdout_then_stderr();
+            let words = std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(|word| word.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            Command::try_from(words).expect("real command")
+        });
+        let error = run_worker_using(
+            &store,
+            &job,
+            (None, process::announce_ready),
+            |working_store, watched_job| {
+                let watcher = controlled_watcher(working_store, watched_job)?;
+                watcher
+                    .sender
+                    .send(Wake::Broken("watch refused".to_owned()))
+                    .expect("failure notice");
+                Ok(watcher)
+            },
+        )
+        .expect_err("watch error");
+        assert!(matches!(error, AppError::Io(ref cause) if cause.to_string() == "watch refused"));
+    }
+
+    #[test]
+    fn failed_output_preserves_the_completed_process_state_and_its_error() {
+        for panicked in [false, true] {
+            let (_temporary, store, job, _watcher) = controlled_watch(false);
+            let relayed = std::thread::spawn(move || -> std::io::Result<(u64, u64)> {
+                assert!(!panicked, "output relay failed");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "log disk full",
+                ))
+            })
+            .join();
+            let error = finish_logged(
+                (&store, &job),
+                &Event::Exited { code: 0 },
+                (Ok(()), relayed),
+            )
+            .expect_err("output error");
+            let expected = if panicked {
+                "the job output relay panicked"
+            } else {
+                "log disk full"
+            };
+            assert!(
+                matches!(error, AppError::Io(ref cause) if cause.to_string() == expected),
+                "{error:?}"
+            );
+            assert!(matches!(
+                store.status(&job).expect("terminal state").outcome(),
+                Some(Outcome::Succeeded)
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_relay_shutdown_cannot_commit_process_completion() {
+        let (_temporary, store, job, _watcher) = controlled_watch(false);
+        let _alive = store.worker_lock(&job).expect("worker lock");
+        let error = finish_logged(
+            (&store, &job),
+            &Event::Exited { code: 0 },
+            (
+                Err(std::io::Error::other("shutdown refused")),
+                Ok(Ok((0, 0))),
+            ),
+        )
+        .expect_err("shutdown error");
+        assert!(
+            matches!(error, AppError::Io(ref cause) if cause.to_string() == "shutdown refused")
+        );
+        assert_eq!(
+            store.status(&job).expect("job state").kind(),
+            PhaseKind::Running
+        );
+    }
+
+    #[test]
+    fn a_missing_state_preserves_the_completion_publication_error() {
+        let (temporary, store, job, _watcher) = controlled_watch(false);
+        crate::testing::remove(&job_fixture_file(&temporary, &job, "state.json"));
+        let result = finish_logged(
+            (&store, &job),
+            &Event::Exited { code: 0 },
+            (Ok(()), Ok(Ok((0, 0)))),
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_missing_state_preserves_the_worker_launch_failure_publication_error() {
+        let (temporary, store, job) = accepted_job();
+        let result = start_worker_using(&store, &job, |_job| {
+            crate::testing::remove(&job_fixture_file(&temporary, &job, "state.json"));
+            Err(ProcessError::NotStarted("worker refused".to_owned()))
+        });
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn a_worker_preserves_the_store_open_error_when_diagnostics_cannot_open_it() {
+        let job =
+            JobId::try_from("00000000000000000000000000000001".to_owned()).expect("job identity");
+        let result = worker_using(
+            &job,
+            None,
+            || Err(StoreError::Io(std::io::Error::other("store unavailable"))),
+            controlled_watcher,
+        );
+        assert!(
+            matches!(result, Err(AppError::Store(StoreError::Io(ref cause)))
+            if cause.to_string() == "store unavailable")
+        );
     }
 
     #[test]
