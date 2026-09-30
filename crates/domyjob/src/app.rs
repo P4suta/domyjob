@@ -282,13 +282,11 @@ fn handle_using(
     start: impl Fn(&Store, &JobId) -> Result<(), AppError>,
 ) -> Result<Reply, AppError> {
     match request {
-        Request::Chat(request) => {
-            let chat = |error: crate::chat::sync::SyncError| AppError::Chat(Box::new(error));
-            let store = crate::chat::store::Store::open().map_err(|error| chat(error.into()))?;
-            Ok(Reply::Chat(
-                crate::chat::sync::serve(&store, request, abandoned).map_err(chat)?,
-            ))
-        }
+        Request::Chat(request) => chat_using(
+            (request, abandoned),
+            crate::chat::store::Store::open,
+            crate::chat::sync::serve,
+        ),
         Request::Hello => Ok(Reply::Hello {
             build: identity::current(),
         }),
@@ -321,22 +319,53 @@ fn handle_using(
         }
         Request::Kill { job } => {
             let store = open_store()?;
-            let _launch = store.launch_lock(&job)?;
-            let state = store.status(&job)?;
-            let stopped = match state.kind() {
-                PhaseKind::Accepted => store.transition(&job, &Event::Killed)?,
-                PhaseKind::Starting | PhaseKind::Running => {
-                    store.request_cancel(&job)?;
-                    store.wait(&job)?
-                }
-                PhaseKind::Finished => state,
-            };
-            Ok(Reply::Status { state: stopped })
+            kill_using(
+                (&store, &job),
+                Store::transition,
+                (Store::request_cancel, Store::wait),
+            )
         }
         Request::Clean { target } => Ok(Reply::Cleaned {
             count: open_store()?.clean(&target)?,
         }),
     }
+}
+
+fn chat_using(
+    (request, abandoned): (domyjob_core::chat_wire::ChatRequest, &AtomicBool),
+    open: impl FnOnce() -> Result<crate::chat::store::Store, crate::chat::store::StoreError>,
+    serve: impl FnOnce(
+        &crate::chat::store::Store,
+        domyjob_core::chat_wire::ChatRequest,
+        &AtomicBool,
+    ) -> Result<domyjob_core::chat_wire::ChatReply, crate::chat::sync::SyncError>,
+) -> Result<Reply, AppError> {
+    let chat = |error: crate::chat::sync::SyncError| AppError::Chat(Box::new(error));
+    let store = open().map_err(|error| chat(error.into()))?;
+    Ok(Reply::Chat(
+        serve(&store, request, abandoned).map_err(chat)?,
+    ))
+}
+
+fn kill_using(
+    (store, job): (&Store, &JobId),
+    transition: impl FnOnce(&Store, &JobId, &Event) -> Result<domyjob_core::state::JobState, StoreError>,
+    (cancel, wait): (
+        impl FnOnce(&Store, &JobId) -> Result<(), StoreError>,
+        impl FnOnce(&Store, &JobId) -> Result<domyjob_core::state::JobState, StoreError>,
+    ),
+) -> Result<Reply, AppError> {
+    let _launch = store.launch_lock(job)?;
+    let state = store.status(job)?;
+    let stopped = match state.kind() {
+        PhaseKind::Accepted => transition(store, job, &Event::Killed)?,
+        PhaseKind::Starting | PhaseKind::Running => {
+            cancel(store, job)?;
+            wait(store, job)?
+        }
+        PhaseKind::Finished => state,
+    };
+    Ok(Reply::Status { state: stopped })
 }
 
 fn run_worker_using(
@@ -347,6 +376,23 @@ fn run_worker_using(
         impl FnOnce(Option<&ReadyToken>) -> Result<(), ProcessError>,
     ),
     start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+) -> Result<(), AppError> {
+    run_worker_at_using(
+        (store, job),
+        (ready_event, announce),
+        start_watch,
+        platform::home,
+    )
+}
+
+fn run_worker_at_using(
+    (store, job): (&Store, &JobId),
+    (ready_event, announce): (
+        Option<&ReadyToken>,
+        impl FnOnce(Option<&ReadyToken>) -> Result<(), ProcessError>,
+    ),
+    start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+    home: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
 ) -> Result<(), AppError> {
     let Some(_alive) = store.worker_lock(job)? else {
         return Ok(());
@@ -368,18 +414,37 @@ fn run_worker_using(
         return Ok(());
     }
     let directory = match input {
-        Input::Home => platform::home()?,
+        Input::Home => home()?,
         Input::Snapshot(_) => store.workspace(job)?,
     };
     let process = job_command(&command, &directory);
     let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
-    match spawn_logged(process, log, MAX_LOG_BYTES) {
+    run_logged_using(
+        (store, job),
+        (process, log, cancellation),
+        (spawn_logged, finish_logged),
+    )
+}
+
+fn run_logged_using(
+    (store, job): (&Store, &JobId),
+    (process, log, cancellation): (Process, File, CancellationWatch),
+    (spawn, finish): (
+        impl FnOnce(Process, File, u64) -> Result<(Group, Relay, process::OutputStop), ProcessError>,
+        impl FnOnce(
+            (&Store, &JobId),
+            &Event,
+            (std::io::Result<()>, RelayResult),
+        ) -> Result<(), AppError>,
+    ),
+) -> Result<(), AppError> {
+    match spawn(process, log, MAX_LOG_BYTES) {
         Ok((child, relay, stop)) => {
             store.transition(job, &Event::Spawned { pid: child.id() })?;
             let completion = cancellation.wait(store, job, &child)?;
             let stopped = stop.stop();
             let relayed = relay.join();
-            finish_logged((store, job), &completion, (stopped, relayed))?;
+            finish((store, job), &completion, (stopped, relayed))?;
         }
         Err(error) => {
             let reason = launch_failure_reason(&error)?;
@@ -430,8 +495,9 @@ mod tests {
     use domyjob_core::wire::{CleanTarget, Input, Reply, Request};
 
     use super::{
-        AppError, CancellationWatch, Wake, finish_logged, handle_using, relay_output,
-        run_worker_using, spawn_logged, spawn_logged_using, start_worker_using, worker_using,
+        AppError, CancellationWatch, Wake, chat_using, finish_logged, handle_using, kill_using,
+        relay_output, run_logged_using, run_worker_at_using, run_worker_using, spawn_logged,
+        spawn_logged_using, start_worker_using, worker_using,
     };
     use crate::process::{self, ProcessError, Stop as _};
     use crate::state_io as state_file;
@@ -1313,6 +1379,247 @@ mod tests {
             matches!(result, Err(AppError::Store(StoreError::Io(ref cause)))
             if cause.to_string() == "store unavailable")
         );
+    }
+
+    #[test]
+    fn failed_terminal_worker_transitions_preserve_the_missing_state_error() {
+        for cancelled in [false, true] {
+            let (temporary, store, job) = accepted_job();
+            if cancelled {
+                store.request_cancel(&job).expect("cancel request");
+            }
+            let result = run_worker_using(
+                &store,
+                &job,
+                (None, |_event| {
+                    assert_eq!(
+                        store.status(&job).expect("starting job").kind(),
+                        PhaseKind::Starting
+                    );
+                    crate::testing::remove(&job_fixture_file(&temporary, &job, "state.json"));
+                    Ok(())
+                }),
+                controlled_watcher,
+            );
+            assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+            assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+        }
+    }
+
+    #[test]
+    fn killing_an_accepted_job_preserves_a_failed_terminal_transition() {
+        let (temporary, store, job) = accepted_job();
+        let result = kill_using(
+            (&store, &job),
+            |store, job, event| {
+                assert_eq!(store.status(job)?.kind(), PhaseKind::Accepted);
+                crate::testing::remove(&job_fixture_file(&temporary, job, "state.json"));
+                store.transition(job, event)
+            },
+            (
+                |_store, _job| panic!("an accepted job is killed without cancellation"),
+                |_store, _job| panic!("an accepted job does not wait for a worker"),
+            ),
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+    }
+
+    #[test]
+    fn killing_an_active_job_preserves_a_failed_cancellation_publication() {
+        let (temporary, store, job, _watcher) = controlled_watch(false);
+        let _alive = store.worker_lock(&job).expect("worker lock");
+        crate::testing::mkdir(&job_fixture_file(&temporary, &job, "cancel"));
+        let result = handle_using(
+            (
+                Request::Kill { job: job.clone() },
+                None,
+                &AtomicBool::new(false),
+            ),
+            || Ok(store.clone()),
+            |_store, _job| panic!("killing cannot start a worker"),
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::State(_)))));
+        assert_eq!(
+            store.status(&job).expect("active job").kind(),
+            PhaseKind::Running
+        );
+    }
+
+    #[test]
+    fn killing_an_active_job_preserves_a_failed_wait_after_publishing_cancellation() {
+        let (temporary, store, job, _watcher) = controlled_watch(false);
+        let mut alive = store.worker_lock(&job).expect("worker lock");
+        let result = kill_using(
+            (&store, &job),
+            |_store, _job, _event| panic!("a running job waits for its worker"),
+            (
+                |working_store, target_job| {
+                    working_store.request_cancel(target_job)?;
+                    drop(alive.take());
+                    let path = job_fixture_file(&temporary, target_job, "alive.lock");
+                    crate::testing::remove(&path);
+                    crate::testing::mkdir(&path);
+                    Ok(())
+                },
+                Store::wait,
+            ),
+        );
+        assert!(
+            store
+                .cancel_requested(&job)
+                .expect("published cancellation")
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Lock(_)))));
+    }
+
+    #[test]
+    fn a_chat_request_preserves_real_open_and_service_failures() {
+        for opening in [true, false] {
+            let temporary = tempfile::tempdir().expect("temporary state root");
+            let root = temporary.path().join("state");
+            let state = crate::layout::State::at(&root);
+            if opening {
+                crate::testing::write(&root, b"not a directory");
+            }
+            let result = chat_using(
+                (
+                    domyjob_core::chat_wire::ChatRequest::Identity {},
+                    &AtomicBool::new(false),
+                ),
+                || {
+                    let store = crate::chat::store::Store::open_in(&state)?;
+                    if !opening {
+                        let path = store.paths().database();
+                        crate::testing::remove(&path);
+                        crate::testing::mkdir(&path);
+                    }
+                    Ok(store)
+                },
+                crate::chat::sync::serve,
+            );
+            assert!(matches!(result, Err(AppError::Chat(ref error))
+                if matches!(error.as_ref(), crate::chat::sync::SyncError::Store(crate::chat::store::StoreError::State(_)))));
+        }
+    }
+
+    #[test]
+    fn a_worker_preserves_a_failed_home_provider_before_command_launch() {
+        let (_temporary, store, job) = accepted_job();
+        let result = run_worker_at_using(
+            (&store, &job),
+            (None, process::announce_ready),
+            controlled_watcher,
+            || {
+                Err(std::io::Error::other(
+                    "the user home directory is unavailable",
+                ))
+            },
+        );
+        assert!(matches!(result, Err(AppError::Io(ref cause))
+            if cause.to_string() == "the user home directory is unavailable"));
+        assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+    }
+
+    #[test]
+    fn a_worker_preserves_a_replaced_snapshot_workspace_before_command_launch() {
+        let temporary = tempfile::tempdir().expect("temporary state root");
+        let store = Store::fixture(temporary.path().join("state")).expect("private store");
+        let archive = crate::source_archive::Archive::new()
+            .finish()
+            .expect("empty archive");
+        let descriptor = domyjob_core::wire::Snapshot::new(
+            u64::try_from(archive.len()).expect("archive length"),
+            blake3::hash(&archive).to_hex().to_string(),
+        )
+        .expect("snapshot");
+        let received = store
+            .receive_archive(&mut archive.as_slice(), &descriptor)
+            .expect("received archive");
+        let submission = SubmissionId::try_from("4".repeat(32)).expect("submission ID");
+        let request = Request::Run {
+            submission: submission.clone(),
+            command: Command::try_from(vec!["never-launched".to_owned()]).expect("command"),
+            input: Input::Snapshot(descriptor),
+        };
+        let job = store
+            .reserve(&submission, &request, Some(&received))
+            .expect("snapshot job");
+        let path = store.workspace(&job).expect("original workspace");
+        state_file::set_aside(&path, &temporary.path().join("trash")).expect("replaced workspace");
+        state_file::write_bytes(&path, b"not a directory").expect("blocked workspace");
+        let result = run_worker_at_using(
+            (&store, &job),
+            (None, process::announce_ready),
+            controlled_watcher,
+            || panic!("snapshot jobs do not use the user's home"),
+        );
+        assert!(matches!(result, Err(AppError::Store(StoreError::Corrupt))));
+        assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
+    }
+
+    fn running_log_fixture(
+        store: &Store,
+        job: &JobId,
+    ) -> (std::process::Command, std::fs::File, CancellationWatch) {
+        store
+            .transition(job, &Event::Starting)
+            .expect("starting job");
+        let log = state_file::open_append(&store.log_path(job)).expect("job log");
+        (
+            process::stdout_then_stderr(),
+            log,
+            controlled_watcher(store, job).expect("watcher"),
+        )
+    }
+
+    #[test]
+    fn a_logged_worker_preserves_running_and_completed_publication_errors() {
+        for before_wait in [true, false] {
+            let (temporary, store, job) = accepted_job();
+            let _alive = store.worker_lock(&job).expect("worker lock");
+            let result = run_logged_using(
+                (&store, &job),
+                running_log_fixture(&store, &job),
+                (
+                    |process, log, limit| {
+                        let (child, relay, stop) = spawn_logged(process, log, limit)?;
+                        if before_wait {
+                            child.wait().expect("completed real child");
+                            crate::testing::remove(&job_fixture_file(
+                                &temporary,
+                                &job,
+                                "state.json",
+                            ));
+                        }
+                        Ok((child, relay, stop))
+                    },
+                    |(working_store, target_job), event, relayed| {
+                        assert!(
+                            !before_wait,
+                            "a missing running state cannot publish completion"
+                        );
+                        assert!(matches!(event, Event::Exited { code: 0 }));
+                        crate::testing::remove(&job_fixture_file(
+                            &temporary,
+                            target_job,
+                            "state.json",
+                        ));
+                        finish_logged((working_store, target_job), event, relayed)
+                    },
+                ),
+            );
+            assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
+            if !before_wait {
+                assert!(
+                    store
+                        .log_tail(&job)
+                        .expect("job log")
+                        .0
+                        .for_terminal()
+                        .starts_with("0123456789")
+                );
+            }
+        }
     }
 
     #[test]
