@@ -17,6 +17,21 @@ pub(crate) const POLLS: u32 = 2400;
 
 const PREFIX: &str = "domyjob-e2e-";
 
+pub(crate) fn prepare_binaries() -> Result<tempfile::TempDir, Failure> {
+    let binaries = tempfile::Builder::new()
+        .prefix("domyjob-e2e-binaries-")
+        .tempdir()
+        .context("creating the immutable test binaries")?;
+    let harness = std::env::current_exe().context("locating the harness")?;
+    fs::copy(harness, binaries.path().join("harness")).context("preparing the fake binaries")?;
+    fs::copy(
+        env!("CARGO_BIN_EXE_domyjob"),
+        binaries.path().join("domyjob"),
+    )
+    .context("preparing the domyjob binary under test")?;
+    Ok(binaries)
+}
+
 #[derive(Debug)]
 pub(crate) struct World {
     root: PathBuf,
@@ -26,7 +41,7 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn create(machines: &[&str]) -> Result<Self, Failure> {
+    pub(crate) fn create(machines: &[&str], binaries: &Path) -> Result<Self, Failure> {
         sweep()?;
         let lock = tempfile::Builder::new()
             .prefix(PREFIX)
@@ -43,12 +58,11 @@ impl World {
             background: Mutex::new(Vec::new()),
         };
         fs::create_dir_all(world.bin()).context("creating bin")?;
-        let harness = std::env::current_exe().context("locating the harness")?;
         for fake in FAKES {
-            fs::copy(&harness, world.program(fake))
+            fs::hard_link(binaries.join("harness"), world.program(fake))
                 .context(&format!("installing the fake {fake}"))?;
         }
-        fs::copy(env!("CARGO_BIN_EXE_domyjob"), world.domyjob())
+        fs::hard_link(binaries.join("domyjob"), world.domyjob())
             .context("installing the domyjob binary under test")?;
         for name in &world.machines {
             let machine = world.machine(name);

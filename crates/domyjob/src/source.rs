@@ -74,18 +74,20 @@ mod tests {
             bytes.len()
         );
         let mut tar = tar::Archive::new(bytes.as_slice());
-        let names = tar
+        let entries = tar
             .entries()
             .expect("archive entries")
             .map(|entry| {
-                entry
-                    .expect("archive entry")
+                let entry = entry.expect("archive entry");
+                let name = entry
                     .path()
                     .expect("archive path")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned();
+                let mode = entry.header().mode().expect("portable file mode");
+                (name, mode)
             })
             .collect::<Vec<_>>();
-        assert_eq!(names, ["new.txt"]);
+        assert_eq!(entries, [("new.txt".to_owned(), 0o644)]);
     }
 }

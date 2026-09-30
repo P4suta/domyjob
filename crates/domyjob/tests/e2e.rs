@@ -251,6 +251,13 @@ fn runner() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    let binaries = match world::prepare_binaries() {
+        Ok(binaries) => binaries,
+        Err(failure) => {
+            eprintln!("e2e: {failure}");
+            return ExitCode::FAILURE;
+        }
+    };
     let keep = std::env::var_os("E2E_KEEP").is_some();
     println!("\nrunning {} end-to-end scenarios", selected.len());
     let started = Instant::now();
@@ -259,7 +266,7 @@ fn runner() -> ExitCode {
     let mut tally = Tally::default();
     std::thread::scope(|scope| {
         for _ in 0..jobs() {
-            let (queue, sender) = (&queue, sender.clone());
+            let (queue, sender, binaries) = (&queue, sender.clone(), binaries.path());
             scope.spawn(move || {
                 loop {
                     let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
@@ -267,7 +274,7 @@ fn runner() -> ExitCode {
                         return;
                     };
                     let clock = Instant::now();
-                    let result = attempt(scenario, keep);
+                    let result = attempt(scenario, binaries, keep);
                     if sender.send((scenario, result, clock.elapsed())).is_err() {
                         return;
                     }
@@ -282,8 +289,8 @@ fn runner() -> ExitCode {
     tally.finish(started.elapsed())
 }
 
-fn attempt(scenario: &Scenario, keep: bool) -> Result<(), Failure> {
-    let world = World::create(scenario.machines)?;
+fn attempt(scenario: &Scenario, binaries: &Path, keep: bool) -> Result<(), Failure> {
+    let world = World::create(scenario.machines, binaries)?;
     let outcome = (scenario.run)(&world);
     let cleaned = world
         .cleanup()
