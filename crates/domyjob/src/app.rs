@@ -85,6 +85,15 @@ impl CancellationWatch {
     }
 
     fn wait(self, store: &Store, job: &JobId, group: &Group) -> Result<Event, AppError> {
+        self.wait_using((store, job), || group.wait(), || group.kill())
+    }
+
+    fn wait_using(
+        self,
+        (store, job): (&Store, &JobId),
+        wait: impl FnOnce() -> Result<std::process::ExitStatus, ProcessError>,
+        kill: impl Fn() -> Result<(), ProcessError> + Send,
+    ) -> Result<Event, AppError> {
         let cancelled = AtomicBool::new(false);
         let status = std::thread::scope(|scope| -> Result<_, AppError> {
             let cancelled_by_request = &cancelled;
@@ -94,22 +103,22 @@ impl CancellationWatch {
                         Ok(Wake::Changed) => match store.cancel_requested(job) {
                             Ok(true) => {
                                 cancelled_by_request.store(true, Ordering::Release);
-                                group.kill()?;
+                                kill()?;
                                 return Ok(());
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                let _stopped = group.kill();
+                                let _stopped = kill();
                                 return Err(error.into());
                             }
                         },
                         Ok(Wake::Broken(message)) => {
-                            let _stopped = group.kill();
+                            let _stopped = kill();
                             return Err(AppError::Io(std::io::Error::other(message)));
                         }
                         Ok(Wake::Finished) => return Ok(()),
                         Err(_closed) => {
-                            let _stopped = group.kill();
+                            let _stopped = kill();
                             return Err(AppError::Io(std::io::Error::other(
                                 "cancellation watcher disconnected",
                             )));
@@ -117,7 +126,7 @@ impl CancellationWatch {
                     }
                 }
             });
-            let status = group.wait();
+            let status = wait();
             let _sent = self.sender.send(Wake::Finished);
             watch_thread.join().map_err(|_panic| {
                 AppError::Io(std::io::Error::other("cancellation watcher panicked"))
@@ -365,17 +374,105 @@ fn worker_using(
 
 #[cfg(test)]
 mod tests {
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
     use domyjob_core::domain::{Command, JobId, SubmissionId};
-    use domyjob_core::state::Outcome;
+    use domyjob_core::state::{Event, Outcome};
     use domyjob_core::wire::{Input, Request};
 
-    use super::{AppError, CancellationWatch, relay_output, spawn_logged, worker_using};
-    use crate::process::{self, Stop as _};
+    use super::{AppError, CancellationWatch, Wake, relay_output, spawn_logged, worker_using};
+    use crate::process::{self, ProcessError, Stop as _};
     use crate::state_io as state_file;
     use crate::store::{Store, StoreError};
     use crate::watch_event;
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
+
+    fn requested_cancellation() -> (tempfile::TempDir, Store, JobId, CancellationWatch) {
+        let temporary = tempfile::tempdir().expect("temporary state root");
+        let store = Store::fixture(temporary.path().join("state")).expect("private store");
+        let submission = SubmissionId::try_from("2".repeat(32)).expect("submission ID");
+        let request = Request::Run {
+            submission: submission.clone(),
+            command: Command::try_from(vec!["controlled-job".to_owned()]).expect("command"),
+            input: Input::Home,
+        };
+        let job = store.reserve(&submission, &request, None).expect("job");
+        store.transition(&job, &Event::Starting).expect("starting");
+        store
+            .transition(&job, &Event::Spawned { pid: 42 })
+            .expect("running");
+        store.request_cancel(&job).expect("cancel request");
+        let watcher = CancellationWatch::start_using(
+            &store,
+            &job,
+            watch_event::watcher,
+            |_watcher, _directory| Ok(()),
+        )
+        .expect("controlled watcher");
+        watcher.sender.send(Wake::Changed).expect("cancel notice");
+        (temporary, store, job, watcher)
+    }
+
+    fn successful_exit() -> std::process::ExitStatus {
+        process::stdout_then_stderr()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("completed command")
+    }
+
+    #[test]
+    fn a_requested_cancellation_remains_killed_when_the_process_exits_successfully() {
+        let (_temporary, store, job, watcher) = requested_cancellation();
+        let status = successful_exit();
+        let (stopped, observed) = mpsc::sync_channel(1);
+        let completion = watcher
+            .wait_using(
+                (&store, &job),
+                || {
+                    observed.recv().expect("process was stopped");
+                    Ok(status)
+                },
+                || {
+                    stopped.send(()).expect("report the stop");
+                    Ok(())
+                },
+            )
+            .expect("cancellation completion");
+        let state = store.transition(&job, &completion).expect("terminal state");
+        assert!(matches!(state.outcome(), Some(Outcome::Killed)));
+    }
+
+    #[test]
+    fn a_failed_cancellation_signal_preserves_its_process_error() {
+        let (_temporary, store, job, watcher) = requested_cancellation();
+        let status = successful_exit();
+        let (stopped, observed) = mpsc::sync_channel(1);
+        let error = watcher
+            .wait_using(
+                (&store, &job),
+                || {
+                    observed.recv().expect("signal was attempted");
+                    Ok(status)
+                },
+                || {
+                    stopped.send(()).expect("report the signal");
+                    Err(ProcessError::Signal(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "signal refused",
+                    )))
+                },
+            )
+            .expect_err("signal error");
+        assert!(
+            matches!(error, AppError::Proc(ProcessError::Signal(ref cause))
+                if cause.kind() == std::io::ErrorKind::PermissionDenied
+                    && cause.to_string() == "signal refused"),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn cancellation_watch_returns_a_missing_job_before_registration() {
