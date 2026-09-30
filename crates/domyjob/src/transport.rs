@@ -234,20 +234,37 @@ fn raw_call(
     payload: &[u8],
     policy: Policy,
 ) -> Result<Reply, TransportError> {
-    let mut child = SshChild::start(
+    let child = SshChild::start(
         machine,
         &node_command(shell, &identity::tag()),
         Stdio::piped(),
     )?;
+    exchange(child, request, payload, policy)
+}
+
+fn exchange(
+    mut child: SshChild,
+    request: &Request,
+    payload: &[u8],
+    policy: Policy,
+) -> Result<Reply, TransportError> {
     let watchdog = Watchdog::start(&child.child, policy.deadline);
     let mut stdin = child
         .child
         .stdin
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
-    stdin.write_all(&wire::frame(request)?)?;
-    stdin.write_all(payload)?;
-    stdin.flush()?;
+    let sent = stdin
+        .write_all(&wire::frame(request)?)
+        .and_then(|()| stdin.write_all(payload))
+        .and_then(|()| stdin.flush());
+    if let Err(error) = sent {
+        drop(stdin);
+        drop(child.child.stdout.take());
+        let status = child.wait()?;
+        drop(watchdog);
+        return Err(failure(status, policy, error.into()));
+    }
     let held = if policy.hold_input {
         Some(stdin)
     } else {
@@ -805,10 +822,54 @@ pub(crate) fn node(output: &Output) -> Result<(), TransportError> {
 
 #[cfg(test)]
 mod tests {
-    use domyjob_core::wire::BuildId;
+    use std::process::Stdio;
 
-    use super::{EMBEDDED_SOURCE, Shell, identity, install_command, node_command};
-    use crate::source_fingerprint;
+    use domyjob_core::wire::{BuildId, Request};
+
+    use super::{
+        EMBEDDED_SOURCE, PLAIN, Shell, SshChild, TransportError, exchange, identity,
+        install_command, node_command,
+    };
+    use crate::{process, source_fingerprint};
+
+    fn rejected_large_send(unix: &str, windows: &str) -> TransportError {
+        let mut command = process::command(if cfg!(windows) { "cmd.exe" } else { "sh" });
+        if cfg!(windows) {
+            command.args(["/D", "/C", windows]);
+        } else {
+            command.args(["-c", unix]);
+        }
+        let child = SshChild {
+            child: command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            finished: false,
+        };
+        exchange(child, &Request::Hello, &vec![b'x'; 2_097_152], PLAIN).unwrap_err()
+    }
+
+    #[test]
+    fn missing_node_status_survives_a_broken_pipe_during_a_large_send() {
+        let error = rejected_large_send("exit 97", "exit /b 97");
+        assert!(matches!(error, TransportError::Missing), "{error:?}");
+    }
+
+    #[test]
+    fn unreachable_ssh_status_survives_a_broken_pipe_during_a_large_send() {
+        let error = rejected_large_send("exit 255", "exit /b 255");
+        assert!(matches!(error, TransportError::Unreachable), "{error:?}");
+    }
+
+    #[test]
+    fn other_exit_status_preserves_the_original_send_io_error() {
+        let error = rejected_large_send("exit 23", "exit /b 23");
+        assert!(
+            matches!(error, TransportError::Io(ref io) if io.kind() == std::io::ErrorKind::BrokenPipe),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn embedded_deployment_source_matches_the_compiled_build() {
