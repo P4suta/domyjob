@@ -32,16 +32,21 @@ fn line(attribute: &syn::Attribute) -> usize {
         .map_or(1, |part| part.ident.span().start().line)
 }
 
-fn expected(attribute: &syn::Attribute) -> Option<Vec<String>> {
+enum Expected {
+    Lints(Vec<String>),
+    Malformed,
+}
+
+fn expected(attribute: &syn::Attribute) -> Option<Expected> {
     if !attribute.path().is_ident("expect") {
         return None;
     }
     let Ok(arguments) =
         attribute.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
     else {
-        return Some(Vec::new());
+        return Some(Expected::Malformed);
     };
-    Some(
+    Some(Expected::Lints(
         arguments
             .iter()
             .filter_map(|argument| match argument {
@@ -55,7 +60,7 @@ fn expected(attribute: &syn::Attribute) -> Option<Vec<String>> {
                 syn::Meta::List(_) | syn::Meta::NameValue(_) => None,
             })
             .collect(),
-    )
+    ))
 }
 
 fn conditional_exception(attribute: &syn::Attribute) -> bool {
@@ -108,12 +113,19 @@ impl Exceptions {
         let mut declared = false;
         for attribute in &module.attrs {
             match (attribute.style, expected(attribute)) {
-                (syn::AttrStyle::Inner(_), Some(lints))
+                (syn::AttrStyle::Inner(_), Some(Expected::Lints(lints)))
                     if lints
                         .iter()
                         .all(|lint| EFFECT_LINTS.contains(&lint.as_str())) =>
                 {
                     declared = true;
+                }
+                (_, Some(Expected::Malformed)) => {
+                    declared = true;
+                    self.findings.push(format!(
+                        "{}: an expect attribute has malformed arguments",
+                        line(attribute)
+                    ));
                 }
                 (_, Some(_)) => {
                     declared = true;
@@ -169,7 +181,11 @@ pub fn check(path: &str, file: &syn::File) -> Vec<String> {
         .map_or(&[][..], |(_, lints)| *lints);
     for attribute in &file.attrs {
         match expected(attribute) {
-            Some(lints) if lints.iter().all(|lint| allowed.contains(&lint.as_str())) => {}
+            Some(Expected::Lints(lints)) if lints.iter().all(|lint| allowed.contains(&lint.as_str())) => {}
+            Some(Expected::Malformed) => exceptions.findings.push(format!(
+                "{}: an expect attribute has malformed arguments",
+                line(attribute)
+            )),
             Some(_) => exceptions.findings.push(format!(
                 "{}: only foreign-function modules and the end-to-end harness expect lints file-wide",
                 line(attribute)
@@ -187,12 +203,11 @@ pub fn check(path: &str, file: &syn::File) -> Vec<String> {
 mod tests {
     use super::check;
 
-    fn findings(source: &str) -> usize {
+    fn findings(source: &str) -> Vec<String> {
         check(
             "crates/domyjob/src/example.rs",
             &syn::parse_file(source).unwrap(),
         )
-        .len()
     }
 
     #[test]
@@ -204,7 +219,7 @@ mod tests {
                 pub(super) fn write(path: &Path) -> std::io::Result<()> { std::fs::write(path, b"") }
             }
         "#;
-        assert_eq!(findings(owned), 0);
+        assert!(findings(owned).is_empty());
         for misplaced in [
             r#"#[expect(clippy::disallowed_methods, reason = "x")] fn write() {}"#,
             r#"#![expect(clippy::disallowed_methods, reason = "x")] fn write() {}"#,
@@ -217,10 +232,81 @@ mod tests {
             r#"mod raw { #![expect(clippy::disallowed_methods, reason = "x")] struct Hidden; }"#,
             "mod raw { fn f() {} }",
         ] {
-            assert_eq!(findings(misplaced), 1, "{misplaced}");
+            assert_eq!(findings(misplaced).len(), 1, "{misplaced}");
         }
         let foreign =
             syn::parse_file(r#"#![expect(unsafe_code, reason = "x")] fn f() {}"#).unwrap();
         assert!(check("crates/domyjob/src/process/windows.rs", &foreign).is_empty());
+    }
+
+    #[test]
+    fn exceptions_report_their_exact_owner_and_attribute_line() {
+        assert_eq!(
+            findings("\n\n#[expect(dead_code, reason = \"x\")] fn f() {}"),
+            ["3: lint exceptions belong in a private `raw` module that owns the effect"]
+        );
+        assert_eq!(
+            findings("\n#![expect(dead_code, reason = \"x\")]\nfn f() {}"),
+            ["2: only foreign-function modules and the end-to-end harness expect lints file-wide"]
+        );
+        assert_eq!(
+            findings("\nmod raw {\n#![expect(dead_code, reason = \"x\")]\n}"),
+            ["3: a `raw` module expects only the lints that reserve effects"]
+        );
+        for source in [
+            "#[inline] fn f() {}",
+            "#[cfg_attr(windows, inline)] fn f() {}",
+            "#[derive(Debug)] struct Value;",
+            "mod nested { #[inline] fn f() {} }",
+        ] {
+            assert!(findings(source).is_empty(), "{source}");
+        }
+        let foreign =
+            syn::parse_file(r#"#![expect(unsafe_code, reason = "x")] fn f() {}"#).unwrap();
+        assert_eq!(
+            check("crates/domyjob/src/example.rs", &foreign),
+            ["1: only foreign-function modules and the end-to-end harness expect lints file-wide"]
+        );
+    }
+
+    #[test]
+    fn raw_values_keep_their_private_or_owner_visibility() {
+        for source in [
+            r#"mod raw { #![expect(clippy::disallowed_methods, reason = "x")] const VALUE: usize = 1; static FLAG: bool = false; }"#,
+            r#"mod raw { #![expect(clippy::disallowed_methods, reason = "x")] pub(super) const VALUE: usize = 1; pub(super) static FLAG: bool = false; }"#,
+        ] {
+            assert!(findings(source).is_empty(), "{source}");
+        }
+        for item in [
+            "pub const VALUE: usize = 1;",
+            "pub static FLAG: bool = false;",
+        ] {
+            let source = format!(
+                r#"mod raw {{ #![expect(clippy::disallowed_methods, reason = "x")] {item} }}"#
+            );
+            assert_eq!(
+                findings(&source),
+                ["1: a `raw` module only forwards to what it owns, one statement per function"]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_expectations_cannot_grant_lint_exceptions() {
+        for path in [
+            "crates/domyjob/src/example.rs",
+            "crates/domyjob/src/process/windows.rs",
+        ] {
+            let file =
+                syn::parse_file("\n#![expect(unsafe_code reason = \"x\")]\nfn f() {}").unwrap();
+            assert_eq!(
+                check(path, &file),
+                ["2: an expect attribute has malformed arguments"]
+            );
+        }
+        assert_eq!(
+            findings("mod raw {\n#![expect(clippy::disallowed_methods reason = \"x\")]\n}"),
+            ["2: an expect attribute has malformed arguments"]
+        );
     }
 }
