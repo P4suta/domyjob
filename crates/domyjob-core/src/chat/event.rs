@@ -477,6 +477,86 @@ mod tests {
     }
 
     #[test]
+    fn message_age_displays_whole_units_at_each_boundary() {
+        let sent = Stamp::from_unix_millis(0);
+        for (millis, expected) in [
+            (0, "0s ago"),
+            (999, "0s ago"),
+            (1000, "1s ago"),
+            (59_999, "59s ago"),
+            (60_000, "1m ago"),
+            (3_599_999, "59m ago"),
+            (3_600_000, "1h ago"),
+            (86_399_999, "23h ago"),
+            (86_400_000, "1d ago"),
+            (172_800_000, "2d ago"),
+        ] {
+            assert_eq!(
+                alloc::format!("{}", sent.age(Stamp::from_unix_millis(millis))),
+                expected,
+                "age at {millis} milliseconds"
+            );
+        }
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                Stamp::from_unix_millis(1000).age(Stamp::from_unix_millis(0))
+            ),
+            "0s ago"
+        );
+    }
+
+    #[test]
+    fn outcome_names_match_their_wire_names() {
+        for (outcome, name) in [
+            (super::Outcome::Failed, "failed"),
+            (super::Outcome::Interrupted, "interrupted"),
+            (super::Outcome::Unavailable, "unavailable"),
+            (super::Outcome::Withdrawn, "withdrawn"),
+        ] {
+            assert_eq!(outcome.as_str(), name);
+            assert_eq!(
+                serde_json::to_string(&outcome).unwrap(),
+                alloc::format!("\"{name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn replies_and_turn_endings_keep_their_request_identity() {
+        let (alice, bob) = (agent("alice", 'a'), agent("bob", 'b'));
+        let request = id('a', 1);
+        let mut reply = ask(&bob, &alice);
+        assert_eq!(reply.request(), None);
+        if let Body::Message { intent, .. } = &mut reply {
+            *intent = Intent::Reply {
+                request: request.clone(),
+            };
+        }
+        let conversation = Conversation::direct(&alice, &bob).unwrap();
+        let audience = crate::chat::policy::audience([&alice, &bob]).unwrap();
+        for body in [
+            reply,
+            Body::TurnStarted {
+                request: request.clone(),
+                conversation: conversation.clone(),
+                audience: audience.clone(),
+                agent: bob.name().clone(),
+            },
+            Body::Resolved {
+                request: request.clone(),
+                conversation,
+                audience,
+                agent: bob.name().clone(),
+                outcome: super::Outcome::Failed,
+            },
+        ] {
+            assert_eq!(body.request(), Some(&request));
+        }
+        assert_eq!(Body::Omitted {}.request(), None);
+    }
+
+    #[test]
     fn decoding_rejects_unknown_fields_invalid_clocks_and_foreign_audiences() {
         let omitted = |extra: &str| {
             alloc::format!(

@@ -65,13 +65,21 @@ fn git(root: &Path, arguments: &[&str]) -> Result<String, FixError> {
 }
 
 pub fn commit_msg(root: &Path, path: &Path) -> Result<(), FixError> {
+    commit_msg_with(root, path, &git)
+}
+
+fn commit_msg_with(
+    root: &Path,
+    path: &Path,
+    ask: &impl Fn(&Path, &[&str]) -> Result<String, FixError>,
+) -> Result<(), FixError> {
     let message = crate::raw::read_to_string(path).map_err(FixError::Message)?;
     if !is_fix(&message) {
         return Ok(());
     }
-    let names = git(root, &["diff", "--cached", "--name-only"])?;
+    let names = ask(root, &["diff", "--cached", "--name-only"])?;
     let staged: Vec<&str> = names.lines().collect();
-    let diff = git(
+    let diff = ask(
         root,
         &["diff", "--cached", "--unified=0", "--", "crates", "fuzz"],
     )?;
@@ -80,7 +88,7 @@ pub fn commit_msg(root: &Path, path: &Path) -> Result<(), FixError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FixError, check};
+    use super::{FixError, check, commit_msg, commit_msg_with};
 
     #[test]
     fn a_fix_to_product_code_needs_a_test_beside_it() {
@@ -112,5 +120,91 @@ mod tests {
         check("feat: add a thing\n", &code, "").unwrap();
         check("fix: correct the docs\n", &["docs/chat.md"], "").unwrap();
         check("# comment\nfix: prefix only\n", &["README.md"], "").unwrap();
+    }
+
+    #[test]
+    fn only_fix_subjects_and_added_checks_trigger_the_gate() {
+        let code = ["crates/domyjob/src/transport.rs"];
+        for message in [
+            "# template: choose a type\n\nfix: stop the race",
+            "\n\nfix: stop the race",
+        ] {
+            assert!(matches!(check(message, &code, ""), Err(FixError::Untested)));
+        }
+        for message in [
+            "fix",
+            "fixture: add a fixture",
+            "fix(node: malformed",
+            "prefix): documentation",
+        ] {
+            check(message, &code, "").unwrap();
+        }
+        for diff in [
+            "-assert_eq!(a, b);",
+            " assert_eq!(a, b);",
+            "+++ b/assertions.rs",
+            "+++ b/#[test]",
+        ] {
+            assert!(
+                matches!(
+                    check("fix: stop the race", &code, diff),
+                    Err(FixError::Untested)
+                ),
+                "{diff}"
+            );
+        }
+        for path in [
+            "xtask/src/lib.rs",
+            "crates/domyjob/README.md",
+            "crates/domyjob/src/settings.toml",
+            "examples/src/main.rs",
+            "standalone.rs",
+        ] {
+            check("fix: update tooling", &[path], "").unwrap();
+        }
+    }
+
+    #[test]
+    fn commit_messages_check_the_actual_staged_diff() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git(root.path(), &["init", "--quiet"]).unwrap();
+        let code = root.path().join("crates/domyjob/src/example.rs");
+        crate::raw::create_dir_all(code.parent().unwrap()).unwrap();
+        crate::raw::write(&code, b"fn f() {}\n").unwrap();
+        crate::git(root.path(), &["add", "crates/domyjob/src/example.rs"]).unwrap();
+        let message = root.path().join("COMMIT_EDITMSG");
+        crate::raw::write(&message, b"fix: repair example\n").unwrap();
+        assert!(matches!(
+            commit_msg(root.path(), &message),
+            Err(FixError::Untested)
+        ));
+        crate::raw::write(
+            &code,
+            b"fn f() {}\n#[test] fn regression() { assert!(true); }\n",
+        )
+        .unwrap();
+        crate::git(root.path(), &["add", "crates/domyjob/src/example.rs"]).unwrap();
+        commit_msg(root.path(), &message).unwrap();
+    }
+
+    #[test]
+    fn commit_message_checks_keep_diff_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let message = root.path().join("COMMIT_EDITMSG");
+        assert!(matches!(
+            commit_msg(root.path(), &message),
+            Err(FixError::Message(_))
+        ));
+        crate::raw::write(&message, b"fix: repair example\n").unwrap();
+        let ask = |_root: &std::path::Path, args: &[&str]| {
+            if args.contains(&"--name-only") {
+                Ok("crates/domyjob/src/example.rs\n".into())
+            } else {
+                Err(FixError::Git("staged diff failed".into()))
+            }
+        };
+        assert!(
+            matches!(commit_msg_with(root.path(), &message, &ask), Err(FixError::Git(error)) if error == "staged diff failed")
+        );
     }
 }

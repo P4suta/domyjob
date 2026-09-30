@@ -336,6 +336,21 @@ mod tests {
     use super::{open_read, read_bytes, remove_file, write_bytes};
 
     #[test]
+    fn state_readers_refuse_directories_with_their_paths() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        let path = root.path().join("state");
+        super::private_dir(&path).expect("private directory");
+        assert!(matches!(
+            open_read(&path),
+            Err(super::StateError::NotFile { path: blocked }) if blocked == path
+        ));
+        assert!(matches!(
+            read_bytes(&path),
+            Err(super::StateError::NotFile { path: blocked }) if blocked == path
+        ));
+    }
+
+    #[test]
     fn a_state_file_is_replaced_while_another_handle_holds_it_open() {
         let root = tempfile::tempdir().expect("temporary state root");
         let path = root.path().join("state").join("generation");

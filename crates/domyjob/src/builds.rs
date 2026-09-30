@@ -194,6 +194,7 @@ mod tests {
             assert!(testing::is_dir(&versions.join(format!("{kept:016}"))));
         }
         assert!(testing::is_dir(&versions.join("notes")));
+        running.unlock().unwrap();
         drop(running);
         assert_eq!(
             prune(&versions, &format!("{:016}", 7)).unwrap(),

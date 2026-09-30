@@ -1,11 +1,5 @@
-[[mutation.expect]]
-path = "crates/domyjob-core/src/chat/exchange.rs"
-item = "Outgoing::offer"
-rule = "false-to-true"
-original = "false"
-line = 31
-reason = "a full batch refuses the event either way; answering true only lets the caller offer the remaining events, which are refused too, so the batch and its more flag are the same"
-outcome = "survived"
+[mutation]
+steps = 500000000
 
 [[mutation.expect]]
 path = "crates/domyjob-core/src/chat/model.rs"
@@ -67,7 +61,7 @@ reason = "callers pass positions inside the text, so the rest of the text always
 outcome = "survived"
 
 [[mutation.expect]]
-id = "3d2cae5bd09a3830f749"
+id = "a783dcac4df8995c24c4"
 reason = "a block comment starts with the two bytes it matched, so the text after them always exists; an unterminated comment is tested through the other question mark on this line"
 outcome = "survived"
 
@@ -191,4 +185,117 @@ rule = "question-to-unwrap"
 original = "?"
 line = 275
 reason = "the length was checked against MAX_CONTROL_BYTES, which fits a u32"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "xtask/src/comments.rs"
+item = "raw_hashes"
+rule = "question-to-unwrap"
+original = "?"
+line = 32
+reason = "the lexer calls raw_hashes only at an r character, so stripping that prefix always succeeds"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "xtask/src/comments.rs"
+item = "raw_hashes"
+rule = "question-to-unwrap"
+original = "?"
+line = 36
+reason = "hashes is the byte length of the leading ASCII hash signs, so it is always an in-bounds UTF-8 boundary"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/ledger.rs"
+item = "Resolution::precedes"
+rule = "lt-to-le"
+original = "<"
+line = 42
+reason = "equal ordering keys identify the same event, which admit rejects as a conflicting digest or accepts as a duplicate before resolution ordering is reached"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/model.rs"
+item = "Model::sync_with"
+rule = "question-to-unwrap"
+original = "?"
+line = 94
+reason = "the model stores consecutive owner-specific events and exports only valid typed events, so its outgoing batch cannot produce an inconsistent offer"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/event.rs"
+item = "Sealed::new"
+rule = "question-to-unwrap"
+original = "?"
+line = 432
+reason = "typed events contain no fallible custom serializers, floating-point values or maps with non-string keys, so their JSON encoding cannot fail"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/event.rs"
+item = "Sealed::new"
+rule = "condition-to-false"
+original = "encoded.len() > MAX_EVENT_BYTES"
+line = 433
+reason = "the largest message uses at most 64 KiB of text expanded sixfold, 64 audience origins and eight chain members; even maximum fields encode to 396767 bytes, below the 409600-byte limit"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/event.rs"
+item = "Sealed::new"
+rule = "gt-to-ge"
+original = ">"
+line = 433
+reason = "bounded typed events cannot reach the 409600-byte encoding limit, so rejecting equality cannot reject any additional event"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob-core/src/chat/exchange.rs"
+item = "offer_event"
+rule = "question-to-unwrap"
+original = "?"
+line = 48
+reason = "export preserves a valid typed event or replaces its body with the smaller omitted body, so encoding remains infallible and below the event size limit"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "xtask/src/comments.rs"
+item = "char_literal"
+rule = "false-to-true"
+original = "false"
+line = 44
+reason = "this arm sees only a final apostrophe at end of input; either branch consumes that final character and produces no additional comment or line"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "xtask/src/lib.rs"
+item = "gates_with"
+rule = "question-to-unwrap"
+original = "?"
+line = 359
+reason = "the same unchanged source string was already parsed successfully with syn::parse_file before the pure-core checker parses it again"
+outcome = "survived"
+
+[[mutation.skip]]
+path = "xtask/src/main.rs"
+lines = "23-23"
+reason = "this success arm has only the return-default mutation, and ExitCode::default is ExitCode::SUCCESS; network-backed dependency checks are not run successfully by the isolated CLI tests"
+
+[[mutation.expect]]
+path = "xtask/src/main.rs"
+item = "workflows"
+rule = "return-default"
+original = "ExitCode::SUCCESS"
+line = 33
+reason = "ExitCode::default is ExitCode::SUCCESS, so replacing the success arm cannot change the CLI exit status"
+outcome = "survived"
+
+[[mutation.expect]]
+path = "xtask/src/main.rs"
+item = "commit_msg"
+rule = "return-default"
+original = "ExitCode::SUCCESS"
+line = 43
+reason = "ExitCode::default is ExitCode::SUCCESS, so replacing the success arm cannot change the CLI exit status"
 outcome = "survived"

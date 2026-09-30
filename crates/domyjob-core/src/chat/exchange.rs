@@ -125,3 +125,6 @@ pub fn accept<L: Outbox + ?Sized>(
         received,
     }))
 }
+
+#[cfg(test)]
+mod tests;

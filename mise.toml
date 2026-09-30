@@ -66,8 +66,12 @@ run = [
 ]
 
 [tasks.mutants]
-description = "Check that the core's tests notice every change of its behavior"
-run = "rust-mutants run --package domyjob-core --jobs auto"
+description = "Measure mutations in the core and repository gates"
+run = "rust-mutants run --package domyjob-core --package xtask --jobs auto --locked --trace"
+
+[tasks."mutants:source"]
+description = "Measure ordinary binary tests with isolated source mutations"
+run = "rust-mutants run --package domyjob --execution-mode source --jobs auto --locked --trace"
 
 [tasks.deny]
 description = "Check dependency licenses, bans, and sources"

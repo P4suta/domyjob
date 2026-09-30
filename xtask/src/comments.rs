@@ -264,6 +264,63 @@ mod tests {
     }
 
     #[test]
+    fn literals_and_nested_blocks_end_before_the_next_comment() {
+        for literal in [
+            r#"r"plain""#,
+            r##"r#"a " // still raw"#"##,
+            r##"br#"a " // still raw"#"##,
+            r##"cr#"a " // still raw"#"##,
+            r###"r##"a "# // still raw"##"###,
+            r##"r#"a # // still raw"#"##,
+            r####"r###"a "## /* still raw */"###"####,
+            r"'/'",
+            r"'\''",
+            r"'\\'",
+            r#"'"'"#,
+            r#"'\"'"#,
+            r"'\n'",
+            r"'\u{2f}'",
+            r#""escaped \" // text""#,
+        ] {
+            assert_eq!(
+                in_rust(&format!("let value = {literal};\n// after\n/* last */")),
+                [2, 3],
+                "{literal}"
+            );
+        }
+        assert_eq!(
+            in_rust("/* outer\n / x * y\n /* nested */\n // inside\n */\n// after\n"),
+            [1, 6]
+        );
+        assert_eq!(in_rust("// text /* block\n// next\n"), [1, 2]);
+        assert_eq!(in_rust("fn f<'a>() {}\n// after\n"), [2]);
+        assert_eq!(in_rust("let r#type = '\\\\';\n// after\n"), [2]);
+        for source in ["'", "'\\", "\"\\", "r#\"open", "/* open"] {
+            let expected = if source.starts_with("/*") {
+                vec![1]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(in_rust(source), expected, "{source}");
+        }
+        assert_eq!(in_rust("'\\unfinished // still quoted'\n// after"), [2]);
+        assert_eq!(in_rust("'\\' // still quoted'\n// after"), [2]);
+        assert_eq!(in_rust("'"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn raw_prefixes_respect_adjacent_identifier_tokens() {
+        for prefix in ["ar", "_r", "abr", "acr", "ébr", "_br"] {
+            let source = format!("tokens!({prefix}#\"text\" // comment\n);\n// after");
+            assert_eq!(in_rust(&source), [1, 3], "{prefix}");
+        }
+        for prefix in ["r", "br", "cr"] {
+            let source = format!("tokens!({prefix}#\"text\" // raw\"#);\n// after");
+            assert_eq!(in_rust(&source), [2], "{prefix}");
+        }
+    }
+
+    #[test]
     fn configuration_comments_are_found_except_version_pins_and_generated_files() {
         assert_eq!(
             in_config("mise.toml", "# a\nb = \"#c\"\nd = 1 # e\n"),
@@ -275,5 +332,37 @@ mod tests {
         assert!(in_config(".github/workflows/ci.yml", pin).is_empty());
         assert_eq!(in_config(".github/workflows/ci.yml", "  # note\n"), [1]);
         assert!(in_config("supply-chain/audits.toml", "# cargo-vet audits file\n").is_empty());
+    }
+
+    #[test]
+    fn configuration_quotes_close_and_only_complete_workflow_pins_are_exempt() {
+        let quoted = r#"a = "escaped \" # quoted" # first
+b = 'backslash \' # second
+c = "single ' quote" # third
+d = 'double " quote' # fourth
+e = "backslash \\" # fifth
+f = plain#value
+"#;
+        assert_eq!(in_config("x.toml", quoted), [1, 2, 3, 4, 5]);
+        assert_eq!(in_config("x.toml", "a = \"\" # empty\n"), [1]);
+        assert!(in_config("x.toml", r#"a = "escaped \" # quoted""#).is_empty());
+        assert!(in_config("x.toml", r#"a = "text # quoted""#).is_empty());
+        assert!(in_config("x.toml", "a = 'text # quoted'").is_empty());
+        let digest = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+        let pin = format!("uses: actions/checkout@{digest} # v7.0.1\n");
+        for path in ["ci.yml", "ci.yaml", "CI.YML", "CI.YAML"] {
+            assert!(in_config(path, &pin).is_empty(), "{path}");
+        }
+        assert_eq!(in_config("x.toml", &pin), [1]);
+        for reference in [
+            "short # v1",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz # v1",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # note",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 extra # v1",
+        ] {
+            let source = format!("uses: owner/action@{reference}");
+            assert_eq!(in_config("ci.yml", &source), [1], "{reference}");
+        }
+        assert!(in_config("supply-chain/config.toml", "# generated").is_empty());
     }
 }

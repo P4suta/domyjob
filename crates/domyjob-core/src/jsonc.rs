@@ -490,6 +490,48 @@ mod tests {
     }
 
     #[test]
+    fn comments_end_before_the_next_value() {
+        for (source, at, expected) in [
+            ("// note\n1", 0, Some(7)),
+            ("// note\r1", 0, Some(7)),
+            ("// note", 0, Some(7)),
+            (" /* note */1", 1, Some(11)),
+            (" /* first */ /* next */1", 1, Some(12)),
+            ("1", 0, None),
+        ] {
+            assert_eq!(
+                super::comment_end(source.as_bytes(), at),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_values_end_after_their_closing_quote() {
+        for literal in [r#""plain""#, r#""a\"b""#, r#""a\\""#, "\"🥚\""] {
+            let source = format!("  {literal}, next");
+            assert_eq!(
+                super::string_end(source.as_bytes(), 2),
+                literal.len().saturating_add(2),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unterminated_quotes_keep_the_remaining_text_for_the_decoder() {
+        for source in ["\"", "\"unclosed", "\"escaped\\"] {
+            assert_eq!(super::string_end(source.as_bytes(), 0), source.len());
+            assert_eq!(strip(source), source);
+            assert!(matches!(
+                set_member(source, &["key"], "1"),
+                Err(JsoncError::Document(_))
+            ));
+        }
+    }
+
+    #[test]
     fn strip_blanks_comments_and_trailing_commas_outside_strings() {
         assert_eq!(
             strip("[1, /* c */ 2, // d\n]"),

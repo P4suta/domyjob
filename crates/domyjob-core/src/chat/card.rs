@@ -205,6 +205,36 @@ mod tests {
     }
 
     #[test]
+    fn provider_names_match_their_wire_names() {
+        for (tool, name) in [
+            (super::Tool::Claude, "claude"),
+            (super::Tool::Codex, "codex"),
+            (super::Tool::Opencode, "opencode"),
+        ] {
+            assert_eq!(tool.as_str(), name);
+            assert_eq!(serde_json::to_string(&tool).unwrap(), format!("\"{name}\""));
+        }
+    }
+
+    #[test]
+    fn cards_omit_empty_skills_and_preserve_nonempty_skills() {
+        let empty = card("Alice", "reviewer", &[]);
+        assert!(empty.skills.is_empty());
+        assert!(
+            !serde_json::to_string(&empty)
+                .unwrap()
+                .contains("\"skills\"")
+        );
+        let skilled = card("Alice", "reviewer", &["rust"]);
+        assert!(!skilled.skills.is_empty());
+        assert!(
+            serde_json::to_string(&skilled)
+                .unwrap()
+                .contains("\"skills\":[\"rust\"]")
+        );
+    }
+
+    #[test]
     fn tags_and_skills_hold_their_exact_limits() {
         Tag::try_from("a".repeat(32)).unwrap();
         Tag::try_from("a".repeat(33)).unwrap_err();

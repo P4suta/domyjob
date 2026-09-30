@@ -406,3 +406,177 @@ fn long_histories_move_in_bounded_rounds() {
             .all(|event| audience_of(event) == Some(2))
     );
 }
+
+#[test]
+fn follow_ups_must_preserve_the_question_thread_and_advance_its_clock() {
+    let (alice, bob) = (agent("alice", 'a'), agent("bob", 'b'));
+    let mut original = model('a');
+    let question = room_question(&mut original, &[&alice, &bob], &bob);
+    let (conversation, members) = question.body().thread().unwrap();
+    let other_room = Conversation::Room(RoomId::new(
+        origin('a'),
+        RoomName::try_from("other".to_owned()).unwrap(),
+    ));
+    for (thread, recipients, clock) in [
+        (
+            other_room,
+            members.clone(),
+            question.clock().checked_add(1).unwrap(),
+        ),
+        (
+            conversation.clone(),
+            audience([&bob, &agent("carol", 'c')]).unwrap(),
+            question.clock().checked_add(1).unwrap(),
+        ),
+        (conversation.clone(), members.clone(), question.clock()),
+    ] {
+        let bodies = [
+            Body::Message {
+                conversation: thread.clone(),
+                from: bob.name().clone(),
+                text: text("answer"),
+                audience: recipients.clone(),
+                intent: Intent::Reply {
+                    request: question.id().clone(),
+                },
+                at: Stamp::from_unix_millis(0),
+            },
+            Body::Resolved {
+                request: question.id().clone(),
+                conversation: thread.clone(),
+                audience: recipients.clone(),
+                agent: bob.name().clone(),
+                outcome: Outcome::Failed,
+            },
+            Body::TurnStarted {
+                request: question.id().clone(),
+                conversation: thread,
+                audience: recipients,
+                agent: bob.name().clone(),
+            },
+        ];
+        for body in bodies {
+            let mut local = original.clone();
+            let incoming = Event::new(id('b', 1), clock, body).unwrap();
+            let Ok(received) = receive(&mut local, &origin('b'), &[incoming]);
+            assert_eq!(received.appended, 0);
+            assert!(matches!(
+                received.rejected,
+                Some(Rejection::Mismatch { .. })
+            ));
+            assert_eq!(local.cursor(&origin('b')).map(|cursor| cursor.seen), Ok(0));
+            assert!(local.resolutions().is_empty());
+            assert!(local.started().is_empty());
+            assert_eq!(local.open_asks(), original.open_asks());
+        }
+    }
+}
+
+#[test]
+fn another_room_member_cannot_start_the_responders_turn() {
+    let (alice, bob, other) = (agent("alice", 'a'), agent("bob", 'b'), agent("other", 'b'));
+    let mut local = model('a');
+    let question = room_question(&mut local, &[&alice, &bob, &other], &bob);
+    let (conversation, members) = question.body().thread().unwrap();
+    let incoming = Event::new(
+        id('b', 1),
+        question.clock().checked_add(1).unwrap(),
+        Body::TurnStarted {
+            request: question.id().clone(),
+            conversation: conversation.clone(),
+            audience: members.clone(),
+            agent: other.name().clone(),
+        },
+    )
+    .unwrap();
+    let Ok(received) = receive(&mut local, &origin('b'), &[incoming]);
+    assert!(matches!(
+        received.rejected,
+        Some(Rejection::Mismatch { .. })
+    ));
+    assert!(local.started().is_empty());
+    assert_eq!(local.open_asks().len(), 1);
+}
+
+#[test]
+fn synchronization_propagates_peer_rejections_instead_of_panicking() {
+    let mut local = model('a');
+    let mut same_origin = model('a');
+    assert_eq!(
+        local.sync_with(&mut same_origin, 1),
+        Err(Rejection::WrongPeer)
+    );
+    assert_eq!(
+        local.sync_with(&mut model('b'), 0),
+        Err(Rejection::Inconsistent)
+    );
+    let mut peer = model('b');
+    peer.write(Body::Omitted {}).unwrap();
+    sync(&mut local, &mut peer);
+    let mut forgotten_peer = model('b');
+    assert_eq!(
+        local.sync_with(&mut forgotten_peer, 1),
+        Err(Rejection::AheadOfHistory)
+    );
+    let mut sender = model('c');
+    sender.write(Body::Omitted {}).unwrap();
+    sync(&mut sender, &mut peer);
+    let mut forgotten_sender = model('c');
+    assert_eq!(
+        forgotten_sender.sync_with(&mut peer, 1),
+        Err(Rejection::AheadOfHistory)
+    );
+}
+
+#[test]
+fn one_sync_call_finishes_multiple_batches_and_reports_the_final_received_prefix() {
+    let (mut local, mut peer) = (model('a'), model('b'));
+    for _ in 0..300 {
+        local.write(Body::Omitted {}).unwrap();
+        peer.write(Body::Omitted {}).unwrap();
+    }
+    let progress = local.sync_with(&mut peer, 8).unwrap();
+    assert!(!progress.more);
+    assert_eq!(progress.received.appended, 44);
+    assert_eq!(progress.received.seen, 300);
+    assert_eq!(ids(&local), ids(&peer));
+    assert_eq!(ids(&local).len(), 600);
+}
+
+#[test]
+fn outgoing_starts_strictly_after_the_acknowledged_sequence() {
+    use crate::chat::exchange::{Outbox as _, offer};
+    let (mut local, mut peer) = (model('a'), model('b'));
+    local.write(Body::Omitted {}).unwrap();
+    sync(&mut local, &mut peer);
+    let second = local.write(Body::Omitted {}).unwrap();
+    let Ok(request) = offer(&local, &origin('b'));
+    let request = request.unwrap();
+    assert_eq!(request.after, 1);
+    assert_eq!(request.batch.events(), &[second]);
+    let Ok(()) = local.record_ack(&origin('b'), 0);
+    assert_eq!(local.ack(&origin('b')), Ok(1));
+    let Ok(()) = local.record_ack(&origin('b'), u64::MAX);
+    assert_eq!(local.ack(&origin('b')), Ok(2));
+}
+
+#[test]
+fn a_clock_at_its_last_valid_value_cannot_issue_another_local_event() {
+    let mut local = model('a');
+    let incoming = Event::new(
+        id('b', 1),
+        u64::MAX.checked_sub(1).unwrap(),
+        Body::Omitted {},
+    )
+    .unwrap();
+    let Ok(received) = receive(&mut local, &origin('b'), &[incoming]);
+    assert_eq!(received.appended, 1);
+    assert!(matches!(
+        local.write(Body::Omitted {}),
+        Err(Failure::Invalid(crate::chat::id::Invalid(
+            "local sequence or clock exhausted"
+        )))
+    ));
+    assert_eq!(local.cursor(&origin('a')).map(|cursor| cursor.seen), Ok(0));
+    assert_eq!(local.ordered().len(), 1);
+}

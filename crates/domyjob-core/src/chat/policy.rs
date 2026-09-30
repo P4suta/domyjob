@@ -197,4 +197,52 @@ mod tests {
             Err(Refusal::Full)
         );
     }
+
+    #[test]
+    fn event_and_byte_capacity_limits_are_both_strict() {
+        let at_or_above = |limit: Usage| {
+            [
+                Usage {
+                    events: limit.events,
+                    bytes: 0,
+                },
+                Usage {
+                    events: limit.events + 1,
+                    bytes: 0,
+                },
+                Usage {
+                    events: 0,
+                    bytes: limit.bytes,
+                },
+                Usage {
+                    events: 0,
+                    bytes: limit.bytes + 1,
+                },
+            ]
+        };
+        for (priority, limit) in [
+            (Priority::Ordinary, ORDINARY_LIMIT),
+            (Priority::Ending, ENDING_LIMIT),
+        ] {
+            check_capacity(
+                Usage {
+                    events: limit.events - 1,
+                    bytes: limit.bytes - 1,
+                },
+                priority,
+            )
+            .unwrap();
+            for usage in at_or_above(limit) {
+                assert_eq!(check_capacity(usage, priority), Err(Refusal::Full));
+            }
+        }
+        let limit = super::RECEIVED_LIMIT;
+        assert!(super::fits_received(Usage {
+            events: limit.events - 1,
+            bytes: limit.bytes - 1,
+        }));
+        for usage in at_or_above(limit) {
+            assert!(!super::fits_received(usage));
+        }
+    }
 }

@@ -7,7 +7,7 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 | Rule | Bug class it removes | Enforced by |
 | --- | --- | --- |
 | Each effect has one owner, and only a private `raw` module inside it calls the reserved API | Effects scattered where no policy applies; exceptions that hide unrelated violations | Clippy `disallowed-methods`, `disallowed-types`, `disallowed-macros`; `cargo xtask gates` |
-| No lint exception outside a `raw` module, except foreign-function modules and the end-to-end harness | Convenience exceptions that accumulate and hide bugs | `cargo xtask gates` (`xtask/src/exceptions.rs`) |
+| No lint exception outside a `raw` module, except foreign-function modules and the end-to-end harness; malformed exception declarations are rejected | Convenience exceptions that accumulate and hide bugs; invalid declarations treated as permission | `cargo xtask gates` (`xtask/src/exceptions.rs`) |
 | Standard output is reachable only through the `Output` that `main` creates | A stray line corrupting the MCP or node protocol stream | `disallowed-macros`, `disallowed-methods`, gate on `Output::of_process` |
 | Every child process starts from `process::command`, with standard input and output closed | A child writing into its parent's protocol stream | `disallowed-methods` on `Command::new` and `Command::output` |
 | Every read and queue has a bound | Memory growth driven by a peer, a child, or a watcher | `disallowed-methods` on unbounded reads and `mpsc::channel`; `bounded` |
@@ -72,6 +72,11 @@ The wire protocol has no format of its own, because a client only ever talks to 
 - `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, spelling, workflows, and duplication.
 - `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and every end-to-end scenario on one host, each test in its own process.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
-- `mise run mutants` changes the core's code one mutation at a time and requires the tests to notice each change;
-  `.rust-mutants.toml` lists the few mutations that change nothing observable, each with its reason.
+- `mise run mutants` measures changes to the core and xtask, including the repository's policy gates.
+  `.rust-mutants.toml` records equivalent mutations with their reasons and checks that those expectations still name the current code.
+  The 500 million step budget allows complete core test bundles to finish; exhaustion alone is not counted as detection.
+- `mise run mutants:source` rebuilds isolated copies of the binary crate with one source mutation at a time and checks a restored control.
+  It requires a source-capable rust-mutants build and runs the ordinary tests, including children and grandchildren that clear their environment.
+  Native observations remain unproven leads and do not count toward the sealed mutation score.
+  A native lead gives exit status 2; preserve that status when collecting logs or running multiple groups, and inspect every report rather than treating a completed job as a passing mutation run.
 - `mise run check:fleet` runs the checks on Linux and Windows through domyjob.

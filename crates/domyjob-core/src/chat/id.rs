@@ -422,6 +422,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_handles_include_their_64_byte_boundary() {
+        let longest = "a".repeat(64);
+        assert_eq!(
+            AgentName::try_from(longest.clone()).unwrap().as_str(),
+            longest
+        );
+        assert_eq!(
+            super::RoomName::try_from(longest.clone()).unwrap().as_str(),
+            longest
+        );
+        super::RoomName::try_from("a".repeat(65)).unwrap_err();
+    }
+
+    #[test]
     fn only_the_pair_authors_in_a_direct_conversation() {
         let (alice, bob, carol) = (agent("alice", 'a'), agent("bob", 'b'), agent("carol", 'c'));
         let direct = Conversation::direct(&alice, &bob).unwrap();
@@ -516,5 +530,18 @@ mod tests {
         let audience = Audience::try_from(vec![origin('a'), origin('b')]).unwrap();
         assert!(audience.includes(&origin('b')));
         assert!(!audience.includes(&origin('c')));
+        assert_eq!(vec::Vec::from(audience), vec![origin('a'), origin('b')]);
+
+        let members: vec::Vec<_> = (0..=64_u8)
+            .map(|last| {
+                let mut entropy = [0; 16];
+                *entropy.last_mut().unwrap() = last;
+                Origin::from_entropy(entropy)
+            })
+            .collect();
+        Audience::try_from(members.clone()).unwrap_err();
+        let boundary: vec::Vec<_> = members.into_iter().take(super::MAX_AUDIENCE).collect();
+        let largest = Audience::try_from(boundary).unwrap();
+        assert_eq!(largest.members().len(), super::MAX_AUDIENCE);
     }
 }

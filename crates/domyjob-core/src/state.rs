@@ -231,10 +231,12 @@ mod tests {
     fn transition_matrix_has_one_terminal_outcome() {
         let mut state = JobState::accepted();
         assert_eq!(state.kind(), PhaseKind::Accepted);
+        assert_eq!(state.pid(), None);
         state.advance(&Event::Exited { code: 0 }).unwrap_err();
         state.advance(&Event::Spawned { pid: 0 }).unwrap_err();
         state.advance(&Event::Starting).unwrap();
         assert_eq!(state.kind(), PhaseKind::Starting);
+        assert_eq!(state.pid(), None);
         state.advance(&Event::Starting).unwrap_err();
         state.advance(&Event::Spawned { pid: 0 }).unwrap_err();
         state.advance(&Event::Spawned { pid: 42 }).unwrap();
@@ -242,6 +244,7 @@ mod tests {
         state.advance(&Event::Spawned { pid: 43 }).unwrap_err();
         state.advance(&Event::Exited { code: 0 }).unwrap();
         assert_eq!(state.outcome(), Some(&Outcome::Succeeded));
+        assert_eq!(state.pid(), None);
         state.advance(&Event::Killed).unwrap_err();
     }
 

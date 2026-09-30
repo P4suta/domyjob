@@ -484,3 +484,6 @@ pub fn receive<L: Ledger + ?Sized>(
         rejected,
     })
 }
+
+#[cfg(test)]
+mod tests;

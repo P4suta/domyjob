@@ -41,7 +41,15 @@ pub enum DependencyError {
 }
 
 fn lockfiles(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), DependencyError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| DependencyError::Read {
+    lockfiles_with(dir, found, &crate::directory_entries)
+}
+
+fn lockfiles_with(
+    dir: &Path,
+    found: &mut Vec<PathBuf>,
+    scan: &impl Fn(&Path) -> crate::DirectoryEntries,
+) -> Result<(), DependencyError> {
+    let entries = scan(dir).map_err(|source| DependencyError::Read {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -50,9 +58,9 @@ fn lockfiles(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), DependencyError
             path: dir.to_path_buf(),
             source,
         })?;
-        let name = entry.file_name();
-        let path = entry.path();
-        let kind = entry.file_type().map_err(|source| DependencyError::Read {
+        let name = entry.name;
+        let path = entry.path;
+        let kind = entry.kind.map_err(|source| DependencyError::Read {
             path: path.clone(),
             source,
         })?;
@@ -61,7 +69,7 @@ fn lockfiles(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), DependencyError
                 .iter()
                 .any(|ignored| name == *ignored)
             {
-                lockfiles(&path, found)?;
+                lockfiles_with(&path, found, scan)?;
             }
         } else if kind.is_file() && name == "Cargo.lock" {
             found.push(path);
@@ -98,6 +106,14 @@ fn manifest_beside(lock: &Path) -> Result<PathBuf, DependencyError> {
 }
 
 pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
+    run_with(root, check, Command::status)
+}
+
+fn run_with(
+    root: &Path,
+    check: Check,
+    mut execute: impl FnMut(&mut Command) -> std::io::Result<ExitStatus>,
+) -> Result<(), DependencyError> {
     let root = root
         .canonicalize()
         .map_err(|source| DependencyError::Read {
@@ -157,7 +173,7 @@ pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
             }
         };
         eprintln!("{name}: {}", lock.display());
-        let status = command.status().map_err(|source| DependencyError::Start {
+        let status = execute(&mut command).map_err(|source| DependencyError::Start {
             check: name,
             lock: lock.clone(),
             source,
@@ -176,6 +192,9 @@ pub fn run(root: &Path, check: Check) -> Result<(), DependencyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{
+        ScanFailure, denied, failed_status, failing_entries, failure_path, nested_failure,
+    };
 
     #[test]
     fn discovers_a_new_graph_without_a_task_list_edit() {
@@ -184,8 +203,14 @@ mod tests {
         crate::raw::create_dir_all(&nested).unwrap();
         crate::raw::write(&root.path().join("Cargo.lock"), b"").unwrap();
         crate::raw::write(&nested.join("Cargo.lock"), b"").unwrap();
-        crate::raw::create_dir_all(&root.path().join("target")).unwrap();
-        crate::raw::write(&root.path().join("target/Cargo.lock"), b"").unwrap();
+        for ignored in [".git", "target", "corpus", "artifacts", "node_modules"] {
+            let dir = root.path().join(ignored);
+            crate::raw::create_dir_all(&dir).unwrap();
+            crate::raw::write(&dir.join("Cargo.lock"), b"").unwrap();
+        }
+        crate::raw::write(&root.path().join("README.md"), b"").unwrap();
+        crate::raw::write(&root.path().join("Cargo.lock.backup"), b"").unwrap();
+        crate::raw::write(&root.path().join("no_extension"), b"").unwrap();
         let mut found = Vec::new();
         lockfiles(root.path(), &mut found).unwrap();
         found.sort();
@@ -193,5 +218,205 @@ mod tests {
             found,
             vec![root.path().join("Cargo.lock"), nested.join("Cargo.lock")]
         );
+        assert!(matches!(
+            lockfiles(&root.path().join("missing"), &mut Vec::new()),
+            Err(DependencyError::Read { .. })
+        ));
+        assert!(matches!(
+            manifest_beside(&root.path().join("Cargo.lock")),
+            Err(DependencyError::MissingManifest { .. })
+        ));
+        crate::raw::create_dir_all(&root.path().join("Cargo.toml")).unwrap();
+        assert!(matches!(
+            manifest_beside(&root.path().join("Cargo.lock")),
+            Err(DependencyError::MissingManifest { .. })
+        ));
+    }
+
+    #[test]
+    fn lockfile_discovery_preserves_errors_at_each_level() {
+        let root = tempfile::tempdir().unwrap();
+        for failure in [
+            ScanFailure::Directory,
+            ScanFailure::Entry,
+            ScanFailure::Kind,
+        ] {
+            let error = lockfiles_with(root.path(), &mut Vec::new(), &|dir| {
+                failing_entries(dir, failure)
+            })
+            .unwrap_err();
+            let expected = failure_path(root.path(), failure);
+            assert!(matches!(error, DependencyError::Read { path, source }
+                if path == expected && source.kind() == std::io::ErrorKind::PermissionDenied));
+        }
+        let nested = root.path().join("nested");
+        let error = lockfiles_with(root.path(), &mut Vec::new(), &|dir| {
+            nested_failure(root.path(), dir)
+        })
+        .unwrap_err();
+        assert!(matches!(error, DependencyError::Read { path, source }
+            if path == nested && source.kind() == std::io::ErrorKind::PermissionDenied));
+    }
+
+    fn expected_arguments(root: &Path, check: Check, index: usize) -> Vec<String> {
+        let graph = if index == 0 {
+            root.to_path_buf()
+        } else {
+            root.join("nested")
+        };
+        let manifest = graph.join("Cargo.toml").to_string_lossy().into_owned();
+        let lock = graph.join("Cargo.lock").to_string_lossy().into_owned();
+        match check {
+            Check::Deny => vec![
+                "deny".into(),
+                "--locked".into(),
+                "--manifest-path".into(),
+                manifest,
+                "check".into(),
+                "--hide-inclusion-graph".into(),
+                "licenses".into(),
+                "bans".into(),
+                "sources".into(),
+            ],
+            Check::Audit => {
+                let mut expected = vec![
+                    "audit".into(),
+                    "--url".into(),
+                    ADVISORY_DB_URL.into(),
+                    "--db".into(),
+                    root.join("target/advisory-db")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "--file".into(),
+                    lock,
+                ];
+                if index > 0 {
+                    expected.push("--no-fetch".into());
+                }
+                expected.extend(["--deny".into(), "warnings".into()]);
+                expected
+            }
+            Check::Vet => vec![
+                "vet".into(),
+                "check".into(),
+                "--locked".into(),
+                "--no-registry-suggestions".into(),
+                "--manifest-path".into(),
+                manifest,
+                "--store-path".into(),
+                root.join("supply-chain").to_string_lossy().into_owned(),
+                "--cache-dir".into(),
+                root.join("target/vet-cache").to_string_lossy().into_owned(),
+            ],
+        }
+    }
+
+    #[test]
+    fn dependency_checks_use_each_manifest_and_share_the_root_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        crate::raw::create_dir_all(&root.join("nested")).unwrap();
+        for file in [
+            "Cargo.lock",
+            "Cargo.toml",
+            "nested/Cargo.lock",
+            "nested/Cargo.toml",
+        ] {
+            crate::raw::write(&root.join(file), b"").unwrap();
+        }
+        for check in [Check::Deny, Check::Audit, Check::Vet] {
+            let mut commands = Vec::new();
+            run_with(&root, check, |command| {
+                assert_eq!(command.get_program(), "cargo");
+                assert_eq!(command.get_current_dir(), Some(root.as_path()));
+                commands.push(
+                    command
+                        .get_args()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(ExitStatus::default())
+            })
+            .unwrap();
+            assert_eq!(commands.len(), 2);
+            match check {
+                Check::Audit => assert!(std::fs::metadata(root.join("target")).unwrap().is_dir()),
+                Check::Deny => assert!(
+                    matches!(std::fs::metadata(root.join("target")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                ),
+                Check::Vet => {}
+            }
+            for (index, args) in commands.iter().enumerate() {
+                assert_eq!(args, &expected_arguments(&root, check, index));
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_failures_keep_the_check_and_lockfile_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        crate::raw::write(&root.join("Cargo.lock"), b"").unwrap();
+        crate::raw::write(&root.join("Cargo.toml"), b"").unwrap();
+        for check in [Check::Deny, Check::Audit, Check::Vet] {
+            let name = match check {
+                Check::Deny => "deny",
+                Check::Audit => "audit",
+                Check::Vet => "vet",
+            };
+            let error = run_with(&root, check, |_| Err(denied())).unwrap_err();
+            assert!(
+                matches!(error, DependencyError::Start { check: failed_check, lock, source }
+                if failed_check == name && lock == root.join("Cargo.lock") && source.kind() == std::io::ErrorKind::PermissionDenied)
+            );
+        }
+        let failed = failed_status();
+        let error = run_with(&root, Check::Deny, |_| Ok(failed)).unwrap_err();
+        assert!(
+            matches!(error, DependencyError::Failed { check: "deny", lock, status }
+            if lock == root.join("Cargo.lock") && status == failed)
+        );
+    }
+
+    #[test]
+    fn setup_failures_do_not_start_dependency_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let execute = |_command: &mut Command| -> std::io::Result<ExitStatus> {
+            panic!("a setup error cannot run cargo")
+        };
+        assert!(matches!(
+            run_with(&root.path().join("missing"), Check::Deny, execute),
+            Err(DependencyError::Read { .. })
+        ));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(matches!(
+            run_with(file.path(), Check::Deny, execute),
+            Err(DependencyError::Read { .. })
+        ));
+        crate::raw::write(&root.path().join("Cargo.lock"), b"").unwrap();
+        assert!(matches!(
+            run_with(root.path(), Check::Deny, execute),
+            Err(DependencyError::MissingManifest { .. })
+        ));
+        crate::raw::write(&root.path().join("Cargo.toml"), b"").unwrap();
+        crate::raw::write(&root.path().join("target"), b"not a directory").unwrap();
+        assert!(matches!(
+            run_with(root.path(), Check::Audit, execute),
+            Err(DependencyError::Prepare { .. })
+        ));
+        let lock = file.path().join("Cargo.lock");
+        let kind = std::fs::metadata(lock.with_file_name("Cargo.toml"))
+            .unwrap_err()
+            .kind();
+        match manifest_beside(&lock).unwrap_err() {
+            DependencyError::MissingManifest { .. } => {
+                assert_eq!(kind, std::io::ErrorKind::NotFound);
+            }
+            DependencyError::Read { source, .. } => assert_eq!(source.kind(), kind),
+            unexpected @ (DependencyError::Prepare { .. }
+            | DependencyError::MissingRootLockfile { .. }
+            | DependencyError::Start { .. }
+            | DependencyError::Failed { .. }) => panic!("{unexpected}"),
+        }
     }
 }

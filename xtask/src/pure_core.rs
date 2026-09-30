@@ -53,13 +53,18 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(check("extern crate alloc;", true).unwrap().len(), 1);
-        assert_eq!(check("extern crate std;", false).unwrap().len(), 1);
         assert_eq!(
-            check("fn read() { std::fs::read(\"x\"); }", false)
-                .unwrap()
-                .len(),
-            1
+            check("extern crate alloc;", true).unwrap(),
+            ["1: domyjob-core must remain unconditionally no_std"]
         );
+        assert_eq!(
+            check("\nextern crate std;", false).unwrap(),
+            ["2: domyjob-core cannot import std"]
+        );
+        assert_eq!(
+            check("\n\nfn read() { std::fs::read(\"x\"); }", false).unwrap(),
+            ["3: domyjob-core cannot import std"]
+        );
+        check("fn broken(", false).unwrap_err();
     }
 }
