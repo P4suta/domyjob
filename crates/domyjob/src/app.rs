@@ -1091,14 +1091,9 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary state root");
         let store = Store::fixture(temporary.path().join("state")).expect("private store");
         let job = JobId::try_from("0".repeat(32)).expect("job ID");
-        let result = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            |_store, _job| {
-                panic!("a missing worker job cannot start a watcher");
-            },
-        );
+        let result = run_worker_using(&store, &job, (None, |_event| Ok(())), |_store, _job| {
+            panic!("a missing worker job cannot start a watcher");
+        });
         assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
     }
 
@@ -1108,14 +1103,9 @@ mod tests {
         store
             .transition(&job, &Event::Killed)
             .expect("finished job");
-        run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            |_store, _job| {
-                panic!("a finished worker job cannot start a watcher");
-            },
-        )
+        run_worker_using(&store, &job, (None, |_event| Ok(())), |_store, _job| {
+            panic!("a finished worker job cannot start a watcher");
+        })
         .expect("nothing remains to launch");
         assert_killed(&store, &job);
     }
@@ -1124,14 +1114,9 @@ mod tests {
     fn a_missing_stored_request_preserves_the_record_error() {
         let (temporary, store, job) = accepted_job();
         crate::testing::remove(&job_fixture_file(&temporary, &job, "request.json"));
-        let result = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            |_store, _job| {
-                panic!("a missing request cannot start a watcher");
-            },
-        );
+        let result = run_worker_using(&store, &job, (None, |_event| Ok(())), |_store, _job| {
+            panic!("a missing request cannot start a watcher");
+        });
         assert!(matches!(result, Err(AppError::Store(StoreError::Missing))));
     }
 
@@ -1143,14 +1128,9 @@ mod tests {
             panic!("an incomplete record cannot start a worker");
         });
         assert!(matches!(started, Err(AppError::Store(StoreError::Missing))));
-        let running = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            |_store, _job| {
-                panic!("an incomplete record cannot start a watcher");
-            },
-        );
+        let running = run_worker_using(&store, &job, (None, |_event| Ok(())), |_store, _job| {
+            panic!("an incomplete record cannot start a watcher");
+        });
         assert!(matches!(running, Err(AppError::Store(StoreError::Missing))));
     }
 
@@ -1161,14 +1141,9 @@ mod tests {
         let payload = domyjob_core::wire::payload(&encoded).expect("hello payload");
         state_file::write_bytes(&job_fixture_file(&temporary, &job, "request.json"), payload)
             .expect("replaced request fixture");
-        let error = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            |_store, _job| {
-                panic!("a non-run request cannot start a watcher");
-            },
-        )
+        let error = run_worker_using(&store, &job, (None, |_event| Ok(())), |_store, _job| {
+            panic!("a non-run request cannot start a watcher");
+        })
         .expect_err("invalid stored request");
         assert!(
             matches!(error, AppError::Io(ref cause) if cause.to_string() == "stored request is not a run")
@@ -1179,13 +1154,8 @@ mod tests {
     fn cancellation_before_command_launch_finishes_the_job_as_killed() {
         let (_temporary, store, job) = accepted_job();
         store.request_cancel(&job).expect("cancel request");
-        run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            controlled_watcher,
-        )
-        .expect("cancelled worker");
+        run_worker_using(&store, &job, (None, |_event| Ok(())), controlled_watcher)
+            .expect("cancelled worker");
         assert_killed(&store, &job);
         assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
     }
@@ -1196,7 +1166,7 @@ mod tests {
         let result = run_worker_using(
             &store,
             &job,
-            (None, process::announce_ready),
+            (None, |_event| Ok(())),
             |working_store, watched_job| {
                 let watcher = controlled_watcher(working_store, watched_job)?;
                 working_store.transition(watched_job, &Event::Killed)?;
@@ -1214,12 +1184,7 @@ mod tests {
     fn a_cancel_marker_with_the_wrong_file_kind_preserves_its_state_error() {
         let (temporary, store, job) = accepted_job();
         crate::testing::mkdir(&job_fixture_file(&temporary, &job, "cancel"));
-        let result = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            controlled_watcher,
-        );
+        let result = run_worker_using(&store, &job, (None, |_event| Ok(())), controlled_watcher);
         assert!(matches!(result, Err(AppError::Store(StoreError::State(_)))));
     }
 
@@ -1229,12 +1194,7 @@ mod tests {
         let path = store.log_path(&job);
         state_file::write_bytes(&path, b"").expect("empty log fixture");
         let permissions = crate::testing::protect(&path);
-        let result = run_worker_using(
-            &store,
-            &job,
-            (None, process::announce_ready),
-            controlled_watcher,
-        );
+        let result = run_worker_using(&store, &job, (None, |_event| Ok(())), controlled_watcher);
         crate::testing::restore(&path, permissions);
         assert!(matches!(result, Err(AppError::Store(StoreError::State(_)))));
     }
@@ -1273,7 +1233,7 @@ mod tests {
         let error = run_worker_using(
             &store,
             &job,
-            (None, process::announce_ready),
+            (None, |_event| Ok(())),
             |working_store, watched_job| {
                 let watcher = controlled_watcher(working_store, watched_job)?;
                 watcher
@@ -1507,7 +1467,7 @@ mod tests {
         let (_temporary, store, job) = accepted_job();
         let result = run_worker_at_using(
             (&store, &job),
-            (None, process::announce_ready),
+            (None, |_event| Ok(())),
             controlled_watcher,
             || {
                 Err(std::io::Error::other(
@@ -1549,7 +1509,7 @@ mod tests {
         state_file::write_bytes(&path, b"not a directory").expect("blocked workspace");
         let result = run_worker_at_using(
             (&store, &job),
-            (None, process::announce_ready),
+            (None, |_event| Ok(())),
             controlled_watcher,
             || panic!("snapshot jobs do not use the user's home"),
         );
