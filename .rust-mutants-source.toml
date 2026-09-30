@@ -10,3 +10,23 @@ line = 47
 where = { cfg = "windows" }
 reason = "The private numeric-ID result changes from None to Some(0), but Windows public service flows select TaskScheduler and cannot reach its Systemd or Launchd callers; Windows file ownership uses SIDs independently; this records a native survival observation and its current caller reachability argument, not equal return values or a sealed equivalence verdict."
 outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/bounded.rs"
+item = "read"
+rule = "question-to-unwrap"
+original = "?"
+line = 22
+where = { cfg = 'any(target_pointer_width = "32", target_pointer_width = "64")' }
+reason = "A 32-bit or 64-bit usize fits in u64, so converting the caller's size limit cannot fail on these targets; the recorded observation remains native and unproven."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/bounded.rs"
+item = "prefix"
+rule = "question-to-unwrap"
+original = "?"
+line = 33
+where = { cfg = 'any(target_pointer_width = "32", target_pointer_width = "64")' }
+reason = "A 32-bit or 64-bit usize fits in u64, so converting the caller's size limit cannot fail on these targets; the recorded observation remains native and unproven."
+outcome = "survived"
