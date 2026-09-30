@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -26,14 +27,15 @@ jobs:
       - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
         with:
           install_args: rust
-      - name: The tag names the workspace version
+      - name: Read and validate the workspace version
         id: version
         env:
+          EVENT_NAME: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           version="$(cargo metadata --format-version 1 --no-deps --locked | jq --raw-output '.packages[] | select(.name == "domyjob") | .version')"
-          if [ "v${version}" != "${TAG}" ]; then
+          if [ "$EVENT_NAME" = "push" ] && [ "v${version}" != "${TAG}" ]; then
             echo "the tag ${TAG} does not name version ${version}" >&2
             exit 1
           fi
@@ -120,6 +122,17 @@ jobs:
           file_path: ${{ github.workspace }}/target/${{ matrix.target }}/release/domyjob.exe
           override: true
           environment_name: PROD
+      - name: Verify the Windows signature and timestamp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $binary = "target/$env:TARGET/release/domyjob.exe"
+          $signature = Get-AuthenticodeSignature -FilePath $binary
+          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) {
+            throw "The binary needs a valid Authenticode signature and timestamp: $($signature.Status)"
+          }
       - name: Bundle
         shell: bash
         env:
@@ -136,15 +149,14 @@ jobs:
           fi
           cp LICENSE-MIT LICENSE-APACHE README.md "dist/${name}/"
           (cd dist && tar --create --gzip --file "${name}.tar.gz" "${name}")
-          (cd dist && shasum --algorithm 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   publish:
-    name: publish
+    name: verify and publish
     needs: [check, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -159,10 +171,31 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      - name: Generate and verify checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          archives=( *.tar.gz )
+          if [ "${#archives[@]}" -ne 5 ]; then
+            echo "expected five release archives, got ${#archives[@]}" >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            sha256sum "$archive" > "$archive.sha256"
+          done
+          sha256sum --check -- *.sha256
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
+      - name: Preserve the verified archives
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-verified
+          path: dist/*
+          if-no-files-found: error
       - name: Publish the release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}

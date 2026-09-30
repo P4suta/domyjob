@@ -4,6 +4,7 @@ changelog_update = false
 dependencies_update = false
 git_release_enable = false
 git_tag_enable = false
+git_only = true
 publish = false
 semver_check = false
 
@@ -17,6 +18,7 @@ version_group = "domyjob"
 
 [[package]]
 name = "domyjob-core"
+git_tag_name = "v{{ version }}"
 version_group = "domyjob"
 
 [[package]]
