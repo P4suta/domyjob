@@ -49,11 +49,25 @@ fn validated_sid(text: String) -> io::Result<Sid> {
 }
 
 fn sid_text(sid: PSID) -> io::Result<Sid> {
+    converted_sid(
+        sid,
+        |value, output| unsafe { ConvertSidToStringSidW(value, output) },
+        |value| {
+            unsafe { LocalFree(value.cast()) };
+        },
+    )
+}
+
+fn converted_sid(
+    sid: PSID,
+    convert: impl FnOnce(PSID, &mut *mut u16) -> i32,
+    release: impl FnOnce(*mut u16),
+) -> io::Result<Sid> {
     if sid.is_null() {
         return Err(io::Error::other("the SID is missing"));
     }
     let mut wide: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(sid, &raw mut wide) } == 0 || wide.is_null() {
+    if convert(sid, &mut wide) == 0 || wide.is_null() {
         return Err(io::Error::last_os_error());
     }
     let mut length = 0_usize;
@@ -67,7 +81,7 @@ fn sid_text(sid: PSID) -> io::Result<Sid> {
             .map_err(io::Error::other)?;
         validated_sid(text)
     };
-    unsafe { LocalFree(wide.cast()) };
+    release(wide);
     result
 }
 
@@ -79,16 +93,20 @@ fn current_user_sid() -> io::Result<Sid> {
         return Err(io::Error::last_os_error());
     }
     let token = unsafe { OwnedHandle::from_raw_handle(raw) };
-    let mut needed = 0_u32;
-    unsafe {
+    token_user(|buffer, length, needed| unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
             TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &raw mut needed,
+            buffer.map_or(std::ptr::null_mut(), |value| value.as_mut_ptr().cast()),
+            length,
+            needed,
         )
-    };
+    })
+}
+
+fn token_user(mut query: impl FnMut(Option<&mut [u8]>, u32, &mut u32) -> i32) -> io::Result<Sid> {
+    let mut needed = 0_u32;
+    query(None, 0, &mut needed);
     if needed == 0 || needed > 4096 {
         return Err(io::Error::other(
             "the token user is unavailable or too large",
@@ -96,16 +114,7 @@ fn current_user_sid() -> io::Result<Sid> {
     }
     let size = usize::try_from(needed).map_err(io::Error::other)?;
     let mut buffer = vec![0_u8; size];
-    if unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    } == 0
-        || buffer.len() < size_of::<TOKEN_USER>()
+    if query(Some(&mut buffer), needed, &mut needed) == 0 || buffer.len() < size_of::<TOKEN_USER>()
     {
         return Err(io::Error::other("the token has no user"));
     }
@@ -264,7 +273,96 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validated_sid;
+    use std::cell::Cell;
+
+    use windows_sys::Win32::Foundation::{ERROR_NOT_ENOUGH_MEMORY, SetLastError};
+    use windows_sys::Win32::Security::{
+        SECURITY_MAX_SID_SIZE, SID, SID_IDENTIFIER_AUTHORITY, TOKEN_USER,
+    };
+
+    use super::{converted_sid, token_user, validated_sid};
+
+    #[test]
+    fn a_missing_sid_is_rejected_before_conversion() {
+        let called = Cell::new(false);
+        let error = converted_sid(
+            std::ptr::null_mut(),
+            |_sid, _output| {
+                called.set(true);
+                unsafe { SetLastError(ERROR_NOT_ENOUGH_MEMORY) };
+                0
+            },
+            |_output| {},
+        )
+        .expect_err("missing SID");
+        assert_eq!(error.to_string(), "the SID is missing");
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn a_failed_conversion_never_accepts_its_output_buffer() {
+        let mut sid = SID {
+            Revision: 1,
+            SubAuthorityCount: 1,
+            IdentifierAuthority: SID_IDENTIFIER_AUTHORITY {
+                Value: [0, 0, 0, 0, 0, 5],
+            },
+            SubAuthority: [18],
+        };
+        let mut text: Vec<u16> = "S-1-5-18"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let released = Cell::new(false);
+        let error = converted_sid(
+            (&raw mut sid).cast(),
+            |_sid, output| {
+                *output = text.as_mut_ptr();
+                unsafe { SetLastError(ERROR_NOT_ENOUGH_MEMORY) };
+                0
+            },
+            |_output| released.set(true),
+        )
+        .expect_err("converter failure");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_NOT_ENOUGH_MEMORY.cast_signed())
+        );
+        assert!(!released.get());
+    }
+
+    #[test]
+    fn a_failed_token_size_query_stops_before_loading_the_user() {
+        let called = Cell::new(0);
+        let error = token_user(|_buffer, _length, _needed| {
+            called.set(called.get() + 1);
+            0
+        })
+        .expect_err("no required size");
+        assert_eq!(
+            error.to_string(),
+            "the token user is unavailable or too large"
+        );
+        assert_eq!(called.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_token_read_never_interprets_its_initialized_buffer() {
+        let size =
+            size_of::<TOKEN_USER>() + usize::try_from(SECURITY_MAX_SID_SIZE).expect("SID bound");
+        let error = token_user(|buffer, length, needed| {
+            if let Some(bytes) = buffer {
+                assert_eq!(bytes.len(), size);
+                assert_eq!(length, u32::try_from(size).expect("token size"));
+            } else {
+                assert_eq!(length, 0);
+                *needed = u32::try_from(size).expect("token size");
+            }
+            0
+        })
+        .expect_err("token query failure");
+        assert_eq!(error.to_string(), "the token has no user");
+    }
 
     #[test]
     fn only_windows_sid_syntax_enters_an_acl() {
