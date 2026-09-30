@@ -30,3 +30,99 @@ line = 33
 where = { cfg = 'any(target_pointer_width = "32", target_pointer_width = "64")' }
 reason = "A 32-bit or 64-bit usize fits in u64, so converting the caller's size limit cannot fail on these targets; the recorded observation remains native and unproven."
 outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "converted_sid"
+rule = "lt-to-le"
+original = "<"
+line = 74
+where = { cfg = "windows" }
+reason = "The SDK bounds a conforming converted SID string to 187 UTF-16 code units including its terminator, so iteration ends before either index-256 loop boundary; this records a native observation and its API-bound reasoning without assigning a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "converted_sid"
+rule = "condition-to-false"
+original = "length == 256"
+line = 77
+where = { cfg = "windows" }
+reason = "A conforming converted SID string terminates within the SDK limit of 187 UTF-16 code units, so length cannot reach the 256-unit rejection boundary; this records a native observation and its API-bound reasoning without assigning a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "converted_sid"
+rule = "question-to-unwrap"
+original = "?"
+line = 81
+where = { cfg = "windows" }
+reason = "ConvertSidToStringSidW produces the standard SID notation using ASCII letters, separators, decimal digits, and optional hexadecimal authority digits, which cannot fail UTF-16 decoding; this records a native observation and its encoding argument without assigning a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "token_user"
+rule = "gt-to-ge"
+original = ">"
+line = 110
+where = { cfg = "windows" }
+reason = "TOKEN_USER_MAX_SIZE is sizeof(TOKEN_USER) plus the 68-byte maximum SID, so a defined TokenUser required length is below 4096 and cannot distinguish the two upper-bound comparisons; this reasoning covers conforming API lengths and the recorded observation remains native and unproven."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "token_user"
+rule = "question-to-unwrap"
+original = "?"
+line = 115
+where = { cfg = "all(windows, any(target_pointer_width = \"32\", target_pointer_width = \"64\"))" }
+reason = "The existing guard limits needed to at most 4096, which fits usize on supported 32-bit and 64-bit Windows targets, so this conversion cannot fail; the recorded observation remains native and unproven."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows_acl.rs"
+item = "token_user"
+rule = "lt-to-le"
+original = "<"
+line = 117
+where = { cfg = "windows" }
+reason = "A conforming successful TokenUser reply includes TOKEN_USER and at least the eight-byte SID header, so its required buffer is larger than sizeof(TOKEN_USER), while a failed query already short-circuits this comparison; this is a layout inference from SE_TOKEN_USER and the token-query buffer contract, and the recorded observation remains native and unproven."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/app.rs"
+item = "CancellationWatch::wait_using"
+rule = "return-ok-default"
+original = "Err(AppError::Io(std::io::Error::other(\n                                \"cancellation watcher disconnected\",\n                            )))"
+line = 122
+reason = "The waiting watcher retains its sender until its receiving thread joins, so the disconnected-channel branch cannot be reached through this private production flow; this records caller reachability for a native observation without a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/app.rs"
+item = "<Log as Write>::flush"
+rule = "return-ok-default"
+original = "self.file.flush()"
+line = 171
+reason = "The private Log writer is used only by relay_output through io::copy and writeln, and neither operation calls its flush method in the pinned Rust 1.98 implementation; this records current caller reachability for a native observation without a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/app.rs"
+item = "start_worker_using"
+rule = "question-to-unwrap"
+original = "?"
+line = 265
+reason = "launch_failure_reason takes at most 4096 Unicode scalar values, producing at most 16384 UTF-8 bytes, while RemoteText rejects only strings larger than 65536 bytes, so this conversion cannot fail; the recorded observation remains native and unproven."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/app.rs"
+item = "run_logged_using"
+rule = "question-to-unwrap"
+original = "?"
+line = 450
+reason = "launch_failure_reason takes at most 4096 Unicode scalar values, producing at most 16384 UTF-8 bytes, while RemoteText rejects only strings larger than 65536 bytes, so this conversion cannot fail; the recorded observation remains native and unproven."
+outcome = "survived"
