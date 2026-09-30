@@ -1,0 +1,12 @@
+[execution]
+mode = "source"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/platform/windows.rs"
+item = "<Windows as System>::user_id"
+rule = "return-some-default"
+original = "None"
+line = 47
+where = { cfg = "windows" }
+reason = "The private numeric-ID result changes from None to Some(0), but Windows public service flows select TaskScheduler and cannot reach its Systemd or Launchd callers; Windows file ownership uses SIDs independently; this records a native survival observation and its current caller reachability argument, not equal return values or a sealed equivalence verdict."
+outcome = "survived"

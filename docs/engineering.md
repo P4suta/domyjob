@@ -77,6 +77,16 @@ The wire protocol has no format of its own, because a client only ever talks to 
   The 500 million step budget allows complete core test bundles to finish; exhaustion alone is not counted as detection.
 - `mise run mutants:source` rebuilds isolated copies of the binary crate with one source mutation at a time and checks a restored control.
   It requires a source-capable rust-mutants build and runs the ordinary tests, including children and grandchildren that clear their environment.
+  `.rust-mutants-source.toml` records individually reviewed native leads with their reasons, separately from the core and xtask expectations.
+  These reasons do not turn native observations into sealed verdicts or make an unproven run pass.
   Native observations remain unproven leads and do not count toward the sealed mutation score.
   A native lead gives exit status 2; preserve that status when collecting logs or running multiple groups, and inspect every report rather than treating a completed job as a passing mutation run.
 - `mise run check:fleet` runs the checks on Linux and Windows through domyjob.
+
+Either mutation task accepts a dedicated engine through `DOMYJOB_MUTATION_TOOL`, so the default installation can stay unchanged.
+Create a separate temporary directory for that engine before running the task to keep incompatible build caches apart:
+
+```sh
+mkdir -p /path/to/mutation-tmp
+DOMYJOB_MUTATION_TOOL=/path/to/dedicated/rust-mutants TMPDIR=/path/to/mutation-tmp mise run mutants:source
+```
