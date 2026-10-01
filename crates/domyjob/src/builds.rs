@@ -226,6 +226,7 @@ mod tests {
     fn assert_build_held(directory: &Path, held: File) {
         assert!(running(directory).unwrap());
         assert_eq!(testing::read(&directory.join(STARTED)), "1");
+        held.unlock().unwrap();
         drop(held);
         assert!(!running(directory).unwrap());
     }
