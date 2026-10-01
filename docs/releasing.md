@@ -20,6 +20,7 @@ CI uses the latest available stable Ubuntu and macOS images, independently of th
      It signs the macOS binaries with the Developer ID certificate and the hardened runtime and waits for Apple to accept their notarization.
      `cargo xtask release sign-macos` owns the temporary credentials and keychain, verifies the selected identity, and restores the original keychain search list when it finishes.
      It signs the Windows binary with SSL.com eSigner and requires a valid Authenticode signature with signer and timestamp certificates.
+     The eSigner action selects `signing_method: v2` to use its configured Java runtime and current trust store instead of CodeSignTool's bundled legacy JDK.
      Each binary is packed with the licenses, README, and icon assets into a `.tar.gz`.
    - `publish` requires five archives, generates and checks their SHA-256 sums on Ubuntu, records GitHub's build provenance attestation for every archive, and publishes the release.
 

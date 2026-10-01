@@ -84,6 +84,7 @@ jobs:
         uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
         with:
           command: sign
+          signing_method: v2
           username: ${{ secrets.SSLDOTCOM_USERNAME }}
           password: ${{ secrets.SSLDOTCOM_PASSWORD }}
           credential_id: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
