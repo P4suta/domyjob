@@ -64,7 +64,11 @@ fn check_with(
 ) -> Result<(), WorkflowError> {
     let files = workflow_files(root)?;
     let mut command = crate::raw::command("actionlint");
-    command.current_dir(root).args(files);
+    command
+        .current_dir(root)
+        .arg("-config-file")
+        .arg(root.join(".github/actionlint.yaml"))
+        .args(files);
     let status = execute(&mut command).map_err(WorkflowError::Start)?;
     if status.success() {
         Ok(())
@@ -128,6 +132,31 @@ mod tests {
     }
 
     #[test]
+    fn actionlint_loads_runner_config_without_git_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".github/workflows");
+        crate::raw::create_dir_all(&dir).unwrap();
+        crate::raw::write(
+            &dir.join("fixture.yml"),
+            b"name: fixture\non: push\njobs:\n  check:\n    runs-on: domyjob-test-runner\n    steps:\n      - run: echo fixture\n",
+        )
+        .unwrap();
+        let config = root.path().join(".github/actionlint.yaml");
+        crate::raw::write(
+            &config,
+            b"self-hosted-runner:\n  labels:\n    - domyjob-test-runner\n",
+        )
+        .unwrap();
+        check(root.path()).unwrap();
+        crate::raw::write(
+            &config,
+            b"self-hosted-runner:\n  labels:\n    - other-test-runner\n",
+        )
+        .unwrap();
+        assert!(matches!(check(root.path()), Err(WorkflowError::Failed(_))));
+    }
+
+    #[test]
     fn actionlint_checks_every_workflow_and_reports_process_failures() {
         let root = tempfile::tempdir().unwrap();
         assert!(matches!(
@@ -144,7 +173,12 @@ mod tests {
             assert_eq!(command.get_current_dir(), Some(root.path()));
             assert_eq!(
                 command.get_args().map(PathBuf::from).collect::<Vec<_>>(),
-                [dir.join("a.yml"), dir.join("b.yaml")]
+                [
+                    PathBuf::from("-config-file"),
+                    root.path().join(".github/actionlint.yaml"),
+                    dir.join("a.yml"),
+                    dir.join("b.yaml")
+                ]
             );
             Ok(ExitStatus::default())
         })

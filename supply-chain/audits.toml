@@ -1,4 +1,78 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.cc]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.4.7 -> 1.5.1"
+notes = """
+Automated delta source review from the existing 1.4.7 exemption baseline.
+Reviewed every changed packaged file, including the complete Rust implementation diff.
+New x86 target-feature mappings use a finite allowlist and compiler Command arguments; they do not introduce a shell or arbitrary feature passthrough.
+Reviewed MSVC per-source -Tp handling, /link flag removal and warning, exact echoed-filename warning filtering with CRLF support, shared once-per-Build C++ linker metadata, and Redox riscv64 ABI handling.
+The remaining Rust edits substitute core for equivalent std primitives and update the temporary-file flag type for find-msvc-tools 0.1.14.
+No new unsafe block, network operation, build script, or dependency beyond the reviewed find-msvc-tools patch was introduced.
+Cargo checksum equality was checked for both exact crate archives; licenses and unchanged packaged files retain their previous bytes.
+This is a delta audit from an existing exemption, not a claim that the exempted baseline received a new full audit.
+The review was performed by Codex and is not represented as a human audit.
+Exact archive SHA256 values: 54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313 -> f360145194ee8e21db5ee7f3fcd4fe52210864c75c985dae33218202c8bbe040.
+Evidence: reports/dependencies/20261001-latest-stable/crate-delta-evidence.json and cc-1.4.7-to-1.5.1.diff.txt.
+"""
+
+[[audits.find-msvc-tools]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.1.13 -> 0.1.14"
+notes = """
+Automated delta source review from the existing 0.1.13 exemption baseline.
+Reviewed every changed packaged file and the complete Rust implementation diff.
+Existing Windows ABI declarations and repr(C) layouts move into a private bindings module without changing their signatures or layouts; unused library/semaphore declarations are removed.
+The public Windows adapter retains PeekNamedPipe and exposes FILE_ATTRIBUTE_TEMPORARY as u32 for cc-rs; other binding exports become crate-private.
+The RIDL Deref implementation uses core instead of the equivalent std trait and generated extern declarations gain only a missing_docs allowance.
+No new unsafe operation, network access, dependency, or build script was introduced.
+Cargo checksum equality was checked for both exact crate archives; licenses and other packaged source files retain their previous bytes.
+This is a delta audit from an existing exemption, not a claim that the exempted baseline received a new full audit.
+The review was performed by Codex and is not represented as a human audit.
+Exact archive SHA256 values: ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b -> aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484.
+Evidence: reports/dependencies/20261001-latest-stable/crate-delta-evidence.json and find-msvc-tools-0.1.13-to-0.1.14.diff.txt.
+"""
+
+[[audits.version_check]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+version = "0.9.5"
+notes = """
+Automated full packaged-source review of version_check 0.9.5, independent of its pre-existing exemption.
+Reviewed all four Rust source files (1,242 lines including documentation and tests), manifests, documentation, license files, and the packaged-file inventory.
+The dependency has no third-party dependencies, bundled native implementation, or package build script.
+Production compiler detection selects the executable from RUSTC or PATH and uses direct Command arguments --verbose and --version; no shell construction, direct network API, unsafe Rust, or production filesystem write was found.
+Reviewed safe-string parsing of compiler output, u16 version components, packed comparison values, date fields, channel classification, and optional RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS allow-features handling.
+Compiler launch and UTF-8 failures yield no detected version; process exit status is not checked, so trusted compiler identity and output remain assumptions rather than established security properties.
+Version and date parsing are intentionally limited: channel recognition is permissive, dates are not validated against a complete calendar, and feature detection is not a compiler capability probe.
+The child process has no internal timeout or output-size cap; this review assumes the trusted build compiler and environment and does not claim universal termination or panic freedom.
+winresource uses is_min_version only in its GNU archive linker selection; the selected MSVC icon compilation path does not invoke that check.
+The manifest declares no rust-version; the packaged README states compatibility with Rust 1.0.0, which this source review did not independently test.
+The review was performed by Codex and is not represented as human certification or proof of absence of all bugs.
+Exact archive SHA256: 0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a; equality with the recorded Cargo checksum and all 13 packaged-file hashes was independently verified.
+Evidence: reports/dependencies/20261001-icon-build-dependency/version-check-independent-review.json.
+"""
+
+[[audits.winresource]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+version = "0.1.31"
+notes = """
+Automated full source review of winresource 0.1.31; no exemption or older-version audit is used as a baseline for this audit.
+Reviewed the complete packaged library source and its manifest, documentation, license, and sample-data inventory.
+This crate is used only as a Cargo build dependency with default features disabled and a caller-owned assets/icon.rc resource file; the optional TOML parser is not enabled.
+The implementation has build-time filesystem and process authority: it reads Cargo/SDK environment settings, queries installed SDK roots through reg.exe using direct arguments, and invokes RC or windres/ar through direct Command arguments.
+No unsafe Rust, bundled native implementation, shell construction, or direct network API was found in the library source.
+Resource file I/O, compiler spawn failures, nonzero RC/ar exits, and unsupported target environments propagate as io::Result errors; the caller must enforce Windows target selection and retain the errors.
+Reviewed OUT_DIR output paths, resource string escaping, MSVC resource.res link metadata, and GNU archive linking.
+The SDK text parser assumes installed Windows SDK registry records and Cargo variables are well formed and has panic paths for malformed build environments; this audit does not claim universal panic freedom, SDK availability, or successful Windows linking.
+The constructor falls back to an empty toolkit path when SDK discovery returns an error; SDK discovery errors are not all propagated, while actual resource compiler failures remain errors.
+Compiler executables, SDK registry data, environment overrides, resource paths, and build inputs remain part of the trusted build environment.
+The review was performed by Codex and is not represented as a human audit or Windows runtime/resource-extraction measurement.
+Exact archive SHA256: 0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087; equality with the Cargo.lock checksum was verified.
+Evidence: reports/dependencies/20261001-icon-build-dependency/winresource-source-evidence.json and winresource-source-review.json.
+"""

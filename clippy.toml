@@ -20,7 +20,7 @@ max-fn-params-bools = 1
 enum-variant-name-threshold = 2
 enum-variant-size-threshold = 256
 
-msrv = "1.98.0"
+msrv = "1.98.1"
 
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
