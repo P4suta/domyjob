@@ -6,6 +6,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::ptr::NonNull;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::{
@@ -13,7 +14,7 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetTokenInformation,
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
     TOKEN_USER, TokenUser,
@@ -181,13 +182,11 @@ pub(super) fn ownership(file: &fs::File) -> io::Result<Ownership> {
 fn ownership_using(
     file: &fs::File,
     current_user: impl FnOnce() -> io::Result<Sid>,
-    owner_sid: impl FnOnce(PSID) -> io::Result<Sid>,
+    mut sid_text_using: impl FnMut(PSID) -> io::Result<Sid>,
 ) -> io::Result<Ownership> {
     use std::os::windows::io::AsRawHandle as _;
 
-    const SYSTEM: &str = "S-1-5-18";
     const ADMINISTRATORS: &str = "S-1-5-32-544";
-    const MAX_ACES: u32 = 32;
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
@@ -208,39 +207,64 @@ fn ownership_using(
     }
     let _descriptor = SecurityDescriptor(descriptor);
     let user = current_user()?;
-    let owner = owner_sid(owner)?;
+    let owner = sid_text_using(owner)?;
     if owner != user && owner.as_str() != ADMINISTRATORS {
         return Ok(Ownership::Foreign);
     }
-    if dacl.is_null() {
+    acl_ownership(NonNull::new(dacl), &user, sid_text_using)
+}
+
+fn acl_ownership(
+    dacl: Option<NonNull<ACL>>,
+    user: &Sid,
+    mut ace_sid: impl FnMut(PSID) -> io::Result<Sid>,
+) -> io::Result<Ownership> {
+    const SYSTEM: &str = "S-1-5-18";
+    let Some(dacl) = dacl else {
         return Ok(Ownership::Exposed(Exposure));
-    }
+    };
     let mut size = ACL_SIZE_INFORMATION::default();
     let bytes = u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).map_err(io::Error::other)?;
-    if unsafe { GetAclInformation(dacl, (&raw mut size).cast(), bytes, AclSizeInformation) } == 0 {
+    if unsafe {
+        GetAclInformation(
+            dacl.as_ptr(),
+            (&raw mut size).cast(),
+            bytes,
+            AclSizeInformation,
+        )
+    } == 0
+    {
         return Err(io::Error::last_os_error());
     }
-    if size.AceCount > MAX_ACES {
+    if too_many_aces(size.AceCount) {
         return Ok(Ownership::Exposed(Exposure));
     }
     for index in 0..size.AceCount {
         let mut raw = std::ptr::null_mut();
-        if unsafe { GetAce(dacl, index, &raw mut raw) } == 0 {
+        if unsafe { GetAce(dacl.as_ptr(), index, &raw mut raw) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let header: &ACE_HEADER = unsafe { &*raw.cast() };
-        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
-            || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
-        {
+        if unsupported_ace(*header) {
             return Ok(Ownership::Exposed(Exposure));
         }
         let ace: &ACCESS_ALLOWED_ACE = unsafe { &*raw.cast() };
-        let sid = sid_text((&raw const ace.SidStart).cast_mut().cast())?;
-        if sid != user && sid.as_str() != SYSTEM {
+        let sid = ace_sid((&raw const ace.SidStart).cast_mut().cast())?;
+        if &sid != user && sid.as_str() != SYSTEM {
             return Ok(Ownership::Exposed(Exposure));
         }
     }
     Ok(Ownership::Private)
+}
+
+const fn too_many_aces(count: u32) -> bool {
+    const MAX_ACES: u32 = 32;
+    count > MAX_ACES
+}
+
+fn unsupported_ace(header: ACE_HEADER) -> bool {
+    u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+        || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
 }
 
 pub(super) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
@@ -253,8 +277,22 @@ pub(super) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
 }
 
 pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
-    let user = current_user_sid()?;
-    let descriptor = SecurityDescriptor::for_user(&user)?;
+    create_private_dir_using(
+        path,
+        current_user_sid,
+        SecurityDescriptor::for_user,
+        SecurityDescriptor::create_dir,
+    )
+}
+
+fn create_private_dir_using(
+    path: &Path,
+    current_user: impl FnOnce() -> io::Result<Sid>,
+    descriptor_for_user: impl FnOnce(&Sid) -> io::Result<SecurityDescriptor>,
+    mut create_dir: impl FnMut(&SecurityDescriptor, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let user = current_user()?;
+    let descriptor = descriptor_for_user(&user)?;
     for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
         if ancestor.as_os_str().is_empty() {
             continue;
@@ -265,7 +303,7 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        match descriptor.create_dir(ancestor) {
+        match create_dir(&descriptor, ancestor) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(ancestor)?;
@@ -290,13 +328,20 @@ mod tests {
         ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_NOT_ENOUGH_MEMORY, SetLastError,
     };
     use windows_sys::Win32::Security::{
-        SECURITY_MAX_SID_SIZE, SID, SID_IDENTIFIER_AUTHORITY, TOKEN_USER,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, SECURITY_MAX_SID_SIZE, SID, SID_IDENTIFIER_AUTHORITY,
+        TOKEN_USER,
     };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
     use super::{
-        SecurityDescriptor, converted_sid, current_user_sid, ownership, ownership_using,
-        token_user, validated_sid,
+        SecurityDescriptor, acl_ownership, converted_sid, create_private_dir,
+        create_private_dir_using, current_user_sid, open_private_dir, ownership, ownership_using,
+        sid_text, token_user, too_many_aces, unsupported_ace, validated_sid,
     };
+
+    fn assert_os_error(error: &std::io::Error, code: u32) {
+        assert_eq!(error.raw_os_error(), Some(code.cast_signed()));
+    }
 
     #[test]
     fn a_missing_sid_is_rejected_before_conversion() {
@@ -467,6 +512,254 @@ mod tests {
         assert_eq!(
             error.raw_os_error(),
             Some(ERROR_NOT_ENOUGH_MEMORY.cast_signed())
+        );
+    }
+
+    #[test]
+    fn an_absent_acl_is_exposed_without_inspecting_aces() {
+        let called = Cell::new(false);
+        let user = validated_sid("S-1-5-18".to_owned()).expect("system SID");
+        let result = acl_ownership(None, &user, |_sid| {
+            called.set(true);
+            Err(std::io::Error::other("an absent ACL has no ACE"))
+        })
+        .expect("absent ACL policy");
+        assert!(matches!(result, super::Ownership::Exposed(_)));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn the_acl_count_limit_accepts_its_last_permitted_ace() {
+        assert!(!too_many_aces(31));
+        assert!(!too_many_aces(32));
+        assert!(too_many_aces(33));
+    }
+
+    #[test]
+    fn ace_type_and_header_size_are_independent_rejection_reasons() {
+        let size = u16::try_from(size_of::<ACCESS_ALLOWED_ACE>()).expect("ACE size");
+        let allowed = u8::try_from(ACCESS_ALLOWED_ACE_TYPE).expect("allowed ACE type");
+        let mut header = ACE_HEADER {
+            AceType: allowed,
+            AceFlags: 0,
+            AceSize: size,
+        };
+        assert!(!unsupported_ace(header));
+        header.AceType = allowed + 1;
+        assert!(unsupported_ace(header));
+        header.AceType = allowed;
+        header.AceSize = size - 1;
+        assert!(unsupported_ace(header));
+    }
+
+    #[test]
+    fn a_failed_ace_sid_conversion_preserves_its_error() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let private = root.path().join("private");
+        create_private_dir(&private).expect("private directory");
+        let file = tempfile::NamedTempFile::new_in(&private).expect("owned private file");
+        assert!(matches!(
+            ownership(file.as_file()).expect("private ownership"),
+            super::Ownership::Private
+        ));
+        let calls = Cell::new(0);
+        let error = ownership_using(file.as_file(), current_user_sid, |sid| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                sid_text(sid)
+            } else {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_NOT_ENOUGH_MEMORY.cast_signed(),
+                ))
+            }
+        })
+        .expect_err("ACE conversion failed");
+        assert_os_error(&error, ERROR_NOT_ENOUGH_MEMORY);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_directory_user_lookup_stops_before_descriptor_creation() {
+        let called = Cell::new(false);
+        let error = create_private_dir_using(
+            Path::new(""),
+            || {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED.cast_signed(),
+                ))
+            },
+            |_user| {
+                called.set(true);
+                Err(std::io::Error::other(
+                    "descriptor creation was not requested",
+                ))
+            },
+            |_descriptor, _path| {
+                Err(std::io::Error::other(
+                    "directory creation was not requested",
+                ))
+            },
+        )
+        .expect_err("user lookup failed");
+        assert_os_error(&error, ERROR_ACCESS_DENIED);
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn a_failed_directory_descriptor_preserves_its_error() {
+        let called = Cell::new(false);
+        let error = create_private_dir_using(
+            Path::new(""),
+            current_user_sid,
+            |_user| {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_NOT_ENOUGH_MEMORY.cast_signed(),
+                ))
+            },
+            |_descriptor, _path| {
+                called.set(true);
+                Err(std::io::Error::other(
+                    "directory creation was not requested",
+                ))
+            },
+        )
+        .expect_err("descriptor creation failed");
+        assert_os_error(&error, ERROR_NOT_ENOUGH_MEMORY);
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn a_relative_directory_skips_only_the_empty_ancestor() {
+        let root = tempfile::TempDir::new_in(".").expect("owned current directory fixture");
+        let current = std::env::current_dir().expect("current directory");
+        let relative = root
+            .path()
+            .strip_prefix(&current)
+            .expect("relative fixture");
+        assert!(!relative.is_absolute());
+        let leaf = relative.join("first").join("second");
+        create_private_dir(&leaf).expect("relative private directory");
+        let file = open_private_dir(&leaf).expect("created leaf");
+        assert!(matches!(
+            ownership(&file).expect("private ownership"),
+            super::Ownership::Private
+        ));
+    }
+
+    #[test]
+    fn a_regular_file_blocks_private_directory_creation() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let file = tempfile::NamedTempFile::new_in(root.path()).expect("owned blocker");
+        let error = create_private_dir(file.path()).expect_err("a regular file is not a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let metadata = file.as_file().metadata().expect("blocker unchanged");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 0);
+    }
+
+    #[test]
+    fn a_directory_creation_error_is_not_treated_as_an_existing_directory() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let path = root.path().join("uncreated");
+        let calls = Cell::new(0);
+        let error = create_private_dir_using(
+            &path,
+            current_user_sid,
+            SecurityDescriptor::for_user,
+            |_descriptor, ancestor| {
+                calls.set(calls.get() + 1);
+                assert_eq!(ancestor, path);
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_ACCESS_DENIED.cast_signed(),
+                ))
+            },
+        )
+        .expect_err("creation denied");
+        assert_os_error(&error, ERROR_ACCESS_DENIED);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            fs::symlink_metadata(&path)
+                .expect_err("directory was not created")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    enum Inspected {
+        Directory,
+        Missing,
+        File,
+    }
+
+    fn with_directory_race(
+        path: &Path,
+        inspected: &Inspected,
+        check: impl FnOnce(std::io::Result<()>),
+    ) {
+        let calls = Cell::new(0_u32);
+        let result = create_private_dir_using(
+            path,
+            current_user_sid,
+            SecurityDescriptor::for_user,
+            |descriptor, ancestor| {
+                calls.set(calls.get().saturating_add(1));
+                assert_eq!(ancestor, path);
+                descriptor.create_dir(ancestor).expect("competing creation");
+                let error = descriptor
+                    .create_dir(ancestor)
+                    .expect_err("already created");
+                match inspected {
+                    Inspected::Directory => {}
+                    Inspected::Missing | Inspected::File => {
+                        fs::remove_dir(ancestor).expect("remove the owned empty directory");
+                        if matches!(inspected, Inspected::File) {
+                            crate::testing::write(ancestor, b"");
+                        }
+                    }
+                }
+                Err(error)
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        check(result);
+    }
+
+    #[test]
+    fn a_directory_created_during_inspection_is_checked_again() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let path = root.path().join("created-concurrently");
+        with_directory_race(&path, &Inspected::Directory, |result| {
+            result.expect("a concurrently created directory is accepted after inspection");
+        });
+        let file = open_private_dir(&path).expect("created directory");
+        assert!(matches!(
+            ownership(&file).expect("private ownership"),
+            super::Ownership::Private
+        ));
+    }
+
+    #[test]
+    fn a_directory_that_disappears_before_reinspection_preserves_the_error() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let path = root.path().join("removed-during-inspection");
+        with_directory_race(&path, &Inspected::Missing, |result| {
+            let error = result.expect_err("reinspection lost the directory");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        });
+    }
+
+    #[test]
+    fn a_file_that_replaces_a_directory_during_inspection_is_rejected() {
+        let root = tempfile::tempdir().expect("owned directory");
+        let path = root.path().join("replaced-during-inspection");
+        with_directory_race(&path, &Inspected::File, |result| {
+            let error = result.expect_err("a regular file replaced the directory");
+            assert_os_error(&error, ERROR_ALREADY_EXISTS);
+        });
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("owned blocker")
+                .is_file()
         );
     }
 

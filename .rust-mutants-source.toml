@@ -36,7 +36,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "converted_sid"
 rule = "lt-to-le"
 original = "<"
-line = 74
+line = 75
 where = { cfg = "windows" }
 reason = "The SDK bounds a conforming converted SID string to 187 UTF-16 code units including its terminator, so iteration ends before either index-256 loop boundary; this records a native observation and its API-bound reasoning without assigning a sealed verdict."
 outcome = "survived"
@@ -46,7 +46,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "converted_sid"
 rule = "condition-to-false"
 original = "length == 256"
-line = 77
+line = 78
 where = { cfg = "windows" }
 reason = "A conforming converted SID string terminates within the SDK limit of 187 UTF-16 code units, so length cannot reach the 256-unit rejection boundary; this records a native observation and its API-bound reasoning without assigning a sealed verdict."
 outcome = "survived"
@@ -56,7 +56,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "converted_sid"
 rule = "question-to-unwrap"
 original = "?"
-line = 81
+line = 82
 where = { cfg = "windows" }
 reason = "ConvertSidToStringSidW produces the standard SID notation using ASCII letters, separators, decimal digits, and optional hexadecimal authority digits, which cannot fail UTF-16 decoding; this records a native observation and its encoding argument without assigning a sealed verdict."
 outcome = "survived"
@@ -66,7 +66,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "token_user"
 rule = "gt-to-ge"
 original = ">"
-line = 110
+line = 111
 where = { cfg = "windows" }
 reason = "TOKEN_USER_MAX_SIZE is sizeof(TOKEN_USER) plus the 68-byte maximum SID, so a defined TokenUser required length is below 4096 and cannot distinguish the two upper-bound comparisons; this reasoning covers conforming API lengths and the recorded observation remains native and unproven."
 outcome = "survived"
@@ -76,7 +76,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "token_user"
 rule = "question-to-unwrap"
 original = "?"
-line = 115
+line = 116
 where = { cfg = "all(windows, any(target_pointer_width = \"32\", target_pointer_width = \"64\"))" }
 reason = "The existing guard limits needed to at most 4096, which fits usize on supported 32-bit and 64-bit Windows targets, so this conversion cannot fail; the recorded observation remains native and unproven."
 outcome = "survived"
@@ -86,7 +86,7 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "token_user"
 rule = "lt-to-le"
 original = "<"
-line = 117
+line = 118
 where = { cfg = "windows" }
 reason = "A conforming successful TokenUser reply includes TOKEN_USER and at least the eight-byte SID header, so its required buffer is larger than sizeof(TOKEN_USER), while a failed query already short-circuits this comparison; this is a layout inference from SE_TOKEN_USER and the token-query buffer contract, and the recorded observation remains native and unproven."
 outcome = "survived"
@@ -132,17 +132,17 @@ path = "crates/domyjob/src/platform/windows_acl.rs"
 item = "SecurityDescriptor::create_dir"
 rule = "question-to-unwrap"
 original = "?"
-line = 158
+line = 159
 where = { cfg = 'all(windows, any(target_pointer_width = "32", target_pointer_width = "64"))' }
 reason = "The pinned windows-sys 0.61.2 SECURITY_ATTRIBUTES is a fixed repr(C) structure containing u32, a pointer, and BOOL, so its 12-byte or 24-byte size fits u32 on supported 32-bit and 64-bit Windows targets; this records a native size-bound argument without assigning a sealed verdict."
 outcome = "survived"
 
 [[mutation.expect]]
 path = "crates/domyjob/src/platform/windows_acl.rs"
-item = "ownership_using"
+item = "acl_ownership"
 rule = "question-to-unwrap"
 original = "?"
-line = 219
+line = 227
 where = { cfg = 'all(windows, any(target_pointer_width = "32", target_pointer_width = "64"))' }
 reason = "The pinned windows-sys 0.61.2 ACL_SIZE_INFORMATION is a fixed repr(C) structure of three u32 fields with a 12-byte size, so converting its size to u32 cannot fail on supported Windows targets; this records a native size-bound argument without assigning a sealed verdict."
 outcome = "survived"
