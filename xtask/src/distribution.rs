@@ -324,13 +324,21 @@ fn write_version(
     match text_environment(environment, "EVENT_NAME")?.as_str() {
         "push" => {
             let tag = text_environment(environment, "TAG")?;
-            if tag != format!("v{VERSION}") {
+            if tag != format!("v{VERSION}")
+                || text_environment(environment, "SOURCE_REF")? != format!("refs/tags/v{VERSION}")
+            {
                 return Err(DistributionError::Invalid(format!(
                     "the tag {tag:?} does not name version {VERSION}"
                 )));
             }
         }
-        "workflow_dispatch" => {}
+        "workflow_dispatch" => {
+            if text_environment(environment, "SOURCE_REF")? != "refs/heads/main" {
+                return Err(DistributionError::Invalid(
+                    "a rehearsal must use refs/heads/main".to_owned(),
+                ));
+            }
+        }
         event => {
             return Err(DistributionError::Invalid(format!(
                 "unsupported release event: {event}"
@@ -488,7 +496,7 @@ fn bundle(
     }
     let mut tar = command(staging.directory.path(), "tar");
     tar.env("COPYFILE_DISABLE", "1");
-    tar.args(["--create", "--gzip", "--file"])
+    tar.args(["--create", "--gzip", "--format=ustar", "--file"])
         .arg(&staging.path)
         .arg(target.package());
     execute(&mut tar)?;
@@ -659,6 +667,15 @@ fn run_with(
 }
 
 #[cfg(test)]
+pub(crate) fn native_archive_fixture() -> Result<tempfile::TempDir, DistributionError> {
+    let root = tests::fixture();
+    for target in Target::ALL {
+        bundle(root.path(), target, &mut execute, &raw::copy)?;
+    }
+    Ok(root)
+}
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -671,7 +688,7 @@ mod tests {
     };
     use serde_json::json;
 
-    fn fixture() -> tempfile::TempDir {
+    pub(super) fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         for resource in RESOURCES {
             let path = root.path().join(resource);
@@ -764,6 +781,7 @@ mod tests {
         raw::write(&output, b"previous=value\n").unwrap();
         let output = output.to_str().unwrap();
         let wrong_tag = format!("v{VERSION}-wrong");
+        let valid_tag = format!("v{VERSION}");
         for values in [
             vec![
                 ("EVENT_NAME", "push"),
@@ -776,6 +794,17 @@ mod tests {
                 ("GITHUB_OUTPUT", output),
             ],
             vec![("EVENT_NAME", "pull_request"), ("GITHUB_OUTPUT", output)],
+            vec![
+                ("EVENT_NAME", "workflow_dispatch"),
+                ("SOURCE_REF", "refs/heads/other"),
+                ("GITHUB_OUTPUT", output),
+            ],
+            vec![
+                ("EVENT_NAME", "push"),
+                ("TAG", valid_tag.as_str()),
+                ("SOURCE_REF", "refs/heads/main"),
+                ("GITHUB_OUTPUT", output),
+            ],
         ] {
             assert!(matches!(
                 write_version(&|name| env(&values, name)),
@@ -784,14 +813,17 @@ mod tests {
             assert_eq!(read(Path::new(output), 1024).unwrap(), b"previous=value\n");
         }
         let tag = format!("v{VERSION}");
+        let source_ref = format!("refs/tags/v{VERSION}");
         for values in [
             vec![
                 ("EVENT_NAME", "push"),
                 ("TAG", tag.as_str()),
+                ("SOURCE_REF", source_ref.as_str()),
                 ("GITHUB_OUTPUT", output),
             ],
             vec![
                 ("EVENT_NAME", "workflow_dispatch"),
+                ("SOURCE_REF", "refs/heads/main"),
                 ("GITHUB_OUTPUT", output),
             ],
         ] {
@@ -805,6 +837,7 @@ mod tests {
             write_version(&|name| env(
                 &[
                     ("EVENT_NAME", "workflow_dispatch"),
+                    ("SOURCE_REF", "refs/heads/main"),
                     ("GITHUB_OUTPUT", "missing/output")
                 ],
                 name

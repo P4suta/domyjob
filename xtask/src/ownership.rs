@@ -8,6 +8,8 @@ const DESCRIPTOR: &str = "crates/domyjob/src/platform/windows_acl/descriptor.rs"
 const RELEASE: &str = "xtask/src/release.rs";
 const DISTRIBUTION: &str = "xtask/src/distribution.rs";
 const CI: &str = "xtask/src/ci.rs";
+const RELEASE_QUEUE: &str = "xtask/src/release_queue.rs";
+const RELEASE_ORCHESTRATION: &str = "xtask/src/release_orchestration.rs";
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -36,6 +38,13 @@ const CAPABILITIES: &[&str] = &[
     "SigningKeychain",
     "StagedArchive",
     "ChildBuildDirectory",
+    "NotaryKeyFile",
+    "AcceptedToken",
+    "ExtractedBundle",
+    "StagedReceipt",
+    "Origin",
+    "VerifiedHandoff",
+    "ReceiptDestination",
 ];
 
 const COPYABLE_CAPABILITIES: &[&str] = &[
@@ -55,7 +64,15 @@ fn capability(kind: &syn::Type) -> bool {
 fn capability_owner(owner: &str) -> bool {
     matches!(
         owner,
-        KERNEL | DESCRIPTOR | LOCK | REPLACEMENT | RELEASE | DISTRIBUTION | CI
+        KERNEL
+            | DESCRIPTOR
+            | LOCK
+            | REPLACEMENT
+            | RELEASE
+            | DISTRIBUTION
+            | CI
+            | RELEASE_QUEUE
+            | RELEASE_ORCHESTRATION
     )
 }
 
@@ -103,6 +120,8 @@ const RAW_OWNERS: &[&str] = &[
     "xtask/src/lib.rs",
     "xtask/src/main.rs",
     "xtask/src/release.rs",
+    RELEASE_QUEUE,
+    RELEASE_ORCHESTRATION,
     CI,
     "xtask/src/distribution.rs",
     "xtask/tests/cli.rs",
@@ -412,7 +431,10 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CI, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, REPLACEMENT, check};
+    use super::{
+        CI, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, RELEASE_ORCHESTRATION,
+        RELEASE_QUEUE, REPLACEMENT, check,
+    };
 
     fn rejected(owner: &str, source: &str) {
         assert!(
@@ -460,9 +482,21 @@ mod tests {
     #[test]
     fn task_resources_cannot_expose_secrets_or_duplicate_checked_owners() {
         for (owner, names) in [
-            (RELEASE, &["Secret", "PrivateFiles", "SigningKeychain"][..]),
+            (
+                RELEASE,
+                &[
+                    "Secret",
+                    "PrivateFiles",
+                    "SigningKeychain",
+                    "NotaryKeyFile",
+                    "AcceptedToken",
+                    "ReceiptDestination",
+                ][..],
+            ),
             (DISTRIBUTION, &["StagedArchive"][..]),
             (CI, &["ChildBuildDirectory"][..]),
+            (RELEASE_QUEUE, &["ExtractedBundle", "StagedReceipt"][..]),
+            (RELEASE_ORCHESTRATION, &["Origin", "VerifiedHandoff"][..]),
         ] {
             for name in names {
                 for source in [

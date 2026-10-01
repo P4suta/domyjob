@@ -15,6 +15,10 @@ An individual mutation is evidence to investigate, rather than a requirement to 
 | A capability check missed an alternate spelling or a generated exception | Aliases, custom trait implementations, and nested conditional attributes could hide the operation from a local syntax check | Capability owners have no type or import aliases or globs, only an explicit Drop implementation, and recursively checked conditional exceptions |
 | A compiler proof appeared complete with repeated evidence | Counting fixtures or primary spans did not establish distinct required categories and failure sites | An exact contract inventory, actual leaf paths, one primary per diagnostic, and independent ACL and SID lifetime sites |
 | A mutation appeared to require another runtime fixture despite being forbidden in CI | The ordinary source mutation build ran tests without the mandatory Clippy pass | Separate static rejection from observed runtime behavior in the evidence and closure assessment |
+| An external submission outlived its runner | Signing, upload, waiting, and publication shared one process lifetime without a durable continuation | Preserve the original signed bytes, source-bound submission IDs, and attested handoff; query each existing ID once in a later bounded job |
+| An external submission succeeded before its receipt could be saved | Output storage was checked after the external side effect, and cleanup could discard the returned ID | `ReceiptDestination` checks storage before signing; receipt preservation precedes cleanup, whose failure still rejects success |
+| A status response could be confused with publication authority | Progress, cryptographic verification, source identity, and publication were represented as procedural steps | `Origin`, `VerifiedHandoff`, and `AcceptedToken` are separate private capabilities; publication requires all three and rechecks unchanged bytes and protected source |
+| Archive generation and validation disagreed on a host | The native tar format was implicit, while isolated fixtures never exercised the actual producer and consumer together | Emit the portable USTAR format and pass every target's actual native archive through the strict inventory and extraction contract |
 
 The duplicate-descriptor contract demonstrates why close alone is insufficient.
 An inherited descriptor from another concurrently spawned child is a plausible explanation for the observed restored-control lock failure, but the responsible child was not captured.
@@ -47,6 +51,8 @@ Suspended process creation remains part of the existing launch factory's reviewe
 | Windows SDK leaf | BOOL and immediate last-error capture; NULL and invalid-handle rejection; direct error status; typed wait outcomes; exit-code output; descriptor-borrowed ACL and SID lifetime; job failure cleanup and successful launch |
 | Architecture gates | Forbidden replacement through an approved exception; unregistered raw owner; cross-owner lock operation; output aliases and macro tokens; SDK imports outside the exact leaves |
 | Independent mutation evidence | Actual source splice; restored control; fresh artifact provenance; raw execution attribution; missing or conflicting evidence remains unaudited |
+| Release continuation | Exact original repository, run, attempt, main ancestry, source and artifact; original attestation; duplicate-field and bounded archive rejection; pending, rejected and accepted native outcomes; no automatic resubmission |
+| Release resource and publication ownership | Storage preflight before side effects; receipt retained on cleanup failure; owned credential and extraction cleanup; private capabilities without fabrication or cloning; manual origins never publish; exact draft assets before immutable publication |
 
 Compiler checks cover prohibited capability combinations and ownership lifetimes without executing invalid SDK operations.
 An operating-system capability proves the requested resource kind and granted access at construction, rather than promising that later operations cannot fail.
@@ -64,3 +70,7 @@ A public behavior defect or a new SDK result convention can justify another comm
 A survivor count alone does not justify restarting individual fixture expansion.
 Timeouts, failed controls, and errors are never counted as detections, and historical runs are not promoted to evidence for a later source tree.
 Native observations remain separate from sealed core and repository-gate scores.
+
+Release changes use the same finite boundary: freeze their source, pass the shared contracts and mandatory gates on each affected host, then run one nonpublishing rehearsal of the final source.
+An external pending result leaves final notarization acceptance incomplete; it does not justify rebuilding or adding more individual fixtures.
+Source capabilities constrain the order of trusted operations, while native checks and reviewed dependency versions cover behavior that Rust's type system cannot prove.

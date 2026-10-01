@@ -19,6 +19,27 @@ Exact archive SHA256 values: 54413ede23c2daf518f35156dfde027feb2374004d63bd497f9
 Evidence: reports/dependencies/20261001-latest-stable/crate-delta-evidence.json and cc-1.4.7-to-1.5.1.diff.txt.
 """
 
+[[audits.crc32fast]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.4.2 -> 1.5.0"
+notes = """
+Automated delta source review from the existing Google safe-to-deploy audit of 1.4.2.
+Reviewed every changed packaged file, normalized and original manifests, the new build script, and all complete Rust implementation differences.
+The substantive algorithm change replaces GF(2) matrix combination with a bounded 32-bit polynomial multiply and a 32-entry exponent table; indexing is capped and at most 64 length bits are processed.
+An independent comparison against the trusted baseline combination algorithm passed 19,584 cases, including zero length, every power-of-two boundary, arbitrary CRC states, and large u64 lengths.
+Stable ARM CRC dispatch is enabled only on compilers with the stabilized intrinsics; constructors still require CPU CRC support through runtime detection or the no_std compile-time target feature.
+Reviewed the previously gated ARM implementation's aligned integer slices, exact eight-element chunk indexing, remainder handling, and CRC instruction selection; 59,392 native aarch64 cases passed against an independent bitwise CRC oracle across initial states, alignments, boundaries, resets, and streaming splits.
+The x86 folding algorithm remains 128-bit and unchanged apart from qualified paths, documentation, and removal of inactive debug output; this version has no 128-to-256/512 SIMD casts.
+The build script invokes the trusted RUSTC executable directly with --version and emits Cargo cfg metadata; compiler identity and output remain trusted build inputs, and the script has no internal timeout.
+The edition and minimum compiler version increase, and package-only benchmarks, lockfile, CI, and tests change; the reconstruction-from-length property test loses its distinct reconstruction coverage.
+The selected workspace graph disables default features, retains the Rust/miniz backend, and confines this dependency to xtask rather than the shipped product.
+This audit does not approve 1.5.1 or 1.5.2, exercise x86 at runtime, prove every polynomial/input case, or newly fully review the imported baseline.
+The review is automated and is not represented as a human audit.
+Exact crate archive SHA256 values, independently matched to the official Cargo registry index: a97769d94ddab943e4510d138150169a2758b5ef3eb191a9ee688de3e23ef7b3 -> 9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511.
+Evidence: reports/dependencies/20261002-notarization-queue/crc32fast-1.5.0-candidate-source.json, baseline-trust-paths.json, crc32fast-independent-oracle.json, crc32fast-selected-review.json, and crc32fast-1.4.2-to-1.5.0.diff.txt.
+"""
+
 [[audits.find-msvc-tools]]
 who = "Codex (automated source review)"
 criteria = "safe-to-deploy"
@@ -35,6 +56,63 @@ This is a delta audit from an existing exemption, not a claim that the exempted 
 The review was performed by Codex and is not represented as a human audit.
 Exact archive SHA256 values: ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b -> aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484.
 Evidence: reports/dependencies/20261001-latest-stable/crate-delta-evidence.json and find-msvc-tools-0.1.13-to-0.1.14.diff.txt.
+"""
+
+[[audits.flate2]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.1.5 -> 1.1.10"
+notes = """
+Automated delta source review from the existing imported safe-to-deploy path ending at 1.1.5.
+Reviewed every changed packaged file, manifests, the removed corrupt-gzip fixture, and all complete implementation differences.
+The selected workspace Rust/miniz backend, with default features disabled, retains safe slices, consumption counters, reset semantics, and error propagation while mapping partial flush distinctly.
+Reviewed the new safe zlib-rs adapter, optional backend selection, retired bindings, and std-to-core/alloc changes; optional backend dependency implementations remain separately audited if activated.
+The inherited Google baseline explicitly excludes any_zlib coverage, so this delta does not claim a new full audit of the C backends or optional dependencies.
+Gzip header/footer zero-progress writes now fail with WriteZero, truncated deflate input fails with UnexpectedEof, and gzip extra-field length is validated before u16 serialization.
+Gzip and zlib resets preserve allocation while resetting backend/header/CRC state; unread-reader and output-order requirements are documented.
+Runtime detection becomes an explicit default feature, and no package build script, production shell, network, or filesystem authority is introduced.
+CRC32 remains a separately audited dependency; the workspace pins a reviewed version that avoids the later wide-SIMD cast finding.
+Archive input, gzip headers, and decompressed output must be bounded by the caller; this review does not prove universal termination or all-feature/architecture behavior.
+This is an automated delta audit, not a new full review of the imported baseline or a human audit.
+Exact crate archive SHA256 values, independently matched to the official Cargo registry index: bfe33edd8e85a12a67454e37f8c75e730830d83e313556ab9ebf9ee7fbeb3bfb -> 6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb.
+Evidence: reports/dependencies/20261002-notarization-queue/crate-delta-evidence.json, baseline-trust-paths.json, automated-delta-review.json, and flate2-1.1.5-to-1.1.10.diff.txt.
+"""
+
+[[audits.miniz_oxide]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.8.9 -> 0.9.1"
+notes = """
+Automated delta source review from the existing Bytecode Alliance safe-to-deploy path ending at 0.8.9.
+Reviewed every changed packaged file and all complete Rust implementation differences.
+The crate retains forbid(unsafe_code) and introduces no OS, network, or process authority.
+Reviewed prefix-code space checks that reject over-subscribed Huffman tables, incomplete multi-bit codes, the saturating output-byte limit capped to the slice, and the existing bounded fallback copy path.
+The changed absolute-end versus bytes-left comparison can select the slower copy path; that path still caps writes to the remaining output space.
+Verified all 512 entries of the old small-distance extra-bit table against the reduced 128-entry table indexed by distance >> 2.
+Reviewed new owned-buffer Clone implementations, bounded compression parameters, partial and optional flush markers, Finish/trailer handling, stored-block changes, boxed Wasm buffers, and explicit alloc/no_std serde features.
+Post-start compression parameter changes remain unsupported, and this audit does not claim every optional window/level combination is correct or universally panic-free.
+The distinct RAW/RLE flag conjunction in window_bits_from_flags does not recognize those flags; the remaining branches still bound its result, and no selected decompression-path issue was found.
+Callers must enforce archive input and decompressed-output limits independently.
+This is an automated delta audit, not a new full review of the imported baseline or a human audit.
+Exact crate archive SHA256 values, independently matched to the official Cargo registry index: 1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316 -> b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c.
+Evidence: reports/dependencies/20261002-notarization-queue/crate-delta-evidence.json, baseline-trust-paths.json, automated-delta-review.json, and miniz_oxide-0.8.9-to-0.9.1.diff.txt.
+"""
+
+[[audits.simd-adler32]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.3.7 -> 0.3.10"
+notes = """
+Automated delta source review from the existing Google safe-to-deploy audit of 0.3.7.
+Reviewed every changed packaged file, including all Rust implementation, manifest, CI, test, documentation, and packaged lockfile changes.
+The substantive production change enables ARM NEON dispatch and replaces the prior unusable placeholder with 32-byte NEON folding under compile-time NEON availability.
+Reviewed the exact-slice vector loads, fixed weight arrays, remainder handling, modulo reduction, and 5,536-byte chunk bounds; the 16-bit column and 32-bit Adler accumulators remain within their integer ranges.
+Other production changes narrow WebAssembly cfg selection and update architecture-specific nightly gates; no production dependency or build script is added.
+An independent scalar Adler-32 oracle passed 5,208 native aarch64 NEON cases across chunk boundaries, arbitrary initial states, data patterns, and streaming splits.
+The oracle does not exercise x86, ARM32, WebAssembly, or all possible inputs.
+This is an automated delta audit, not a new full review of the imported baseline or a human audit.
+Exact crate archive SHA256 values, independently matched to the official Cargo registry index: d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe -> 3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea.
+Evidence: reports/dependencies/20261002-notarization-queue/crate-delta-evidence.json, baseline-trust-paths.json, automated-delta-review.json, and simd-adler32-0.3.7-to-0.3.10.diff.txt.
 """
 
 [[audits.version_check]]

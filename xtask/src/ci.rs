@@ -429,7 +429,11 @@ fn classify(paths: &[String]) -> Plan {
                 plan.windows_contracts();
             } else if matches!(
                 path.as_str(),
-                "xtask/src/release.rs" | "xtask/src/distribution.rs" | "xtask/src/ci.rs"
+                "xtask/src/release.rs"
+                    | "xtask/src/release_queue.rs"
+                    | "xtask/src/release_orchestration.rs"
+                    | "xtask/src/distribution.rs"
+                    | "xtask/src/ci.rs"
             ) || path.starts_with("xtask/src/release/")
                 || path.starts_with("xtask/tests/")
             {
@@ -931,7 +935,14 @@ mod tests {
         assert!(native.has(Check::Fleet));
         assert!(!native.has(Check::Product));
         assert!(!native.has(Check::WindowsContracts));
-        assert!(for_paths(&["xtask/src/distribution.rs"]).has(Check::XtaskNative));
+        for path in [
+            "xtask/src/distribution.rs",
+            "xtask/src/release_queue.rs",
+            "xtask/src/release_orchestration.rs",
+        ] {
+            assert!(for_paths(&[path]).has(Check::XtaskNative));
+            assert!(for_paths(&[path]).has(Check::Fleet));
+        }
         let ci = for_paths(&["xtask/src/ci.rs"]);
         assert!(ci.has(Check::XtaskNative));
         assert!(!ci.has(Check::WindowsContracts));
