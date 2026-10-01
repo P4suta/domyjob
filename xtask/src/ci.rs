@@ -1356,11 +1356,13 @@ mod tests {
 
     #[cfg(windows)]
     fn link_directory(target: &Path, link: &Path) -> Result<(), CiError> {
+        let target = super::native_command_directory(raw::canonicalize(target)?)?;
+        let parent = super::native_command_directory(raw::canonicalize(
+            link.parent()
+                .ok_or(CiError::Invalid("junction fixture has no parent"))?,
+        )?)?;
         let status = crate::raw::command("cmd.exe")
-            .current_dir(
-                link.parent()
-                    .ok_or(CiError::Invalid("junction fixture has no parent"))?,
-            )
+            .current_dir(parent)
             .args(["/d", "/c", "mklink", "/j"])
             .arg(
                 link.file_name()
@@ -1453,13 +1455,12 @@ mod tests {
         missing.close().unwrap();
         ChildBuildDirectory::for_parent(&dangling_root, &dangling_parent).unwrap_err();
         super::native_command_directory(raw::canonicalize(&dangling_parent).unwrap()).unwrap_err();
-        super::native_command_directory(
-            raw::canonicalize(&dangling_root)
-                .unwrap()
-                .join("target")
-                .join(".."),
-        )
-        .unwrap_err();
+        let mut noncanonical = raw::canonicalize(&dangling_root).unwrap().into_os_string();
+        noncanonical.push(std::path::MAIN_SEPARATOR_STR);
+        noncanonical.push("target");
+        noncanonical.push(std::path::MAIN_SEPARATOR_STR);
+        noncanonical.push("..");
+        super::native_command_directory(PathBuf::from(noncanonical)).unwrap_err();
     }
 
     #[test]
