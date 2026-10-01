@@ -56,7 +56,7 @@ Git commit signing uses the developer's existing Git signing configuration; it d
 | --- | --- |
 | `APPLE_CERTIFICATE` | The Developer ID Application certificate and its private key, exported as `.p12` and encoded with base64 |
 | `APPLE_CERTIFICATE_PASSWORD` | The password of that `.p12` |
-| `APPLE_SIGNING_IDENTITY` | The certificate's name, such as `Developer ID Application: NAME (TEAMID)` |
+| `APPLE_SIGNING_IDENTITY` | The 40-character SHA-1 fingerprint of the intended Developer ID Application signing identity |
 | `APPLE_NOTARY_KEY` | The complete contents of an App Store Connect team API key (`.p8`) allowed to notarize |
 | `APPLE_NOTARY_KEY_ID` | That key's ID |
 | `APPLE_NOTARY_ISSUER_ID` | The issuer ID shown for the App Store Connect team API keys |
@@ -82,7 +82,12 @@ Apple's [Developer ID certificate guide](https://developer.apple.com/help/accoun
    Save the `.p12` and password in 1Password.
    A `.cer` alone contains no private key and cannot sign a binary.
    See [Apple's keychain export instructions](https://support.apple.com/guide/keychain-access/kyca35961/mac).
-5. Run `security find-identity -v -p codesigning` and copy the complete Developer ID Application identity into `APPLE_SIGNING_IDENTITY`.
+5. Run `security find-identity -v -p codesigning` and copy the 40-character SHA-1 fingerprint from the intended Developer ID Application row into `APPLE_SIGNING_IDENTITY`.
+   The fingerprint selects the certificate without depending on its display name.
+
+Validate the CI `.p12` with the workflow's native importer and include any intermediate certificate needed to build its trust chain.
+The modern PKCS12 memory importer and `security import`'s automatic format detection can accept different formats.
+If a generated CI export needs a compatible format, preserve the original export in 1Password and use the [documented PKCS12 compatibility options](https://cryptography.io/en/stable/hazmat/primitives/asymmetric/serialization/#pkcs12) for the derived input.
 
 ### Apple notarization key
 
@@ -121,11 +126,21 @@ Use `gh secret set` with file input or its hidden interactive prompt, so their v
 Do not paste them into issues, pull requests, or chat.
 See [the GitHub CLI secret command](https://cli.github.com/manual/gh_secret_set).
 
+Validate the credential files before registration.
+The certificate example prepares and checks a nonempty private input before writing the remote secret, then removes it when the subshell exits.
 On the Mac, replace only the file paths in these examples:
 
 ```sh
-set -o pipefail
-base64 -i /path/to/developer-id.p12 | gh secret set APPLE_CERTIFICATE --repo P4suta/domyjob --env release
+(
+  set -euo pipefail
+  umask 077
+  certificate_input="$(mktemp "${TMPDIR:-/tmp}/domyjob-certificate.XXXXXX")"
+  trap 'rm -f "$certificate_input"' EXIT
+  test -s /path/to/developer-id.p12
+  base64 -i /path/to/developer-id.p12 > "$certificate_input"
+  test -s "$certificate_input"
+  gh secret set APPLE_CERTIFICATE --repo P4suta/domyjob --env release < "$certificate_input"
+)
 gh secret set APPLE_NOTARY_KEY --repo P4suta/domyjob --env release < /path/to/AuthKey_KEYID.p8
 gh secret set APPLE_CERTIFICATE_PASSWORD --repo P4suta/domyjob --env release
 gh secret set APPLE_SIGNING_IDENTITY --repo P4suta/domyjob --env release

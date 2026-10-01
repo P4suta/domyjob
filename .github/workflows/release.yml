@@ -90,26 +90,67 @@ jobs:
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
+          umask 077
           binary="target/$TARGET/release/domyjob"
           keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychains="$RUNNER_TEMP/signing-keychains.json"
+          certificate="$RUNNER_TEMP/certificate.p12"
+          key="$RUNNER_TEMP/notary.p8"
+          notary_archive="$RUNNER_TEMP/domyjob.zip"
+          python3 - "$keychains" <<'PY'
+          import json, pathlib, shlex, subprocess, sys
+          paths = shlex.split(subprocess.check_output(["security", "list-keychains", "-d", "user"], text=True))
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(paths))
+          PY
+          cleanup() {
+            original_status=$?
+            trap - EXIT
+            set +e
+            cleanup_status=0
+            python3 - "$keychains" <<'PY' || cleanup_status=1
+          import json, pathlib, subprocess, sys
+          paths = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", *paths], check=True)
+          PY
+            if [ -e "$keychain" ]; then
+              security delete-keychain "$keychain" || cleanup_status=1
+            fi
+            rm -f -- "$certificate" "$key" "$notary_archive" "$keychains" || cleanup_status=1
+            if [ "$original_status" -eq 0 ]; then exit "$cleanup_status"; fi
+            exit "$original_status"
+          }
+          trap cleanup EXIT
           password="$(uuidgen)"
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          python3 - "$keychains" "$keychain" <<'PY'
+          import json, pathlib, subprocess, sys
+          paths = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", sys.argv[2], *paths], check=True)
+          PY
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"
+          security import "$certificate" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security find-identity -p codesigning "$keychain"
+          python3 - "$keychain" <<'PY'
+          import os, re, subprocess, sys
+          identities = subprocess.check_output(["security", "find-identity", "-v", "-p", "codesigning", sys.argv[1]], text=True)
+          print(identities, end="")
+          valid = {value.upper() for value in re.findall(r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s', identities, re.MULTILINE)}
+          configured = os.environ["APPLE_SIGNING_IDENTITY"]
+          if not re.fullmatch(r'[0-9A-Fa-f]{40}', configured) or configured.upper() not in valid:
+              sys.exit("APPLE_SIGNING_IDENTITY must be the SHA-1 of a valid native code-signing identity.")
+          PY
           codesign --force --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp "$binary"
           codesign --verify --strict --verbose=2 "$binary"
-          key="$RUNNER_TEMP/notary.p8"
           printf '%s' "$APPLE_NOTARY_KEY" > "$key"
-          ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/domyjob.zip"
-          result="$(xcrun notarytool submit "$RUNNER_TEMP/domyjob.zip" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json)"
+          ditto -c -k --keepParent "$binary" "$notary_archive"
+          result="$(xcrun notarytool submit "$notary_archive" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json)"
           if [ "$(jq --raw-output .status <<<"$result")" != "Accepted" ]; then
             xcrun notarytool log "$(jq --raw-output .id <<<"$result")" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"
             exit 1
           fi
-          security delete-keychain "$keychain"
       - name: Sign the Windows binary
         if: runner.os == 'Windows'
         uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
