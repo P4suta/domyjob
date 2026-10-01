@@ -68,6 +68,18 @@ struct ChildBuildDirectory {
     target: PathBuf,
 }
 
+fn configure_bootstrapped_tools(command: &mut Command) {
+    command
+        .env("MISE_AUTO_INSTALL", "false")
+        .env("MISE_TASK_RUN_AUTO_INSTALL", "false");
+}
+
+fn command(program: &str) -> Command {
+    let mut command = crate::raw::command(program);
+    configure_bootstrapped_tools(&mut command);
+    command
+}
+
 impl ChildBuildDirectory {
     fn current(root: &Path) -> Result<Self, CiError> {
         Self::for_parent(root, &std::env::current_exe()?)
@@ -121,7 +133,7 @@ impl ChildBuildDirectory {
     }
 
     fn execute(&self, program: &str, arguments: &[&str]) -> Result<(), CiError> {
-        let mut command = crate::raw::command(program);
+        let mut command = command(program);
         self.configure(&mut command);
         command.args(arguments);
         require_success(program, command.status()?)
@@ -460,7 +472,7 @@ fn classify(paths: &[String]) -> Plan {
 
 fn git(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, CiError> {
     let output = capture(
-        crate::raw::command("git")
+        command("git")
             .current_dir(root)
             .args(["-c", "core.fsmonitor=false"])
             .args(arguments),
@@ -613,7 +625,7 @@ fn execute(root: &Path, program: &str, arguments: &[&str]) -> Result<(), CiError
     if matches!(program, "cargo" | "mise") {
         return ChildBuildDirectory::current(root)?.execute(program, arguments);
     }
-    let status = crate::raw::command(program)
+    let status = command(program)
         .current_dir(root)
         .args(arguments)
         .status()?;
@@ -927,6 +939,30 @@ mod tests {
                 .map(|path| (*path).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn ci_process_policy_overrides_inherited_automatic_provisioning() {
+        for program in ["cargo", "mise", "typos", "jscpd", "git"] {
+            let mut inherited = crate::raw::command(program);
+            inherited
+                .env("MISE_AUTO_INSTALL", "true")
+                .env("MISE_TASK_RUN_AUTO_INSTALL", "true");
+            super::configure_bootstrapped_tools(&mut inherited);
+            let configured = super::command(program);
+            for command in [&inherited, &configured] {
+                for name in ["MISE_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL"] {
+                    assert_eq!(
+                        command
+                            .get_envs()
+                            .find(|(key, _value)| *key == name)
+                            .unwrap()
+                            .1,
+                        Some(std::ffi::OsStr::new("false"))
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1500,7 +1536,7 @@ mod tests {
             link.parent()
                 .ok_or(CiError::Invalid("junction fixture has no parent"))?,
         )?)?;
-        let status = crate::raw::command("cmd.exe")
+        let status = super::command("cmd.exe")
             .current_dir(parent)
             .args(["/d", "/c", "mklink", "/j"])
             .arg(
@@ -1540,7 +1576,7 @@ mod tests {
                     .starts_with(&canonical_target)
             );
             for program in ["cargo", "mise"] {
-                let mut command = crate::raw::command(program);
+                let mut command = super::command(program);
                 command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
                 context.configure(&mut command);
                 assert_eq!(command.get_current_dir(), Some(context.root.as_path()));
@@ -1615,7 +1651,7 @@ mod tests {
         )
         .unwrap();
         let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
-        let mut command = crate::raw::command("cargo");
+        let mut command = super::command("cargo");
         command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
         context.configure(&mut command);
         command.args([

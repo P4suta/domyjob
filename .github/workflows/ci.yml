@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  MISE_AUTO_INSTALL: "false"
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+
 jobs:
   changes:
     uses: ./.github/workflows/changes.yml
