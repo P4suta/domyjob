@@ -66,6 +66,13 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["release", "queue", rest @ ..] => match xtask::release_orchestration::run(root, rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("release: {error}");
+                ExitCode::FAILURE
+            }
+        },
         ["release", rest @ ..] => match xtask::distribution::run(root, rest) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -86,7 +93,7 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
         ["dependencies", "vet"] => dependencies(root, xtask::dependencies::Check::Vet),
         _ => {
             eprintln!(
-                "usage: cargo xtask gates | workflows | windows-contracts | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|verify-windows|bundle|checksums | ci plan|check|test|hook|gate"
+                "usage: cargo xtask gates | workflows | windows-contracts | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|verify-windows|bundle|checksums|queue handoff|discover|finalize | ci plan|check|test|hook|gate"
             );
             ExitCode::from(2)
         }

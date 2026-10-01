@@ -1,6 +1,6 @@
 # Releasing
 
-A release is one merge of the release pull request; everything else is automatic.
+A release begins with one merge of the release pull request; publication follows after Apple accepts both macOS submissions.
 Releases go to GitHub Releases only; nothing is published to crates.io.
 The release-plz configuration uses `git_only` to detect both workspace packages' versions from the shared `vX.Y.Z` tag instead of the Cargo registry.
 See [release-plz's git-only configuration](https://release-plz.dev/docs/config#the-git_only-field).
@@ -8,6 +8,7 @@ Before the first release, complete the verification run below with the signing c
 
 Linux distribution builds retain Ubuntu 24.04 as their compatibility baseline.
 CI uses the latest available stable Ubuntu and macOS images, independently of the distribution build baseline.
+Release tooling pins crc32fast to 1.5.0 because later versions' wide SIMD CRC injection uses casts whose upper lanes are not guaranteed to be zero; this dependency is confined to xtask.
 
 ## How a release happens
 
@@ -17,18 +18,36 @@ CI uses the latest available stable Ubuntu and macOS images, independently of th
 3. The tag starts `.github/workflows/release.yml`:
    - `check` refuses a tag that does not name the workspace version.
    - `build` compiles `domyjob` for x86-64 and Arm Linux, x86-64 and Arm macOS, and x86-64 Windows.
-     It signs the macOS binaries with the Developer ID certificate and the hardened runtime and waits for Apple to accept their notarization.
-     `cargo xtask release sign-macos` owns the temporary credentials and keychain, verifies the selected identity, and restores the original keychain search list when it finishes.
+     It signs the macOS binaries with the Developer ID certificate and the hardened runtime and submits them to Apple without waiting.
+     `cargo xtask release sign-macos` owns the temporary credentials and keychain, verifies the selected identity, restores the original keychain search list, and saves a public submission receipt before it finishes.
      It signs the Windows binary with SSL.com eSigner and requires a valid Authenticode signature with signer and timestamp certificates.
      The eSigner action selects `signing_method: v2` to use its configured Java runtime and current trust store instead of CodeSignTool's bundled legacy JDK.
      Each binary is packed with the licenses, README, and icon assets into a `.tar.gz`.
-   - `publish` requires five archives, generates and checks their SHA-256 sums on Ubuntu, records GitHub's build provenance attestation for every archive, and publishes the release.
+   - `handoff` requires five archives and two submission receipts, generates and checks the archive SHA-256 sums, and records GitHub's build provenance attestation for every archive and the source manifest in the original build run.
+     It preserves `dist-pending` for 14 days and finishes without publishing a release.
+4. `.github/workflows/release-finalize.yml` checks existing submissions after a completed build, once an hour, or on an explicit manual request.
+   Ubuntu discovery scans at most the latest 100 build runs; macOS jobs start only for eligible pending runs.
+   `cargo xtask release queue finalize` verifies the original run, attempt, source, artifacts, checksums, and provenance before querying each Apple submission once.
+   It requires the original source commit to remain an ancestor of current `main` and checks this again before publication.
+   A pending result finishes successfully without rebuilding, signing, submitting, or publishing anything.
+   After both submissions are accepted, the task checks the saved binaries' signatures and notarization and preserves `dist-verified-ORIGINAL_RUN_ID-ORIGINAL_ATTEMPT`.
+   A tag origin may publish only when its version, original commit, and current protected tag agree.
+   A manual build origin never publishes, even when a later automatic finalizer accepts it.
 
 The workflow uses [GitHub CLI's draft-and-upload sequence](https://cli.github.com/manual/gh_release_create) to upload all assets before publication.
+The finalizer executes from the repository's trusted `main`; source ancestry verifies membership in that history rather than independently auditing branch protection settings.
 GitHub Release immutability takes effect when the release is published.
 See [GitHub's immutable release documentation](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
 The repository also protects `v*` tags against updates and deletion, so merging the release pull request and creating its tag belong to the final publication step.
+Before signing and publication, the same tag policy check requires an authenticated [GraphQL ruleset bypass connection](https://docs.github.com/en/graphql/reference/repos#repositoryruleset) with an explicit zero `totalCount` and consistent empty page; this trusts GitHub's connection contract and never treats omitted REST bypass metadata as an empty list.
 The manual verification run below creates neither a tag nor a GitHub Release.
+
+Notarization has a seven-day queue deadline, independent of the 15-minute finalizer job limit.
+Expired entries appear in scheduled summaries, and an explicit request for an expired entry fails.
+This does not cancel Apple's processing or request another submission.
+Keep the original archives and receipts; a new signature or build changes the bytes being verified.
+Apple supports checking a saved submission ID independently of the upload, and its service continues processing after a client wait times out.
+See [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
 The Windows executable embeds the icon as a native resource during compilation, before signing.
 The resource compiler must succeed for every normal Windows build.
@@ -178,15 +197,32 @@ After the workflow changes are on `main` and the credentials are configured, dis
 gh workflow run release.yml --repo P4suta/domyjob --ref main
 gh run list --repo P4suta/domyjob --workflow release.yml --event workflow_dispatch --limit 5
 gh run watch RUN_ID --repo P4suta/domyjob --exit-status
-gh run download RUN_ID --repo P4suta/domyjob --name dist-verified --dir dist-verified
+gh run download RUN_ID --repo P4suta/domyjob --name dist-pending --dir dist-pending
+gh run list --repo P4suta/domyjob --workflow release-finalize.yml --limit 5
 ```
 
 Use the run ID returned by `gh run list` for the dispatched commit.
-Manual execution reads the workspace version from that commit and runs the same five builds, signatures, notarization, packaging, checksums, and attestations as a tag push.
-It saves five archives and five checksum files in `dist-verified` without creating a tag or GitHub Release.
+Manual execution is restricted to `main`, reads the workspace version from that commit, and runs the same five builds, signatures, submissions, packaging, checksums, and attestations as a tag push.
+It saves five archives, five checksum files, two submission receipts, and a source manifest in `dist-pending` without creating a tag or GitHub Release.
 Manual signing and notarization use the production services and consume the signing service's normal allowance.
 
-Require all five build jobs and the final verification job to succeed.
+The finalizer runs automatically after the build and checks again hourly while the queue remains eligible.
+To check the same original submissions immediately without rebuilding or using another signing allowance, dispatch the finalizer on `main`:
+
+```sh
+gh workflow run release-finalize.yml --repo P4suta/domyjob --ref main -f run_id=ORIGINAL_RUN_ID
+gh run list --repo P4suta/domyjob --workflow release-finalize.yml --limit 5
+gh run watch FINALIZER_RUN_ID --repo P4suta/domyjob --exit-status
+gh run download FINALIZER_RUN_ID --repo P4suta/domyjob --name dist-verified-ORIGINAL_RUN_ID-ORIGINAL_ATTEMPT --dir dist-verified
+```
+
+Read the original attempt from `dist-pending/manifest.json`.
+A successful pending check has no `dist-verified` artifact and is not proof that notarization finished.
+The accepted artifact becomes a completion marker only after its finalizer run succeeds, so a failed publication can be retried with the same original bytes.
+Retries verify an existing release's asset digests and add only missing draft assets; they never replace published assets or move the protected tag.
+The finalizer preserves the original build attestations rather than attributing the binaries to a later `main` commit.
+
+Require all five build jobs, the handoff job, and an accepted finalizer with its verified artifact to succeed.
 Check every archive with its sum and GitHub attestation, then extract and run `domyjob --help` on native Linux, macOS, and Windows machines.
 Complete the signature checks below for both macOS architectures and Windows before merging the first release pull request.
 
@@ -198,7 +234,7 @@ Complete the signature checks below for both macOS architectures and Windows bef
 - `shasum --algorithm 256 --check ARCHIVE.sha256` checks the archive against its published sum.
   On Linux, use `sha256sum --check ARCHIVE.sha256` instead.
 - On macOS, `codesign --verify --strict --verbose=2 domyjob` checks the signature.
-  `codesign --display --verbose=2 domyjob` shows the signing authority and hardened runtime, and `codesign --verify --verbose=2 -R='notarized' domyjob` checks notarization with an online connection.
+  `codesign --display --verbose=2 domyjob` shows the signing authority and hardened runtime, and `codesign --verify --verbose=2 -R='notarized' --check-notarization domyjob` forces an online notarization check.
   This distribution contains a standalone CLI binary; [Apple does not support stapling a notarization ticket to that format](https://developer.apple.com/videos/play/wwdc2019/703/?time=1948).
   Plan for the first Gatekeeper notarization check to require an online connection.
 - On Windows, `Get-AuthenticodeSignature .\domyjob.exe | Format-List Status, SignerCertificate, TimeStamperCertificate` must report `Valid` with both certificates present.

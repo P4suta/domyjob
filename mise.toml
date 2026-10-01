@@ -57,8 +57,12 @@ run = "cargo xtask windows-contracts"
 
 [tasks.lint]
 description = "Check formatting, types, architecture, spelling, workflows, and duplication"
-depends = ["fmt:check", "clippy", "clippy:targets", "gates", "windows-contracts", "fuzz:check"]
-run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
+depends = ["clippy", "clippy:targets", "windows-contracts", "fuzz:check"]
+run = "mise run lint:static"
+
+[tasks."lint:static"]
+description = "Run the shared formatting, architecture, spelling, workflow, and duplication checks"
+run = "cargo xtask ci static"
 
 [tasks.test]
 description = "Run the complete workspace test suite, each test in its own process"

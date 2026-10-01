@@ -7,6 +7,16 @@ use serde_json::{Map, Value};
 
 const INPUT_LIMIT: u64 = 4_194_304;
 const CHILD_TARGETS: [&str; 2] = ["target/ci-build", "target/ci-build-alt"];
+const XTASK_CLIPPY: [&str; 8] = [
+    "clippy",
+    "--locked",
+    "-p",
+    "xtask",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CiError {
@@ -56,6 +66,18 @@ mod raw {
 struct ChildBuildDirectory {
     root: PathBuf,
     target: PathBuf,
+}
+
+fn configure_bootstrapped_tools(command: &mut Command) {
+    command
+        .env("MISE_AUTO_INSTALL", "false")
+        .env("MISE_TASK_RUN_AUTO_INSTALL", "false");
+}
+
+fn command(program: &str) -> Command {
+    let mut command = crate::raw::command(program);
+    configure_bootstrapped_tools(&mut command);
+    command
 }
 
 impl ChildBuildDirectory {
@@ -111,7 +133,7 @@ impl ChildBuildDirectory {
     }
 
     fn execute(&self, program: &str, arguments: &[&str]) -> Result<(), CiError> {
-        let mut command = crate::raw::command(program);
+        let mut command = command(program);
         self.configure(&mut command);
         command.args(arguments);
         require_success(program, command.status()?)
@@ -429,7 +451,11 @@ fn classify(paths: &[String]) -> Plan {
                 plan.windows_contracts();
             } else if matches!(
                 path.as_str(),
-                "xtask/src/release.rs" | "xtask/src/distribution.rs" | "xtask/src/ci.rs"
+                "xtask/src/release.rs"
+                    | "xtask/src/release_queue.rs"
+                    | "xtask/src/release_orchestration.rs"
+                    | "xtask/src/distribution.rs"
+                    | "xtask/src/ci.rs"
             ) || path.starts_with("xtask/src/release/")
                 || path.starts_with("xtask/tests/")
             {
@@ -446,7 +472,7 @@ fn classify(paths: &[String]) -> Plan {
 
 fn git(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, CiError> {
     let output = capture(
-        crate::raw::command("git")
+        command("git")
             .current_dir(root)
             .args(["-c", "core.fsmonitor=false"])
             .args(arguments),
@@ -599,7 +625,7 @@ fn execute(root: &Path, program: &str, arguments: &[&str]) -> Result<(), CiError
     if matches!(program, "cargo" | "mise") {
         return ChildBuildDirectory::current(root)?.execute(program, arguments);
     }
-    let status = crate::raw::command(program)
+    let status = command(program)
         .current_dir(root)
         .args(arguments)
         .status()?;
@@ -615,43 +641,64 @@ fn require_success(program: &str, status: ExitStatus) -> Result<(), CiError> {
 }
 
 fn check(root: &Path, plan: &Plan) -> Result<(), CiError> {
+    check_with(plan, &mut |program, arguments| {
+        execute(root, program, arguments)
+    })
+}
+
+fn static_checks(
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<(), CiError>,
+) -> Result<(), CiError> {
+    execute("mise", &["run", "fmt:check"])?;
+    execute("cargo", &["xtask", "gates"])?;
+    execute("typos", &[])?;
+    execute("cargo", &["xtask", "workflows"])?;
+    execute("jscpd", &["--config", ".jscpd.json", "--silent"])
+}
+
+fn check_with(
+    plan: &Plan,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<(), CiError>,
+) -> Result<(), CiError> {
     if plan.has(Check::Product) {
-        return execute(root, "mise", &["run", "lint"]);
+        return execute("mise", &["run", "lint"]);
     }
-    execute(root, "typos", &[])?;
     if plan.has(Check::Xtask) {
-        execute(root, "cargo", &["fmt", "--all", "--", "--check"])?;
-        xtask_clippy(root)?;
-        execute(root, "cargo", &["xtask", "gates"])?;
+        static_checks(execute)?;
+        return execute("cargo", &XTASK_CLIPPY);
     }
-    if plan.has(Check::Workflows) {
-        execute(root, "cargo", &["xtask", "workflows"])?;
-    }
-    Ok(())
+    execute("typos", &[])
 }
 
 fn xtask_clippy(root: &Path) -> Result<(), CiError> {
-    execute(
-        root,
-        "cargo",
-        &[
-            "clippy",
-            "--locked",
-            "-p",
-            "xtask",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    )
+    execute(root, "cargo", &XTASK_CLIPPY)
 }
 
 fn xtask_tests(root: &Path, plan: &Plan) -> Result<(), CiError> {
+    xtask_tests_with(plan, &mut |program, arguments| {
+        execute(root, program, arguments)
+    })
+}
+
+fn xtask_tests_with(
+    plan: &Plan,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<(), CiError>,
+) -> Result<(), CiError> {
     if plan.has(Check::WindowsContracts) && std::env::consts::OS == "windows" {
-        execute(root, "cargo", &["xtask", "windows-contracts"])?;
+        execute("cargo", &["xtask", "windows-contracts"])?;
     }
-    execute(root, "cargo", &["test", "--locked", "-p", "xtask"])
+    execute("cargo", &["test", "--locked", "-p", "xtask"])
+}
+
+fn scoped_hook(
+    plan: &Plan,
+    execute: &mut impl FnMut(&str, &[&str]) -> Result<(), CiError>,
+) -> Result<(), CiError> {
+    check_with(plan, execute)?;
+    if plan.has(Check::Xtask) {
+        xtask_tests_with(plan, execute)?;
+    }
+    Ok(())
 }
 
 fn test(root: &Path, plan: &Plan) -> Result<(), CiError> {
@@ -774,10 +821,9 @@ fn hook(root: &Path, remote: Option<&str>) -> Result<(), CiError> {
     if plan.has(Check::Product) {
         execute(root, "mise", &["run", "check"])?;
     } else {
-        check(root, &plan)?;
-        if plan.has(Check::Xtask) {
-            xtask_tests(root, &plan)?;
-        }
+        scoped_hook(&plan, &mut |program, arguments| {
+            execute(root, program, arguments)
+        })?;
     }
     if plan.has(Check::WindowsContracts) && !plan.has(Check::Product) {
         execute(root, "mise", &["run", "check:xtask:windows-contracts"])?;
@@ -856,6 +902,7 @@ fn verify_gate(workflow: &str, plan_text: &str, needs_text: &str) -> Result<(), 
 
 pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
     match words {
+        ["static"] => static_checks(&mut |program, arguments| execute(root, program, arguments)),
         ["plan"] => output(&conservative(ci_plan(root))),
         ["check"] => check(root, &Plan::decode(&environment("PLAN_JSON")?)?),
         ["test"] => test(root, &Plan::decode(&environment("PLAN_JSON")?)?),
@@ -867,7 +914,7 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
             &environment("NEEDS_JSON")?,
         ),
         _ => Err(CiError::Invalid(
-            "usage: cargo xtask ci plan|check|test|hook [REMOTE]|gate WORKFLOW",
+            "usage: cargo xtask ci static|plan|check|test|hook [REMOTE]|gate WORKFLOW",
         )),
     }
 }
@@ -881,8 +928,8 @@ mod tests {
 
     use super::{
         CHILD_TARGETS, Check, ChildBuildDirectory, CiError, INPUT_LIMIT, Plan, ScopeInputs,
-        bounded_read, capture, changed, classify, conservative, gate_jobs, git, oid, paths,
-        push_plan, raw, scope_inputs, verify_gate,
+        bounded_read, capture, changed, check_with, classify, conservative, gate_jobs, git, oid,
+        paths, push_plan, raw, scope_inputs, scoped_hook, verify_gate,
     };
 
     fn for_paths(paths: &[&str]) -> Plan {
@@ -892,6 +939,30 @@ mod tests {
                 .map(|path| (*path).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn ci_process_policy_overrides_inherited_automatic_provisioning() {
+        for program in ["cargo", "mise", "typos", "jscpd", "git"] {
+            let mut inherited = crate::raw::command(program);
+            inherited
+                .env("MISE_AUTO_INSTALL", "true")
+                .env("MISE_TASK_RUN_AUTO_INSTALL", "true");
+            super::configure_bootstrapped_tools(&mut inherited);
+            let configured = super::command(program);
+            for command in [&inherited, &configured] {
+                for name in ["MISE_AUTO_INSTALL", "MISE_TASK_RUN_AUTO_INSTALL"] {
+                    assert_eq!(
+                        command
+                            .get_envs()
+                            .find(|(key, _value)| *key == name)
+                            .unwrap()
+                            .1,
+                        Some(std::ffi::OsStr::new("false"))
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -924,6 +995,103 @@ mod tests {
         assert!(!task.has(Check::Fleet));
     }
 
+    struct CheckedCommands {
+        result: Result<(), CiError>,
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    fn checked_commands(plan: &Plan, hook: bool, fail: Option<&str>) -> CheckedCommands {
+        let mut calls = Vec::new();
+        let mut execute = |program: &str, arguments: &[&str]| {
+            calls.push((
+                program.to_owned(),
+                arguments.iter().map(|word| (*word).to_owned()).collect(),
+            ));
+            if fail == Some(program) {
+                Err(CiError::Invalid("static command failed"))
+            } else {
+                Ok(())
+            }
+        };
+        let result = if hook {
+            scoped_hook(plan, &mut execute)
+        } else {
+            check_with(plan, &mut execute)
+        };
+        CheckedCommands { result, calls }
+    }
+
+    #[test]
+    fn scoped_ci_and_hook_share_static_checks_before_package_only_work() {
+        for path in [
+            "xtask/src/comments.rs",
+            "xtask/src/release_orchestration.rs",
+            ".github/workflows/release.yml",
+        ] {
+            let plan = for_paths(&[path]);
+            let ci = checked_commands(&plan, false, None);
+            let hook = checked_commands(&plan, true, None);
+            ci.result.unwrap();
+            hook.result.unwrap();
+            assert_eq!(
+                hook.calls.iter().take(ci.calls.len()).collect::<Vec<_>>(),
+                ci.calls.iter().collect::<Vec<_>>()
+            );
+            for program in ["typos", "jscpd"] {
+                assert!(
+                    ci.calls
+                        .iter()
+                        .any(|(selected, _arguments)| selected == program)
+                );
+            }
+            assert!(ci.calls.iter().any(
+                |(program, arguments)| program == "mise" && arguments == &["run", "fmt:check"]
+            ));
+            assert!(
+                ci.calls
+                    .iter()
+                    .any(|(program, arguments)| program == "cargo"
+                        && arguments == &["xtask", "gates"])
+            );
+            assert!(
+                ci.calls
+                    .iter()
+                    .any(|(program, arguments)| program == "cargo"
+                        && arguments == &["xtask", "workflows"])
+            );
+            assert_eq!(
+                hook.calls.last().unwrap().1,
+                ["test", "--locked", "-p", "xtask"]
+            );
+            assert!(!hook.calls.iter().any(|(_program, arguments)| {
+                arguments
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "check:fleet" | "--workspace"))
+            }));
+        }
+        let docs = checked_commands(&Plan::docs(), true, None);
+        docs.result.unwrap();
+        assert_eq!(docs.calls, [("typos".to_owned(), Vec::<String>::new())]);
+    }
+
+    #[test]
+    fn static_failures_abort_ci_and_hook_before_clippy_tests_or_fleet() {
+        let plan = for_paths(&["xtask/src/release_orchestration.rs"]);
+        for program in ["mise", "typos", "jscpd"] {
+            let ci = checked_commands(&plan, false, Some(program));
+            let hook = checked_commands(&plan, true, Some(program));
+            ci.result.unwrap_err();
+            hook.result.unwrap_err();
+            assert_eq!(ci.calls, hook.calls);
+            assert_eq!(ci.calls.last().unwrap().0, program);
+            assert!(!ci.calls.iter().any(|(_program, arguments)| {
+                arguments
+                    .iter()
+                    .any(|word| matches!(word.as_str(), "clippy" | "test" | "check:xtask:fleet"))
+            }));
+        }
+    }
+
     #[test]
     fn native_xtask_checks_limit_windows_compiler_contracts_to_their_owners() {
         let native = for_paths(&["xtask/src/release.rs"]);
@@ -931,7 +1099,14 @@ mod tests {
         assert!(native.has(Check::Fleet));
         assert!(!native.has(Check::Product));
         assert!(!native.has(Check::WindowsContracts));
-        assert!(for_paths(&["xtask/src/distribution.rs"]).has(Check::XtaskNative));
+        for path in [
+            "xtask/src/distribution.rs",
+            "xtask/src/release_queue.rs",
+            "xtask/src/release_orchestration.rs",
+        ] {
+            assert!(for_paths(&[path]).has(Check::XtaskNative));
+            assert!(for_paths(&[path]).has(Check::Fleet));
+        }
         let ci = for_paths(&["xtask/src/ci.rs"]);
         assert!(ci.has(Check::XtaskNative));
         assert!(!ci.has(Check::WindowsContracts));
@@ -1361,7 +1536,7 @@ mod tests {
             link.parent()
                 .ok_or(CiError::Invalid("junction fixture has no parent"))?,
         )?)?;
-        let status = crate::raw::command("cmd.exe")
+        let status = super::command("cmd.exe")
             .current_dir(parent)
             .args(["/d", "/c", "mklink", "/j"])
             .arg(
@@ -1401,7 +1576,7 @@ mod tests {
                     .starts_with(&canonical_target)
             );
             for program in ["cargo", "mise"] {
-                let mut command = crate::raw::command(program);
+                let mut command = super::command(program);
                 command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
                 context.configure(&mut command);
                 assert_eq!(command.get_current_dir(), Some(context.root.as_path()));
@@ -1476,7 +1651,7 @@ mod tests {
         )
         .unwrap();
         let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
-        let mut command = crate::raw::command("cargo");
+        let mut command = super::command("cargo");
         command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
         context.configure(&mut command);
         command.args([

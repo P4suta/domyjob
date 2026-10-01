@@ -172,6 +172,12 @@ struct Invocation<'a> {
 trait Driver {
     fn invoke(&self, invocation: Invocation<'_>) -> Result<Vec<u8>, Failure>;
 
+    fn hash(&self, path: &Path) -> Result<String, Failure> {
+        crate::release_queue::sha256_file_bounded(path).map_err(|_error| {
+            Failure::new("notarization receipt", "could not hash the signed input")
+        })
+    }
+
     fn run(
         &self,
         stage: &'static str,
@@ -548,12 +554,63 @@ fn require_identity(output: &[u8], identity: &str) -> Result<(), Failure> {
     }
 }
 
-fn sign_and_notarize<D: Driver>(
+#[derive(Debug)]
+struct Submission {
+    id: String,
+    binary_sha256: String,
+    zip_sha256: String,
+    cdhash: String,
+}
+
+fn native_cdhash(output: &[u8]) -> Result<String, Failure> {
+    let value = std::str::from_utf8(output).map_err(|_error| {
+        Failure::new("notarization receipt", "code-signing metadata is not UTF-8")
+    })?;
+    let hashes: Vec<_> = value
+        .lines()
+        .filter_map(|line| line.strip_prefix("CDHash="))
+        .collect();
+    match hashes.as_slice() {
+        [hash] if hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            Ok(hash.to_ascii_lowercase())
+        }
+        _ => Err(Failure::new(
+            "notarization receipt",
+            "the signed binary needs one exact CDHash",
+        )),
+    }
+}
+
+fn submission_id(output: &[u8]) -> Result<String, Failure> {
+    let response = raw::json(output)
+        .map_err(|_error| Failure::new("notarization", "notarytool did not return valid JSON"))?;
+    let id = response
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Failure::new("notarization", "Apple did not return a submission ID"))?;
+    if id.len() != 36
+        || id.bytes().enumerate().any(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte != b'-'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(Failure::new(
+            "notarization",
+            "Apple returned a malformed submission ID",
+        ));
+    }
+    Ok(id.to_ascii_lowercase())
+}
+
+fn sign_and_submit<D: Driver>(
     keychain: &SigningKeychain<'_, D>,
     root: &Path,
     configuration: &Configuration,
     files: &PrivateFiles,
-) -> Result<(), Failure> {
+) -> Result<Submission, Failure> {
     let driver = keychain.driver;
     let binary = root
         .join("target")
@@ -580,6 +637,13 @@ fn sign_and_notarize<D: Driver>(
         "/usr/bin/codesign",
         &arguments(&["--verify", "--strict", "--verbose=2", binary]),
     )?;
+    let metadata = driver.run(
+        "inspect signed binary",
+        "/usr/bin/codesign",
+        &arguments(&["--display", "--verbose=4", binary]),
+    )?;
+    let cdhash = native_cdhash(&metadata)?;
+    let binary_sha256 = driver.hash(Path::new(binary))?;
     driver.run(
         "create notarization archive",
         "/usr/bin/ditto",
@@ -591,6 +655,7 @@ fn sign_and_notarize<D: Driver>(
             path_text(files.archive_path()?)?,
         ]),
     )?;
+    let zip_sha256 = driver.hash(files.archive_path()?)?;
     let authentication = [
         "--key",
         path_text(files.notary_key_path()?)?,
@@ -601,59 +666,166 @@ fn sign_and_notarize<D: Driver>(
     ];
     let mut submit = arguments(&["notarytool", "submit", path_text(files.archive_path()?)?]);
     submit.extend(arguments(&authentication));
-    submit.extend(arguments(&["--wait", "--output-format", "json"]));
+    submit.extend(arguments(&["--no-wait", "--output-format", "json"]));
     let output = driver.run("submit notarization", "/usr/bin/xcrun", &submit)?;
-    let response = raw::json(&output)
-        .map_err(|_error| Failure::new("notarization", "notarytool did not return valid JSON"))?;
-    if response.get("status").and_then(serde_json::Value::as_str) == Some("Accepted") {
-        return Ok(());
-    }
-    if let Some(id) = response.get("id").and_then(serde_json::Value::as_str) {
-        let mut log = arguments(&["notarytool", "log", id]);
-        log.extend(arguments(&authentication));
-        let rejected = driver.run("retrieve rejected notarization log", "/usr/bin/xcrun", &log);
-        if rejected.is_err() {
-            return Err(Failure::new(
-                "notarization",
-                "Apple did not accept the signed binary; its rejection log could not be retrieved",
-            ));
-        }
-    }
-    Err(Failure::new(
-        "notarization",
-        "Apple did not accept the signed binary",
-    ))
+    Ok(Submission {
+        id: submission_id(&output)?,
+        binary_sha256,
+        zip_sha256,
+        cdhash,
+    })
 }
 
-fn run_with<D: Driver>(
+fn run_signing<D: Driver, T>(
     root: &Path,
     configuration: &Configuration,
     driver: &D,
-) -> Result<(), SigningError> {
+    preserve: impl FnOnce(Submission) -> Result<T, Failure>,
+) -> Result<T, SigningError> {
     let files = PrivateFiles::create(configuration)?;
     let captured =
         SigningKeychain::capture(driver, files.directory.path().join("signing.keychain-db"));
-    let (primary, mut cleanup) = match captured {
+    let (result, mut cleanup) = match captured {
         Ok(mut keychain) => {
-            let primary = keychain
+            let result = keychain
                 .prepare(configuration, &files)
-                .and_then(|()| sign_and_notarize(&keychain, root, configuration, &files))
-                .err();
-            (primary, keychain.finish())
+                .and_then(|()| sign_and_submit(&keychain, root, configuration, &files))
+                .and_then(preserve);
+            (result, keychain.finish())
         }
-        Err(primary) => (Some(primary), Vec::new()),
+        Err(primary) => (Err(primary), Vec::new()),
     };
     cleanup.extend(files.finish());
-    if primary.is_none() && cleanup.is_empty() {
-        Ok(())
+    if cleanup.is_empty() {
+        result.map_err(SigningError::from)
     } else {
-        Err(SigningError { primary, cleanup })
+        Err(SigningError {
+            primary: result.err(),
+            cleanup,
+        })
     }
 }
 
 pub fn macos(root: &Path) -> Result<(), SigningError> {
+    use crate::release_queue::{Source, SourceClaims};
+
+    let source = Source::new(SourceClaims {
+        source_sha: environment("GITHUB_SHA")?,
+        origin_run_id: environment("GITHUB_RUN_ID")?
+            .parse()
+            .map_err(|_error| Failure::new("configuration", "GITHUB_RUN_ID must be positive"))?,
+        run_attempt: environment("GITHUB_RUN_ATTEMPT")?
+            .parse()
+            .map_err(|_error| {
+                Failure::new("configuration", "GITHUB_RUN_ATTEMPT must be positive")
+            })?,
+        source_ref: environment("GITHUB_REF")?,
+        event: environment("GITHUB_EVENT_NAME")?,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    })
+    .map_err(|_error| Failure::new("configuration", "the release source identity is invalid"))?;
     let configuration = Configuration::read()?;
-    run_with(root, &configuration, &Native)
+    submit_and_preserve(root, source, &configuration, &Native)
+}
+
+#[derive(Debug)]
+struct ReceiptDestination {
+    path: PathBuf,
+}
+
+impl ReceiptDestination {
+    fn prepare(root: &Path, target: &str) -> Result<Self, Failure> {
+        if !crate::release_queue::MAC_TARGETS.contains(&target) {
+            return Err(Failure::new(
+                "notarization receipt",
+                "invalid receipt target",
+            ));
+        }
+        let directory = root.join("notarization");
+        match raw::metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                raw::create_directory(&directory).map_err(|_error| {
+                    Failure::new("notarization receipt", "could not create receipt directory")
+                })?;
+            }
+            _ => {
+                return Err(Failure::new(
+                    "notarization receipt",
+                    "unsafe receipt directory",
+                ));
+            }
+        }
+        let metadata = raw::metadata(&directory).map_err(|_error| {
+            Failure::new(
+                "notarization receipt",
+                "could not inspect receipt directory",
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Failure::new(
+                "notarization receipt",
+                "unsafe receipt directory",
+            ));
+        }
+        let path = directory.join(format!("{target}.json"));
+        match raw::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(Failure::new(
+                    "notarization receipt",
+                    "receipt already exists",
+                ));
+            }
+        }
+        raw::private_file(&directory, ".probe")
+            .and_then(NamedTempFile::close)
+            .map_err(|_error| {
+                Failure::new("notarization receipt", "receipt directory is not writable")
+            })?;
+        Ok(Self { path })
+    }
+
+    fn preserve(self, receipt: &crate::release_queue::PendingNotarization) -> Result<(), Failure> {
+        receipt.store(&self.path).map_err(|_error| {
+            Failure::new(
+                "notarization receipt",
+                format!(
+                    "could not preserve submission {}; do not resubmit automatically",
+                    receipt.submission_id()
+                ),
+            )
+        })
+    }
+}
+
+fn submit_and_preserve<D: Driver>(
+    root: &Path,
+    source: crate::release_queue::Source,
+    configuration: &Configuration,
+    driver: &D,
+) -> Result<(), SigningError> {
+    use crate::release_queue::{PendingClaims, PendingNotarization};
+
+    let destination = ReceiptDestination::prepare(root, &configuration.target)?;
+    run_signing(root, configuration, driver, |submission| {
+        let receipt = PendingNotarization::new(PendingClaims {
+            source,
+            target: configuration.target.clone(),
+            submission_id: submission.id,
+            binary_sha256: submission.binary_sha256,
+            submission_zip_sha256: submission.zip_sha256,
+            signing_identity_sha1: configuration.identity.to_ascii_lowercase(),
+            cdhash: submission.cdhash,
+        })
+        .map_err(|_error| {
+            Failure::new(
+                "notarization receipt",
+                "the saved submission claims are invalid",
+            )
+        })?;
+        destination.preserve(&receipt)
+    })
 }
 
 fn keychain_password() -> Result<Secret, Failure> {
@@ -667,6 +839,383 @@ fn keychain_password() -> Result<Secret, Failure> {
     Ok(Secret(
         data_encoding::HEXLOWER.encode(&entropy.0).into_bytes(),
     ))
+}
+
+pub(crate) struct AcceptedToken {
+    source: crate::release_queue::Source,
+}
+
+impl AcceptedToken {
+    pub(crate) const fn source(&self) -> &crate::release_queue::Source {
+        &self.source
+    }
+}
+
+pub(crate) enum NotaryOutcome {
+    Pending,
+    Accepted(AcceptedToken),
+}
+
+struct NotaryAuthentication {
+    key: Secret,
+    key_id: String,
+    issuer: String,
+    temporary_root: PathBuf,
+}
+
+impl NotaryAuthentication {
+    fn read() -> Result<Self, Failure> {
+        let value = Self {
+            key: Secret(environment("APPLE_NOTARY_KEY")?.into_bytes()),
+            key_id: environment("APPLE_NOTARY_KEY_ID")?,
+            issuer: environment("APPLE_NOTARY_ISSUER_ID")?,
+            temporary_root: PathBuf::from(environment("RUNNER_TEMP")?),
+        };
+        if value.key.0.is_empty() || value.key_id.is_empty() || value.issuer.is_empty() {
+            return Err(Failure::new(
+                "configuration",
+                "notarization credentials must not be empty",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+struct NotaryKeyFile {
+    directory: TempDir,
+    key: Option<NamedTempFile>,
+}
+
+impl NotaryKeyFile {
+    fn create(configuration: &NotaryAuthentication) -> Result<Self, SigningError> {
+        let directory =
+            raw::temporary_directory(&configuration.temporary_root).map_err(|_error| {
+                Failure::new(
+                    "private directory",
+                    "could not create the owned temporary directory",
+                )
+            })?;
+        let mut owner = Self {
+            directory,
+            key: None,
+        };
+        match private_write(
+            &mut owner.key,
+            owner.directory.path(),
+            ".p8",
+            &configuration.key,
+        ) {
+            Ok(()) => Ok(owner),
+            Err(primary) => Err(SigningError {
+                primary: Some(primary),
+                cleanup: owner.finish(),
+            }),
+        }
+    }
+
+    fn path(&self) -> Result<&Path, Failure> {
+        private_path(self.key.as_ref())
+    }
+
+    fn finish(self) -> Vec<Failure> {
+        let mut failures = Vec::new();
+        if let Some(key) = self.key
+            && key.close().is_err()
+        {
+            failures.push(Failure::new(
+                "private notarization key",
+                "could not remove the owned private key",
+            ));
+        }
+        if self.directory.close().is_err() {
+            failures.push(Failure::new(
+                "private directory",
+                "could not remove the owned temporary directory",
+            ));
+        }
+        failures
+    }
+}
+
+fn notarization_state(
+    output: &[u8],
+    expected_id: &str,
+) -> Result<crate::release_queue::NotaryState, Failure> {
+    let response = raw::json(output).map_err(|_error| {
+        Failure::new(
+            "notarization status",
+            "Apple did not return valid status JSON",
+        )
+    })?;
+    if response.get("id").and_then(serde_json::Value::as_str) != Some(expected_id) {
+        return Err(Failure::new(
+            "notarization status",
+            "Apple returned a different submission ID",
+        ));
+    }
+    let state = response
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Failure::new(
+                "notarization status",
+                "Apple did not return a submission status",
+            )
+        })?;
+    crate::release_queue::NotaryState::parse(state).map_err(|_error| {
+        Failure::new(
+            "notarization status",
+            "Apple returned an unknown submission status",
+        )
+    })
+}
+
+fn require_ticket(output: &[u8], expected_id: &str, expected_cdhash: &str) -> Result<(), Failure> {
+    let value = raw::json(output).map_err(|_error| {
+        Failure::new("notarization ticket", "Apple did not return valid log JSON")
+    })?;
+    if value.get("jobId").and_then(serde_json::Value::as_str) != Some(expected_id)
+        || value.get("status").and_then(serde_json::Value::as_str) != Some("Accepted")
+        || !value
+            .get("ticketContents")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tickets| {
+                tickets.iter().any(|ticket| {
+                    ticket.get("cdhash").and_then(serde_json::Value::as_str)
+                        == Some(expected_cdhash)
+                })
+            })
+    {
+        return Err(Failure::new(
+            "notarization ticket",
+            "the accepted Apple ticket does not identify this binary",
+        ));
+    }
+    if value
+        .get("issues")
+        .is_some_and(|issues| !issues.is_null() && !issues.as_array().is_some_and(Vec::is_empty))
+    {
+        return Err(Failure::new(
+            "notarization ticket",
+            "Apple reported notarization issues",
+        ));
+    }
+    Ok(())
+}
+
+fn verified_metadata(output: &[u8], expected_cdhash: &str) -> Result<(), Failure> {
+    if native_cdhash(output)? != expected_cdhash {
+        return Err(Failure::new(
+            "notarization verification",
+            "the saved CDHash does not match the signed binary",
+        ));
+    }
+    let text = std::str::from_utf8(output).map_err(|_error| {
+        Failure::new(
+            "notarization verification",
+            "signature metadata is not UTF-8",
+        )
+    })?;
+    let timestamp = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Timestamp="));
+    let runtime = text
+        .lines()
+        .any(|line| line.contains("flags=") && line.contains("(runtime)"));
+    if !runtime
+        || !timestamp.is_some_and(|value| !value.is_empty() && !matches!(value, "none" | "not set"))
+    {
+        return Err(Failure::new(
+            "notarization verification",
+            "the binary needs a hardened runtime and secure timestamp",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_existing_binary<D: Driver>(
+    bundle: &crate::release_queue::ExtractedBundle,
+    target: &str,
+    authentication: &[OsString],
+    driver: &D,
+) -> Result<(), Failure> {
+    let receipt = bundle.receipt(target).map_err(|_error| {
+        Failure::new(
+            "notarization verification",
+            "the saved target receipt is invalid",
+        )
+    })?;
+    let binary = bundle.binary(target).map_err(|_error| {
+        Failure::new(
+            "notarization verification",
+            "the saved target binary is invalid",
+        )
+    })?;
+    if driver.hash(binary)? != receipt.binary_sha256() {
+        return Err(Failure::new(
+            "notarization verification",
+            "the saved binary hash has changed",
+        ));
+    }
+    let architecture = driver.run(
+        "inspect binary architecture",
+        "/usr/bin/lipo",
+        &arguments(&["-archs", path_text(binary)?]),
+    )?;
+    let expected_architecture = if target == "aarch64-apple-darwin" {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+    if !matches!(std::str::from_utf8(&architecture), Ok(value) if value.trim() == expected_architecture)
+    {
+        return Err(Failure::new(
+            "notarization verification",
+            "the saved binary has a different architecture",
+        ));
+    }
+    driver.run(
+        "verify signed binary",
+        "/usr/bin/codesign",
+        &arguments(&[
+            "--verify",
+            "--strict",
+            "--verbose=2",
+            "-R",
+            &format!(
+                "certificate leaf = H\"{}\"",
+                receipt.signing_identity_sha1()
+            ),
+            path_text(binary)?,
+        ]),
+    )?;
+    let metadata = driver.run(
+        "inspect signed binary",
+        "/usr/bin/codesign",
+        &arguments(&["--display", "--verbose=4", path_text(binary)?]),
+    )?;
+    verified_metadata(&metadata, receipt.cdhash())?;
+    let mut log = arguments(&["notarytool", "log", receipt.submission_id()]);
+    log.extend(authentication.iter().cloned());
+    let ticket = driver.run("read accepted notarization ticket", "/usr/bin/xcrun", &log)?;
+    require_ticket(&ticket, receipt.submission_id(), receipt.cdhash())?;
+    driver.run(
+        "verify online notarization",
+        "/usr/bin/codesign",
+        &arguments(&[
+            "--verify",
+            "--strict",
+            "--verbose=2",
+            "-R=notarized",
+            "--check-notarization",
+            path_text(binary)?,
+        ]),
+    )?;
+    if driver.hash(binary)? != receipt.binary_sha256() {
+        return Err(Failure::new(
+            "notarization verification",
+            "the verified binary changed during native checks",
+        ));
+    }
+    Ok(())
+}
+
+fn query_and_verify<D: Driver>(
+    bundle: &crate::release_queue::ExtractedBundle,
+    configuration: &NotaryAuthentication,
+    key_file: &NotaryKeyFile,
+    driver: &D,
+) -> Result<NotaryOutcome, Failure> {
+    use crate::release_queue::{MAC_TARGETS, NotaryState};
+
+    let authentication = arguments(&[
+        "--key",
+        path_text(key_file.path()?)?,
+        "--key-id",
+        &configuration.key_id,
+        "--issuer",
+        &configuration.issuer,
+        "--output-format",
+        "json",
+    ]);
+    let mut pending = false;
+    for target in MAC_TARGETS {
+        let receipt = bundle.receipt(target).map_err(|_error| {
+            Failure::new(
+                "notarization verification",
+                "the saved target receipt is invalid",
+            )
+        })?;
+        let mut info = arguments(&["notarytool", "info", receipt.submission_id()]);
+        info.extend(authentication.iter().cloned());
+        let output = driver.run("read notarization status", "/usr/bin/xcrun", &info)?;
+        match notarization_state(&output, receipt.submission_id())? {
+            NotaryState::InProgress => pending = true,
+            NotaryState::Accepted => {}
+            NotaryState::Invalid | NotaryState::Expired => {
+                return Err(Failure::new(
+                    "notarization status",
+                    "Apple rejected the saved submission",
+                ));
+            }
+        }
+    }
+    if pending {
+        return Ok(NotaryOutcome::Pending);
+    }
+    for target in MAC_TARGETS {
+        verify_existing_binary(bundle, target, &authentication, driver)?;
+    }
+    Ok(NotaryOutcome::Accepted(AcceptedToken {
+        source: bundle.source().clone(),
+    }))
+}
+
+fn status_with<D: Driver>(
+    handoff: &crate::release_queue::Handoff,
+    configuration: &NotaryAuthentication,
+    driver: &D,
+) -> Result<NotaryOutcome, SigningError> {
+    let key_file = NotaryKeyFile::create(configuration)?;
+    let mut cleanup = Vec::new();
+    let result = (|| {
+        let bundle = crate::release_queue::ExtractedBundle::extract(handoff).map_err(|_error| {
+            Failure::new(
+                "notarization verification",
+                "could not validate and extract the saved binaries",
+            )
+        })?;
+        let result = query_and_verify(&bundle, configuration, &key_file, driver);
+        if bundle.close().is_err() {
+            cleanup.push(Failure::new(
+                "verification cleanup",
+                "could not remove the owned extracted binaries",
+            ));
+        }
+        result
+    })();
+    cleanup.extend(key_file.finish());
+    if cleanup.is_empty() {
+        result.map_err(SigningError::from)
+    } else {
+        Err(SigningError {
+            primary: result.err(),
+            cleanup,
+        })
+    }
+}
+
+pub(crate) fn notary_status(
+    handoff: &crate::release_queue::Handoff,
+) -> Result<NotaryOutcome, SigningError> {
+    if std::env::consts::OS != "macos" {
+        return Err(Failure::new(
+            "notarization verification",
+            "native macOS is required to verify the saved signatures",
+        )
+        .into());
+    }
+    status_with(handoff, &NotaryAuthentication::read()?, &Native)
 }
 
 fn bounded(mut stream: impl Read) -> Result<Vec<u8>, ()> {
@@ -745,7 +1294,8 @@ impl Driver for Native {
                         "native output could not be captured within its bound",
                     )
                 })?;
-            err.join()
+            let diagnostics = err
+                .join()
                 .map_err(|_panic| Failure::new(stage, "native diagnostic reader stopped"))?
                 .map_err(|()| {
                     Failure::new(
@@ -760,7 +1310,11 @@ impl Driver for Native {
                     format!("native command exited with {status}"),
                 ));
             }
-            Ok(output)
+            if stage == "inspect signed binary" {
+                Ok(diagnostics)
+            } else {
+                Ok(output)
+            }
         })
     }
 }
@@ -775,6 +1329,14 @@ mod raw {
     use std::path::Path;
     pub(super) fn environment(name: &str) -> Result<String, std::env::VarError> {
         std::env::var(name)
+    }
+
+    pub(super) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
+    pub(super) fn create_directory(path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
     }
 
     pub(super) fn temporary_directory(root: &Path) -> io::Result<tempfile::TempDir> {
@@ -817,7 +1379,7 @@ mod tests {
     use super::{
         Configuration, Driver, Failure, Invocation, Native, PrivateFiles, SECURITY, Secret,
         SigningKeychain, arguments, bounded, configured_identity, original_keychains,
-        require_identity, run_with, security_input,
+        require_identity, security_input,
     };
 
     const IDENTITY: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
@@ -825,6 +1387,14 @@ mod tests {
     const CERTIFICATE: &[u8] = b"synthetic-private-certificate";
     const NOTARY_KEY: &[u8] = b"synthetic-private-notary-key";
     const SEARCH_LIST: &str = "    \"/Users/test/quoted\" and \\ path.keychain-db\"\n    \"/Library/Keychains/System.keychain\"\n";
+
+    fn run_with<D: Driver>(
+        root: &Path,
+        configuration: &Configuration,
+        driver: &D,
+    ) -> Result<super::Submission, super::SigningError> {
+        super::run_signing(root, configuration, driver, Ok)
+    }
 
     #[derive(Debug)]
     struct Call {
@@ -847,7 +1417,7 @@ mod tests {
             Self {
                 calls: RefCell::new(Vec::new()),
                 failures,
-                response: br#"{"status":"Accepted","id":"public-notary-id"}"#.to_vec(),
+                response: br#"{"id":"01234567-89ab-4def-8123-456789abcdef"}"#.to_vec(),
                 identity: IDENTITY.to_owned(),
                 owned_keychain: RefCell::new(None),
             }
@@ -897,6 +1467,10 @@ mod tests {
     }
 
     impl Driver for Fake {
+        fn hash(&self, _path: &Path) -> Result<String, Failure> {
+            Ok("a".repeat(64))
+        }
+
         fn invoke(&self, invocation: Invocation<'_>) -> Result<Vec<u8>, Failure> {
             self.record(&invocation);
             let stage = invocation.stage;
@@ -907,6 +1481,7 @@ mod tests {
                 "capture keychain search list" => Ok(SEARCH_LIST.as_bytes().to_vec()),
                 "validate signing identity" => Ok(format!("  1) {} \"Developer ID Application: Synthetic Publisher\"\n     1 valid identities found\n", self.identity).into_bytes()),
                 "submit notarization" => Ok(self.response.clone()),
+                "inspect signed binary" => Ok(format!("CDHash={}\nflags=0x10000(runtime)\nTimestamp=Oct 1, 2026\n", "b".repeat(40)).into_bytes()),
                 _ => Ok(Vec::new()),
             }
         }
@@ -933,7 +1508,96 @@ mod tests {
     }
 
     #[test]
-    fn accepted_signing_restores_search_list_and_removes_private_files() {
+    fn fresh_checkout_preserves_submission_and_refuses_to_submit_over_existing_receipt() {
+        let (_fixture, handoff) = crate::release_queue::handoff_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let configuration = configuration(credentials.path());
+        let fake = Fake::new(Vec::new());
+        super::submit_and_preserve(root.path(), handoff.source().clone(), &configuration, &fake)
+            .unwrap();
+        let path = root.path().join("notarization/aarch64-apple-darwin.json");
+        let receipt = crate::release_queue::PendingNotarization::load(
+            &path,
+            handoff.source(),
+            &configuration.target,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.submission_id(),
+            "01234567-89ab-4def-8123-456789abcdef"
+        );
+        assert_eq!(receipt.binary_sha256(), "a".repeat(64));
+        assert_owned_files_removed(credentials.path(), &fake);
+        let before = fake.stages();
+        let error = super::submit_and_preserve(
+            root.path(),
+            handoff.source().clone(),
+            &configuration,
+            &fake,
+        )
+        .unwrap_err();
+        assert_eq!(error.primary.unwrap().reason, "receipt already exists");
+        assert_eq!(fake.stages(), before);
+        assert_eq!(
+            std::fs::read_dir(root.path().join("notarization"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_receipt_directory_prevents_every_native_signing_command() {
+        let (_fixture, handoff) = crate::release_queue::handoff_fixture();
+        let root = tempfile::tempdir().unwrap();
+        crate::raw::write(&root.path().join("notarization"), b"existing file").unwrap();
+        let fake = Fake::new(Vec::new());
+        let error = super::submit_and_preserve(
+            root.path(),
+            handoff.source().clone(),
+            &configuration(root.path()),
+            &fake,
+        )
+        .unwrap_err();
+        assert_eq!(error.primary.unwrap().reason, "unsafe receipt directory");
+        assert_eq!(fake.stages(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn accepted_submission_receipt_survives_a_failed_keychain_cleanup() {
+        let (_fixture, handoff) = crate::release_queue::handoff_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let credentials = tempfile::tempdir().unwrap();
+        let configuration = configuration(credentials.path());
+        let fake = Fake::new(vec!["restore keychain search list"]);
+        let error = super::submit_and_preserve(
+            root.path(),
+            handoff.source().clone(),
+            &configuration,
+            &fake,
+        )
+        .unwrap_err();
+        assert_eq!(error.cleanup.len(), 1);
+        assert_eq!(
+            error.cleanup.first().unwrap().stage,
+            "restore keychain search list"
+        );
+        let receipt = crate::release_queue::PendingNotarization::load(
+            &root.path().join("notarization/aarch64-apple-darwin.json"),
+            handoff.source(),
+            &configuration.target,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.submission_id(),
+            "01234567-89ab-4def-8123-456789abcdef"
+        );
+        assert_owned_files_removed(credentials.path(), &fake);
+    }
+
+    #[test]
+    fn submitted_signing_restores_search_list_and_removes_private_files_without_waiting() {
         let root = tempfile::tempdir().unwrap();
         let fake = Fake::new(Vec::new());
         run_with(root.path(), &configuration(root.path()), &fake).unwrap();
@@ -950,6 +1614,7 @@ mod tests {
                 "validate signing identity",
                 "sign binary",
                 "verify signed binary",
+                "inspect signed binary",
                 "create notarization archive",
                 "submit notarization",
                 "restore keychain search list",
@@ -968,6 +1633,12 @@ mod tests {
                 .any(|pair| pair == arguments(&["--options", "runtime"]))
         );
         assert!(sign.args.contains(&OsString::from("--timestamp")));
+        let submit = calls
+            .iter()
+            .find(|call| call.stage == "submit notarization")
+            .unwrap();
+        assert!(submit.args.contains(&OsString::from("--no-wait")));
+        assert!(!submit.args.contains(&OsString::from("--wait")));
         let restore = calls
             .iter()
             .find(|call| call.stage == "restore keychain search list")
@@ -991,6 +1662,7 @@ mod tests {
             "validate signing identity",
             "sign binary",
             "verify signed binary",
+            "inspect signed binary",
             "create notarization archive",
             "submit notarization",
         ] {
@@ -1017,7 +1689,7 @@ mod tests {
     fn capture_failure_never_changes_keychain_configuration() {
         let root = tempfile::tempdir().unwrap();
         let fake = Fake::new(vec!["capture keychain search list"]);
-        assert!(run_with(root.path(), &configuration(root.path()), &fake).is_err());
+        run_with(root.path(), &configuration(root.path()), &fake).unwrap_err();
         assert_eq!(fake.stages(), ["capture keychain search list"]);
         assert_owned_files_removed(root.path(), &fake);
     }
@@ -1111,9 +1783,9 @@ mod tests {
     }
 
     #[test]
-    fn rejected_and_malformed_notarization_never_report_acceptance() {
+    fn absent_or_malformed_submission_ids_never_produce_a_receipt() {
         for response in [
-            br#"{"status":"Invalid","id":"public-notary-id"}"#.as_slice(),
+            br#"{"id":"public-notary-id"}"#.as_slice(),
             br#"{"status":"In Progress"}"#,
             b"private-diagnostic-not-json",
         ] {
@@ -1125,16 +1797,6 @@ mod tests {
             assert!(!error.to_string().contains("private-diagnostic"));
             assert_owned_files_removed(root.path(), &fake);
         }
-        let root = tempfile::tempdir().unwrap();
-        let mut fake = Fake::new(vec!["retrieve rejected notarization log"]);
-        fake.response = br#"{"status":"Invalid","id":"public-notary-id"}"#.to_vec();
-        let error = run_with(root.path(), &configuration(root.path()), &fake).unwrap_err();
-        assert_eq!(error.primary.as_ref().unwrap().stage, "notarization");
-        assert!(error.to_string().contains("Apple did not accept"));
-        assert!(
-            fake.stages()
-                .contains(&"retrieve rejected notarization log")
-        );
     }
 
     #[test]
@@ -1152,6 +1814,204 @@ mod tests {
         assert!(security_input(&[&"a".repeat(4093)]).is_err());
         assert!(security_input(&[&"\\".repeat(2047)]).is_err());
         assert!(security_input(&["arg"; 32]).is_err());
+    }
+
+    #[test]
+    fn apple_status_must_identify_the_saved_submission_and_known_state() {
+        let id = "01234567-89ab-4def-8123-456789abcdef";
+        for (text, expected) in [
+            ("In Progress", crate::release_queue::NotaryState::InProgress),
+            ("Accepted", crate::release_queue::NotaryState::Accepted),
+            ("Invalid", crate::release_queue::NotaryState::Invalid),
+        ] {
+            let response = serde_json::json!({"id": id, "status": text});
+            assert_eq!(
+                super::notarization_state(&serde_json::to_vec(&response).unwrap(), id).unwrap(),
+                expected
+            );
+        }
+        for response in [
+            serde_json::json!({"id": id, "status": "Unknown"}),
+            serde_json::json!({"id": id}),
+            serde_json::json!({"status": "Accepted"}),
+            serde_json::json!({"id": "different", "status": "Accepted"}),
+            serde_json::json!({"id": id, "status": true}),
+        ] {
+            super::notarization_state(&serde_json::to_vec(&response).unwrap(), id).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn an_accepted_ticket_must_bind_the_saved_cdhash_and_have_no_issues() {
+        let id = "01234567-89ab-4def-8123-456789abcdef";
+        let hash = "b".repeat(40);
+        let accepted = serde_json::json!({"jobId": id, "status": "Accepted", "ticketContents": [{"cdhash": hash}], "issues": null});
+        let encode = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
+        super::require_ticket(&encode(&accepted), id, &hash).unwrap();
+        for (field, replacement) in [
+            ("jobId", serde_json::json!("different")),
+            ("status", serde_json::json!("In Progress")),
+            (
+                "ticketContents",
+                serde_json::json!([{ "cdhash": "c".repeat(40) }]),
+            ),
+            ("ticketContents", serde_json::json!([])),
+            ("issues", serde_json::json!([{ "severity": "warning" }])),
+        ] {
+            let mut changed = accepted.clone();
+            *changed.get_mut(field).unwrap() = replacement;
+            super::require_ticket(&encode(&changed), id, &hash).unwrap_err();
+        }
+        let mut no_issues = accepted;
+        *no_issues.get_mut("issues").unwrap() = serde_json::json!([]);
+        super::require_ticket(&encode(&no_issues), id, &hash).unwrap();
+    }
+
+    #[test]
+    fn native_metadata_requires_one_cdhash_runtime_and_timestamp() {
+        let hash = "b".repeat(40);
+        let valid = format!(
+            "CDHash={hash}\nCodeDirectory v=20500 flags=0x10000(runtime)\nTimestamp=Oct 1, 2026\n"
+        );
+        super::verified_metadata(valid.as_bytes(), &hash).unwrap();
+        for invalid in [
+            valid.replace("(runtime)", "(none)"),
+            valid.replace("Timestamp=Oct 1, 2026", "Timestamp=none"),
+            valid.replace("Timestamp=Oct 1, 2026", "Timestamp="),
+            format!("{valid}CDHash={hash}\n"),
+            valid.replace(&hash, &"c".repeat(40)),
+        ] {
+            super::verified_metadata(invalid.as_bytes(), &hash).unwrap_err();
+        }
+    }
+
+    struct StatusFake {
+        mode: &'static str,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl StatusFake {
+        fn record(&self, invocation: &Invocation<'_>) {
+            self.calls.borrow_mut().push(invocation.stage);
+            assert!(invocation.args.iter().all(|value| value != "submit"));
+            assert_ne!(invocation.program, SECURITY);
+            if invocation.stage == "verify online notarization" {
+                assert!(
+                    invocation
+                        .args
+                        .contains(&OsString::from("--check-notarization"))
+                );
+            }
+        }
+    }
+
+    impl Driver for StatusFake {
+        fn invoke(&self, invocation: Invocation<'_>) -> Result<Vec<u8>, Failure> {
+            self.record(&invocation);
+            let id = "01234567-89ab-4cde-8fab-0123456789ab";
+            let hash = "d".repeat(40);
+            match invocation.stage {
+                "read notarization status" => Ok(serde_json::to_vec(&serde_json::json!({
+                    "id": id,
+                    "status": match self.mode {
+                        "pending" => "In Progress",
+                        "rejected" => "Invalid",
+                        "unknown" => "Unknown",
+                        _ => "Accepted",
+                    },
+                })).map_err(|_error| Failure::new("synthetic response", "could not encode fixture JSON"))?),
+                "inspect binary architecture" => {
+                    let path = invocation.args.last().ok_or_else(|| Failure::new("synthetic response", "missing fixture binary"))?.to_string_lossy();
+                    Ok(if self.mode == "wrong-architecture" || path.contains("aarch64") {
+                        b"arm64\n".to_vec()
+                    } else {
+                        b"x86_64\n".to_vec()
+                    })
+                }
+                "inspect signed binary" => Ok(format!("CDHash={hash}\nflags=0x10000(runtime)\nTimestamp=Oct 1, 2026\n").into_bytes()),
+                "read accepted notarization ticket" => Ok(serde_json::to_vec(&serde_json::json!({
+                    "jobId": id,
+                    "status": "Accepted",
+                    "ticketContents": [{"cdhash": if self.mode == "wrong-ticket" { "e".repeat(40) } else { hash }}],
+                    "issues": null,
+                })).map_err(|_error| Failure::new("synthetic response", "could not encode fixture JSON"))?),
+                "verify online notarization" if self.mode == "failed-native-check" => {
+                    Err(Failure::new(invocation.stage, "synthetic native failure"))
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+    }
+
+    #[test]
+    fn pending_status_exits_without_rebuilding_signing_or_submitting() {
+        let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+        let private_root = tempfile::tempdir().unwrap();
+        let credentials = super::NotaryAuthentication {
+            key: Secret(NOTARY_KEY.to_vec()),
+            key_id: "synthetic-key-id".to_owned(),
+            issuer: "synthetic-issuer".to_owned(),
+            temporary_root: private_root.path().to_path_buf(),
+        };
+        let driver = StatusFake {
+            mode: "pending",
+            calls: RefCell::new(Vec::new()),
+        };
+        assert!(matches!(
+            super::status_with(&handoff, &credentials, &driver).unwrap(),
+            super::NotaryOutcome::Pending
+        ));
+        assert_eq!(
+            *driver.calls.borrow(),
+            ["read notarization status", "read notarization status"]
+        );
+        assert_eq!(std::fs::read_dir(private_root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn accepted_status_requires_every_native_check_before_minting_a_source_token() {
+        for mode in [
+            "accepted",
+            "rejected",
+            "unknown",
+            "wrong-ticket",
+            "wrong-architecture",
+            "failed-native-check",
+        ] {
+            let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+            let private_root = tempfile::tempdir().unwrap();
+            let credentials = super::NotaryAuthentication {
+                key: Secret(NOTARY_KEY.to_vec()),
+                key_id: "synthetic-key-id".to_owned(),
+                issuer: "synthetic-issuer".to_owned(),
+                temporary_root: private_root.path().to_path_buf(),
+            };
+            let driver = StatusFake {
+                mode,
+                calls: RefCell::new(Vec::new()),
+            };
+            match super::status_with(&handoff, &credentials, &driver) {
+                Ok(super::NotaryOutcome::Accepted(token)) => {
+                    assert_eq!(mode, "accepted");
+                    assert_eq!(token.source(), handoff.source());
+                    assert_eq!(
+                        driver
+                            .calls
+                            .borrow()
+                            .iter()
+                            .filter(|stage| **stage == "verify online notarization")
+                            .count(),
+                        2
+                    );
+                }
+                Err(error) => {
+                    assert_ne!(mode, "accepted", "{error}");
+                    assert!(error.cleanup.is_empty());
+                }
+                Ok(super::NotaryOutcome::Pending) => panic!("unexpected pending state: {mode}"),
+            }
+            assert_eq!(std::fs::read_dir(private_root.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]

@@ -111,6 +111,10 @@ proc-macro2 = { version = "1.0", default-features = false, features = ["span-loc
 rustix = { version = "1.1", features = ["event", "pipe", "process", "system"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+crc32fast = { version = "=1.5.0", default-features = false }
+semver = "1"
 redb = "4.3.0"
 schemars = "1"
 syn = { version = "3", default-features = false, features = [

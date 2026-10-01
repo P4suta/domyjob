@@ -1,0 +1,101 @@
+name: finalize release
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Original release run ID, or empty to scan recent pending runs
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  discover:
+    name: discover pending notarizations
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      has_pending: ${{ steps.queue.outputs.has_pending }}
+      matrix: ${{ steps.queue.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: domyjob-ci-v2
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Discover original runs without rebuilding or resubmitting
+        id: queue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_RUN_ID: ${{ inputs.run_id || '' }}
+          QUEUE_TRIGGER_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+        run: cargo xtask release queue discover
+
+  finalize:
+    name: finalize original run ${{ matrix.run_id }} attempt ${{ matrix.run_attempt }}
+    needs: discover
+    if: needs.discover.outputs.has_pending == 'true'
+    runs-on: macos-26
+    timeout-minutes: 15
+    environment: release
+    concurrency:
+      group: release-finalize-${{ matrix.run_id }}-${{ matrix.run_attempt }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: rust
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ matrix.artifact_id }}
+          run-id: ${{ matrix.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: dist
+      - name: Verify provenance, check existing submissions, and finalize accepted bytes
+        id: finalize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_RUN_ID: ${{ matrix.run_id }}
+          QUEUE_RUN_ATTEMPT: ${{ matrix.run_attempt }}
+          QUEUE_ARTIFACT_ID: ${{ matrix.artifact_id }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: cargo xtask release queue finalize
+      - name: Preserve the accepted original distribution
+        if: steps.finalize.outputs.accepted == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-verified-${{ matrix.run_id }}-${{ matrix.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

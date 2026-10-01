@@ -2,6 +2,9 @@
 extend-ignore-identifiers-re = ["[A-Fa-f0-9]{7,}", "[0-9A-HJKMNP-TV-Z]{16}"]
 extend-ignore-re = ["RC-[A-Z]{1,2}"]
 
+[default.extend-identifiers]
+flate2 = "flate2"
+
 [default.extend-words]
 Yasunobu = "Yasunobu"
 

@@ -45,6 +45,8 @@ mod raw {
 }
 pub mod pure_core;
 pub mod release;
+pub mod release_orchestration;
+pub mod release_queue;
 pub mod windows_contracts;
 pub mod workflows;
 
