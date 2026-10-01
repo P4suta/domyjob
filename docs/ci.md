@@ -18,4 +18,8 @@ Workflows always produce their final required checks.
 `cargo xtask ci gate` requires the changes job to succeed and accepts skipped jobs only when its complete, validated plan did not select them.
 CI jobs share cached Rust dependencies, separated by operating system, CPU architecture, toolchain, and dependency configuration.
 Only `main` saves these caches; pull requests restore them without saving, and release jobs use their independent builds.
+CI adapters run child Cargo and mise commands with a validated `CARGO_TARGET_DIR` inside `target/ci-build`, using `target/ci-build-alt` when the running task occupies the first directory.
+The child directory remains disjoint from the live task executable, including custom parent target directories and directory links, so Windows can rebuild `xtask` without replacing a running executable.
+Directory links that escape the checkout's target cache and invalid directory layouts fail before a child starts.
+Both child directories remain in the shared dependency cache; documentation-only spelling checks do not create them.
 Release rehearsals and tagged releases remain independent of this policy and build, sign, and verify all five distribution targets.

@@ -171,6 +171,7 @@ fn effect_module(path: &str) -> bool {
         "crates/domyjob/src/platform.rs"
             | "crates/domyjob/src/process.rs"
             | "crates/domyjob/tests/e2e/os.rs"
+            | "xtask/src/ci.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
         || path.starts_with("crates/domyjob/tests/e2e/os/")
@@ -456,6 +457,7 @@ mod tests {
             "crates/domyjob/src/process.rs",
             "crates/domyjob/tests/e2e/os.rs",
             "crates/domyjob/src/platform/windows_acl.rs",
+            "xtask/src/ci.rs",
             "crates/domyjob/src/process/windows.rs",
             "crates/domyjob/tests/e2e/os/windows.rs",
         ] {

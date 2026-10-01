@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
 use serde_json::{Map, Value};
 
 const INPUT_LIMIT: u64 = 4_194_304;
+const CHILD_TARGETS: [&str; 2] = ["target/ci-build", "target/ci-build-alt"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum CiError {
@@ -22,7 +23,7 @@ pub enum CiError {
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "CI adapters expose reads and the runner's public output protocol to bounded callers"
+        reason = "CI adapters expose bounded input, public output, and build-directory filesystem queries"
     )]
 
     use std::io::{Read, Write};
@@ -32,6 +33,118 @@ mod raw {
 
     pub(super) fn print(bytes: &[u8]) -> std::io::Result<()> {
         std::io::stdout().write_all(bytes)
+    }
+
+    pub(super) fn canonicalize(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        std::fs::canonicalize(path)
+    }
+
+    pub(super) fn metadata(path: &std::path::Path) -> std::io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn link_directory(
+        target: &std::path::Path,
+        link: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+}
+
+#[derive(Debug)]
+struct ChildBuildDirectory {
+    root: PathBuf,
+    target: PathBuf,
+}
+
+impl ChildBuildDirectory {
+    fn current(root: &Path) -> Result<Self, CiError> {
+        Self::for_parent(root, &std::env::current_exe()?)
+    }
+
+    fn for_parent(root: &Path, parent: &Path) -> Result<Self, CiError> {
+        let root = raw::canonicalize(root)?;
+        let parent = raw::canonicalize(parent)?;
+        if !raw::metadata(&root)?.is_dir() || !raw::metadata(&parent)?.is_file() {
+            return Err(CiError::Invalid(
+                "CI root and live executable must have their expected file types",
+            ));
+        }
+        let cache_root = resolved_directory(&root.join("target"))?;
+        if !cache_root.starts_with(&root) || cache_root == root {
+            return Err(CiError::Invalid(
+                "CI target cache must remain inside the checkout",
+            ));
+        }
+        for relative in CHILD_TARGETS {
+            let candidate = root.join(relative);
+            let target = resolved_directory(&candidate)?;
+            if !target.starts_with(&cache_root) || target == cache_root {
+                return Err(CiError::Invalid(
+                    "CI child target must remain inside the checkout's target cache",
+                ));
+            }
+            if parent.starts_with(&target) {
+                continue;
+            }
+            crate::raw::create_dir_all(&candidate)?;
+            if raw::canonicalize(&candidate)? != target || !raw::metadata(&target)?.is_dir() {
+                return Err(CiError::Invalid(
+                    "CI child target changed while it was being validated",
+                ));
+            }
+            return Ok(Self { root, target });
+        }
+        Err(CiError::Invalid(
+            "reserved CI child targets contain the live executable",
+        ))
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command
+            .current_dir(&self.root)
+            .env("CARGO_TARGET_DIR", &self.target);
+    }
+
+    fn execute(&self, program: &str, arguments: &[&str]) -> Result<(), CiError> {
+        let mut command = crate::raw::command(program);
+        self.configure(&mut command);
+        command.args(arguments);
+        require_success(program, command.status()?)
+    }
+}
+
+fn resolved_directory(path: &Path) -> Result<PathBuf, CiError> {
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    loop {
+        match raw::metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = raw::canonicalize(ancestor)?;
+                if !raw::metadata(&resolved)?.is_dir() {
+                    return Err(CiError::Invalid(
+                        "CI child target has a non-directory ancestor",
+                    ));
+                }
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .ok_or(CiError::Invalid("CI child target has no existing ancestor"))?
+                        .to_owned(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .ok_or(CiError::Invalid("CI child target has no existing ancestor"))?;
+            }
+            Err(error) => return Err(CiError::Io(error)),
+        }
     }
 }
 
@@ -252,7 +365,7 @@ fn classify(paths: &[String]) -> Plan {
                 plan.windows_contracts();
             } else if matches!(
                 path.as_str(),
-                "xtask/src/release.rs" | "xtask/src/distribution.rs"
+                "xtask/src/release.rs" | "xtask/src/distribution.rs" | "xtask/src/ci.rs"
             ) || path.starts_with("xtask/src/release/")
                 || path.starts_with("xtask/tests/")
             {
@@ -419,10 +532,17 @@ fn output(plan: &Plan) -> Result<(), CiError> {
 }
 
 fn execute(root: &Path, program: &str, arguments: &[&str]) -> Result<(), CiError> {
+    if matches!(program, "cargo" | "mise") {
+        return ChildBuildDirectory::current(root)?.execute(program, arguments);
+    }
     let status = crate::raw::command(program)
         .current_dir(root)
         .args(arguments)
         .status()?;
+    require_success(program, status)
+}
+
+fn require_success(program: &str, status: ExitStatus) -> Result<(), CiError> {
     if status.success() {
         Ok(())
     } else {
@@ -691,8 +811,15 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
+    use std::path::{Path, PathBuf};
 
-    use super::*;
+    use serde_json::{Map, Value};
+
+    use super::{
+        CHILD_TARGETS, Check, ChildBuildDirectory, CiError, INPUT_LIMIT, Plan, ScopeInputs,
+        bounded_read, capture, changed, classify, conservative, gate_jobs, git, oid, paths,
+        push_plan, raw, scope_inputs, verify_gate,
+    };
 
     fn for_paths(paths: &[&str]) -> Plan {
         classify(
@@ -726,7 +853,7 @@ mod tests {
         ] {
             assert!(!workflow.has(skipped));
         }
-        let task = for_paths(&["xtask/src/ci.rs"]);
+        let task = for_paths(&["xtask/src/comments.rs"]);
         assert!(task.has(Check::Xtask));
         assert!(task.has(Check::CodeqlRust));
         assert!(!task.has(Check::Product));
@@ -741,6 +868,9 @@ mod tests {
         assert!(!native.has(Check::Product));
         assert!(!native.has(Check::WindowsContracts));
         assert!(for_paths(&["xtask/src/distribution.rs"]).has(Check::XtaskNative));
+        let ci = for_paths(&["xtask/src/ci.rs"]);
+        assert!(ci.has(Check::XtaskNative));
+        assert!(!ci.has(Check::WindowsContracts));
         for path in [
             "xtask/src/windows_contracts.rs",
             "xtask/src/lib.rs",
@@ -1143,5 +1273,154 @@ mod tests {
     fn bounded_protocol_inputs_reject_excess_bytes() {
         assert_eq!(bounded_read(&b"bounded"[..]).unwrap(), b"bounded");
         bounded_read(std::io::repeat(b'x').take(INPUT_LIMIT.saturating_add(1))).unwrap_err();
+    }
+
+    fn live_parent(relative: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        let parent = temp.path().join(relative);
+        crate::raw::create_dir_all(&root).unwrap();
+        crate::raw::create_dir_all(parent.parent().unwrap()).unwrap();
+        crate::raw::write(&parent, b"synthetic executable location").unwrap();
+        (temp, root, parent)
+    }
+
+    #[cfg(unix)]
+    fn link_directory(target: &Path, link: &Path) -> Result<(), CiError> {
+        raw::link_directory(target, link).map_err(CiError::Io)
+    }
+
+    #[cfg(windows)]
+    fn link_directory(target: &Path, link: &Path) -> Result<(), CiError> {
+        let status = crate::raw::command("cmd.exe")
+            .current_dir(
+                link.parent()
+                    .ok_or(CiError::Invalid("junction fixture has no parent"))?,
+            )
+            .args(["/d", "/c", "mklink", "/j"])
+            .arg(
+                link.file_name()
+                    .ok_or(CiError::Invalid("junction fixture has no file name"))?,
+            )
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()?;
+        super::require_success("cmd.exe", status)
+    }
+
+    #[test]
+    fn child_builds_remain_disjoint_from_default_custom_and_reserved_parent_locations() {
+        for (parent_path, selected) in [
+            ("checkout/target/debug/xtask.exe", "target/ci-build"),
+            ("custom-target/debug/xtask.exe", "target/ci-build"),
+            (
+                "checkout/target/ci-build/debug/xtask.exe",
+                "target/ci-build-alt",
+            ),
+            (
+                "checkout/target/ci-build-alt/debug/xtask.exe",
+                "target/ci-build",
+            ),
+        ] {
+            let (_temp, root, parent) = live_parent(parent_path);
+            let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
+            assert_eq!(
+                context.target,
+                raw::canonicalize(&root.join(selected)).unwrap()
+            );
+            assert!(
+                !raw::canonicalize(&parent)
+                    .unwrap()
+                    .starts_with(&context.target)
+            );
+            for program in ["cargo", "mise"] {
+                let mut command = crate::raw::command(program);
+                command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
+                context.configure(&mut command);
+                assert_eq!(command.get_current_dir(), Some(context.root.as_path()));
+                let forwarded = command
+                    .get_envs()
+                    .find(|(name, _value)| *name == "CARGO_TARGET_DIR")
+                    .unwrap()
+                    .1;
+                assert_eq!(forwarded, Some(context.target.as_os_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn child_target_symlinks_cannot_alias_the_live_parent_or_escape_the_cache() {
+        let (_temp, root, parent) = live_parent("checkout/target/debug/xtask.exe");
+        link_directory(parent.parent().unwrap(), &root.join(CHILD_TARGETS[0])).unwrap();
+        let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
+        assert_eq!(
+            context.target,
+            raw::canonicalize(&root.join(CHILD_TARGETS[1])).unwrap()
+        );
+        let (_other_temp, aliased_root, aliased_parent) =
+            live_parent("checkout/target/debug/xtask.exe");
+        for relative in CHILD_TARGETS {
+            link_directory(
+                aliased_parent.parent().unwrap(),
+                &aliased_root.join(relative),
+            )
+            .unwrap();
+        }
+        ChildBuildDirectory::for_parent(&aliased_root, &aliased_parent).unwrap_err();
+        let (escape_temp, escape_root, escape_parent) =
+            live_parent("checkout/target/debug/xtask.exe");
+        let outside = escape_temp.path().join("outside");
+        crate::raw::create_dir_all(&outside).unwrap();
+        link_directory(&outside, &escape_root.join(CHILD_TARGETS[0])).unwrap();
+        ChildBuildDirectory::for_parent(&escape_root, &escape_parent).unwrap_err();
+        raw::metadata(&escape_root.join(CHILD_TARGETS[1])).unwrap_err();
+    }
+
+    #[test]
+    fn child_target_rejects_non_directory_and_dangling_ancestors_before_starting_commands() {
+        let (_temp, root, parent) = live_parent("checkout/target/debug/xtask.exe");
+        crate::raw::write(&root.join(CHILD_TARGETS[0]), b"not a directory").unwrap();
+        ChildBuildDirectory::for_parent(&root, &parent).unwrap_err();
+        let (dangling_temp, dangling_root, dangling_parent) =
+            live_parent("checkout/target/debug/xtask.exe");
+        let missing = tempfile::tempdir_in(dangling_temp.path()).unwrap();
+        link_directory(missing.path(), &dangling_root.join(CHILD_TARGETS[0])).unwrap();
+        missing.close().unwrap();
+        ChildBuildDirectory::for_parent(&dangling_root, &dangling_parent).unwrap_err();
+    }
+
+    #[test]
+    fn real_cargo_metadata_observes_the_validated_child_directory() {
+        let (_temp, root, parent) = live_parent("custom-target/debug/xtask.exe");
+        crate::raw::create_dir_all(&root.join("src")).unwrap();
+        crate::raw::write(&root.join("src/lib.rs"), b"").unwrap();
+        crate::raw::write(&root.join("Cargo.toml"), b"[package]\nname = \"ci-target-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n").unwrap();
+        crate::raw::write(
+            &root.join("Cargo.lock"),
+            b"version = 4\n[[package]]\nname = \"ci-target-fixture\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
+        let mut command = crate::raw::command("cargo");
+        command.env("CARGO_TARGET_DIR", parent.parent().unwrap());
+        context.configure(&mut command);
+        command.args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--no-deps",
+            "--format-version",
+            "1",
+        ]);
+        let result = capture(&mut command).unwrap();
+        assert!(result.status.success());
+        let json: Value =
+            domyjob_core::ingress::foreign_json(std::str::from_utf8(&result.stdout).unwrap())
+                .unwrap();
+        let target = json.get("target_directory").unwrap().as_str().unwrap();
+        assert_eq!(
+            raw::canonicalize(Path::new(target)).unwrap(),
+            context.target
+        );
     }
 }

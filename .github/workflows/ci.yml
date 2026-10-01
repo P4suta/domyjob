@@ -30,7 +30,7 @@ jobs:
           install_args: ${{ needs.changes.outputs.product == 'true' && 'rust actionlint taplo typos npm:jscpd' || needs.changes.outputs.workflows == 'true' && 'rust actionlint typos' || 'rust typos' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: domyjob-ci-v1
+          shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask ci check
@@ -84,7 +84,7 @@ jobs:
           install_args: ${{ needs.changes.outputs.product == 'true' && 'rust actionlint aqua:nextest-rs/nextest/cargo-nextest' || 'rust actionlint' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: domyjob-ci-v1
+          shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask ci test
@@ -122,7 +122,7 @@ jobs:
           install_args: rust
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: domyjob-ci-v1
+          shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Require every selected gating job

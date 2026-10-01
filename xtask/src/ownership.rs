@@ -7,6 +7,7 @@ const KERNEL: &str = "crates/domyjob/src/process/windows/kernel.rs";
 const DESCRIPTOR: &str = "crates/domyjob/src/platform/windows_acl/descriptor.rs";
 const RELEASE: &str = "xtask/src/release.rs";
 const DISTRIBUTION: &str = "xtask/src/distribution.rs";
+const CI: &str = "xtask/src/ci.rs";
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -34,6 +35,7 @@ const CAPABILITIES: &[&str] = &[
     "PrivateFiles",
     "SigningKeychain",
     "StagedArchive",
+    "ChildBuildDirectory",
 ];
 
 const COPYABLE_CAPABILITIES: &[&str] = &[
@@ -53,7 +55,7 @@ fn capability(kind: &syn::Type) -> bool {
 fn capability_owner(owner: &str) -> bool {
     matches!(
         owner,
-        KERNEL | DESCRIPTOR | LOCK | REPLACEMENT | RELEASE | DISTRIBUTION
+        KERNEL | DESCRIPTOR | LOCK | REPLACEMENT | RELEASE | DISTRIBUTION | CI
     )
 }
 
@@ -101,7 +103,7 @@ const RAW_OWNERS: &[&str] = &[
     "xtask/src/lib.rs",
     "xtask/src/main.rs",
     "xtask/src/release.rs",
-    "xtask/src/ci.rs",
+    CI,
     "xtask/src/distribution.rs",
     "xtask/tests/cli.rs",
     REPLACEMENT,
@@ -410,7 +412,7 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, REPLACEMENT, check};
+    use super::{CI, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, REPLACEMENT, check};
 
     fn rejected(owner: &str, source: &str) {
         assert!(
@@ -456,10 +458,11 @@ mod tests {
     }
 
     #[test]
-    fn release_resources_cannot_expose_secrets_or_duplicate_cleanup_owners() {
+    fn task_resources_cannot_expose_secrets_or_duplicate_checked_owners() {
         for (owner, names) in [
             (RELEASE, &["Secret", "PrivateFiles", "SigningKeychain"][..]),
             (DISTRIBUTION, &["StagedArchive"][..]),
+            (CI, &["ChildBuildDirectory"][..]),
         ] {
             for name in names {
                 for source in [
