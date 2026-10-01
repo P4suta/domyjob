@@ -94,7 +94,10 @@ impl ChildBuildDirectory {
                     "CI child target changed while it was being validated",
                 ));
             }
-            return Ok(Self { root, target });
+            return Ok(Self {
+                root: native_command_directory(root)?,
+                target: native_command_directory(target)?,
+            });
         }
         Err(CiError::Invalid(
             "reserved CI child targets contain the live executable",
@@ -113,6 +116,67 @@ impl ChildBuildDirectory {
         command.args(arguments);
         require_success(program, command.status()?)
     }
+}
+
+pub(crate) fn native_command_directory(canonical: PathBuf) -> Result<PathBuf, CiError> {
+    if raw::canonicalize(&canonical)? != canonical || !raw::metadata(&canonical)?.is_dir() {
+        return Err(CiError::Invalid(
+            "native command directory requires an existing canonical directory",
+        ));
+    }
+    if std::env::consts::OS != "windows" {
+        return Ok(canonical);
+    }
+    let normal = windows_directory_shape(&canonical)?;
+    if raw::canonicalize(&normal)? != canonical {
+        return Err(CiError::Invalid(
+            "CI command directory must resolve to its validated canonical directory",
+        ));
+    }
+    Ok(normal)
+}
+
+fn windows_directory_shape(path: &Path) -> Result<PathBuf, CiError> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let mut normal = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut unc_prefix = std::ffi::OsString::from(r"\\");
+                unc_prefix.push(server);
+                unc_prefix.push(r"\");
+                unc_prefix.push(share);
+                unc_prefix.push(r"\");
+                PathBuf::from(unc_prefix)
+            }
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) | Prefix::UNC(_, _) | Prefix::Disk(_) => {
+                return Err(CiError::Invalid(
+                    "CI command directory has an unsupported prefix",
+                ));
+            }
+        },
+        _ => {
+            return Err(CiError::Invalid(
+                "CI command directory needs an absolute Windows prefix",
+            ));
+        }
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(CiError::Invalid(
+            "CI command directory must have an absolute root",
+        ));
+    }
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(CiError::Invalid(
+                "CI command directory has a non-normal component",
+            ));
+        };
+        normal.push(name);
+    }
+    Ok(normal)
 }
 
 fn resolved_directory(path: &Path) -> Result<PathBuf, CiError> {
@@ -1324,14 +1388,15 @@ mod tests {
         ] {
             let (_temp, root, parent) = live_parent(parent_path);
             let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
+            let canonical_target = raw::canonicalize(&context.target).unwrap();
             assert_eq!(
-                context.target,
+                canonical_target,
                 raw::canonicalize(&root.join(selected)).unwrap()
             );
             assert!(
                 !raw::canonicalize(&parent)
                     .unwrap()
-                    .starts_with(&context.target)
+                    .starts_with(&canonical_target)
             );
             for program in ["cargo", "mise"] {
                 let mut command = crate::raw::command(program);
@@ -1354,7 +1419,7 @@ mod tests {
         link_directory(parent.parent().unwrap(), &root.join(CHILD_TARGETS[0])).unwrap();
         let context = ChildBuildDirectory::for_parent(&root, &parent).unwrap();
         assert_eq!(
-            context.target,
+            raw::canonicalize(&context.target).unwrap(),
             raw::canonicalize(&root.join(CHILD_TARGETS[1])).unwrap()
         );
         let (_other_temp, aliased_root, aliased_parent) =
@@ -1387,11 +1452,20 @@ mod tests {
         link_directory(missing.path(), &dangling_root.join(CHILD_TARGETS[0])).unwrap();
         missing.close().unwrap();
         ChildBuildDirectory::for_parent(&dangling_root, &dangling_parent).unwrap_err();
+        super::native_command_directory(raw::canonicalize(&dangling_parent).unwrap()).unwrap_err();
+        super::native_command_directory(
+            raw::canonicalize(&dangling_root)
+                .unwrap()
+                .join("target")
+                .join(".."),
+        )
+        .unwrap_err();
     }
 
     #[test]
     fn real_cargo_metadata_observes_the_validated_child_directory() {
         let (_temp, root, parent) = live_parent("custom-target/debug/xtask.exe");
+        let root = root.join("space 日本語");
         crate::raw::create_dir_all(&root.join("src")).unwrap();
         crate::raw::write(&root.join("src/lib.rs"), b"").unwrap();
         crate::raw::write(&root.join("Cargo.toml"), b"[package]\nname = \"ci-target-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[workspace]\n").unwrap();
@@ -1420,7 +1494,42 @@ mod tests {
         let target = json.get("target_directory").unwrap().as_str().unwrap();
         assert_eq!(
             raw::canonicalize(Path::new(target)).unwrap(),
-            context.target
+            raw::canonicalize(&context.target).unwrap()
         );
+        if std::env::consts::OS == "windows" {
+            for directory in [&context.root, &context.target] {
+                assert!(matches!(
+                    directory.components().next(),
+                    Some(std::path::Component::Prefix(prefix))
+                        if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::UNC(_, _))
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_directory_shapes_preserve_disk_unc_and_literal_components() {
+        for (verbatim, normal) in [
+            (r"\\?\C:\space 日本語\ci-build", r"C:\space 日本語\ci-build"),
+            (
+                r"\\?\UNC\server\share\space 日本語\ci-build",
+                r"\\server\share\space 日本語\ci-build",
+            ),
+        ] {
+            assert_eq!(
+                super::windows_directory_shape(Path::new(verbatim)).unwrap(),
+                PathBuf::from(normal)
+            );
+        }
+        for unsupported in [
+            r"\\.\COM1",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\ci-build",
+            r"C:relative",
+            r"relative\ci-build",
+            r"\\?\C:\parent\..\ci-build",
+        ] {
+            super::windows_directory_shape(Path::new(unsupported)).unwrap_err();
+        }
     }
 }

@@ -20,6 +20,7 @@ CI jobs share cached Rust dependencies, separated by operating system, CPU archi
 Only `main` saves these caches; pull requests restore them without saving, and release jobs use their independent builds.
 CI adapters run child Cargo and mise commands with a validated `CARGO_TARGET_DIR` inside `target/ci-build`, using `target/ci-build-alt` when the running task occupies the first directory.
 The child directory remains disjoint from the live task executable, including custom parent target directories and directory links, so Windows can rebuild `xtask` without replacing a running executable.
+Windows commands receive standard drive or UNC paths only after they resolve to the same validated canonical directories, avoiding MSVC incompatibility with verbatim path syntax.
 Directory links that escape the checkout's target cache and invalid directory layouts fail before a child starts.
 Both child directories remain in the shared dependency cache; documentation-only spelling checks do not create them.
 Release rehearsals and tagged releases remain independent of this policy and build, sign, and verify all five distribution targets.

@@ -622,6 +622,8 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), DistributionError> {
     let root = root
         .canonicalize()
         .map_err(|source| io_error("reading repository", root, source))?;
+    let root = crate::ci::native_command_directory(root)
+        .map_err(|error| DistributionError::Invalid(error.to_string()))?;
     run_with(&root, words, &environment, &mut execute)
 }
 
