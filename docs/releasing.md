@@ -6,6 +6,9 @@ The release-plz configuration uses `git_only` to detect both workspace packages'
 See [release-plz's git-only configuration](https://release-plz.dev/docs/config#the-git_only-field).
 Before the first release, complete the verification run below with the signing credentials configured.
 
+Linux distribution builds retain Ubuntu 24.04 as their compatibility baseline.
+CI uses the latest available stable Ubuntu and macOS images, independently of the distribution build baseline.
+
 ## How a release happens
 
 1. On every push to `main`, release-plz keeps one pull request open that bumps the workspace version and writes `CHANGELOG.md` from the Conventional Commits since the last tag.
@@ -16,8 +19,15 @@ Before the first release, complete the verification run below with the signing c
    - `build` compiles `domyjob` for x86-64 and Arm Linux, x86-64 and Arm macOS, and x86-64 Windows.
      It signs the macOS binaries with the Developer ID certificate and the hardened runtime and waits for Apple to accept their notarization.
      It signs the Windows binary with SSL.com eSigner and requires a valid Authenticode signature with signer and timestamp certificates.
-     Each binary is packed with the licenses and README into a `.tar.gz`.
+     Each binary is packed with the licenses, README, and icon assets into a `.tar.gz`.
    - `publish` requires five archives, generates and checks their SHA-256 sums on Ubuntu, records GitHub's build provenance attestation for every archive, and publishes the release.
+
+The Windows executable embeds the icon as a native resource during compilation, before signing.
+The resource compiler must succeed for every normal Windows build.
+The SVG retains the vector artwork; PNG, ICO, and ICNS copies are included in each archive's `assets` directory.
+The icon uses Carbon's `intent-request-create` under Apache-2.0; its license and notice accompany the assets.
+The macOS distribution remains a standalone command-line executable.
+Its ICNS asset does not set a Finder or Dock icon; macOS application icons require an [application bundle](https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/BundleTypes/BundleTypes.html).
 
 ## What the signatures prove
 

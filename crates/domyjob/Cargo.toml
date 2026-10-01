@@ -49,6 +49,7 @@ blake3.workspace = true
 domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
 tar.workspace = true
 thiserror.workspace = true
+winresource = { version = "0.1", default-features = false }
 
 [lints]
 workspace = true

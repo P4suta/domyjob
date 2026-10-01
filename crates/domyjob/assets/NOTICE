@@ -1,0 +1,10 @@
+domyjob icon
+
+The icon is Carbon Design System's intent-request--create icon.
+Copyright 2015 IBM Corp.
+Licensed under the Apache License, Version 2.0.
+
+Source: https://github.com/carbon-design-system/carbon/blob/c73d22708b2bd494a4b7551f9f1cd6d3bb4606c8/packages/icons/src/svg/32/intent-request--create.svg
+
+Modifications: converted the plus polygon to an equivalent path, removed the invisible artboard and unused export metadata, and made the black fill explicit.
+The hexagon and plus geometry are unchanged.

@@ -22,8 +22,8 @@ mod raw {
     #![expect(
         clippy::disallowed_methods,
         clippy::disallowed_macros,
-        reason = "the build script writes generated source only inside Cargo OUT_DIR \
-                  and speaks to Cargo on standard output"
+        reason = "the build script writes generated source and compiled Windows icon resources \
+                  inside Cargo OUT_DIR and speaks to Cargo on standard output"
     )]
 
     use std::io;
@@ -35,6 +35,12 @@ mod raw {
 
     pub(super) fn instruct(instruction: &str) {
         println!("cargo:{instruction}");
+    }
+
+    pub(super) fn embed_windows_icon() -> io::Result<()> {
+        winresource::WindowsResource::new()
+            .set_resource_file("assets/icon.rc")
+            .compile()
     }
 }
 
@@ -71,5 +77,9 @@ fn main() -> io::Result<()> {
         ));
     }
     raw::write(&Path::new(&output).join("source.tar"), &archive)?;
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").map_err(io::Error::other)?;
+    if target_os == "windows" && std::env::var_os("CARGO_FEATURE_PURE").is_none() {
+        raw::embed_windows_icon()?;
+    }
     Ok(())
 }

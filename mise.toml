@@ -1,14 +1,14 @@
 [tools]
-rust = { version = "1.98.0", components = ["clippy", "rustfmt"] }
+rust = { version = "1.98.1", components = ["clippy", "rustfmt"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
-typos = "1.50.1"
-lefthook = "2.1.9"
-"aqua:EmbarkStudios/cargo-deny" = "0.19.7"
+typos = "1.50.3"
+lefthook = "2.1.15"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "aqua:rustsec/rustsec/cargo-audit" = "0.22.2"
 "cargo:cargo-vet" = "0.10.2"
 "aqua:crate-ci/committed" = "1.1.11"
-"npm:jscpd" = "5.3.2"
+"npm:jscpd" = "5.4.0"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 
 [settings]
@@ -75,9 +75,9 @@ dir = "fuzz"
 run = [
   "mkdir -p corpus/wire",
   "cp seeds/wire/* corpus/wire/",
-  "cargo +nightly-2026-08-21 fuzz run wire -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-08-21 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-08-21 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-10-01 fuzz run wire -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-10-01 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-10-01 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
 [tasks.mutants]
