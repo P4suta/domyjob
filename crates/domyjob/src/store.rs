@@ -1,1114 +1,996 @@
-use crate::failure::io;
-use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::collections::BTreeSet;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use domyjob_core::domain::RelativePath;
+use domyjob_core::domain::{JobId, RemoteText, SubmissionId};
+use domyjob_core::ingress;
+use domyjob_core::state::{Event, InvalidTransition, JobState, PhaseKind};
+use domyjob_core::wire::{self, CleanTarget, Request, WireError};
+use thiserror::Error;
 
-use crate::domain::{EnvName, Invalid, JobId, JobRef};
-use crate::lock::{LockError, OsLock};
-use crate::paths::Dirs;
-use crate::protocol::{Job, Phase, Settings, Spec, Supervisor};
+use crate::lock::{LockError, OsLock, Probe};
+use crate::platform;
+use crate::state_io::{self as state_file, StateError};
+use crate::workspace::{Rooted, WorkspaceError};
 
-const SCHEMA: &str = "v3";
-
-const OUTCOME_RESERVED: usize = 4096;
-
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
+#[derive(Debug, Error)]
+pub(crate) enum StoreError {
     #[error(transparent)]
-    Io(#[from] crate::failure::IoFailure),
-    #[error("{path} holds malformed JSON: {source}")]
-    Json {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    #[error("no job matches {0}")]
-    NoSuchJob(JobRef),
-    #[error("{reference} is ambiguous: {count} jobs match")]
-    Ambiguous { reference: JobRef, count: usize },
-    #[error(transparent)]
-    State(#[from] crate::state_file::StateError),
+    State(#[from] StateError),
     #[error(transparent)]
     Lock(#[from] LockError),
-    #[error("job {0} already exists")]
-    Exists(JobId),
     #[error(transparent)]
-    Invalid(#[from] Invalid),
-}
-
-fn read_json<T: crate::ingress::Ingress>(path: &Path) -> Result<T, StoreError> {
-    crate::state_file::read_json(path)?
-        .ok_or_else(|| io("reading", path)(ErrorKind::NotFound.into()).into())
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchEnv {
-    pub vars: BTreeMap<String, String>,
-    pub not_unicode: Vec<String>,
-}
-
-impl LaunchEnv {
-    #[must_use]
-    pub fn with_agent(mut self, agent: Option<PathBuf>) -> Self {
-        if let Some(agent) = agent {
-            self.vars
-                .insert("SSH_AUTH_SOCK".to_owned(), agent.display().to_string());
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn of_this_process() -> Self {
-        Self::from_vars(std::env::vars_os())
-    }
-
-    fn from_vars(vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Self {
-        let mut launch = Self::default();
-        for (key, value) in vars {
-            match (key.into_string(), value.into_string()) {
-                (Ok(key), Ok(value)) if allowed_launch_variable(&key) => {
-                    launch.vars.insert(key, value);
-                }
-                (Ok(key), Err(_)) if allowed_launch_variable(&key) => {
-                    launch.not_unicode.push(key);
-                }
-                (Ok(_) | Err(_), Ok(_) | Err(_)) => {}
-            }
-        }
-        launch
-    }
-}
-
-fn allowed_launch_variable(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper.starts_with("LC_")
-        || matches!(
-            upper.as_str(),
-            "PATH"
-                | "HOME"
-                | "USER"
-                | "USERNAME"
-                | "USERPROFILE"
-                | "LOGNAME"
-                | "SHELL"
-                | "TMPDIR"
-                | "TMP"
-                | "TEMP"
-                | "SYSTEMROOT"
-                | "WINDIR"
-                | "COMSPEC"
-                | "PATHEXT"
-                | "HOMEDRIVE"
-                | "HOMEPATH"
-                | "APPDATA"
-                | "LOCALAPPDATA"
-                | "PROGRAMDATA"
-                | "PROGRAMFILES"
-                | "PROGRAMFILES(X86)"
-                | "PROGRAMW6432"
-                | "COMMONPROGRAMFILES"
-                | "COMMONPROGRAMFILES(X86)"
-                | "COMMONPROGRAMW6432"
-                | "LANG"
-                | "LANGUAGE"
-                | "TZ"
-                | "TERM"
-                | "COLORTERM"
-                | "NO_COLOR"
-        )
-}
-
-const ENV: &str = "env.json";
-const NOTES_KEPT: usize = 20;
-const LAUNCH_ENV: &str = "launch-env.json";
-const SUPERVISOR_BOOT: &str = "supervisor-boot";
-
-pub struct Launch {
-    vars: BTreeMap<String, zeroize::Zeroizing<String>>,
-    not_unicode: Vec<String>,
-}
-
-impl std::fmt::Debug for Launch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Launch")
-            .field("names", &self.vars.keys().collect::<Vec<_>>())
-            .field("not_unicode", &self.not_unicode)
-            .finish()
-    }
-}
-
-impl Launch {
-    pub fn apply(self, command: &mut std::process::Command) -> Vec<String> {
-        command.env_clear();
-        for (key, value) in &self.vars {
-            command.env(key, value.as_str());
-        }
-        self.not_unicode
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sequence {
-    last: u64,
+    Wire(#[from] WireError),
+    #[error(transparent)]
+    Transition(#[from] InvalidTransition),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error("job state I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("the operating system could not provide a job identifier: {0}")]
+    Entropy(getrandom::Error),
+    #[error("the job identifier is absent or its record is incomplete")]
+    Missing,
+    #[error("the same submission identifier was used for different work")]
+    Conflict,
+    #[error("job capacity is full")]
+    Capacity,
+    #[error("an active job cannot be cleaned")]
+    Active,
+    #[error("the job store contains an invalid identifier or record")]
+    Corrupt,
+    #[error("the source archive contains a non-portable or unsafe entry")]
+    ArchiveEntry,
+    #[error("the source archive is missing or does not match its declared size and digest")]
+    ArchiveMismatch,
 }
 
 #[derive(Debug, Clone)]
-pub struct Store {
+pub(crate) struct Store {
     root: PathBuf,
 }
 
-impl Store {
-    pub fn open(dirs: &Dirs) -> Result<Self, StoreError> {
-        let root = dirs.state.join(SCHEMA);
-        for dir in [
-            root.clone(),
-            root.join("jobs"),
-            root.join("staging"),
-            root.join("live"),
-            root.join("slots"),
-        ] {
-            crate::state_file::private_dir(&dir)?;
+#[derive(Debug)]
+pub(crate) struct ReceivedArchive {
+    path: PathBuf,
+    descriptor: wire::Snapshot,
+    _lock: OsLock,
+}
+
+impl Drop for ReceivedArchive {
+    fn drop(&mut self) {
+        let _removed = state_file::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JobPaths {
+    dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OrphanKind {
+    Staging,
+    Incoming,
+}
+
+impl JobPaths {
+    fn at(parent: &Path, job: &JobId) -> Self {
+        Self {
+            dir: parent.join(job.as_str()),
         }
-        Ok(Self { root })
     }
 
-    #[must_use]
-    pub fn area(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+    fn spec(&self) -> PathBuf {
+        self.dir.join("request.json")
     }
 
-    #[must_use]
-    pub fn settings_path(&self) -> PathBuf {
-        self.root.join("settings.json")
+    fn state(&self) -> PathBuf {
+        self.dir.join("state.json")
     }
 
-    pub fn settings(&self) -> Result<Settings, StoreError> {
-        Ok(crate::state_file::read_json(&self.settings_path())?.unwrap_or_default())
+    fn state_lock(&self) -> PathBuf {
+        self.dir.join("state.lock")
     }
 
-    #[must_use]
-    pub fn admission_lock_path(&self) -> PathBuf {
-        self.root.join("queue.lock")
+    fn alive_lock(&self) -> PathBuf {
+        self.dir.join("alive.lock")
     }
 
-    #[must_use]
-    pub fn queue_changed_path(&self) -> PathBuf {
-        self.root.join("queue.changed")
+    fn launch_lock(&self) -> PathBuf {
+        self.dir.join("launch.lock")
     }
 
-    pub fn signal_queue(&self) -> Result<(), StoreError> {
-        Ok(crate::state_file::write_bytes(
-            &self.queue_changed_path(),
-            b"changed",
-        )?)
+    fn cancel(&self) -> PathBuf {
+        self.dir.join("cancel")
     }
 
-    #[must_use]
-    pub fn job_dir(&self, id: &JobId) -> PathBuf {
-        self.root.join("jobs").join(id.as_str())
+    pub(crate) fn log(&self) -> PathBuf {
+        self.dir.join("output.log")
     }
 
-    fn staged_dir(&self, id: &JobId) -> PathBuf {
-        self.root.join("staging").join(id.as_str())
+    fn supervisor_log(&self) -> PathBuf {
+        self.dir.join("supervisor.log")
     }
 
-    #[must_use]
-    pub fn log_path(&self, id: &JobId) -> PathBuf {
-        self.job_dir(id).join("log")
+    fn workspace(&self) -> PathBuf {
+        self.dir.join("workspace")
     }
 
-    #[must_use]
-    pub fn workspace_record(&self, id: &JobId) -> PathBuf {
-        self.job_dir(id).join("workspace")
+    fn order(&self) -> PathBuf {
+        self.dir.join("order")
     }
+}
 
-    #[must_use]
-    pub fn left_path(&self, id: &JobId) -> PathBuf {
-        self.job_dir(id).join("left.json")
-    }
+const KEEP_FINISHED: usize = 32;
 
-    pub fn left(&self, id: &JobId) -> Result<Option<Vec<crate::snapshot::Left>>, StoreError> {
-        Ok(crate::state_file::read_json(&self.left_path(id))?)
-    }
-
-    #[must_use]
-    pub fn alive_path(&self, id: &JobId) -> PathBuf {
-        self.root.join("live").join(format!("{id}.lock"))
-    }
-
-    #[must_use]
-    pub fn control_path(&self, id: &JobId) -> PathBuf {
-        self.root.join("live").join(format!("{id}.sock"))
-    }
-
-    pub fn next_sequence(&self) -> Result<u64, StoreError> {
-        Ok(crate::state_file::update_json(
-            &self.root.join("sequence.json"),
-            Sequence::default,
-            |sequence| {
-                sequence.last = sequence.last.saturating_add(1);
-                sequence.last
-            },
-        )?)
-    }
-
-    pub fn stage(
-        &self,
-        spec: &Spec,
-        (env, launch): (&BTreeMap<EnvName, String>, &LaunchEnv),
-    ) -> Result<(), StoreError> {
-        let dir = self.staged_dir(&spec.id);
-        for taken in [&dir, &self.job_dir(&spec.id)] {
-            crate::faults::at("store::check", taken).map_err(io("checking", taken))?;
-            match std::fs::symlink_metadata(taken) {
-                Ok(_) => return Err(StoreError::Exists(spec.id.clone())),
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(io("checking", taken)(e).into()),
-            }
-        }
-        crate::state_file::private_dir(&dir)?;
-        crate::state_file::write_json(&dir.join("spec.json"), spec)?;
-        crate::state_file::write_json(&dir.join(ENV), env)?;
-        crate::state_file::write_json(&dir.join(LAUNCH_ENV), launch)?;
-        crate::state_file::write_json(&dir.join("phase.json"), &Phase::Queued)?;
-        crate::state_file::create_empty(&dir.join("log"))?;
-        crate::state_file::write_bytes(&dir.join("outcome"), &[b' '; OUTCOME_RESERVED])?;
-        Ok(())
-    }
-
-    pub fn skip_the_queue(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::write_bytes(
-            &self.staged_dir(id).join("now"),
-            b"now",
-        )?)
-    }
-
-    pub fn skips_the_queue(&self, id: &JobId) -> Result<bool, StoreError> {
-        Ok(crate::state_file::read_bytes(&self.job_dir(id).join("now"))?.is_some())
-    }
-
-    pub fn publish(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::publish_dir(
-            &self.staged_dir(id),
-            &self.job_dir(id),
-        )?)
-    }
-
-    pub fn is_published(&self, id: &JobId) -> Result<bool, StoreError> {
-        Ok(crate::state_file::read_bytes(&self.job_dir(id).join("spec.json"))?.is_some())
-    }
-
-    fn failure_path(&self, id: &JobId) -> Result<PathBuf, StoreError> {
-        Ok(if self.is_published(id)? {
-            self.job_dir(id).join("failure")
+fn in_use(root: &Path) -> Result<bool, StoreError> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        let held = if kind.is_dir() && !kind.is_symlink() {
+            entry.file_name() != "workspace" && in_use(&path)?
         } else {
-            self.staged_dir(id).join("failure")
-        })
+            kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                && OsLock::probe(&path)? == Probe::Held
+        };
+        if held {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+const KEEP_OTHER_FORMATS: usize = 2;
+
+pub(crate) fn prune_other_formats(
+    state: &crate::layout::State,
+) -> Result<Vec<PathBuf>, StoreError> {
+    let current = Store {
+        root: state.runner(),
+    };
+    state_file::private_dir(&current.root)?;
+    let mut idle = Vec::new();
+    for root in state.other_runners()? {
+        let judged = in_use(&root).and_then(|busy| {
+            if busy {
+                Ok(None)
+            } else {
+                Ok(Some(Store { root: root.clone() }.opened()?))
+            }
+        });
+        match judged {
+            Ok(Some(place)) => idle.push((place, root)),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "domyjob node: keeping the job store {} for now: {error}",
+                root.display()
+            ),
+        }
+    }
+    let mut removed = Vec::new();
+    for (_, root) in crate::retention::beyond_newest(idle, KEEP_OTHER_FORMATS) {
+        match state_file::set_aside(&root, &current.trash_dir()) {
+            Ok(()) => removed.push(root),
+            Err(error) => eprintln!(
+                "domyjob node: keeping the job store {} for now: {error}",
+                root.display()
+            ),
+        }
+    }
+    current.empty_trash();
+    removed.sort();
+    Ok(removed)
+}
+
+fn next_opening(state: &crate::layout::State) -> Result<u64, StoreError> {
+    let _order = OsLock::exclusive(&state.runner_order_lock())?;
+    let next = Store::read_number(&state.runner_order())?.saturating_add(1);
+    state_file::write_bytes(&state.runner_order(), next.to_string().as_bytes())?;
+    Ok(next)
+}
+
+impl Store {
+    pub(crate) fn open() -> Result<Self, StoreError> {
+        let state = crate::layout::State::here()?;
+        let store = Self::open_directory(state.runner())?;
+        let place = next_opening(&state)?;
+        state_file::write_bytes(&store.opened_path(), place.to_string().as_bytes())?;
+        Ok(store)
     }
 
-    pub fn record_start_failure(&self, id: &JobId, why: &str) -> Result<(), StoreError> {
-        Ok(crate::state_file::write_bytes(
-            &self.failure_path(id)?,
-            why.as_bytes(),
-        )?)
+    fn open_directory(root: PathBuf) -> Result<Self, StoreError> {
+        let store = Self { root };
+        for dir in [
+            store.root.clone(),
+            store.jobs_dir(),
+            store.staging_dir(),
+            store.incoming_dir(),
+            store.trash_dir(),
+        ] {
+            state_file::private_dir(&dir)?;
+        }
+        Ok(store)
     }
 
-    pub fn record_supervisor_boot(&self, id: &JobId) -> Result<(), StoreError> {
-        match crate::platform::boot_identity() {
-            Some(identity) => Ok(crate::state_file::write_bytes(
-                &self.job_dir(id).join(SUPERVISOR_BOOT),
-                identity.as_bytes(),
-            )?),
-            None => Ok(crate::state_file::remove_file(
-                &self.job_dir(id).join(SUPERVISOR_BOOT),
-            )?),
+    #[cfg(test)]
+    pub(crate) fn fixture(root: PathBuf) -> Result<Self, StoreError> {
+        Self::open_directory(root)
+    }
+
+    fn opened_path(&self) -> PathBuf {
+        self.root.join("opened")
+    }
+
+    fn opened(&self) -> Result<u64, StoreError> {
+        Self::read_number(&self.opened_path())
+    }
+
+    fn jobs_dir(&self) -> PathBuf {
+        self.root.join("jobs")
+    }
+
+    fn staging_dir(&self) -> PathBuf {
+        self.root.join("staging")
+    }
+
+    fn incoming_dir(&self) -> PathBuf {
+        self.root.join("incoming")
+    }
+
+    fn trash_dir(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
+    fn empty_trash(&self) {
+        match state_file::empty(&self.trash_dir()) {
+            Ok(leftovers) => {
+                for leftover in leftovers {
+                    eprintln!(
+                        "domyjob node: {} cannot be removed yet: {}",
+                        leftover.path.display(),
+                        leftover.error
+                    );
+                }
+            }
+            Err(error) => eprintln!("domyjob node: the trash cannot be emptied yet: {error}"),
         }
     }
 
-    pub fn supervisor_boot(&self, id: &JobId) -> Result<Option<String>, StoreError> {
-        Ok(
-            crate::state_file::read_bytes(&self.job_dir(id).join(SUPERVISOR_BOOT))?
-                .map(|bytes| String::from_utf8_lossy(bytes.trim_ascii()).into_owned()),
-        )
+    fn incoming_lock(&self) -> PathBuf {
+        self.root.join("incoming.lock")
     }
 
-    pub fn start_failure(&self, id: &JobId) -> Result<Option<String>, StoreError> {
-        Ok(crate::state_file::read_bytes(&self.failure_path(id)?)?
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+    fn sequence(&self) -> PathBuf {
+        self.root.join("sequence")
     }
 
-    #[must_use]
-    pub fn staging_lock_path(&self, id: &JobId) -> PathBuf {
-        self.root.join("staging").join(format!("{id}.lock"))
+    fn read_number(path: &Path) -> Result<u64, StoreError> {
+        match state_file::read_bytes(path)? {
+            None => Ok(0),
+            Some(bytes) => std::str::from_utf8(&bytes)
+                .map_err(|_invalid| StoreError::Corrupt)?
+                .trim()
+                .parse()
+                .map_err(|_invalid| StoreError::Corrupt),
+        }
     }
 
-    pub fn staged_ids(&self) -> Result<Vec<JobId>, StoreError> {
-        let dir = self.root.join("staging");
-        crate::faults::at("store::list", &dir).map_err(io("listing", &dir))?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io("listing", &dir)(e).into()),
-        };
-        let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(io("listing", &dir))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            match name.parse::<JobId>() {
-                Ok(id) => ids.push(id),
-                Err(_lock_or_foreign) => {}
+    fn next_sequence(&self) -> Result<u64, StoreError> {
+        let next = Self::read_number(&self.sequence())?
+            .checked_add(1)
+            .ok_or(StoreError::Capacity)?;
+        state_file::write_bytes(&self.sequence(), next.to_string().as_bytes())?;
+        Ok(next)
+    }
+
+    fn reclaim(&self) -> Result<(), StoreError> {
+        let mut finished = Vec::new();
+        for job in self.list()? {
+            if self.status(&job)?.kind() == PhaseKind::Finished {
+                finished.push((Self::read_number(&self.paths(&job).order())?, job));
             }
         }
-        Ok(ids)
-    }
-
-    #[must_use]
-    pub fn nonce_path(&self, scope: &str, nonce: &crate::domain::Nonce) -> PathBuf {
-        self.root.join("nonces").join(format!("{scope}-{nonce}"))
-    }
-
-    pub fn staged_spec(&self, id: &JobId) -> Result<Spec, StoreError> {
-        read_json(&self.staged_dir(id).join("spec.json"))
-    }
-
-    #[must_use]
-    pub fn collection_lock_path(&self) -> PathBuf {
-        self.root.join("collecting.lock")
-    }
-
-    pub fn remove_job(&self, id: &JobId) -> Result<(), StoreError> {
-        crate::state_file::remove_dir_all(&self.job_dir(id))?;
-        crate::state_file::remove_file(&self.control_path(id))?;
-        Ok(crate::state_file::remove_file(&self.alive_path(id))?)
-    }
-
-    pub fn forget_staging_lock(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::remove_file(&self.staging_lock_path(id))?)
-    }
-
-    pub fn discard_staged(&self, id: &JobId) -> Result<(), StoreError> {
-        Ok(crate::state_file::remove_dir_all(&self.staged_dir(id))?)
-    }
-
-    pub fn spec(&self, id: &JobId) -> Result<Spec, StoreError> {
-        read_json(&self.job_dir(id).join("spec.json"))
-    }
-
-    pub fn take_launch(&self, id: &JobId) -> Result<Launch, StoreError> {
-        let dir = self.job_dir(id);
-        let base: LaunchEnv = read_json(&dir.join(LAUNCH_ENV))?;
-        let env: BTreeMap<EnvName, String> = read_json(&dir.join(ENV))?;
-        self.purge_secrets(id)?;
-        let mut vars: BTreeMap<String, zeroize::Zeroizing<String>> = base
-            .vars
-            .into_iter()
-            .map(|(key, value)| (key, zeroize::Zeroizing::new(value)))
-            .collect();
-        for (key, value) in env {
-            vars.insert(key.as_str().to_owned(), zeroize::Zeroizing::new(value));
+        finished.sort();
+        let excess = finished.len().saturating_sub(KEEP_FINISHED);
+        for (_, job) in finished.into_iter().take(excess) {
+            if let Err(error) = self.clean_one(&job) {
+                eprintln!(
+                    "domyjob node: keeping finished job {} for now: {error}",
+                    job.as_str()
+                );
+            }
         }
-        Ok(Launch {
-            vars,
-            not_unicode: base.not_unicode,
-        })
+        self.empty_trash();
+        Ok(())
     }
 
-    fn purge_secrets(&self, id: &JobId) -> Result<(), StoreError> {
-        for name in [ENV, LAUNCH_ENV] {
-            crate::state_file::remove_file(&self.job_dir(id).join(name))?;
+    fn staged(&self, job: &JobId) -> JobPaths {
+        JobPaths::at(&self.staging_dir(), job)
+    }
+
+    fn paths(&self, job: &JobId) -> JobPaths {
+        JobPaths::at(&self.jobs_dir(), job)
+    }
+
+    fn verified_directory(path: PathBuf) -> Result<PathBuf, StoreError> {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !platform::reparse_point(&metadata) => {
+                state_file::private_dir(&path)?;
+                Ok(path)
+            }
+            Ok(_other) => Err(StoreError::Corrupt),
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(StoreError::Missing),
+            Err(error) => Err(StoreError::Io(error)),
+        }
+    }
+
+    fn verify_job(&self, job: &JobId) -> Result<JobPaths, StoreError> {
+        let paths = self.paths(job);
+        Self::verified_directory(paths.dir.clone())?;
+        Ok(paths)
+    }
+
+    fn admission_lock(&self) -> PathBuf {
+        self.root.join("admission.lock")
+    }
+
+    fn new_job_id() -> Result<JobId, StoreError> {
+        let mut entropy = [0_u8; 16];
+        getrandom::fill(&mut entropy).map_err(StoreError::Entropy)?;
+        let text = format!("{:032x}", u128::from_be_bytes(entropy));
+        JobId::try_from(text).map_err(|_invalid| StoreError::Corrupt)
+    }
+
+    fn read_request(&self, job: &JobId) -> Result<Request, StoreError> {
+        let bytes =
+            state_file::read_bytes(&self.verify_job(job)?.spec())?.ok_or(StoreError::Missing)?;
+        Ok(ingress::stored_request(&bytes)?)
+    }
+
+    fn read_state(&self, job: &JobId) -> Result<JobState, StoreError> {
+        let bytes =
+            state_file::read_bytes(&self.verify_job(job)?.state())?.ok_or(StoreError::Missing)?;
+        Ok(ingress::stored_job(&bytes)?)
+    }
+
+    fn write_state(&self, job: &JobId, state: &JobState) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(state).map_err(WireError::from)?;
+        state_file::write_bytes(&self.paths(job).state(), &bytes)?;
+        Ok(())
+    }
+
+    fn cleanup_orphans(&self, kind: OrphanKind) -> Result<(), StoreError> {
+        let directory = match kind {
+            OrphanKind::Staging => self.staging_dir(),
+            OrphanKind::Incoming => self.incoming_dir(),
+        };
+        for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
+            if index >= 1024 {
+                return Err(StoreError::Capacity);
+            }
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_name| StoreError::Corrupt)?;
+            JobId::try_from(name).map_err(|_invalid| StoreError::Corrupt)?;
+            match kind {
+                OrphanKind::Staging => state_file::set_aside(&entry.path(), &self.trash_dir())?,
+                OrphanKind::Incoming => {
+                    let Some(file) = state_file::open_read(&entry.path())? else {
+                        return Err(StoreError::Corrupt);
+                    };
+                    drop(file);
+                    state_file::remove_file(&entry.path())?;
+                }
+            }
         }
         Ok(())
     }
 
-    pub fn set_phase(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
-        crate::state_file::write_json(&self.job_dir(id).join("phase.json"), phase)?;
-        match phase {
-            Phase::Finished { .. } => self.purge_secrets(id),
-            Phase::Queued
-            | Phase::Preparing { .. }
-            | Phase::Starting { .. }
-            | Phase::Running { .. } => Ok(()),
+    pub(crate) fn receive_archive(
+        &self,
+        input: &mut impl Read,
+        snapshot: &wire::Snapshot,
+    ) -> Result<ReceivedArchive, StoreError> {
+        let lock = OsLock::exclusive(&self.incoming_lock())?;
+        self.cleanup_orphans(OrphanKind::Incoming)?;
+        let id = Self::new_job_id()?;
+        let path = self.incoming_dir().join(id.as_str());
+        state_file::create_empty(&path)?;
+        let mut file = state_file::open_append(&path)?;
+        let received = ReceivedArchive {
+            path,
+            descriptor: snapshot.clone(),
+            _lock: lock,
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut remaining = snapshot.bytes();
+        let mut buffer = [0_u8; 16_384];
+        while remaining != 0 {
+            let wanted =
+                usize::try_from(remaining.min(16_384)).map_err(|_length| StoreError::Capacity)?;
+            let chunk = buffer.get_mut(..wanted).ok_or(StoreError::Capacity)?;
+            let count = input.read(chunk)?;
+            if count == 0 {
+                return Err(StoreError::ArchiveMismatch);
+            }
+            file.write_all(chunk.get(..count).ok_or(StoreError::ArchiveMismatch)?)?;
+            hasher.update(chunk.get(..count).ok_or(StoreError::ArchiveMismatch)?);
+            remaining = remaining
+                .saturating_sub(u64::try_from(count).map_err(|_count| StoreError::Capacity)?);
         }
+        file.sync_all()?;
+        drop(file);
+        if hasher.finalize().to_hex().as_str() != snapshot.digest() {
+            return Err(StoreError::ArchiveMismatch);
+        }
+        Ok(received)
     }
 
-    pub fn phase(&self, id: &JobId) -> Result<Phase, StoreError> {
-        let phase: Phase = read_json(&self.job_dir(id).join("phase.json"))?;
-        if matches!(phase, Phase::Finished { .. }) {
-            return Ok(phase);
+    fn extract_archive(staged: &JobPaths, archive: &ReceivedArchive) -> Result<(), StoreError> {
+        let workspace = staged.workspace();
+        state_file::private_dir(&workspace)?;
+        let rooted = Rooted::open(&workspace)?;
+        let source = state_file::open_read(&archive.path)?.ok_or(StoreError::ArchiveMismatch)?;
+        let mut tar = tar::Archive::new(source);
+        let mut paths = BTreeSet::new();
+        let mut path_bytes = 0_usize;
+        let mut content_bytes = 0_u64;
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            if paths.len() >= 100_000 || !entry.header().entry_type().is_file() {
+                return Err(StoreError::ArchiveEntry);
+            }
+            let path = entry.path()?;
+            let text = path.to_str().ok_or(StoreError::ArchiveEntry)?;
+            let validated = RelativePath::try_from(text.to_owned())
+                .map_err(|_invalid| StoreError::ArchiveEntry)?;
+            path_bytes = path_bytes.saturating_add(validated.as_str().len());
+            if path_bytes > 16_777_216 || !paths.insert(validated.as_str().to_lowercase()) {
+                return Err(StoreError::ArchiveEntry);
+            }
+            let size = entry.header().size()?;
+            content_bytes = content_bytes.saturating_add(size);
+            if content_bytes > wire::MAX_SNAPSHOT_BYTES {
+                return Err(StoreError::ArchiveEntry);
+            }
+            rooted.make_parents(&validated)?;
+            let executable = entry.header().mode()? & 0o111 != 0;
+            let mut output = rooted.create_file(&validated, executable)?;
+            if std::io::copy(&mut entry, &mut output)? != size {
+                return Err(StoreError::ArchiveMismatch);
+            }
+            output.sync_all()?;
         }
-        let reserved = crate::state_file::read_bytes(&self.job_dir(id).join("outcome"))?;
-        let written = reserved.as_deref().map_or(&[][..], <[u8]>::trim_ascii);
-        if written.is_empty() {
-            return Ok(phase);
-        }
-        match crate::ingress::json::<Phase>(written) {
-            Ok(finished @ Phase::Finished { .. }) => Ok(finished),
-            Ok(_) | Err(_) => Ok(phase),
-        }
+        Ok(())
     }
 
-    pub fn record_outcome_in_place(&self, id: &JobId, phase: &Phase) -> Result<(), StoreError> {
-        let mut bytes = serde_json::to_vec(phase).map_err(|e| {
-            StoreError::from(crate::state_file::StateError::Io(
-                crate::failure::IoFailure {
-                    action: "encoding the outcome of",
-                    path: self.job_dir(id),
-                    source: std::io::Error::other(e),
+    fn stage(
+        &self,
+        job: &JobId,
+        request: &Request,
+        archive: Option<&ReceivedArchive>,
+    ) -> Result<(), StoreError> {
+        let staged = self.staged(job);
+        state_file::private_dir(&staged.dir)?;
+        match (request, archive) {
+            (
+                Request::Run {
+                    input: wire::Input::Snapshot(expected),
+                    ..
                 },
-            ))
-        })?;
-        if bytes.len() > OUTCOME_RESERVED {
-            return Err(StoreError::from(crate::state_file::StateError::Io(
-                crate::failure::IoFailure {
-                    action: "fitting the outcome into the space reserved for it in",
-                    path: self.job_dir(id),
-                    source: std::io::Error::other("the outcome is longer than its reserved space"),
+                Some(archive),
+            ) if archive.descriptor == *expected => Self::extract_archive(&staged, archive)?,
+            (
+                Request::Run {
+                    input: wire::Input::Home,
+                    ..
                 },
-            )));
+                None,
+            ) => {}
+            (
+                Request::Run {
+                    input: wire::Input::Snapshot(_),
+                    ..
+                },
+                None | Some(_),
+            )
+            | (
+                Request::Run {
+                    input: wire::Input::Home,
+                    ..
+                },
+                Some(_),
+            )
+            | (
+                Request::Hello
+                | Request::Chat(_)
+                | Request::List
+                | Request::Status { .. }
+                | Request::Logs { .. }
+                | Request::Wait { .. }
+                | Request::Kill { .. }
+                | Request::Clean { .. },
+                _,
+            ) => return Err(StoreError::ArchiveMismatch),
         }
-        bytes.resize(OUTCOME_RESERVED, b' ');
-        crate::state_file::overwrite_in_place(&self.job_dir(id).join("outcome"), &bytes)?;
-        self.purge_secrets(id)
+        let encoded = wire::frame(request)?;
+        state_file::write_bytes(&staged.spec(), wire::payload(&encoded)?)?;
+        let initial = serde_json::to_vec(&JobState::accepted()).map_err(WireError::from)?;
+        state_file::write_bytes(&staged.state(), &initial)?;
+        state_file::write_bytes(
+            &staged.order(),
+            self.next_sequence()?.to_string().as_bytes(),
+        )?;
+        state_file::publish_dir(&staged.dir, &self.paths(job).dir)?;
+        Ok(())
     }
 
-    fn supervisor(&self, id: &JobId) -> Result<Supervisor, StoreError> {
-        match OsLock::probe(&self.alive_path(id))? {
-            crate::lock::Probe::Held => Ok(Supervisor::Alive),
-            crate::lock::Probe::Absent | crate::lock::Probe::Free => Ok(Supervisor::Gone),
-        }
-    }
-
-    pub fn earlier_waiters(&self, waiting: &Spec) -> Result<Vec<JobId>, StoreError> {
-        let mut earlier = Vec::new();
-        for id in self.ids()? {
-            if id == waiting.id || self.skips_the_queue(&id)? {
-                continue;
+    pub(crate) fn reserve(
+        &self,
+        submission: &SubmissionId,
+        request: &Request,
+        archive: Option<&ReceivedArchive>,
+    ) -> Result<JobId, StoreError> {
+        let _admission = OsLock::exclusive(&self.admission_lock())?;
+        self.cleanup_orphans(OrphanKind::Staging)?;
+        let job = JobId::from(submission);
+        match std::fs::symlink_metadata(self.paths(&job).dir) {
+            Ok(_existing) => {
+                self.verify_job(&job)?;
+                if self.read_request(&job)? != *request {
+                    return Err(StoreError::Conflict);
+                }
+                return Ok(job);
             }
-            let spec = self.spec(&id)?;
-            if spec.sequence >= waiting.sequence
-                || !matches!(self.phase(&id)?, Phase::Queued)
-                || !matches!(self.supervisor(&id)?, Supervisor::Alive)
-            {
-                continue;
-            }
-            earlier.push((spec.sequence, id));
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
         }
-        earlier.sort_by_key(|(sequence, _)| *sequence);
-        Ok(earlier.into_iter().map(|(_, id)| id).collect())
+        self.reclaim()?;
+        if self.list()?.len() >= 1024 {
+            return Err(StoreError::Capacity);
+        }
+        self.stage(&job, request, archive)?;
+        Ok(job)
     }
 
-    pub fn job(&self, id: &JobId) -> Result<Job, StoreError> {
-        let supervisor = self.supervisor(id)?;
-        let spec = self.spec(id)?;
-        let phase = self.phase(id)?;
-        let behind = match (&phase, supervisor) {
-            (Phase::Queued, Supervisor::Alive) => self.slot_holders(&spec),
-            _ => Vec::new(),
+    pub(crate) fn list(&self) -> Result<Vec<JobId>, StoreError> {
+        let mut jobs = Vec::new();
+        for entry in std::fs::read_dir(self.jobs_dir())? {
+            let entry = entry?;
+            if jobs.len() >= 1024 {
+                return Err(StoreError::Capacity);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_name| StoreError::Corrupt)?;
+            let job = JobId::try_from(name).map_err(|_invalid| StoreError::Corrupt)?;
+            state_file::private_dir(&entry.path())?;
+            jobs.push(job);
+        }
+        jobs.sort();
+        Ok(jobs)
+    }
+
+    pub(crate) fn transition(&self, job: &JobId, event: &Event) -> Result<JobState, StoreError> {
+        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let mut state = self.read_state(job)?;
+        state.advance(event)?;
+        self.write_state(job, &state)?;
+        Ok(state)
+    }
+
+    pub(crate) fn finish_launch_failure(
+        &self,
+        job: &JobId,
+        reason: RemoteText,
+    ) -> Result<(), StoreError> {
+        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let mut state = self.read_state(job)?;
+        match state.kind() {
+            PhaseKind::Accepted | PhaseKind::Starting => {
+                state.advance(&Event::LaunchFailed { reason })?;
+                self.write_state(job, &state)?;
+            }
+            PhaseKind::Running | PhaseKind::Finished => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn status(&self, job: &JobId) -> Result<JobState, StoreError> {
+        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let mut state = self.read_state(job)?;
+        match state.kind() {
+            PhaseKind::Accepted | PhaseKind::Finished => Ok(state),
+            PhaseKind::Starting | PhaseKind::Running => {
+                match OsLock::probe(&self.paths(job).alive_lock())? {
+                    Probe::Held => Ok(state),
+                    Probe::Absent | Probe::Free => {
+                        state.advance(&Event::SupervisorGone)?;
+                        self.write_state(job, &state)?;
+                        Ok(state)
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn worker_lock(&self, job: &JobId) -> Result<Option<OsLock>, StoreError> {
+        Ok(OsLock::try_exclusive(&self.verify_job(job)?.alive_lock())?)
+    }
+
+    pub(crate) fn launch_lock(&self, job: &JobId) -> Result<OsLock, StoreError> {
+        Ok(OsLock::exclusive(&self.verify_job(job)?.launch_lock())?)
+    }
+
+    pub(crate) fn request_cancel(&self, job: &JobId) -> Result<(), StoreError> {
+        state_file::write_bytes(&self.verify_job(job)?.cancel(), &[])?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_requested(&self, job: &JobId) -> Result<bool, StoreError> {
+        Ok(state_file::open_read(&self.verify_job(job)?.cancel())?.is_some())
+    }
+
+    pub(crate) fn watch_dir(&self, job: &JobId) -> Result<PathBuf, StoreError> {
+        Ok(self.verify_job(job)?.dir)
+    }
+
+    pub(crate) fn request(&self, job: &JobId) -> Result<Request, StoreError> {
+        self.read_request(job)
+    }
+
+    pub(crate) fn log_path(&self, job: &JobId) -> PathBuf {
+        self.paths(job).log()
+    }
+
+    pub(crate) fn supervisor_log_path(&self, job: &JobId) -> Result<PathBuf, StoreError> {
+        Ok(self.verify_job(job)?.supervisor_log())
+    }
+
+    pub(crate) fn workspace(&self, job: &JobId) -> Result<PathBuf, StoreError> {
+        Self::verified_directory(self.verify_job(job)?.workspace())
+    }
+
+    pub(crate) fn log_tail(&self, job: &JobId) -> Result<(RemoteText, u64), StoreError> {
+        let path = self.verify_job(job)?.log();
+        let Some(mut file) = state_file::open_read(&path)? else {
+            return Ok((
+                RemoteText::try_from(String::new()).map_err(|_invalid| StoreError::Corrupt)?,
+                0,
+            ));
         };
-        Ok(Job {
-            spec,
-            phase,
-            supervisor,
-            behind,
-            notes: self.notes(id)?,
-        })
+        let length = file.metadata()?.len();
+        let take = length.min(16_384);
+        let omitted = length.saturating_sub(take);
+        file.seek(SeekFrom::Start(omitted))?;
+        let size = usize::try_from(take).map_err(|_size| StoreError::Capacity)?;
+        let mut bytes = vec![0_u8; size];
+        file.read_exact(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        Ok((
+            RemoteText::try_from(text).map_err(|_invalid| StoreError::Corrupt)?,
+            omitted,
+        ))
     }
 
-    #[must_use]
-    pub fn notes_path(&self, id: &JobId) -> PathBuf {
-        self.job_dir(id).join("notes")
+    pub(crate) fn wait(&self, job: &JobId) -> Result<JobState, StoreError> {
+        let lock = OsLock::exclusive(&self.verify_job(job)?.alive_lock())?;
+        drop(lock);
+        self.status(job)
     }
 
-    fn notes(&self, id: &JobId) -> Result<Vec<crate::terminal::RemoteText>, StoreError> {
-        let Some(bytes) = crate::state_file::read_bytes(&self.notes_path(id))? else {
-            return Ok(Vec::new());
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
-        Ok(lines
-            .get(lines.len().saturating_sub(NOTES_KEPT)..)
-            .unwrap_or_default()
-            .iter()
-            .map(|line| crate::terminal::RemoteText::new((*line).to_owned()))
-            .collect())
-    }
-
-    #[must_use]
-    pub fn slot_holder_path(slot_lock: &Path) -> PathBuf {
-        slot_lock.with_extension("holder")
-    }
-
-    fn slot_holders(&self, waiting: &Spec) -> Vec<JobId> {
-        let slots = self.area("slots");
-        let Ok(entries) = std::fs::read_dir(&slots) else {
-            return Vec::new();
-        };
-        let mut names: Vec<std::ffi::OsString> =
-            entries.flatten().map(|entry| entry.file_name()).collect();
-        names.sort();
-        let mut holders = Vec::new();
-        for name in names {
-            let Some(index) = name.to_str().and_then(|name| name.strip_suffix(".holder")) else {
-                continue;
-            };
-            let Ok(index) = index.parse::<usize>() else {
-                continue;
-            };
-            let lock = slots.join(format!("{index}.lock"));
-            if !matches!(OsLock::probe(&lock), Ok(crate::lock::Probe::Held)) {
-                continue;
-            }
-            let Ok(Some(bytes)) = crate::state_file::read_bytes(&slots.join(&name)) else {
-                continue;
-            };
-            let Ok(holder) = String::from_utf8_lossy(bytes.trim_ascii()).parse::<JobId>() else {
-                continue;
-            };
-            if holder != waiting.id && self.holds_on(&holder) {
-                holders.push(holder);
-            }
+    fn clean_one(&self, job: &JobId) -> Result<bool, StoreError> {
+        let launch = self.launch_lock(job)?;
+        if self.status(job)?.kind() != PhaseKind::Finished {
+            return Ok(false);
         }
-        holders.sort();
-        holders.dedup();
-        holders
+        let paths = self.verify_job(job)?;
+        let alive = OsLock::exclusive(&paths.alive_lock())?;
+        drop(alive);
+        drop(launch);
+        state_file::set_aside(&paths.dir, &self.trash_dir())?;
+        Ok(true)
     }
 
-    fn holds_on(&self, holder: &JobId) -> bool {
-        matches!(self.supervisor(holder), Ok(Supervisor::Alive))
-            && !matches!(self.phase(holder), Ok(Phase::Finished { .. }) | Err(_))
-    }
-
-    pub fn ids(&self) -> Result<Vec<JobId>, StoreError> {
-        let dir = self.root.join("jobs");
-        crate::faults::at("store::list", &dir).map_err(io("listing", &dir))?;
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&dir).map_err(io("listing", &dir))? {
-            let entry = entry.map_err(io("listing", &dir))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            match name.parse::<JobId>() {
-                Ok(id) => ids.push(id),
-                Err(_not_a_job) => {}
+    pub(crate) fn clean(&self, target: &CleanTarget) -> Result<u16, StoreError> {
+        let _admission = OsLock::exclusive(&self.admission_lock())?;
+        match target {
+            CleanTarget::Job(job) => {
+                let cleaned = self.clean_one(job)?;
+                self.empty_trash();
+                if cleaned {
+                    Ok(1)
+                } else {
+                    Err(StoreError::Active)
+                }
             }
-        }
-        Ok(ids)
-    }
-
-    pub fn resolve(&self, reference: &JobRef) -> Result<JobId, StoreError> {
-        let mut matching: Vec<JobId> = self
-            .ids()?
-            .into_iter()
-            .filter(|id| id.matches(reference))
-            .collect();
-        match (matching.pop(), matching.len()) {
-            (Some(only), 0) => Ok(only),
-            (Some(_), others) => Err(StoreError::Ambiguous {
-                reference: reference.clone(),
-                count: others.saturating_add(1),
-            }),
-            (None, _) => Err(StoreError::NoSuchJob(reference.clone())),
+            CleanTarget::Finished => {
+                let mut count = 0_u16;
+                for job in self.list()? {
+                    if self.clean_one(&job)? {
+                        count = count.checked_add(1).ok_or(StoreError::Capacity)?;
+                    }
+                }
+                self.empty_trash();
+                Ok(count)
+            }
         }
     }
 }
 
-impl crate::ingress::Ingress for Sequence {}
-impl crate::ingress::Ingress for LaunchEnv {}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::{Path, PathBuf};
 
-    #[test]
-    fn a_job_keeps_its_last_notes_apart_from_its_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
-        store
-            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
-            .unwrap();
-        store.publish(&id).unwrap();
-        let mut notes = crate::state_file::open_append(&store.notes_path(&id)).unwrap();
-        for n in 0..30 {
-            std::io::Write::write_all(&mut notes, format!("note {n}\n").as_bytes()).unwrap();
-        }
-        let job = store.job(&id).unwrap();
-        assert_eq!(job.notes.len(), NOTES_KEPT);
-        assert_eq!(job.notes.last().unwrap().to_string(), "note 29");
-        assert!(
-            crate::state_file::read_bytes(&store.log_path(&id))
-                .unwrap()
-                .unwrap()
-                .is_empty()
-        );
-    }
-    use crate::domain::Concurrency;
-    use crate::protocol::{Command, Location};
+    use domyjob_core::domain::{Command, JobId, RemoteText, SubmissionId};
+    use domyjob_core::state::{Event, JobState, Outcome};
+    use domyjob_core::wire::{self, Input, Request, Snapshot};
 
-    #[test]
-    fn a_job_inherits_only_the_explicit_base_environment_allowlist() {
-        let launch = LaunchEnv::from_vars([
-            ("PATH".into(), "/bin".into()),
-            ("LC_ALL".into(), "C".into()),
-            ("ProgramFiles(x86)".into(), "C:/Program Files (x86)".into()),
-            ("USERPROFILE".into(), "C:/Users/me".into()),
-            ("DOMYJOB_CI_CANARY".into(), "must-not-leak".into()),
-            ("SSH_CONNECTION".into(), "secret-session-detail".into()),
-        ]);
-        assert_eq!(launch.vars.get("PATH").map(String::as_str), Some("/bin"));
-        assert_eq!(launch.vars.get("LC_ALL").map(String::as_str), Some("C"));
-        assert_eq!(
-            launch.vars.get("ProgramFiles(x86)").map(String::as_str),
-            Some("C:/Program Files (x86)")
-        );
-        assert_eq!(
-            launch.vars.get("USERPROFILE").map(String::as_str),
-            Some("C:/Users/me")
-        );
-        assert!(!launch.vars.contains_key("DOMYJOB_CI_CANARY"));
-        assert!(!launch.vars.contains_key("SSH_CONNECTION"));
-        if std::env::var_os("DOMYJOB_CI_CANARY").is_some() {
-            assert!(
-                !LaunchEnv::of_this_process()
-                    .vars
-                    .contains_key("DOMYJOB_CI_CANARY")
-            );
-        }
+    use super::{Store, state_file};
+
+    fn shown(path: &Path) -> String {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
-    fn spec(id: &JobId, sequence: u64) -> Spec {
-        Spec {
-            id: id.clone(),
-            name: None,
-            command: Command::Script("true".into()),
-            location: Location::Home,
-            env_names: std::collections::BTreeSet::new(),
-            shell: None,
-            concurrency: Concurrency::DEFAULT,
-            sequence,
-            submitted_by: crate::authz::Submitter::Owner,
-            submitted_at: crate::clock::Timestamp::observe(),
-        }
-    }
-
-    fn dirs(root: &Path) -> Dirs {
-        Dirs::for_test(root)
-    }
-
-    #[test]
-    fn an_outcome_written_into_its_reserved_space_is_the_jobs_phase() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0CCCCCCCCCCCCCCC".parse().unwrap();
-        store
-            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
-            .unwrap();
-        store.publish(&id).unwrap();
-        assert!(matches!(store.phase(&id).unwrap(), Phase::Queued));
-        let finished = Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(5),
-            outcome: crate::protocol::Outcome::Failed { exit_code: 3 },
+    fn specimen() -> String {
+        let store = Store {
+            root: PathBuf::from("runner"),
         };
-        store.record_outcome_in_place(&id, &finished).unwrap();
-        assert_eq!(store.phase(&id).unwrap(), finished);
-        let too_long = Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(5),
-            outcome: crate::protocol::Outcome::Errored {
-                reason: crate::terminal::RemoteText::new("x".repeat(OUTCOME_RESERVED)),
-            },
-        };
-        store.record_outcome_in_place(&id, &too_long).unwrap_err();
-        assert_eq!(store.phase(&id).unwrap(), finished);
-    }
-
-    fn staged(store: &Store, id: &JobId, sequence: u64) {
-        store
-            .stage(
-                &spec(id, sequence),
-                (&BTreeMap::new(), &LaunchEnv::default()),
-            )
-            .unwrap();
-    }
-
-    fn at(path: &Path) -> String {
-        path.display().to_string()
-    }
-
-    #[test]
-    fn a_failing_disk_is_an_error_everywhere_in_the_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tag = tmp
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        {
-            let _faults = crate::faults::inject(&[("state_file::dir", &tag)]);
-            Store::open(&dirs(tmp.path())).unwrap_err();
-        }
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0HHHHHHHHHHHHHHH".parse().unwrap();
-        let staging = store.staged_dir(&id);
-        for file in [
-            "spec.json",
-            "env.json",
-            "launch-env.json",
-            "phase.json",
-            "outcome",
-        ] {
-            let target = at(&staging.join(file));
-            let _faults = crate::faults::inject(&[("state_file::write", &target)]);
-            store
-                .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
-                .unwrap_err();
-            store.discard_staged(&id).unwrap();
-        }
-        for (site, target) in [
-            ("state_file::create", at(&staging.join("log"))),
-            ("state_file::dir", at(&staging)),
-            ("store::check", tag.clone()),
-        ] {
-            let _faults = crate::faults::inject(&[(site, &target)]);
-            store
-                .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
-                .unwrap_err();
-            store.discard_staged(&id).unwrap();
-        }
-        staged(&store, &id, 1);
-        {
-            let _faults = crate::faults::inject(&[
-                ("state_file::publish", &tag),
-                ("store::list", &tag),
-                ("state_file::remove", &tag),
-            ]);
-            store.publish(&id).unwrap_err();
-            store.staged_ids().unwrap_err();
-            store.discard_staged(&id).unwrap_err();
-            store.forget_staging_lock(&id).unwrap_err();
-        }
-        store.publish(&id).unwrap();
-        {
-            let _faults = crate::faults::inject(&[
-                ("state_file::read", &tag),
-                ("store::list", &tag),
-                ("state_file::lock", &tag),
-                ("state_file::overwrite", &tag),
-                ("state_file::remove", &tag),
-            ]);
-            store.is_published(&id).unwrap_err();
-            store.record_start_failure(&id, "x").unwrap_err();
-            store.start_failure(&id).unwrap_err();
-            store.phase(&id).unwrap_err();
-            store.job(&id).unwrap_err();
-            store.ids().unwrap_err();
-            store.resolve(&id.as_str().parse().unwrap()).unwrap_err();
-            store.next_sequence().unwrap_err();
-            store
-                .record_outcome_in_place(&id, &Phase::Queued)
-                .unwrap_err();
-            store.remove_job(&id).unwrap_err();
-        }
-        {
-            let outcome = at(&store.job_dir(&id).join("outcome"));
-            let _faults = crate::faults::inject(&[("state_file::read", &outcome)]);
-            store.phase(&id).unwrap_err();
-        }
-        store.remove_job(&id).unwrap();
-        assert!(store.ids().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_fault_in_one_file_of_a_job_is_an_error_about_that_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0MMMMMMMMMMMMMMM".parse().unwrap();
-        staged(&store, &id, 1);
-        store.publish(&id).unwrap();
-        let failure = at(&store.job_dir(&id).join("failure"));
-        {
-            let _faults = crate::faults::inject(&[
-                ("state_file::write", &failure),
-                ("state_file::read", &failure),
-            ]);
-            store.record_start_failure(&id, "x").unwrap_err();
-            store.start_failure(&id).unwrap_err();
-        }
-        {
-            let phase = at(&store.job_dir(&id).join("phase.json"));
-            let _faults = crate::faults::inject(&[("state_file::read", &phase)]);
-            store.job(&id).unwrap_err();
-        }
-        for doomed in [store.control_path(&id), store.alive_path(&id)] {
-            let target = at(&doomed);
-            let _faults = crate::faults::inject(&[("state_file::remove", &target)]);
-            store.remove_job(&id).unwrap_err();
-        }
-    }
-
-    #[test]
-    fn a_start_failure_is_found_before_and_after_publishing_and_files_go_with_their_job() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0JJJJJJJJJJJJJJJ".parse().unwrap();
-        staged(&store, &id, 1);
-        assert!(!store.is_published(&id).unwrap());
-        store.record_start_failure(&id, "no shell").unwrap();
-        assert_eq!(
-            store.start_failure(&id).unwrap().as_deref(),
-            Some("no shell")
-        );
-        store.publish(&id).unwrap();
-        assert!(store.is_published(&id).unwrap());
-        assert_eq!(
-            store.start_failure(&id).unwrap().as_deref(),
-            Some("no shell")
-        );
-        store.record_start_failure(&id, "no slot").unwrap();
-        assert_eq!(
-            store.start_failure(&id).unwrap().as_deref(),
-            Some("no slot")
-        );
-        assert_eq!(
-            store.control_path(&id),
-            store.area("live").join(format!("{id}.sock"))
-        );
-
-        crate::state_file::write_bytes(&store.alive_path(&id), b"").unwrap();
-        crate::state_file::write_bytes(&store.control_path(&id), b"").unwrap();
-        store.remove_job(&id).unwrap();
-        assert!(
-            crate::state_file::read_bytes(&store.alive_path(&id))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            crate::state_file::read_bytes(&store.control_path(&id))
-                .unwrap()
-                .is_none()
-        );
-
-        crate::state_file::write_bytes(&store.staging_lock_path(&id), b"").unwrap();
-        store.forget_staging_lock(&id).unwrap();
-        assert!(
-            crate::state_file::read_bytes(&store.staging_lock_path(&id))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_written_phase_outranks_the_reserved_outcome_and_an_exact_fit_is_kept() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0KKKKKKKKKKKKKKK".parse().unwrap();
-        staged(&store, &id, 1);
-        store.publish(&id).unwrap();
-        let written = Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(1),
-            outcome: crate::protocol::Outcome::Succeeded,
-        };
-        let reserved = Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(2),
-            outcome: crate::protocol::Outcome::Killed,
-        };
-        store.set_phase(&id, &written).unwrap();
-        store.record_outcome_in_place(&id, &reserved).unwrap();
-        assert_eq!(store.phase(&id).unwrap(), written);
-
-        let errored = |length: usize| Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(3),
-            outcome: crate::protocol::Outcome::Errored {
-                reason: crate::terminal::RemoteText::new("x".repeat(length)),
-            },
-        };
-        let bare = serde_json::to_vec(&errored(0)).unwrap().len();
-        let exact = errored(OUTCOME_RESERVED.saturating_sub(bare));
-        assert_eq!(serde_json::to_vec(&exact).unwrap().len(), OUTCOME_RESERVED);
-        store.set_phase(&id, &Phase::Queued).unwrap();
-        store.record_outcome_in_place(&id, &exact).unwrap();
-        assert_eq!(store.phase(&id).unwrap(), exact);
-    }
-
-    #[test]
-    fn a_jobs_area_that_is_not_a_directory_is_an_error_to_list_and_on_unix_to_stage_into() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let jobs = store.area("jobs");
-        crate::state_file::remove_dir_all(&jobs).unwrap();
-        crate::state_file::write_bytes(&jobs, b"").unwrap();
-        store.ids().unwrap_err();
-        let id: JobId = "0NNNNNNNNNNNNNNN".parse().unwrap();
-        let staged = store.stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()));
-        if crate::platform::MODES {
-            assert!(
-                matches!(
-                    staged,
-                    Err(StoreError::Io(crate::failure::IoFailure {
-                        action: "checking",
-                        ..
-                    }))
-                ),
-                "{staged:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_job_marked_to_skip_the_queue_keeps_the_mark_when_published() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let [now, queued]: [JobId; 2] =
-            ["0PPPPPPPPPPPPPPP", "0QQQQQQQQQQQQQQQ"].map(|id| id.parse().unwrap());
-        for (sequence, id) in (1..).zip([&now, &queued]) {
-            store
-                .stage(
-                    &spec(id, sequence),
-                    (&BTreeMap::new(), &LaunchEnv::default()),
-                )
-                .unwrap();
-        }
-        store.skip_the_queue(&now).unwrap();
-        for id in [&now, &queued] {
-            store.publish(id).unwrap();
-        }
-        assert!(store.skips_the_queue(&now).unwrap());
-        assert!(!store.skips_the_queue(&queued).unwrap());
-    }
-
-    #[test]
-    fn a_queued_job_names_the_live_jobs_holding_its_slots() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let [waiting, holding, done, outside]: [JobId; 4] = [
-            "0HHHHHHHHHHHHHHH",
-            "0JJJJJJJJJJJJJJJ",
-            "0KKKKKKKKKKKKKKK",
-            "0MMMMMMMMMMMMMMM",
+        let job = JobId::try_from("0".repeat(32)).unwrap();
+        let mut lines: Vec<String> = [
+            store.jobs_dir(),
+            store.staging_dir(),
+            store.incoming_dir(),
+            store.trash_dir(),
+            store.incoming_lock(),
+            store.admission_lock(),
+            store.sequence(),
+            store.opened_path(),
         ]
-        .map(|id| id.parse().unwrap());
-        let mut alive = Vec::new();
-        for (sequence, id) in (1..).zip([&waiting, &holding, &done, &outside]) {
-            store
-                .stage(
-                    &spec(id, sequence),
-                    (&BTreeMap::new(), &LaunchEnv::default()),
-                )
+        .iter()
+        .map(|path| format!("path {}", shown(path)))
+        .collect();
+        for paths in [store.paths(&job), store.staged(&job)] {
+            for path in [
+                paths.spec(),
+                paths.state(),
+                paths.state_lock(),
+                paths.alive_lock(),
+                paths.launch_lock(),
+                paths.cancel(),
+                paths.log(),
+                paths.supervisor_log(),
+                paths.workspace(),
+                paths.order(),
+            ] {
+                lines.push(format!("path {}", shown(&path)));
+            }
+        }
+        for input in [
+            Input::Home,
+            Input::Snapshot(Snapshot::new(1, "0".repeat(64)).unwrap()),
+        ] {
+            let request = Request::Run {
+                submission: SubmissionId::try_from("1".repeat(32)).unwrap(),
+                command: Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap(),
+                input,
+            };
+            let framed = wire::frame(&request).unwrap();
+            lines.push(format!(
+                "request {}",
+                String::from_utf8(wire::payload(&framed).unwrap().to_vec()).unwrap()
+            ));
+        }
+        let reason = RemoteText::try_from("no such program".to_owned()).unwrap();
+        let mut running = JobState::accepted();
+        let mut states = vec![running.clone()];
+        running.advance(&Event::Starting).unwrap();
+        states.push(running.clone());
+        let mut launch_failed = running.clone();
+        launch_failed
+            .advance(&Event::LaunchFailed { reason })
+            .unwrap();
+        states.push(launch_failed);
+        running.advance(&Event::Spawned { pid: 42 }).unwrap();
+        states.push(running.clone());
+        for ending in [
+            Event::Exited { code: 0 },
+            Event::Exited { code: 3 },
+            Event::SupervisorGone,
+            Event::Killed,
+        ] {
+            let mut finished = running.clone();
+            finished.advance(&ending).unwrap();
+            states.push(finished);
+        }
+        for state in states {
+            lines.push(format!("state {}", serde_json::to_string(&state).unwrap()));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn the_runner_format_is_its_specimen() {
+        crate::formats::check("runner", &specimen());
+    }
+
+    fn store(temporary: &tempfile::TempDir) -> Store {
+        let root = temporary.path().join("state");
+        for directory in ["", "jobs", "staging", "incoming", "trash"] {
+            state_file::private_dir(&root.join(directory)).expect("private store directory");
+        }
+        Store { root }
+    }
+
+    fn admit_finished(store: &Store, submission: String) -> JobId {
+        let submission = SubmissionId::try_from(submission).unwrap();
+        let request = Request::Run {
+            submission: submission.clone(),
+            command: Command::try_from(vec!["true".to_owned()]).unwrap(),
+            input: Input::Home,
+        };
+        let job = store.reserve(&submission, &request, None).unwrap();
+        store
+            .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
+            .unwrap();
+        job
+    }
+
+    #[test]
+    fn stores_of_other_formats_go_once_idle_and_older_than_the_last_opened() {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = crate::layout::State::at(&temporary.path().join("state"));
+        let other = |digit: u64| {
+            temporary
+                .path()
+                .join("state")
+                .join(format!("runner-{digit:016}"))
+        };
+        for (digit, opened) in [
+            (1, Some(1)),
+            (2, Some(2)),
+            (3, Some(3)),
+            (4, Some(4)),
+            (5, None),
+        ] {
+            let root = other(digit);
+            state_file::private_dir(&root.join("jobs").join("a")).unwrap();
+            crate::testing::write(
+                &root
+                    .join("jobs")
+                    .join("a")
+                    .join("workspace")
+                    .join("Cargo.lock"),
+                "",
+            );
+            if let Some(place) = opened {
+                state_file::write_bytes(&root.join("opened"), format!("{place}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let running =
+            crate::lock::OsLock::exclusive(&other(1).join("jobs").join("a").join("alive.lock"))
                 .unwrap();
-            store.publish(id).unwrap();
-            alive.push(OsLock::exclusive(&store.alive_path(id)).unwrap());
-        }
-        let running = Phase::Running {
-            started_at: crate::clock::Timestamp::at_millis(1),
-            pid: 1,
-            workspace: String::new(),
-        };
-        store.set_phase(&holding, &running).unwrap();
-        store.set_phase(&outside, &running).unwrap();
-        store
-            .set_phase(
-                &done,
-                &Phase::Finished {
-                    started_at: None,
-                    finished_at: crate::clock::Timestamp::at_millis(2),
-                    outcome: crate::protocol::Outcome::Succeeded,
-                },
-            )
-            .unwrap();
-        assert!(store.job(&waiting).unwrap().behind.is_empty());
-
-        let slots = store.area("slots");
-        let holder = |name: &str, bytes: &[u8]| {
-            crate::state_file::write_bytes(&slots.join(name), bytes).unwrap();
-        };
-        holder("0.holder", done.as_str().as_bytes());
-        holder("0.lock", b"");
-        crate::state_file::private_dir(&slots.join("01.holder")).unwrap();
-        holder("0a.holder", holding.as_str().as_bytes());
-        holder("1.holder", b"not a job");
-        holder("10.holder", outside.as_str().as_bytes());
-        holder("2.holder", waiting.as_str().as_bytes());
-        crate::state_file::write_bytes(
-            &Store::slot_holder_path(&slots.join("3.lock")),
-            holding.as_str().as_bytes(),
-        )
-        .unwrap();
-        holder("4.holder", outside.as_str().as_bytes());
-        holder("x.holder", outside.as_str().as_bytes());
-        let slot = OsLock::exclusive(&slots.join("3.lock")).unwrap();
         assert_eq!(
-            store.job(&waiting).unwrap().behind,
-            std::slice::from_ref(&holding)
+            super::prune_other_formats(&state).unwrap(),
+            [other(2), other(5)]
         );
-        assert!(store.job(&holding).unwrap().behind.is_empty());
-        slot.release().unwrap();
-
-        for lock in alive {
-            lock.release().unwrap();
+        for kept in [1, 3, 4] {
+            assert!(crate::testing::is_dir(&other(kept)));
         }
-        assert!(store.job(&waiting).unwrap().behind.is_empty());
+        drop(running);
+        assert_eq!(super::prune_other_formats(&state).unwrap(), [other(1)]);
     }
 
     #[test]
-    fn when_the_phase_cannot_be_written_the_reserved_outcome_still_is() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        let id: JobId = "0GGGGGGGGGGGGGGG".parse().unwrap();
-        store
-            .stage(&spec(&id, 1), (&BTreeMap::new(), &LaunchEnv::default()))
-            .unwrap();
-        store.publish(&id).unwrap();
-        let finished = Phase::Finished {
-            started_at: None,
-            finished_at: crate::clock::Timestamp::at_millis(9),
-            outcome: crate::protocol::Outcome::Succeeded,
-        };
-        let full = store.job_dir(&id).join("phase.json").display().to_string();
-        let _faults = crate::faults::inject(&[("state_file::write", &full)]);
-        store.set_phase(&id, &finished).unwrap_err();
-        store.record_outcome_in_place(&id, &finished).unwrap();
-        assert_eq!(store.phase(&id).unwrap(), finished);
+    fn admissions_keep_only_the_newest_finished_jobs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = store(&temporary);
+        let digits: Vec<char> = "0123456789abcdef".chars().collect();
+        let mut admitted = Vec::new();
+        for first in &digits {
+            for second in digits.iter().take(3) {
+                admitted.push(admit_finished(
+                    &store,
+                    format!("{first}{second}").repeat(16),
+                ));
+            }
+        }
+        let last = admit_finished(&store, "f".repeat(32));
+        admitted.push(last);
+        let kept = store.list().unwrap();
+        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
+        let newest: std::collections::BTreeSet<_> = admitted
+            .iter()
+            .rev()
+            .take(super::KEEP_FINISHED.saturating_add(1))
+            .cloned()
+            .collect();
+        assert_eq!(
+            kept.into_iter().collect::<std::collections::BTreeSet<_>>(),
+            newest
+        );
     }
 
     #[test]
-    fn jobs_appear_only_when_published_and_resolve_by_prefix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open(&dirs(tmp.path())).unwrap();
-        assert_eq!(store.next_sequence().unwrap(), 1);
-        assert_eq!(store.next_sequence().unwrap(), 2);
-        let a: JobId = "0AAAAAAAAAAAAAAA".parse().unwrap();
-        let b: JobId = "0BBBBBBBBBBBBBBB".parse().unwrap();
-        let env = BTreeMap::new();
-        store
-            .stage(&spec(&a, 1), (&env, &LaunchEnv::default()))
-            .unwrap();
-        assert!(store.ids().unwrap().is_empty());
-        store.publish(&a).unwrap();
-        store
-            .stage(&spec(&b, 2), (&env, &LaunchEnv::default()))
-            .unwrap();
-        store.publish(&b).unwrap();
-        assert!(matches!(
-            store.stage(&spec(&a, 3), (&env, &LaunchEnv::default())),
-            Err(StoreError::Exists(_))
-        ));
-        assert_eq!(store.resolve(&a.clone().into()).unwrap(), a);
-        assert!(matches!(
-            store.resolve(&JobRef::parse_loose("0").unwrap()),
-            Err(StoreError::Ambiguous { count: 2, .. })
-        ));
-        assert!(matches!(
-            store.resolve(&JobRef::parse_loose("Z").unwrap()),
-            Err(StoreError::NoSuchJob(_))
-        ));
-        assert_eq!(store.job(&b).unwrap().supervisor, Supervisor::Gone);
+    fn a_finished_job_whose_files_cannot_be_removed_never_stops_admission() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = store(&temporary);
+        let admit = |index: usize| admit_finished(&store, format!("{index:032x}"));
+        let oldest = admit(0);
+        let protected = store.paths(&oldest).workspace().join("pkg");
+        crate::testing::write(&protected.join("package.json"), "{}");
+        let permissions = crate::testing::protect(&protected);
+        for index in 1..=super::KEEP_FINISHED {
+            admit(index);
+        }
+        let newest = admit(super::KEEP_FINISHED.saturating_add(1));
+        let kept = store.list().unwrap();
+        assert!(!kept.contains(&oldest), "the oldest job left in one step");
+        assert!(kept.contains(&newest));
+        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
+        for leftover in state_file::empty(&store.trash_dir()).unwrap() {
+            crate::testing::restore(
+                &leftover.path.join("workspace").join("pkg"),
+                permissions.clone(),
+            );
+        }
+        assert!(state_file::empty(&store.trash_dir()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_supervisor_start_is_terminal_and_idempotent() {
+        for starting in [false, true] {
+            let temporary = tempfile::tempdir().expect("temporary state root");
+            let root = temporary.path().join("state");
+            for directory in ["", "jobs", "staging", "incoming"] {
+                state_file::private_dir(&root.join(directory)).expect("private store directory");
+            }
+            let store = Store { root };
+            let submission = SubmissionId::try_from("1".repeat(32)).expect("submission ID");
+            let request = Request::Run {
+                submission: submission.clone(),
+                command: Command::try_from(vec!["missing".to_owned()]).expect("command"),
+                input: Input::Home,
+            };
+            let job = store
+                .reserve(&submission, &request, None)
+                .expect("reserved job");
+            if starting {
+                store.transition(&job, &Event::Starting).expect("start");
+            }
+            let reason = RemoteText::try_from("worker initialization failed".to_owned())
+                .expect("failure reason");
+            store
+                .finish_launch_failure(&job, reason.clone())
+                .expect("terminal launch failure");
+            let outcome = Outcome::LaunchFailed { reason };
+            assert_eq!(
+                store.wait(&job).expect("completed job").outcome(),
+                Some(&outcome)
+            );
+            store
+                .finish_launch_failure(
+                    &job,
+                    RemoteText::try_from("later failure".to_owned()).expect("later reason"),
+                )
+                .expect("repeat failure report");
+            assert_eq!(
+                store.status(&job).expect("stable state").outcome(),
+                Some(&outcome)
+            );
+        }
     }
 }

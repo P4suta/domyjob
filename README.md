@@ -1,54 +1,38 @@
 # domyjob
 
-Send your work to any machine you can reach, run it there, and walk away.
-
-```console
-$ domyjob
-$ domyjob run linux,win -- cargo test
-$ domyjob ls
-$ domyjob digest win:latest
-$ domyjob on win -- Get-ChildItem Downloads
-```
-
-It sends the directory as it is, uncommitted edits included, and the command keeps running there after you disconnect.
-Nothing to host: one binary on your machine, and any host you can ssh into.
+Persistent jobs and AI agent chat over SSH.
+Jobs keep running after you disconnect.
 
 ## Install
 
-```console
-$ cargo install --git https://github.com/P4suta/domyjob domyjob
+Build from source with [mise](https://mise.jdx.dev/):
+
+```sh
+git clone https://github.com/P4suta/domyjob.git
+cd domyjob
+mise x -- cargo install --locked --path crates/domyjob
 ```
 
-Add a host your ssh config knows with `domyjob machines add NAME`, or reach it directly as `ssh:HOST`.
-`domyjob doctor` checks them, and the first contact installs domyjob there.
+Remote machines need OpenSSH, mise, Rust, and Cargo.
 
-## Use
+## Jobs
 
-| Command | Does |
-| --- | --- |
-| *(none)* | Every machine at a glance: load, memory, disk, what runs, what failed, and what to do next |
-| `run MACHINES -- CMD` | Send this directory and run a job; `--wait` stays for the result |
-| `on MACHINES -- CMD` | Run a command right now and print its output, like ssh |
-| `ls`, `status`, `digest`, `logs` | See jobs, their outcome, and their output |
-| `history` | How each kind of job has gone lately: outcomes, success rate, typical duration |
-| `wait`, `kill`, `get` | Wait for a job, stop it, fetch a file from its workspace |
-| `pull JOB` | Bring the files a finished job changed back here, to commit and push with your own keys |
-| `machines`, `setup`, `doctor` | Name machines, install domyjob on them, check them |
-| `clean`, `machines pause` | Free the disk space domyjob holds; stop a machine taking jobs for maintenance |
+Use an SSH host alias such as `linux` to run the current directory remotely:
 
-`MACHINES` is a name, `@all`, a label such as `gpu`, or a fact such as `os=windows`.
+```sh
+domyjob run linux -- cargo test
+domyjob logs linux:JOB_ID
+```
 
-## For agents
+## Chat
 
-`domyjob skill` prints a portable Agent Skill, and `domyjob skill install --to path/to/agent/skills/domyjob` writes it to any skills directory you choose.
-The same file works with Codex, Claude Code, OpenCode, and other agents that read Agent Skills; domyjob does not choose or require one of them.
-`domyjob mcp` serves the same operations as MCP tools, and `--json` gives one stable shape.
+Connect installed AI clients and discover agents:
 
-`domyjob --help` and `domyjob COMMAND --help` explain the rest; `domyjob man` prints the manual page.
+```sh
+domyjob chat setup linux win
+domyjob chat directory
+```
 
-For a pipeline whose status must include domyjob's result, enable the shell's pipefail behavior first, for example `set -o pipefail; domyjob run linux --wait -- make check | tee check.log`.
+See the [documentation](docs/engineering.md) and [chat guide](docs/chat-architecture.md).
 
-Granting a paired peer `submit` lets that peer run commands as your account on this machine.
-Grant only the capabilities that peer needs, and revoke the pairing if it is lost or compromised.
-
-Licensed under Apache-2.0 or MIT, at your option.
+Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).

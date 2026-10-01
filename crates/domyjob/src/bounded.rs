@@ -1,131 +1,73 @@
-use std::io::{BufRead, ErrorKind, Read};
+use std::io::{self, Read};
 
-pub const REQUEST_LINE: u64 = 1 << 20;
-pub const REPLY_LINE: u64 = 64 << 20;
-pub const BLOB: u64 = 8 << 30;
-pub const UPLOAD_COUNT: u64 = 2_000_000;
-pub const TAIL_WINDOW: u64 = 4 << 20;
-pub const CONTROL_LINE: u64 = 1024;
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "`bounded` is the one reader that reads to the end, always through a limit"
+    )]
 
-fn too_long(limit: u64) -> std::io::Error {
-    std::io::Error::new(
-        ErrorKind::InvalidData,
-        format!("a line longer than {limit} bytes was refused"),
-    )
-}
+    use std::io::{self, Read};
 
-pub fn line(reader: &mut dyn BufRead, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(out);
-        }
-        let (take, done) = match available.iter().position(|b| *b == b'\n') {
-            Some(at) => (at.saturating_add(1), true),
-            None => (available.len(), false),
-        };
-        let chunk = available.get(..take).unwrap_or(&[]);
-        if crate::domain::len_u64(out.len().saturating_add(chunk.len())) > limit {
-            return Err(too_long(limit));
-        }
-        out.extend_from_slice(chunk);
-        reader.consume(take);
-        if done {
-            return Ok(out);
-        }
+    pub(super) fn read_limited(
+        reader: impl Read,
+        limit: u64,
+        into: &mut Vec<u8>,
+    ) -> io::Result<usize> {
+        reader.take(limit).read_to_end(into)
     }
 }
 
-pub fn line_unread_past(reader: &mut dyn Read, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if reader.read(&mut byte)? == 0 {
-            return Ok(out);
-        }
-        if crate::domain::len_u64(out.len()) >= limit {
-            return Err(too_long(limit));
-        }
-        out.extend_from_slice(&byte);
-        if byte == *b"\n" {
-            return Ok(out);
-        }
-    }
+pub(crate) fn read(reader: impl Read, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    let beyond = u64::try_from(limit)
+        .map_err(io::Error::other)?
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    raw::read_limited(reader, beyond, &mut bytes)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
 }
 
-pub fn exactly(
-    reader: &mut dyn Read,
-    size: u64,
-    sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut left = size;
-    let mut buffer = vec![0u8; 64 * 1024];
-    while left > 0 {
-        let want = match usize::try_from(left) {
-            Ok(fits) => fits.min(buffer.len()),
-            Err(_beyond_usize) => buffer.len(),
-        };
-        let slot = buffer.get_mut(..want).unwrap_or(&mut []);
-        let read = reader.read(slot)?;
-        if read == 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::UnexpectedEof,
-                "the peer stopped before sending everything it announced",
-            ));
-        }
-        sink(slot.get(..read).unwrap_or(&[]))?;
-        left = left.saturating_sub(crate::domain::len_u64(read));
-    }
-    Ok(())
+pub(crate) fn prefix(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    raw::read_limited(
+        reader,
+        u64::try_from(limit).map_err(io::Error::other)?,
+        &mut bytes,
+    )?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::{self, Read};
 
-    proptest::proptest! {
-        #[test]
-        fn both_line_readers_agree_and_the_unbuffered_one_reads_nothing_past_its_line(
-            input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
-            limit in 0u64..40,
-        ) {
-            let buffered = line(&mut std::io::Cursor::new(&input), limit);
-            let mut raw = std::io::Cursor::new(&input);
-            let unbuffered = line_unread_past(&mut raw, limit);
-            match (&buffered, &unbuffered) {
-                (Ok(a), Ok(b)) => {
-                    proptest::prop_assert_eq!(a, b);
-                    proptest::prop_assert_eq!(raw.position(), crate::domain::len_u64(b.len()));
-                }
-                (Err(a), Err(b)) => proptest::prop_assert_eq!(a.kind(), b.kind()),
-                (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-                    proptest::prop_assert!(false, "{buffered:?} vs {unbuffered:?}");
-                }
-            }
+    use super::{prefix, read};
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reader refused",
+            ))
         }
     }
 
     #[test]
-    fn lines_stop_at_the_limit() {
-        let mut input: &[u8] = b"short\nthis one is far too long\n";
-        assert_eq!(line(&mut input, 10).unwrap(), b"short\n");
-        assert_eq!(
-            line(&mut input, 10).unwrap_err().kind(),
-            ErrorKind::InvalidData
-        );
-        let mut exact: &[u8] = b"abcdef";
-        let mut seen = Vec::new();
-        exactly(&mut exact, 4, &mut |chunk| {
-            seen.extend_from_slice(chunk);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(seen, b"abcd");
-        let mut short: &[u8] = b"ab";
-        assert_eq!(
-            exactly(&mut short, 4, &mut |_| Ok(())).unwrap_err().kind(),
-            ErrorKind::UnexpectedEof
-        );
+    fn a_limit_is_never_exceeded() {
+        assert_eq!(read(&b"four"[..], 4).unwrap(), Some(b"four".to_vec()));
+        assert_eq!(read(&b"five!"[..], 4).unwrap(), None);
+        assert_eq!(prefix(&b"five!"[..], 4).unwrap(), b"five".to_vec());
+    }
+
+    #[test]
+    fn a_reader_error_after_partial_data_is_preserved() {
+        for error in [
+            read((&b"part"[..]).chain(FailingReader), 8).unwrap_err(),
+            prefix((&b"part"[..]).chain(FailingReader), 8).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "reader refused");
+        }
     }
 }

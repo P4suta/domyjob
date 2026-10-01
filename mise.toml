@@ -4,83 +4,114 @@ actionlint = "1.7.12"
 taplo = "0.10.0"
 typos = "1.50.1"
 lefthook = "2.1.9"
-"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.140"
 "aqua:EmbarkStudios/cargo-deny" = "0.19.7"
 "aqua:rustsec/rustsec/cargo-audit" = "0.22.2"
+"cargo:cargo-vet" = "0.10.2"
 "aqua:crate-ci/committed" = "1.1.11"
 "npm:jscpd" = "5.3.2"
-"aqua:axodotdev/cargo-dist" = "0.33.0"
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
+
+[settings]
+cargo.binstall = false
 
 [tasks.bootstrap]
-description = "Fetch the locked dependency graph and install the git hooks"
+description = "Fetch the locked dependencies and install the git hooks"
 run = ["cargo fetch --locked", "lefthook install"]
 
 [tasks.fmt]
 description = "Format Rust and TOML"
-run = ["cargo fmt --all", "taplo fmt"]
+run = ["cargo fmt --all", "cargo fmt --manifest-path fuzz/Cargo.toml", "taplo fmt"]
 env = { RUST_LOG = "warn" }
 
 [tasks."fmt:check"]
-description = "Check Rust and TOML formatting without rewriting files"
-run = ["cargo fmt --all -- --check", "taplo fmt --check", "taplo lint"]
+description = "Check Rust and TOML formatting"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
+  "taplo fmt --check",
+  "taplo lint",
+]
 env = { RUST_LOG = "warn" }
 
 [tasks.clippy]
 description = "Lint every target with warnings denied"
 run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
+[tasks."clippy:targets"]
+description = "Lint every target for Linux and Windows too, whatever the host"
+env = { CARGO_FEATURE_PURE = "1" }
+run = [
+  "rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc",
+  "cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings",
+  "cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings",
+]
+
 [tasks.gates]
-description = "Enforce the rules Clippy cannot express: no comments, no #[allow], exact input, typed errors, no owned trait objects"
+description = "Enforce the pure core and platform effect boundaries"
 run = "cargo xtask gates"
 
+[tasks."windows-contracts"]
+description = "Reject invalid Windows capabilities with the actual SDK types"
+depends = ["clippy:targets"]
+run = "cargo xtask windows-contracts"
+
 [tasks.lint]
-description = "Formatting, Clippy, the repository gates, spelling, workflows, and duplication"
-depends = ["fmt:check", "clippy", "gates"]
-run = ["typos", "actionlint", "jscpd --config .jscpd.json --silent"]
+description = "Check formatting, types, architecture, spelling, workflows, and duplication"
+depends = ["fmt:check", "clippy", "clippy:targets", "gates", "windows-contracts", "fuzz:check"]
+run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
-description = "Run every test"
-env = { DOMYJOB_CI_CANARY = "must-not-reach-a-job" }
-run = [
-  "cargo nextest run --locked --workspace --all-targets --features failpoints",
-  "cargo test --locked --workspace --doc",
-]
+description = "Run the complete workspace test suite, each test in its own process"
+run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
-[tasks.deny]
-description = "Check licenses, bans, and sources"
-run = "cargo deny --locked check licenses bans sources"
-
-[tasks.audit]
-description = "Check the dependency graph against the RustSec advisory database"
-run = "cargo audit --deny warnings"
-
-[tasks.check]
-description = "Every gate a push waits for"
-run = ["mise run lint", "mise run test", "mise run deny", "mise run audit"]
-
-[tasks."check:fleet"]
-description = "Lint and test the commit being pushed on every machine domyjob knows, the other operating systems included"
-run = [
-  "cargo run --quiet --package domyjob -- setup ${DOMYJOB_CHECK_ON:-@all} --build --rev @HEAD --if-missing",
-  "cargo run --quiet --package domyjob -- run ${DOMYJOB_CHECK_ON:-@all} @HEAD --wait --grep 'Summary|FAIL|TIMEOUT|test result|panicked|^error|^warning' -- 'cargo clippy --locked --workspace --all-targets -- -D warnings && cargo nextest run --locked --workspace --all-targets && cargo test --locked --workspace --doc'",
-]
+[tasks."fuzz:check"]
+description = "Type-check every fuzz target against the current core API"
+run = "cargo check --locked --manifest-path fuzz/Cargo.toml --bins"
 
 [tasks.fuzz]
-description = "Fuzz every input boundary for a fixed number of inputs"
+description = "Fuzz the wire ingress, job state transitions, and chat ledger convergence"
+depends = ["fuzz:check"]
 dir = "fuzz"
 run = [
-  "cargo +nightly fuzz run requests -- -runs=200000",
-  "cargo +nightly fuzz run orders -- -runs=200000",
-  "cargo +nightly fuzz run releases -- -runs=200000",
-  "cargo +nightly fuzz run terminal -- -runs=200000",
+  "mkdir -p corpus/wire",
+  "cp seeds/wire/* corpus/wire/",
+  "cargo +nightly-2026-08-21 fuzz run wire -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-08-21 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-08-21 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
-[tasks.kani]
-description = "Prove the Kani harnesses"
-dir = "crates/domyjob"
-run = "cargo kani --lib"
+[tasks.mutants]
+description = "Measure mutations in the core and repository gates"
+run = '"${DOMYJOB_MUTATION_TOOL:-rust-mutants}" run --package domyjob-core --package xtask --jobs auto --locked --trace'
 
-[tasks.proverif]
-description = "Prove the symbolic models of the paired connection (needs proverif on PATH)"
-dir = "docs/security/proverif"
-run = ["proverif connect-x25519-broken.pv", "proverif connect-ml-kem-broken.pv"]
+[tasks."mutants:source"]
+description = "Measure ordinary binary tests with isolated source mutations"
+run = '"${DOMYJOB_MUTATION_TOOL:-rust-mutants}" run --config .rust-mutants-source.toml --package domyjob --execution-mode source --jobs auto --locked --trace'
+
+[tasks.deny]
+description = "Check dependency licenses, bans, and sources"
+run = "cargo xtask dependencies deny"
+
+[tasks.audit]
+description = "Check dependencies against the RustSec advisory database"
+run = "cargo xtask dependencies audit"
+
+[tasks.vet]
+description = "Check pinned dependency audit evidence"
+run = "cargo xtask dependencies vet"
+
+[tasks.check]
+description = "Run local lint, tests, and dependency checks"
+run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mise run vet"]
+
+[tasks."check:linux"]
+description = "Lint and test this checkout on Linux through domyjob"
+run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
+
+[tasks."check:win"]
+description = "Lint and test this checkout on Windows through domyjob"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo xtask windows-contracts; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
+
+[tasks."check:fleet"]
+description = "Run this checkout's checks on Linux and Windows"
+run = ["mise run check:linux", "mise run check:win"]

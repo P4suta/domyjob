@@ -21,6 +21,7 @@ allow = [
   "Unicode-DFS-2016",
   "CC0-1.0",
   "MPL-2.0",
+  "NCSA",
   "Zlib",
 ]
 confidence-threshold = 0.9

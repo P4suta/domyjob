@@ -1,0 +1,90 @@
+mod bell;
+
+pub(crate) use bell::BellError;
+
+use super::runner::{self, RunnerError};
+use super::store::Store;
+use crate::layout;
+use crate::platform::clock::Deadline;
+use crate::state_io::StateError;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PulseError {
+    #[error(transparent)]
+    Bell(#[from] BellError),
+    #[error(transparent)]
+    Runner(#[from] RunnerError),
+}
+
+pub(crate) fn ring(paths: &layout::Chat, generation: u64) -> Result<(), StateError> {
+    bell::ring(&paths.bell(), generation)
+}
+
+pub(crate) fn forget(paths: &layout::Chat) -> Result<(), StateError> {
+    bell::forget(&paths.bell())
+}
+
+#[derive(Debug)]
+pub(crate) struct Pulse<'store> {
+    store: &'store Store,
+    bell: bell::Bell,
+    generation: u64,
+    tick_millis: u64,
+}
+
+impl<'store> Pulse<'store> {
+    pub(crate) fn new(store: &'store Store, tick_millis: u64) -> Result<Self, PulseError> {
+        let directory = store.paths().bell();
+        let bell = bell::Bell::watch(&directory)?;
+        let generation = bell::generation(&directory)?;
+        Ok(Self {
+            store,
+            bell,
+            generation,
+            tick_millis,
+        })
+    }
+
+    pub(crate) fn next(&mut self, deadline: Deadline) -> Result<bool, PulseError> {
+        runner::dispatch(self.store)?;
+        let wake = deadline.min(Deadline::after_millis(self.tick_millis));
+        match self.bell.beyond(self.generation, wake)? {
+            Some(generation) => {
+                self.generation = generation;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domyjob_core::chat::event::Body;
+    use domyjob_core::chat::policy::Priority;
+
+    use super::Pulse;
+    use crate::chat::store::Store;
+    use crate::layout::State;
+    use crate::platform::clock::Deadline;
+
+    #[test]
+    fn a_write_by_another_handle_wakes_a_waiting_pulse_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = State::at(&root.path().join("state"));
+        let store = Store::open_in(&state).unwrap();
+        let writer = Store::open_in(&state).unwrap();
+        let mut pulse = Pulse::new(&store, 60_000).unwrap();
+        let wrote = std::thread::spawn(move || {
+            crate::platform::clock::pause_millis(300);
+            writer
+                .write(|tx| tx.author(Priority::Ordinary, Body::Omitted {}))
+                .unwrap();
+        });
+        assert!(
+            pulse.next(Deadline::after_millis(10_000)).unwrap(),
+            "the doorbell woke the pulse before its deadline"
+        );
+        wrote.join().unwrap();
+    }
+}

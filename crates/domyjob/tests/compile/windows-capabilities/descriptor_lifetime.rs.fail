@@ -1,0 +1,25 @@
+#![allow(dead_code)]
+#![deny(unsafe_code)]
+
+#[path = r"@KERNEL@"]
+mod kernel;
+#[path = r"@DESCRIPTOR@"]
+mod descriptor;
+
+fn acl_outlives_its_owner(file: &std::fs::File) {
+    let acl;
+    {
+        let owner = descriptor::FileSecurity::read(file).unwrap();
+        acl = owner.acl().unwrap();
+    }
+    acl.ace_count();
+}
+
+fn sid_outlives_its_owner(file: &std::fs::File) {
+    let sid;
+    {
+        let owner = descriptor::FileSecurity::read(file).unwrap();
+        sid = owner.owner();
+    }
+    sid.text();
+}

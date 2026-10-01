@@ -1,176 +1,368 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Comment {
-    pub line: usize,
-}
+use std::iter::Peekable;
+use std::path::Path;
+use std::str::CharIndices;
+
+const LICENSE: &str = "// SPDX-";
+
+const GENERATED: [&str; 2] = ["supply-chain/audits.toml", "supply-chain/config.toml"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Code,
+    Text,
+    Raw(usize),
     Line,
     Block(usize),
-    Str,
-    RawStr(usize),
-    Char,
 }
 
-fn raw_start(rest: &[u8]) -> Option<(usize, usize)> {
-    let after_prefix = match rest {
-        [b'b' | b'c', b'r', ..] => 2,
-        [b'r', ..] => 1,
-        _ => return None,
-    };
-    let hashes = rest
-        .iter()
-        .skip(after_prefix)
-        .take_while(|b| **b == b'#')
-        .count();
-    match rest.get(after_prefix.saturating_add(hashes)) {
-        Some(b'"') => Some((
-            hashes,
-            after_prefix.saturating_add(hashes).saturating_add(1),
-        )),
-        _ => None,
+struct Lexer<'source> {
+    source: &'source str,
+    chars: Peekable<CharIndices<'source>>,
+    line: usize,
+    previous: [char; 2],
+    mode: Mode,
+    found: Vec<usize>,
+}
+
+fn identifier(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn raw_hashes(rest: &str) -> Option<usize> {
+    let after = rest.strip_prefix('r')?;
+    let hashes = after
+        .len()
+        .saturating_sub(after.trim_start_matches('#').len());
+    after.get(hashes..)?.starts_with('"').then_some(hashes)
+}
+
+fn char_literal(rest: &str) -> bool {
+    let mut characters = rest.chars().skip(1);
+    match characters.next() {
+        Some('\\') => true,
+        Some(_) => characters.next() == Some('\''),
+        None => false,
     }
 }
 
-fn closes_raw(rest: &[u8], hashes: usize) -> bool {
-    rest.first() == Some(&b'"')
-        && rest
-            .iter()
-            .skip(1)
-            .take(hashes)
-            .filter(|b| **b == b'#')
-            .count()
-            == hashes
-}
-
-fn is_char_literal(rest: &[u8]) -> bool {
-    match rest {
-        [b'\'', b'\\', ..] | [b'\'', _, b'\'', ..] => true,
-        [b'\'', first, ..] => {
-            let width: usize = match first {
-                0xC0..=0xDF => 2,
-                0xE0..=0xEF => 3,
-                0xF0..=0xF7 => 4,
-                _ => return false,
-            };
-            rest.get(width.saturating_add(1)) == Some(&b'\'')
+impl<'source> Lexer<'source> {
+    fn new(source: &'source str) -> Self {
+        Self {
+            source,
+            chars: source.char_indices().peekable(),
+            line: 1,
+            previous: [' ', ' '],
+            mode: Mode::Code,
+            found: Vec::new(),
         }
-        _ => false,
     }
-}
 
-fn code(rest: &[u8], previous_ident: bool) -> (Mode, usize) {
-    match rest {
-        [b'/', b'/', ..] => (Mode::Line, 1),
-        [b'/', b'*', ..] => (Mode::Block(1), 2),
-        [b'"', ..] => (Mode::Str, 1),
-        [b'\'', ..] if is_char_literal(rest) => (Mode::Char, 1),
-        _ => match raw_start(rest) {
-            Some((hashes, width)) if !previous_ident => (Mode::RawStr(hashes), width),
-            Some(_) | None => (Mode::Code, 1),
-        },
+    fn advance(&mut self) -> Option<char> {
+        let (_, character) = self.chars.next()?;
+        if character == '\n' {
+            self.line = self.line.saturating_add(1);
+        }
+        let [_, last] = self.previous;
+        self.previous = [last, character];
+        Some(character)
+    }
+
+    fn skip(&mut self, count: usize) {
+        for _ in 0..count {
+            self.advance();
+        }
+    }
+
+    fn peek_is(&mut self, wanted: char) -> bool {
+        self.chars
+            .peek()
+            .is_some_and(|&(_, character)| character == wanted)
+    }
+
+    fn rest(&self, at: usize) -> &'source str {
+        self.source.get(at..).unwrap_or_default()
+    }
+
+    fn opens_raw(&self, at: usize) -> Option<usize> {
+        let [before, last] = self.previous;
+        let boundary = !identifier(last) || (matches!(last, 'b' | 'c') && !identifier(before));
+        if boundary {
+            raw_hashes(self.rest(at))
+        } else {
+            None
+        }
+    }
+
+    fn code(&mut self, at: usize, character: char) {
+        let rest = self.rest(at);
+        if rest.starts_with("//") {
+            if !rest.starts_with(LICENSE) {
+                self.found.push(self.line);
+            }
+            self.mode = Mode::Line;
+        } else if rest.starts_with("/*") {
+            self.found.push(self.line);
+            self.skip(1);
+            self.mode = Mode::Block(1);
+        } else if character == '"' {
+            self.mode = Mode::Text;
+        } else if character == '\'' && char_literal(rest) {
+            self.skip(1);
+            while let Some(inner) = self.advance() {
+                if inner == '\\' {
+                    self.skip(1);
+                } else if inner == '\'' {
+                    return;
+                }
+            }
+            return;
+        } else if let Some(hashes) = (character == 'r').then(|| self.opens_raw(at)).flatten() {
+            self.skip(hashes.saturating_add(1));
+            self.mode = Mode::Raw(hashes);
+        }
+        self.skip(1);
+    }
+
+    fn text(&mut self, character: char) {
+        self.skip(1);
+        if character == '\\' {
+            self.skip(1);
+        } else if character == '"' {
+            self.mode = Mode::Code;
+        }
+    }
+
+    fn raw(&mut self, at: usize, character: char, hashes: usize) {
+        self.skip(1);
+        let closing = self
+            .rest(at.saturating_add(1))
+            .chars()
+            .take(hashes)
+            .filter(|&next| next == '#')
+            .count();
+        if character == '"' && closing == hashes {
+            self.skip(hashes);
+            self.mode = Mode::Code;
+        }
+    }
+
+    fn block(&mut self, character: char, depth: usize) {
+        self.skip(1);
+        if character == '/' && self.peek_is('*') {
+            self.skip(1);
+            self.mode = Mode::Block(depth.saturating_add(1));
+        } else if character == '*' && self.peek_is('/') {
+            self.skip(1);
+            self.mode = match depth.saturating_sub(1) {
+                0 => Mode::Code,
+                outer => Mode::Block(outer),
+            };
+        }
+    }
+
+    fn run(mut self) -> Vec<usize> {
+        while let Some((at, character)) = self.chars.peek().copied() {
+            match self.mode {
+                Mode::Code => self.code(at, character),
+                Mode::Text => self.text(character),
+                Mode::Raw(hashes) => self.raw(at, character, hashes),
+                Mode::Line => {
+                    if character == '\n' {
+                        self.mode = Mode::Code;
+                    }
+                    self.skip(1);
+                }
+                Mode::Block(depth) => self.block(character, depth),
+            }
+        }
+        self.found.dedup();
+        self.found
     }
 }
 
 #[must_use]
-pub fn find(source: &str) -> Vec<Comment> {
-    let bytes = source.as_bytes();
-    let mut found = Vec::new();
-    let mut mode = Mode::Code;
-    let mut line = 1usize;
-    let mut index = 0usize;
-    let mut previous_ident = false;
-    while let Some(rest) = bytes.get(index..) {
-        let Some(&byte) = rest.first() else { break };
-        let mut step = 1usize;
-        mode = match mode {
-            Mode::Code => {
-                let (next, width) = code(rest, previous_ident);
-                if matches!(next, Mode::Line | Mode::Block(_)) {
-                    found.push(Comment { line });
-                }
-                step = width;
-                previous_ident = byte.is_ascii_alphanumeric() || byte == b'_';
-                next
+pub fn in_rust(source: &str) -> Vec<usize> {
+    Lexer::new(source).run()
+}
+
+fn pinned_action(line: &str) -> bool {
+    line.split_once('@').is_some_and(|(_, reference)| {
+        let (digest, note) = reference.split_at_checked(40).unwrap_or_default();
+        digest.len() == 40
+            && digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            && note
+                .trim_start()
+                .strip_prefix('#')
+                .is_some_and(|version| version.trim_start().starts_with('v'))
+    })
+}
+
+fn comment_at(line: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut spaced = true;
+    for character in line.chars() {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && open == '"' {
+                escaped = true;
+            } else if character == open {
+                quote = None;
             }
-            Mode::Line => {
-                if byte == b'\n' {
-                    Mode::Code
-                } else {
-                    Mode::Line
-                }
-            }
-            Mode::Block(depth) => match rest {
-                [b'*', b'/', ..] => {
-                    step = 2;
-                    if depth <= 1 {
-                        Mode::Code
-                    } else {
-                        Mode::Block(depth.saturating_sub(1))
-                    }
-                }
-                [b'/', b'*', ..] => {
-                    step = 2;
-                    Mode::Block(depth.saturating_add(1))
-                }
-                _ => Mode::Block(depth),
-            },
-            Mode::Str => match rest {
-                [b'\\', _, ..] => {
-                    step = 2;
-                    Mode::Str
-                }
-                [b'"', ..] => Mode::Code,
-                _ => Mode::Str,
-            },
-            Mode::RawStr(hashes) => {
-                if closes_raw(rest, hashes) {
-                    step = hashes.saturating_add(1);
-                    Mode::Code
-                } else {
-                    Mode::RawStr(hashes)
-                }
-            }
-            Mode::Char => match rest {
-                [b'\\', _, ..] => {
-                    step = 2;
-                    Mode::Char
-                }
-                [b'\'', ..] => Mode::Code,
-                _ => Mode::Char,
-            },
-        };
-        for skipped in bytes.iter().skip(index).take(step) {
-            if *skipped == b'\n' {
-                line = line.saturating_add(1);
-            }
+        } else if matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if character == '#' && spaced {
+            return true;
         }
-        index = index.saturating_add(step);
+        spaced = character.is_whitespace();
     }
-    found
+    false
+}
+
+#[must_use]
+pub fn in_config(path: &str, source: &str) -> Vec<usize> {
+    if GENERATED.contains(&path) {
+        return Vec::new();
+    }
+    let workflow = Path::new(path).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+    });
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| comment_at(line) && !(workflow && pinned_action(line)))
+        .map(|(index, _)| index.saturating_add(1))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{in_config, in_rust};
 
-    fn lines(source: &str) -> Vec<usize> {
-        find(source).into_iter().map(|c| c.line).collect()
+    #[test]
+    fn every_rust_comment_is_found_and_nothing_else() {
+        assert_eq!(in_rust("fn f() {}\n// a\n/// b\n//! c\n"), [2, 3, 4]);
+        assert_eq!(in_rust("let a = 1; /* x /* y */ z */ let b = 2;\n"), [1]);
+        assert!(in_rust("// SPDX-License-Identifier: MIT\nfn f() {}\n").is_empty());
+        let quiet = [
+            "let url = \"https://example.com/a\";\n",
+            "let raw = r#\"// not \"a\" comment\"#;\n",
+            "let bytes = br\"/* no */\";\n",
+            "let slash = '/'; let quote = '\\''; let star = '*';\n",
+            "fn f<'a>(x: &'a str) -> &'a str { x }\n",
+            "let escaped = \"\\\" // still text\";\n",
+            "let r#type = 1; let br = 2 / 1;\n",
+        ];
+        for source in quiet {
+            assert!(in_rust(source).is_empty(), "{source}");
+        }
+        assert_eq!(in_rust("let a = '/'; // b\n"), [1]);
+        assert_eq!(in_rust("let a = \"x\";\n\n/* c */\n"), [3]);
     }
 
     #[test]
-    fn comments_are_found_outside_literals() {
-        assert_eq!(lines("let a = 1; // note\nlet b = 2;"), [1]);
-        assert_eq!(lines("/// doc\nfn f() {}"), [1]);
-        assert_eq!(lines("fn f() {}\n/* a /* nested */ b */\n"), [2]);
-        assert!(lines("let url = \"https://example.com\";").is_empty());
-        assert!(lines("let raw = r#\"// not a comment\"#;").is_empty());
-        assert!(lines("let slash = '/'; let quote = '\\''; let s = \"\\\"//\";").is_empty());
+    fn literals_and_nested_blocks_end_before_the_next_comment() {
+        for literal in [
+            r#"r"plain""#,
+            r##"r#"a " // still raw"#"##,
+            r##"br#"a " // still raw"#"##,
+            r##"cr#"a " // still raw"#"##,
+            r###"r##"a "# // still raw"##"###,
+            r##"r#"a # // still raw"#"##,
+            r####"r###"a "## /* still raw */"###"####,
+            r"'/'",
+            r"'\''",
+            r"'\\'",
+            r#"'"'"#,
+            r#"'\"'"#,
+            r"'\n'",
+            r"'\u{2f}'",
+            r#""escaped \" // text""#,
+        ] {
+            assert_eq!(
+                in_rust(&format!("let value = {literal};\n// after\n/* last */")),
+                [2, 3],
+                "{literal}"
+            );
+        }
         assert_eq!(
-            lines("fn f<'a>(x: &'a str) -> &'a str { x } // tail").len(),
-            1
+            in_rust("/* outer\n / x * y\n /* nested */\n // inside\n */\n// after\n"),
+            [1, 6]
         );
-        assert!(lines("let t = br\"//\"; let u = 'é';").is_empty());
+        assert_eq!(in_rust("// text /* block\n// next\n"), [1, 2]);
+        assert_eq!(in_rust("fn f<'a>() {}\n// after\n"), [2]);
+        assert_eq!(in_rust("let r#type = '\\\\';\n// after\n"), [2]);
+        for source in ["'", "'\\", "\"\\", "r#\"open", "/* open"] {
+            let expected = if source.starts_with("/*") {
+                vec![1]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(in_rust(source), expected, "{source}");
+        }
+        assert_eq!(in_rust("'\\unfinished // still quoted'\n// after"), [2]);
+        assert_eq!(in_rust("'\\' // still quoted'\n// after"), [2]);
+        assert_eq!(in_rust("'"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn raw_prefixes_respect_adjacent_identifier_tokens() {
+        for prefix in ["ar", "_r", "abr", "acr", "ébr", "_br"] {
+            let source = format!("tokens!({prefix}#\"text\" // comment\n);\n// after");
+            assert_eq!(in_rust(&source), [1, 3], "{prefix}");
+        }
+        for prefix in ["r", "br", "cr"] {
+            let source = format!("tokens!({prefix}#\"text\" // raw\"#);\n// after");
+            assert_eq!(in_rust(&source), [2], "{prefix}");
+        }
+    }
+
+    #[test]
+    fn configuration_comments_are_found_except_version_pins_and_generated_files() {
+        assert_eq!(
+            in_config("mise.toml", "# a\nb = \"#c\"\nd = 1 # e\n"),
+            [1, 3]
+        );
+        assert!(in_config("x.toml", "a = 'x#y'\n").is_empty());
+        let pin =
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
+        assert!(in_config(".github/workflows/ci.yml", pin).is_empty());
+        assert_eq!(in_config(".github/workflows/ci.yml", "  # note\n"), [1]);
+        assert!(in_config("supply-chain/audits.toml", "# cargo-vet audits file\n").is_empty());
+    }
+
+    #[test]
+    fn configuration_quotes_close_and_only_complete_workflow_pins_are_exempt() {
+        let quoted = r#"a = "escaped \" # quoted" # first
+b = 'backslash \' # second
+c = "single ' quote" # third
+d = 'double " quote' # fourth
+e = "backslash \\" # fifth
+f = plain#value
+"#;
+        assert_eq!(in_config("x.toml", quoted), [1, 2, 3, 4, 5]);
+        assert_eq!(in_config("x.toml", "a = \"\" # empty\n"), [1]);
+        assert!(in_config("x.toml", r#"a = "escaped \" # quoted""#).is_empty());
+        assert!(in_config("x.toml", r#"a = "text # quoted""#).is_empty());
+        assert!(in_config("x.toml", "a = 'text # quoted'").is_empty());
+        let digest = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+        let pin = format!("uses: actions/checkout@{digest} # v7.0.1\n");
+        for path in ["ci.yml", "ci.yaml", "CI.YML", "CI.YAML"] {
+            assert!(in_config(path, &pin).is_empty(), "{path}");
+        }
+        assert_eq!(in_config("x.toml", &pin), [1]);
+        for reference in [
+            "short # v1",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz # v1",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # note",
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 extra # v1",
+        ] {
+            let source = format!("uses: owner/action@{reference}");
+            assert_eq!(in_config("ci.yml", &source), [1], "{reference}");
+        }
+        assert!(in_config("supply-chain/config.toml", "# generated").is_empty());
     }
 }

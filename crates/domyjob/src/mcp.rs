@@ -1,673 +1,495 @@
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::io::{self, BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use schemars::JsonSchema;
+use domyjob_core::chat::card::Tool;
+use domyjob_core::ingress;
+
+use crate::output::Output;
+use domyjob_core::wire::MAX_CONTROL_BYTES;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{self, ClientError, Context, Order, Output, Sending};
-use crate::config::McpTool;
-use crate::protocol::{Request, VERSION, Workspace};
-use crate::template::Arg;
+use crate::chat::args::{
+    AskArgs, DirectoryArgs, EmptyArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs,
+    ProfileArgs, ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs,
+};
+use crate::chat::ops::{self, OpsError, RoomChange, Session};
+use crate::chat::view::Outcome;
+
+const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const MAX_CALLS: usize = 32;
+const INSTRUCTIONS: &str = "Chat with AI agents on this and other machines. \
+Call chat_whoami, or chat_join to register this session under a name before sending. \
+Use chat_directory to find the agent whose role and skills fit a task, then chat_ask it; \
+chat_ask waits for the answer and chat_wait resumes waiting. \
+Replies go to exact message IDs. Results report `unread`; read them with chat_inbox.";
 
 #[derive(Debug, thiserror::Error)]
-pub enum McpError {
-    #[error("reading from the client: {0}")]
-    Input(std::io::Error),
-    #[error("writing to the client: {0}")]
-    Output(std::io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ToolError {
+pub(crate) enum McpError {
     #[error(transparent)]
-    Client(#[from] ClientError),
-    #[error("arguments: {0}")]
-    Arguments(serde_json::Error),
-    #[error("no tool named {0}")]
-    Unknown(String),
-    #[error("the local [mcp] policy does not allow {0}")]
-    NotAllowed(&'static str),
-    #[error("{0} is not in the machines the local [mcp] policy allows")]
-    Machine(String),
-    #[error("{0} is not under a directory the local [mcp] policy allows")]
-    Directory(String),
-    #[error("{0:?} is not a revision")]
-    Revision(String),
-    #[error("writing {0}: {1}")]
-    Destination(String, String),
-    #[error("encoding the answer: {0}")]
-    Encode(serde_json::Error),
+    Ops(#[from] OpsError),
+    #[error("MCP input or output failed: {0}")]
+    Io(#[from] io::Error),
 }
 
-fn answer<T: serde::Serialize>(body: &T) -> Result<Value, ToolError> {
-    crate::output::value(body).map_err(ToolError::Encode)
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    jsonrpc: String,
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Value,
 }
 
-fn part<T: serde::Serialize>(body: &T) -> Value {
-    match serde_json::to_value(body) {
-        Ok(value) => value,
-        Err(error) => Value::String(format!("encoding the answer: {error}")),
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Call {
+    name: String,
+    #[serde(default = "empty_arguments")]
+    arguments: Value,
+    #[serde(rename = "_meta", default)]
+    _meta: Option<Value>,
+}
+
+fn empty_arguments() -> Value {
+    json!({})
+}
+
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
+    ingress::value(value)
+}
+
+fn parse(bytes: &[u8]) -> Result<Request, Value> {
+    let value: Value = ingress::json(bytes, MAX_CONTROL_BYTES)
+        .map_err(|_invalid| error(&Value::Null, -32700, "Parse error"))?;
+    let request: Request =
+        decode(value).map_err(|_invalid| error(&Value::Null, -32600, "Invalid Request"))?;
+    if request.jsonrpc != "2.0"
+        || request
+            .id
+            .as_ref()
+            .is_some_and(|id| !id.is_string() && !id.is_i64() && !id.is_u64())
+        || (!request.params.is_null() && !request.params.is_object())
+    {
+        return Err(error(&Value::Null, -32600, "Invalid Request"));
     }
+    Ok(request)
 }
 
-const fn tool_name(tool: McpTool) -> &'static str {
-    match tool {
-        McpTool::Machines => "machines",
-        McpTool::ListJobs => "list_jobs",
-        McpTool::JobStatus => "job_status",
-        McpTool::JobLogs => "job_logs",
-        McpTool::JobDigest => "job_digest",
-        McpTool::SearchLogs => "search_logs",
-        McpTool::WaitJob => "wait_job",
-        McpTool::GetFile => "get_file",
-        McpTool::Run => "run",
-        McpTool::KillJob => "kill_job",
-    }
+fn error(id: &Value, code: i32, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-fn tool_named(name: &str) -> Option<McpTool> {
-    [
-        McpTool::Machines,
-        McpTool::ListJobs,
-        McpTool::JobStatus,
-        McpTool::JobLogs,
-        McpTool::JobDigest,
-        McpTool::SearchLogs,
-        McpTool::WaitJob,
-        McpTool::GetFile,
-        McpTool::Run,
-        McpTool::KillJob,
-    ]
-    .into_iter()
-    .find(|tool| tool_name(*tool) == name)
-}
-
-fn permitted(ctx: &Context, args: &RunArgs) -> Result<(), ToolError> {
-    let policy = &ctx.config.mcp;
-    let allowed: Vec<crate::domain::MachineName> = if policy.machines.is_empty() {
-        Vec::new()
-    } else {
-        ctx.select(&policy.machines)?
-            .into_iter()
-            .map(|m| m.name)
-            .collect()
-    };
-    for machine in ctx.select(&args.machines)? {
-        if !allowed.contains(&machine.name) {
-            return Err(ToolError::Machine(machine.name.to_string()));
-        }
-    }
-    let directory = std::fs::canonicalize(&args.directory)
-        .map_err(|_missing| ToolError::Directory(args.directory.clone()))?;
-    let mut inside = false;
-    for allowed_dir in &policy.directories {
-        match std::fs::canonicalize(allowed_dir) {
-            Ok(resolved) => inside |= directory.starts_with(resolved),
-            Err(_missing) => eprintln!(
-                "domyjob: the [mcp] directory {} does not exist",
-                allowed_dir.display()
-            ),
-        }
-    }
-    if !inside {
-        return Err(ToolError::Directory(args.directory.clone()));
-    }
-    let runner = args.runner.clone().unwrap_or_else(|| {
-        if args.command.len() == 1 {
-            "shell".to_owned()
-        } else {
-            "exec".to_owned()
-        }
-    });
-    if policy.runners.contains(&runner) {
-        Ok(())
-    } else {
-        Err(ToolError::NotAllowed("that runner"))
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct RunArgs {
-    #[schemars(
-        description = "where to run: a machine, labels joined with + such as windows+gpu, a fact such as os=linux, @group, or @all; comma separated"
-    )]
-    machines: String,
-    #[schemars(
-        description = "one element is a script for the machine's shell; several are an argument vector run without a shell"
-    )]
-    command: Vec<String>,
-    #[schemars(
-        description = "absolute path of the local directory to send; the command runs in the same place inside it"
-    )]
-    directory: String,
-    #[schemars(
-        description = "a runner from the local configuration to hand the command to instead of a shell"
-    )]
-    runner: Option<String>,
-    #[schemars(
-        description = "send a version-control revision such as HEAD or main instead of the directory as it is"
-    )]
-    rev: Option<String>,
-    #[schemars(description = "stay until the jobs finish and return their digests")]
-    wait: Option<bool>,
-    #[schemars(description = "use an empty workspace that is deleted afterwards")]
-    fresh: Option<bool>,
-    #[schemars(description = "a name to refer to the job by later, instead of its id")]
-    name: Option<crate::domain::JobName>,
-}
-
-macro_rules! bounded_u32 {
-    ($name:ident, $min:literal, $max:literal) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
-        struct $name(#[schemars(range(min = $min, max = $max))] u32);
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                let value = u32::deserialize(deserializer)?;
-                if ($min..=$max).contains(&value) {
-                    Ok(Self(value))
-                } else {
-                    Err(serde::de::Error::custom(format!(
-                        "expected an integer from {} through {}",
-                        $min, $max
-                    )))
-                }
-            }
-        }
-
-        impl $name {
-            const fn get(self) -> u32 {
-                self.0
-            }
-        }
-    };
-}
-
-bounded_u32!(TailLines, 0, 1000);
-bounded_u32!(LogLines, 1, 1000);
-bounded_u32!(SearchContext, 0, 20);
-bounded_u32!(ResultLimit, 1, 1000);
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct DigestArgs {
-    #[schemars(
-        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
-    )]
-    job: String,
-    #[schemars(description = "how many of the last lines to include (default 40)")]
-    tail: Option<TailLines>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct SearchArgs {
-    #[schemars(
-        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
-    )]
-    job: String,
-    #[schemars(
-        description = "a regular expression (Rust regex syntax), at most 1024 bytes",
-        length(max = 1024)
-    )]
-    pattern: String,
-    #[schemars(description = "lines of context to return on each side of a match (default 2)")]
-    context: Option<SearchContext>,
-    #[schemars(description = "maximum matching lines to return (default 100)")]
-    limit: Option<ResultLimit>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct FileArgs {
-    #[schemars(
-        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
-    )]
-    job: String,
-    #[schemars(description = "relative to the directory the job ran in")]
-    path: crate::domain::RelPath,
-    #[schemars(description = "absolute local path of a file to create")]
-    destination: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct JobArgs {
-    #[schemars(
-        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
-    )]
-    job: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct LogArgs {
-    #[schemars(
-        description = "a job: its id, a unique prefix of one, MACHINE:ID, a name given with run's name, or latest (MACHINE:latest for one machine)"
-    )]
-    job: String,
-    #[schemars(description = "how many of the last lines to return (default 200)")]
-    lines: Option<LogLines>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct ListArgs {
-    #[schemars(description = "machine selector; omitted means every known machine")]
-    machines: Option<String>,
-    #[schemars(description = "maximum jobs to return from each machine (default 20)")]
-    limit: Option<ResultLimit>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-#[schemars(deny_unknown_fields)]
-struct EmptyArgs {}
-
-fn input_schema<T: JsonSchema>() -> Value {
-    match serde_json::to_value(schemars::schema_for!(T)) {
-        Ok(schema) => schema,
-        Err(error) => {
-            json!({"type": "object", "description": format!("schema generation failed: {error}")})
-        }
-    }
+fn result(id: &Value, value: &Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": value})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Effect {
-    Reads,
-    Writes,
-    Destroys,
+    Read,
+    Write,
+    Destructive,
 }
 
-fn annotated(title: &str, effect: Effect) -> Value {
-    let (read_only, destructive) = match effect {
-        Effect::Reads => (true, false),
-        Effect::Writes => (false, false),
-        Effect::Destroys => (false, true),
-    };
-    json!({"title": title, "readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": read_only, "openWorldHint": true})
-}
-
-fn tools() -> Value {
-    json!([
-        {"name": "run",
-         "description": "Send a local directory to machines and run a command there. The directory goes as it is on disk, uncommitted edits included; only files the machine lacks are uploaded, and build output stays warm between runs. Without wait it returns the job references at once and the jobs keep running; with wait it returns each job's digest when it finishes.",
-         "annotations": annotated("Run a command on machines", Effect::Destroys),
-         "inputSchema": input_schema::<RunArgs>()},
-        {"name": "job_digest",
-         "description": "The cheapest way to learn what a job did: its state, exit code, how long its log is, and its last lines, with terminal control sequences removed.",
-         "annotations": annotated("Summarize a job", Effect::Reads),
-         "inputSchema": input_schema::<DigestArgs>()},
-        {"name": "search_logs",
-         "description": "Search a job's whole log on its machine with a regular expression and return only the matching lines, numbered, with context around them.",
-         "annotations": annotated("Search a job's log", Effect::Reads),
-         "inputSchema": input_schema::<SearchArgs>()},
-        {"name": "wait_job",
-         "description": "Wait until a job finishes, then return its digest. Stopping this call does not stop the job; wait again or ask for its digest later.",
-         "annotations": annotated("Wait for a job", Effect::Reads),
-         "inputSchema": input_schema::<JobArgs>()},
-        {"name": "job_status", "description": "Where a job stands, with its full specification.",
-         "annotations": annotated("Show a job", Effect::Reads),
-         "inputSchema": input_schema::<JobArgs>()},
-        {"name": "job_logs", "description": "The last lines of a job's output as it was written. Prefer job_digest or search_logs, which cost fewer tokens.",
-         "annotations": annotated("Read a job's log", Effect::Reads),
-         "inputSchema": input_schema::<LogArgs>()},
-        {"name": "list_jobs", "description": "Recent jobs on machines, newest first per machine.",
-         "annotations": annotated("List jobs", Effect::Reads),
-         "inputSchema": input_schema::<ListArgs>()},
-        {"name": "get_file", "description": "Copy one file out of a job's workspace to a local path under a directory the local policy allows.",
-         "annotations": annotated("Fetch a file from a job", Effect::Writes),
-         "inputSchema": input_schema::<FileArgs>()},
-        {"name": "kill_job", "description": "Stop a job and every process it started, at once.",
-         "annotations": annotated("Stop a job", Effect::Destroys),
-         "inputSchema": input_schema::<JobArgs>()},
-        {"name": "machines", "description": "The machines domyjob knows, with their labels and how they are reached.",
-         "annotations": annotated("List machines", Effect::Reads),
-         "inputSchema": input_schema::<EmptyArgs>()}
-    ])
-}
-
-const INSTRUCTIONS: &str = "domyjob runs commands on other machines and keeps them running after you disconnect. Typical use: run with wait=false to start work, then job_digest or wait_job to learn the outcome, and search_logs to find the lines that matter. A job's log can be long; job_digest and search_logs return only what you ask for. Refer to jobs by id, by the name you gave them, or as latest. Jobs run in the environment of the machine, not yours: your ssh agent and local credentials are not available to them.";
-
-fn parse<T: crate::ingress::Ingress>(arguments: &Value) -> Result<T, ToolError> {
-    crate::ingress::json_value(arguments).map_err(ToolError::Arguments)
-}
-
-use crate::output::DIGEST_TAIL;
-
-fn digested(ctx: &Context, reference: &str, tail: u32) -> Result<Value, ToolError> {
-    let (machine, digest) = client::digest(ctx, reference, tail)?;
-    Ok(part(&crate::output::DigestView::of(&machine.name, &digest)))
-}
-
-fn inside_allowed(ctx: &Context, destination: &str) -> Result<PathBuf, ToolError> {
-    let path = PathBuf::from(destination);
-    let parent = path
-        .parent()
-        .ok_or_else(|| ToolError::Directory(destination.to_owned()))?;
-    let resolved = std::fs::canonicalize(parent)
-        .map_err(|_missing| ToolError::Directory(destination.to_owned()))?;
-    let allowed = ctx
-        .config
-        .mcp
-        .directories
-        .iter()
-        .any(|dir| std::fs::canonicalize(dir).is_ok_and(|root| resolved.starts_with(root)));
-    match (allowed, path.file_name()) {
-        (true, Some(name)) => Ok(resolved.join(name)),
-        (true, None) | (false, _) => Err(ToolError::Directory(destination.to_owned())),
-    }
-}
-
-fn tail(ctx: &Context, job: &str, lines: u32) -> Result<String, ToolError> {
-    let mut buffer = Vec::new();
-    client::logs(ctx, job, Output::Tail(lines), &mut buffer)?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
-}
-
-fn ran(ctx: &Context, item: &client::Submitted, waiting: bool) -> Value {
-    if !waiting {
-        return part(&crate::output::JobView::summary(
-            &item.machine.name,
-            &item.job,
-        ));
-    }
-    let reference = format!("{}:{}", item.machine.name, item.job.spec.id);
-    match client::wait(ctx, &reference)
-        .map_err(ToolError::from)
-        .and_then(|_| digested(ctx, &reference, DIGEST_TAIL))
-    {
-        Ok(digest) => digest,
-        Err(error) => part(&crate::output::Unsettled {
-            job: reference,
-            machine: item.machine.name.clone(),
-            state: crate::protocol::State::Lost.as_str(),
-            error: crate::output::ErrorView::new(
-                error.to_string(),
-                crate::diagnosis::Diagnosis {
-                    kind: crate::diagnosis::Kind::Unreachable,
-                    hint: Some(
-                        "it may still be running; job_status or wait_job asks again".to_owned(),
-                    ),
-                },
-            ),
-        }),
-    }
-}
-
-fn run(ctx: &Context, args: RunArgs) -> Result<Value, ToolError> {
-    permitted(ctx, &args)?;
-    let rev = match &args.rev {
-        Some(text) => Some(
-            text.parse::<crate::domain::Revision>()
-                .map_err(|_bad| ToolError::Revision(text.clone()))?,
-        ),
-        None => None,
-    };
-    let order = Order {
-        queue: crate::protocol::Queue::Slot,
-        targets: args.machines,
-        words: args
-            .command
-            .into_iter()
-            .map(|w| Arg::user(&crate::input::UserText::from_agent(w)))
-            .collect(),
-        runner: args.runner,
-        rev,
-        sending: Sending::Directory,
-        workspace: if args.fresh == Some(true) {
-            Workspace::Fresh
-        } else {
-            Workspace::Warm
-        },
-        start: PathBuf::from(&args.directory),
-        root: None,
-        env: std::collections::BTreeMap::new(),
-        shell: None,
-        name: args.name,
-    };
-    let (submitted, rejected) = client::submit(ctx, &order, &client::quietly)?;
-    let waiting = args.wait == Some(true);
-    let jobs: Vec<Value> = std::thread::scope(|scope| {
-        #[expect(
-            clippy::needless_collect,
-            reason = "every wait must start before the first is joined, or they run one after another"
-        )]
-        let handles: Vec<_> = submitted
-            .iter()
-            .map(|item| scope.spawn(move || ran(ctx, item, waiting)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| match handle.join() {
-                Ok(entry) => entry,
-                Err(_panicked) => Value::String("a worker panicked".to_owned()),
-            })
-            .collect()
-    });
-    answer(&crate::output::Jobs {
-        jobs,
-        unreachable: rejected
-            .iter()
-            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
-            .collect(),
+fn annotations(title: &str, effect: Effect) -> Value {
+    json!({
+        "title": title,
+        "readOnlyHint": effect == Effect::Read,
+        "destructiveHint": effect == Effect::Destructive,
+        "idempotentHint": effect == Effect::Read,
+        "openWorldHint": false,
     })
 }
 
-fn list_jobs(ctx: &Context, args: &ListArgs) -> Result<Value, ToolError> {
-    let machines = match &args.machines {
-        Some(selector) => ctx.select(selector)?,
-        None => client::known_machines(ctx)?,
-    };
-    let (jobs, rejected) = client::list(ctx, &machines, args.limit.map_or(20, ResultLimit::get));
-    answer(&crate::output::Jobs {
-        jobs: jobs
-            .iter()
-            .map(|(machine, job)| crate::output::JobView::summary(machine, job))
-            .collect(),
-        unreachable: rejected
-            .iter()
-            .map(|r| crate::output::MachineError::of(&r.machine, &r.error))
-            .collect(),
-    })
-}
+type Run<A> = fn(&mut Session, &A, Option<Tool>) -> Result<Outcome, OpsError>;
 
-fn search_logs(ctx: &Context, args: SearchArgs) -> Result<Value, ToolError> {
-    let query = client::Query {
-        pattern: args.pattern,
-        context: args.context.map_or(2, SearchContext::get),
-        limit: args.limit.map_or(100, ResultLimit::get),
-    };
-    let (machine, found) = client::search(ctx, &args.job, query)?;
-    answer(&crate::output::FoundView::of(&machine.name, &found))
-}
+macro_rules! tools {
+    ($(($name:literal, $title:literal, $description:literal, $args:ty, $effect:expr, $run:expr)),+ $(,)?) => {
+        fn catalog() -> Vec<Value> {
+            vec![$(json!({
+                "name": $name,
+                "title": $title,
+                "description": $description,
+                "inputSchema": schemars::schema_for!($args),
+                "annotations": annotations($title, $effect),
+            })),+]
+        }
 
-fn get_file(ctx: &Context, args: &FileArgs) -> Result<Value, ToolError> {
-    let destination = inside_allowed(ctx, &args.destination)?;
-    let local = |e: crate::failure::IoFailure| {
-        ToolError::Destination(args.destination.clone(), e.to_string())
-    };
-    let mut staged = crate::user_files::Staged::beside(&destination).map_err(local)?;
-    let machine = client::get(ctx, &args.job, args.path.clone(), staged.file())?;
-    let bytes = staged.commit().map_err(local)?;
-    answer(&crate::output::Fetched {
-        machine: &machine.name,
-        path: &args.path,
-        written: &destination,
-        bytes,
-    })
-}
-
-fn call(ctx: &Context, name: &str, arguments: &Value) -> Result<Value, ToolError> {
-    let tool = tool_named(name).ok_or_else(|| ToolError::Unknown(name.to_owned()))?;
-    if !ctx.config.mcp.tools.contains(&tool) {
-        return Err(ToolError::NotAllowed(tool_name(tool)));
-    }
-    match tool {
-        McpTool::Run => run(ctx, parse(arguments)?),
-        McpTool::ListJobs => list_jobs(ctx, &parse(arguments)?),
-        McpTool::JobStatus => {
-            let args: JobArgs = parse(arguments)?;
-            let (machine, job) =
-                client::job_request(ctx, &args.job, |job| Request::Status { job })?;
-            answer(&crate::output::JobView::summary(&machine.name, &job))
-        }
-        McpTool::JobLogs => {
-            let args: LogArgs = parse(arguments)?;
-            answer(&crate::output::Log {
-                log: tail(ctx, &args.job, args.lines.map_or(200, LogLines::get))?,
-            })
-        }
-        McpTool::WaitJob => {
-            let args: JobArgs = parse(arguments)?;
-            let (machine, job) = client::wait(ctx, &args.job)?;
-            let (machine, digest) = client::digest(
-                ctx,
-                &format!("{}:{}", machine.name, job.spec.id),
-                DIGEST_TAIL,
-            )?;
-            answer(&crate::output::DigestView::of(&machine.name, &digest))
-        }
-        McpTool::JobDigest => {
-            let args: DigestArgs = parse(arguments)?;
-            let (machine, digest) = client::digest(
-                ctx,
-                &args.job,
-                args.tail.map_or(DIGEST_TAIL, TailLines::get),
-            )?;
-            answer(&crate::output::DigestView::of(&machine.name, &digest))
-        }
-        McpTool::SearchLogs => search_logs(ctx, parse(arguments)?),
-        McpTool::GetFile => get_file(ctx, &parse(arguments)?),
-        McpTool::KillJob => {
-            let args: JobArgs = parse(arguments)?;
-            let (machine, job) = client::job_request(ctx, &args.job, |job| Request::Kill { job })?;
-            answer(&crate::output::JobView::summary(&machine.name, &job))
-        }
-        McpTool::Machines => {
-            let _: EmptyArgs = parse(arguments)?;
-            let configured = ctx.config.configured();
-            let mut machines = Vec::with_capacity(configured.len());
-            for machine in &configured {
-                machines.push(crate::output::Configured {
-                    machine: &machine.name,
-                    host: &machine.host,
-                    transport: &machine.transport,
-                    labels: &machine.labels,
-                    facts: crate::remote::cached_facts(&ctx.dirs, machine)
-                        .map_err(ClientError::from)?,
-                });
+        fn reads(name: &str) -> bool {
+            match name {
+                $($name => $effect == Effect::Read,)+
+                _ => false,
             }
-            answer(&crate::output::Machines { machines })
         }
-    }
-}
 
-fn respond(ctx: Option<&Context>, method: &str, params: &Value) -> Option<Value> {
-    match method {
-        "initialize" => Some(json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "domyjob", "version": VERSION},
-            "instructions": INSTRUCTIONS
-        })),
-        "ping" => Some(json!({})),
-        "tools/list" => Some(json!({"tools": tools()})),
-        "tools/call" => {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            let arguments = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let outcome = match ctx {
-                Some(ctx) => call(ctx, &name, &arguments),
-                None => Err(ToolError::Unknown(
-                    "(configuration failed to load)".to_owned(),
-                )),
-            };
-            Some(match outcome {
-                Ok(value) => {
-                    json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false})
-                }
-                Err(error) => {
-                    json!({"content": [{"type": "text", "text": error.to_string()}], "isError": true})
-                }
-            })
-        }
-        _ => None,
-    }
-}
-
-pub fn serve() -> Result<(), McpError> {
-    let ctx = match Context::load() {
-        Ok(ctx) => Some(ctx),
-        Err(error) => {
-            eprintln!("domyjob: {error}");
-            None
+        fn dispatch(session: &mut Session, name: &str, input: Value, client: Option<Tool>) -> Result<Outcome, CallError> {
+            match name {
+                $($name => {
+                    let arguments: $args = decode(input).map_err(CallError::Arguments)?;
+                    let run: Run<$args> = $run;
+                    let read = reads(name);
+                    ops::around(session, read, |session| run(session, &arguments, client)).map_err(CallError::Ops)
+                })+
+                _ => Err(CallError::Unknown),
+            }
         }
     };
-    let stdin = std::io::stdin();
-    let out = std::sync::Mutex::new(std::io::stdout());
-    let cancelled = std::sync::Mutex::new(std::collections::BTreeSet::<String>::new());
-    std::thread::scope(|scope| -> Result<(), McpError> {
-        for line in stdin.lock().lines() {
-            let line = line.map_err(McpError::Input)?;
-            let Ok(message) = crate::ingress::foreign_json_envelope(&line) else {
-                continue;
-            };
-            let method = message
-                .get("method")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
-            if method == "notifications/cancelled" {
-                if let (Some(request), Ok(mut set)) =
-                    (message.pointer("/params/requestId"), cancelled.lock())
+}
+
+#[derive(Debug)]
+enum CallError {
+    Unknown,
+    Arguments(serde_json::Error),
+    Ops(OpsError),
+}
+
+tools!(
+    (
+        "chat_join",
+        "Join",
+        "Register this session as an agent with a profile and act as it.",
+        JoinArgs,
+        Effect::Write,
+        |session, args, client| {
+            let tool = args
+                .tool
+                .map(Tool::from)
+                .or(client)
+                .ok_or(OpsError::Usage("this client is unknown; pass tool"))?;
+            ops::join(session, args, tool)
+        }
+    ),
+    (
+        "chat_whoami",
+        "Who am I",
+        "Show the agent this session acts as, with its profile and unread count.",
+        EmptyArgs,
+        Effect::Read,
+        |session, _args, _client| ops::whoami(session)
+    ),
+    (
+        "chat_directory",
+        "Directory",
+        "Find agents and rooms by name, role, skill, project, or description.",
+        DirectoryArgs,
+        Effect::Read,
+        |session, args, _client| ops::directory(session, args)
+    ),
+    (
+        "chat_profile",
+        "Update profile",
+        "Change this agent's display name, role, description, skills, project, or status.",
+        ProfileArgs,
+        Effect::Write,
+        |session, args, _client| ops::profile(session, args)
+    ),
+    (
+        "chat_agent_start",
+        "Start agent",
+        "Register a managed agent whose turns this machine runs with an AI CLI.",
+        StartArgs,
+        Effect::Write,
+        |session, args, _client| ops::start(session, args)
+    ),
+    (
+        "chat_agent_remove",
+        "Remove agent",
+        "Remove a local agent and end the asks waiting on it.",
+        NameArgs,
+        Effect::Destructive,
+        |session, args, _client| ops::remove(session, args)
+    ),
+    (
+        "chat_rooms",
+        "Rooms",
+        "List rooms with their topics and members.",
+        EmptyArgs,
+        Effect::Read,
+        |session, _args, _client| ops::rooms(session)
+    ),
+    (
+        "chat_room_create",
+        "Create room",
+        "Create a room owned by this machine with you and the given agents.",
+        RoomArgs,
+        Effect::Write,
+        |session, args, _client| ops::create_room(session, args)
+    ),
+    (
+        "chat_room_add",
+        "Add member",
+        "Add an agent to a room owned by this machine.",
+        MemberArgs,
+        Effect::Write,
+        |session, args, _client| ops::change_room(session, args, RoomChange::Add)
+    ),
+    (
+        "chat_room_remove",
+        "Remove member",
+        "Remove an agent from a room owned by this machine.",
+        MemberArgs,
+        Effect::Write,
+        |session, args, _client| ops::change_room(session, args, RoomChange::Remove)
+    ),
+    (
+        "chat_room_topic",
+        "Set topic",
+        "Set or clear a room's topic.",
+        TopicArgs,
+        Effect::Write,
+        |session, args, _client| ops::set_topic(session, args)
+    ),
+    (
+        "chat_send",
+        "Send",
+        "Send a message to an agent or a room.",
+        SendArgs,
+        Effect::Write,
+        |session, args, _client| ops::send(session, args)
+    ),
+    (
+        "chat_ask",
+        "Ask",
+        "Ask one agent and wait for its answer or ending.",
+        AskArgs,
+        Effect::Write,
+        |session, args, _client| ops::ask(session, args)
+    ),
+    (
+        "chat_reply",
+        "Reply",
+        "Reply to an exact message ID.",
+        ReplyArgs,
+        Effect::Write,
+        |session, args, _client| ops::reply(session, args)
+    ),
+    (
+        "chat_withdraw",
+        "Withdraw",
+        "Withdraw an ask you sent.",
+        MessageArgs,
+        Effect::Write,
+        |session, args, _client| ops::withdraw(session, args)
+    ),
+    (
+        "chat_wait",
+        "Wait",
+        "Show an ask's state, waiting up to `timeout` seconds for its ending.",
+        MessageArgs,
+        Effect::Read,
+        |session, args, _client| ops::wait(session, args)
+    ),
+    (
+        "chat_inbox",
+        "Inbox",
+        "Read the messages addressed to you that you have not read.",
+        InboxArgs,
+        Effect::Write,
+        |session, args, _client| ops::inbox(session, args)
+    ),
+    (
+        "chat_thread",
+        "Thread",
+        "Read a conversation with an agent or a room.",
+        ThreadArgs,
+        Effect::Read,
+        |session, args, _client| ops::thread(session, args)
+    ),
+);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    New,
+    Negotiated,
+    Ready,
+}
+
+struct Server<W> {
+    output: Mutex<W>,
+    phase: Mutex<Phase>,
+    session: Mutex<Session>,
+    client: Mutex<Option<Tool>>,
+    calls: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn client_tool(params: &Value) -> Option<Tool> {
+    let name = params.pointer("/clientInfo/name")?.as_str()?.to_lowercase();
+    if name.contains("claude") {
+        Some(Tool::Claude)
+    } else if name.contains("codex") {
+        Some(Tool::Codex)
+    } else if name.contains("opencode") {
+        Some(Tool::Opencode)
+    } else {
+        None
+    }
+}
+
+impl<W: Write + Send> Server<W> {
+    fn send(&self, value: &Value) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(value)?;
+        if bytes.len() > MAX_CONTROL_BYTES {
+            bytes = serde_json::to_vec(&error(
+                value.get("id").unwrap_or(&Value::Null),
+                -32603,
+                "The result exceeds 1 MiB; request fewer events",
+            ))?;
+        }
+        let mut output = lock(&self.output);
+        output.write_all(&bytes)?;
+        output.write_all(b"\n")?;
+        output.flush()
+    }
+
+    fn initialize(&self, id: &Value, params: &Value) -> Value {
+        let requested = params.get("protocolVersion").and_then(Value::as_str);
+        let valid = requested.is_some()
+            && params.get("capabilities").is_some_and(Value::is_object)
+            && params
+                .pointer("/clientInfo/name")
+                .is_some_and(Value::is_string);
+        {
+            let mut phase = lock(&self.phase);
+            if !valid || *phase != Phase::New {
+                return error(id, -32602, "Invalid initialization");
+            }
+            *phase = Phase::Negotiated;
+        }
+        *lock(&self.client) = client_tool(params);
+        let version = requested
+            .filter(|requested| VERSIONS.contains(requested))
+            .unwrap_or(VERSIONS[0]);
+        result(
+            id,
+            &json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "domyjob", "version": env!("CARGO_PKG_VERSION")},
+                "instructions": INSTRUCTIONS,
+            }),
+        )
+    }
+
+    fn call(&self, id: &Value, params: Value, cancelled: &Arc<AtomicBool>) -> Option<Value> {
+        let Ok(call) = decode::<Call>(params) else {
+            return Some(error(id, -32602, "Invalid tool parameters"));
+        };
+        let mut session = lock(&self.session).clone_for(Arc::clone(cancelled));
+        let client = *lock(&self.client);
+        let outcome = dispatch(&mut session, &call.name, call.arguments, client);
+        if cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        if call.name == "chat_join" && outcome.is_ok() {
+            lock(&self.session).adopt(&session);
+        }
+        Some(match outcome {
+            Ok(outcome) => {
+                let mut value = outcome.json();
+                if let (Value::Object(fields), Ok(Some(unread))) =
+                    (&mut value, ops::unread(&session))
                 {
-                    set.insert(request.to_string());
+                    fields.insert("unread".to_owned(), json!(unread));
                 }
-                continue;
+                result(
+                    id,
+                    &json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false}),
+                )
             }
-            let Some(id) = message.get("id").cloned() else {
+            Err(CallError::Unknown) => error(id, -32602, "Unknown tool"),
+            Err(CallError::Arguments(problem)) => {
+                error(id, -32602, &format!("Invalid arguments: {problem}"))
+            }
+            Err(CallError::Ops(problem)) => result(
+                id,
+                &json!({"content": [{"type": "text", "text": problem.to_string()}], "isError": true}),
+            ),
+        })
+    }
+
+    fn respond(&self, id: &Value, method: &str, params: &Value) -> Value {
+        let ready = *lock(&self.phase) == Phase::Ready;
+        match method {
+            "initialize" => self.initialize(id, params),
+            "ping" => result(id, &json!({})),
+            "tools/list" if ready => result(id, &json!({"tools": catalog()})),
+            "tools/list" | "tools/call" => error(id, -32002, "Server not initialized"),
+            _ => error(id, -32601, "Method not found"),
+        }
+    }
+}
+
+fn key(id: &Value) -> String {
+    id.to_string()
+}
+
+fn read_line(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
+    let limit = u64::try_from(MAX_CONTROL_BYTES)
+        .map_err(io::Error::other)?
+        .saturating_add(1);
+    let mut line = Vec::new();
+    if io::Read::take(&mut *input, limit).read_until(b'\n', &mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+fn serve_io<W: Write + Send>(mut input: impl BufRead, server: &Server<W>) -> io::Result<()> {
+    std::thread::scope(|scope| -> io::Result<()> {
+        while let Some(line) = read_line(&mut input)? {
+            if line.len() > MAX_CONTROL_BYTES {
+                server.send(&error(&Value::Null, -32600, "Request exceeds 1 MiB"))?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oversized MCP request",
+                ));
+            }
+            let request = match parse(&line) {
+                Ok(request) => request,
+                Err(problem) => {
+                    server.send(&problem)?;
+                    continue;
+                }
+            };
+            let Some(id) = request.id else {
+                notification(server, &request.method, &request.params);
                 continue;
             };
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let (ctx, out, cancelled) = (ctx.as_ref(), &out, &cancelled);
-            scope.spawn(move || {
-                let reply = match respond(ctx, &method, &params) {
-                    Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                    None => {
-                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("unknown method {method}")}})
-                    }
-                };
-                let withdrawn = match cancelled.lock() {
-                    Ok(mut set) => set.remove(&id.to_string()),
-                    Err(_poisoned) => false,
-                };
-                if withdrawn {
-                    return;
+            if request.method != "tools/call" || *lock(&server.phase) != Phase::Ready {
+                server.send(&server.respond(&id, &request.method, &request.params))?;
+                continue;
+            }
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let refusal = {
+                let mut calls = lock(&server.calls);
+                if calls.contains_key(&key(&id)) {
+                    Some("request id is already active")
+                } else if calls.len() >= MAX_CALLS {
+                    Some("too many active requests")
+                } else {
+                    calls.insert(key(&id), Arc::clone(&cancelled));
+                    None
                 }
-                if let Ok(mut out) = out.lock() {
-                    match writeln!(out, "{reply}").and_then(|()| out.flush()) {
-                        Ok(()) | Err(_) => {}
-                    }
+            };
+            if let Some(message) = refusal {
+                server.send(&error(&id, -32000, message))?;
+                continue;
+            }
+            scope.spawn(move || {
+                let reply = server.call(&id, request.params, &cancelled);
+                lock(&server.calls).remove(&key(&id));
+                if let Some(reply) = reply {
+                    let _written = server.send(&reply);
                 }
             });
         }
@@ -675,50 +497,41 @@ pub fn serve() -> Result<(), McpError> {
     })
 }
 
-impl crate::ingress::Ingress for RunArgs {}
-impl crate::ingress::Ingress for ListArgs {}
-impl crate::ingress::Ingress for JobArgs {}
-impl crate::ingress::Ingress for LogArgs {}
-impl crate::ingress::Ingress for DigestArgs {}
-impl crate::ingress::Ingress for SearchArgs {}
-impl crate::ingress::Ingress for FileArgs {}
-impl crate::ingress::Ingress for EmptyArgs {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn advertises_tools_and_rejects_unknown_methods() {
-        let init = respond(None, "initialize", &Value::Null).unwrap();
-        assert_eq!(init.pointer("/serverInfo/name"), Some(&json!("domyjob")));
-        let listed = respond(None, "tools/list", &Value::Null).unwrap();
-        let names: Vec<&str> = listed
-            .pointer("/tools")
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t.get("name").unwrap().as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"run") && names.contains(&"wait_job"));
-        assert!(respond(None, "resources/list", &Value::Null).is_none());
-        let failed = respond(None, "tools/call", &json!({"name": "run", "arguments": {}})).unwrap();
-        assert_eq!(failed.get("isError"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn generated_schemas_and_runtime_parsing_share_their_numeric_bounds() {
-        let schema = input_schema::<LogArgs>();
-        assert_eq!(schema.pointer("/$defs/LogLines/minimum"), Some(&json!(1)));
-        assert_eq!(
-            schema.pointer("/$defs/LogLines/maximum"),
-            Some(&json!(1000))
-        );
-        parse::<LogArgs>(&json!({"job": "latest", "lines": 1})).unwrap();
-        parse::<LogArgs>(&json!({"job": "latest", "lines": 1000})).unwrap();
-        parse::<LogArgs>(&json!({"job": "latest", "lines": 0})).unwrap_err();
-        parse::<LogArgs>(&json!({"job": "latest", "lines": 1001})).unwrap_err();
-        parse::<EmptyArgs>(&json!({"unexpected": true})).unwrap_err();
+fn notification<W>(server: &Server<W>, method: &str, params: &Value) {
+    match method {
+        "notifications/initialized" => {
+            let mut phase = lock(&server.phase);
+            if *phase == Phase::Negotiated {
+                *phase = Phase::Ready;
+            }
+        }
+        "notifications/cancelled" => {
+            if let Some(id) = params.get("requestId")
+                && let Some(flag) = lock(&server.calls).get(&key(id))
+            {
+                flag.store(true, Ordering::Release);
+            }
+        }
+        _ => {}
     }
 }
+
+pub(crate) fn serve(
+    output: Output,
+    actor: Option<&str>,
+    turn: Option<&str>,
+) -> Result<(), McpError> {
+    let session = Session::open(actor, turn)?;
+    let server = Server {
+        output: Mutex::new(output.into_stream()),
+        phase: Mutex::new(Phase::New),
+        session: Mutex::new(session),
+        client: Mutex::new(None),
+        calls: Mutex::new(BTreeMap::new()),
+    };
+    serve_io(io::stdin().lock(), &server)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

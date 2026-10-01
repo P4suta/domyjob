@@ -1,89 +1,75 @@
+#[path = "src/platform/file_kind.rs"]
+mod file_kind;
+#[path = "src/source_archive.rs"]
+mod source_archive;
+#[path = "src/source_fingerprint.rs"]
+mod source_fingerprint;
+
+use std::io;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_BUILD_STAMP: &str = "DOMYJOB_EXPECTED_BUILD_STAMP";
-
-fn portable(path: &Path) -> String {
-    let mut portable = String::new();
-    for component in path.components() {
-        if !portable.is_empty() {
-            portable.push('/');
-        }
-        portable.push_str(&component.as_os_str().to_string_lossy());
+fn source_archive(root: &Path, files: Vec<PathBuf>) -> io::Result<Vec<u8>> {
+    let mut archive = source_archive::Archive::new();
+    for path in files {
+        archive
+            .add(root, &path, |_metadata| 0o644)
+            .map_err(io::Error::other)?;
     }
-    portable
+    archive.finish().map_err(io::Error::other)
 }
 
-fn inputs(dir: &Path, root: &Path, found: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            if !matches!(
-                name.to_str(),
-                Some(".git" | ".jj" | "target" | "node_modules")
-            ) {
-                inputs(&path, root, found)?;
-            }
-        } else if kind.is_file()
-            && matches!(
-                path.extension().and_then(|extension| extension.to_str()),
-                Some("rs" | "toml" | "lock")
-            )
-        {
-            let relative = path.strip_prefix(root).map_err(|error| {
-                std::io::Error::other(format!(
-                    "{} is not below {}: {error}",
-                    path.display(),
-                    root.display()
-                ))
-            })?;
-            found.push((portable(relative), relative.to_path_buf()));
-        }
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        clippy::disallowed_macros,
+        reason = "the build script writes generated source only inside Cargo OUT_DIR \
+                  and speaks to Cargo on standard output"
+    )]
+
+    use std::io;
+    use std::path::Path;
+
+    pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        std::fs::write(path, bytes)
     }
-    Ok(())
+
+    pub(super) fn instruct(instruction: &str) {
+        println!("cargo:{instruction}");
+    }
 }
 
-fn main() -> std::io::Result<()> {
-    println!("cargo:rerun-if-env-changed={EXPECTED_BUILD_STAMP}");
-    let target = std::env::var("TARGET")
-        .map_err(|error| std::io::Error::other(format!("TARGET is unavailable: {error}")))?;
-    println!("cargo:rustc-env=DOMYJOB_TARGET={target}");
-    let Some(crate_dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
-        return Err(std::io::Error::other("CARGO_MANIFEST_DIR is unavailable"));
-    };
-    let Some(root) = crate_dir.parent().and_then(Path::parent) else {
-        return Err(std::io::Error::other(format!(
-            "{} has no workspace root two levels above it",
-            crate_dir.display()
-        )));
-    };
-    let mut found = Vec::new();
-    inputs(root, root, &mut found)?;
-    found.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut digest = blake3::Hasher::new();
-    for (portable, relative) in found {
-        let path = root.join(&relative);
-        println!("cargo:rerun-if-changed={}", path.display());
-        digest.update(portable.as_bytes());
-        digest.update(&[0]);
-        digest.update(&std::fs::read(path)?);
-        digest.update(&[0]);
-    }
-    let hash = digest.finalize().to_hex();
-    let Some(stamp) = hash.as_str().get(..16) else {
-        return Err(std::io::Error::other(
-            "the build digest was shorter than 16 ASCII characters",
+fn main() -> io::Result<()> {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .ok_or_else(|| io::Error::other("CARGO_MANIFEST_DIR is missing"))?;
+    let manifest = Path::new(&manifest_dir);
+    let checkout = manifest
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("the checkout root is missing"))?;
+    let mut files = Vec::new();
+    let fingerprint = source_fingerprint::from_checkout(checkout, |kind, path| {
+        raw::instruct(&format!("rerun-if-changed={}", path.display()));
+        if kind == source_fingerprint::SourceKind::File {
+            files.push(path.to_path_buf());
+        }
+    })?;
+    let output =
+        std::env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("OUT_DIR is missing"))?;
+    let generated = Path::new(&output).join("fingerprint.rs");
+    raw::write(
+        &generated,
+        format!(
+            "const COMPILED_FINGERPRINT: u64 = u64::from_be_bytes({:?});\n",
+            fingerprint.to_be_bytes()
+        )
+        .as_bytes(),
+    )?;
+    let archive = source_archive(checkout, files)?;
+    if source_fingerprint::from_checkout(checkout, |_kind, _path| {})? != fingerprint {
+        return Err(io::Error::other(
+            "the source changed while building its archive",
         ));
-    };
-    if let Ok(expected) = std::env::var(EXPECTED_BUILD_STAMP)
-        && expected != stamp
-    {
-        return Err(std::io::Error::other(format!(
-            "the source build stamp is {stamp}, not the expected {expected}"
-        )));
     }
-    println!("cargo:rustc-env=DOMYJOB_BUILD_STAMP={stamp}");
+    raw::write(&Path::new(&output).join("source.tar"), &archive)?;
     Ok(())
 }

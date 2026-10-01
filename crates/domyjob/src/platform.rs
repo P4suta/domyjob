@@ -1,506 +1,298 @@
-#[cfg(unix)]
-pub use std::os::unix::net::{UnixListener, UnixStream};
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
+use domyjob_core::chat::card::{MachineCard, Os};
+use domyjob_core::chat::id::{Invalid, Line};
+
+pub(crate) use crate::file_kind::reparse_point;
+pub(crate) mod clock;
+pub(crate) mod replacement;
+pub(crate) mod service;
+pub(crate) mod user_files;
+
+#[cfg(unix)]
+mod unix;
 #[cfg(windows)]
-pub use uds_windows::{UnixListener, UnixStream};
-
-pub const SOCKET_PATH_LIMIT: usize = if cfg!(windows) { 107 } else { 103 };
-
-use std::path::Path;
-
-use crate::paths::Family;
-use crate::snapshot::Mode;
-
-pub const OS: &str = std::env::consts::OS;
-pub const ARCH: &str = std::env::consts::ARCH;
-pub const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
-pub const FAMILY: Family = if cfg!(windows) {
-    Family::Windows
-} else {
-    Family::Unix
-};
-pub const LINKS: bool = FAMILY.links();
-pub const RUNNING_EXECUTABLE: Option<&str> = if cfg!(target_os = "linux") {
-    Some("/proc/self/exe")
-} else {
-    None
-};
-pub const MODES: bool = FAMILY.modes();
+mod windows;
+#[cfg(windows)]
+mod windows_acl;
 
 #[cfg(unix)]
-#[must_use]
-pub fn numeric_user_id() -> u32 {
-    rustix::process::getuid().as_raw()
-}
+pub(crate) use unix::Mode as Exposure;
+#[cfg(unix)]
+use unix::Unix as Native;
+#[cfg(windows)]
+pub(crate) use windows::Acl as Exposure;
+#[cfg(windows)]
+use windows::Windows as Native;
 
-#[cfg(not(unix))]
-#[must_use]
-pub const fn numeric_user_id() -> u32 {
-    0
-}
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "the platform layer owns raw file options, permissions, and user file effects"
+    )]
 
-#[must_use]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn boot_identity() -> Option<String> {
-    boot_identity_on_this_system()
-}
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::path::Path;
 
-#[must_use]
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub const fn boot_identity() -> Option<String> {
-    boot_identity_on_this_system()
-}
-
-#[cfg(target_os = "linux")]
-fn boot_identity_on_this_system() -> Option<String> {
-    let Ok(identity) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
-        return None;
-    };
-    let identity = identity.trim().to_owned();
-    (!identity.is_empty()).then_some(identity)
-}
-
-#[cfg(target_os = "macos")]
-fn boot_identity_on_this_system() -> Option<String> {
-    let Ok(output) = crate::spawn::Invocation::new(
-        crate::template::Arg::literal("sysctl"),
-        vec![
-            crate::template::Arg::literal("-n"),
-            crate::template::Arg::literal("kern.bootsessionuuid"),
-        ],
-    )
-    .command()
-    .output() else {
-        return None;
-    };
-    if !output.status.success() {
-        return None;
+    pub(super) fn options() -> OpenOptions {
+        OpenOptions::new()
     }
-    let Ok(identity) = String::from_utf8(output.stdout) else {
-        return None;
-    };
-    let identity = identity.trim().to_owned();
-    (!identity.is_empty()).then_some(identity)
-}
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const fn boot_identity_on_this_system() -> Option<String> {
-    None
-}
+    #[cfg(unix)]
+    pub(super) fn set_permissions(
+        path: &Path,
+        permissions: std::fs::Permissions,
+    ) -> io::Result<()> {
+        std::fs::set_permissions(path, permissions)
+    }
 
-const fn bits(mode: Mode) -> u32 {
-    mode.unix_bits()
-}
+    pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
 
-const fn mode_from(bits: u32) -> Mode {
-    if bits & 0o111 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
+    pub(super) fn copy(from: &Path, to: &Path) -> io::Result<u64> {
+        std::fs::copy(from, to)
+    }
+
+    pub(super) fn remove_file(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 }
 
-pub trait Moded {
-    fn mode(&self) -> Mode;
-}
+trait System {
+    const OS: Os;
+    const JOB_ENVIRONMENT: &'static [&'static str];
 
-impl Moded for std::fs::Metadata {
-    fn mode(&self) -> Mode {
-        mode_from(std_bits(self))
-    }
-}
-
-impl Moded for cap_std::fs::Metadata {
-    fn mode(&self) -> Mode {
-        mode_from(cap_bits(self))
-    }
-}
-
-#[cfg(unix)]
-fn std_bits(meta: &std::fs::Metadata) -> u32 {
-    std::os::unix::fs::PermissionsExt::mode(&meta.permissions())
-}
-
-#[cfg(not(unix))]
-const fn std_bits(_meta: &std::fs::Metadata) -> u32 {
-    Mode::Regular.unix_bits()
-}
-
-#[cfg(unix)]
-fn cap_bits(meta: &cap_std::fs::Metadata) -> u32 {
-    cap_std::fs::PermissionsExt::mode(&meta.permissions())
-}
-
-#[cfg(not(unix))]
-const fn cap_bits(_meta: &cap_std::fs::Metadata) -> u32 {
-    Mode::Regular.unix_bits()
-}
-
-pub fn create_as(options: &mut cap_std::fs::OpenOptions, mode: Mode) {
-    create_with_bits(options, bits(mode));
-}
-
-#[cfg(unix)]
-fn create_with_bits(options: &mut cap_std::fs::OpenOptions, bits: u32) {
-    cap_std::fs::OpenOptionsExt::mode(options, bits);
-}
-
-#[cfg(not(unix))]
-#[expect(
-    clippy::missing_const_for_fn,
-    reason = "kept a plain function so create_as has one signature on every system"
-)]
-fn create_with_bits(_options: &mut cap_std::fs::OpenOptions, _bits: u32) {}
-
-pub fn link(dir: &cap_std::fs::Dir, target: &str, at: &Path) -> std::io::Result<()> {
-    link_in(dir, target, at)
-}
-
-#[cfg(unix)]
-fn link_in(dir: &cap_std::fs::Dir, target: &str, at: &Path) -> std::io::Result<()> {
-    dir.symlink_contents(target, at)
-}
-
-#[cfg(not(unix))]
-fn link_in(_dir: &cap_std::fs::Dir, target: &str, _at: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!("a symbolic link to {target} cannot be made on this system"),
-    ))
-}
-
-#[cfg(test)]
-pub fn make_link(target: &str, at: &Path) -> std::io::Result<()> {
-    make_link_in(target, at)
-}
-
-#[cfg(all(test, unix))]
-fn make_link_in(target: &str, at: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, at)
-}
-
-#[cfg(all(test, not(unix)))]
-fn make_link_in(target: &str, _at: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!("a symbolic link to {target} cannot be made on this system"),
-    ))
-}
-
-#[cfg(all(test, unix))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests give fixture files the mode a project would have"
-)]
-pub fn set_mode(path: &Path, mode: Mode) -> std::io::Result<()> {
-    std::fs::set_permissions(
-        path,
-        std::os::unix::fs::PermissionsExt::from_mode(bits(mode)),
-    )
-}
-
-#[cfg(all(test, not(unix)))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the signature of systems that keep an executable bit"
-)]
-pub const fn set_mode(_path: &Path, _mode: Mode) -> std::io::Result<()> {
-    Ok(())
+    fn host_name() -> String;
+    fn user_id() -> Option<u32>;
+    fn executable(metadata: &fs::Metadata) -> bool;
+    fn make_executable(path: &Path) -> io::Result<()>;
+    fn file_mode(metadata: &fs::Metadata) -> u32;
+    fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool);
+    fn ownership(file: &fs::File) -> io::Result<Ownership>;
+    fn open_private_dir(path: &Path) -> io::Result<fs::File>;
+    fn create_private_dir(path: &Path) -> io::Result<()>;
+    fn owner_only(options: &mut fs::OpenOptions);
+    fn no_follow(options: &mut fs::OpenOptions);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ownership {
+pub(crate) enum Ownership {
     Private,
-    OtherOwner,
-    Exposed(u32),
+    Foreign,
+    Exposed(Exposure),
 }
 
-#[cfg(unix)]
+pub(crate) fn variable(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+pub(crate) fn home() -> io::Result<PathBuf> {
+    variable("HOME")
+        .or_else(|| variable("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("the user home directory is unavailable"))
+}
+
+pub(crate) fn ssh_control_path(
+    directory: &Path,
+) -> Result<Option<PathBuf>, crate::state_io::StateError> {
+    if cfg!(windows) || directory.as_os_str().len().saturating_add(41) > 100 {
+        return Ok(None);
+    }
+    crate::state_io::private_dir(directory)?;
+    Ok(Some(directory.join("%C")))
+}
+
+pub(crate) fn stable_program(build: &str) -> io::Result<PathBuf> {
+    Ok(home()?
+        .join(".cargo")
+        .join("domyjob")
+        .join("versions")
+        .join(build)
+        .join("bin")
+        .join(format!("domyjob{}", std::env::consts::EXE_SUFFIX)))
+}
+
+pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
+    Native::make_executable(path)
+}
+
+pub(crate) fn user_id() -> Option<u32> {
+    Native::user_id()
+}
+
+pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
+    let name = Native::host_name();
+    let label = name.split('.').next().unwrap_or_default().trim().to_owned();
+    Ok(MachineCard {
+        label: Line::try_from(if label.is_empty() {
+            "machine".to_owned()
+        } else {
+            label.chars().take(64).collect()
+        })?,
+        os: Native::OS,
+    })
+}
+
+pub(crate) fn user_runtime_dir() -> Option<String> {
+    variable("XDG_RUNTIME_DIR")
+        .map(|value| value.to_string_lossy().into_owned())
+        .or_else(|| user_id().map(|id| format!("/run/user/{id}")))
+}
+
 #[must_use]
-pub fn ownership(meta: &std::fs::Metadata) -> Ownership {
-    use std::os::unix::fs::MetadataExt;
-    const GROUP_AND_OTHER_BITS: u32 = 6;
-    if meta.uid() != rustix::process::geteuid().as_raw() {
-        return Ownership::OtherOwner;
+pub(crate) fn find_program(name: &str) -> Option<PathBuf> {
+    let path = variable("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|directory| directory.is_absolute())
+        .flat_map(|directory| candidates(&directory, name))
+        .find(|candidate| fs::metadata(candidate).is_ok_and(|found| Native::executable(&found)))
+}
+
+fn candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    candidates_on(cfg!(windows), directory, name)
+}
+
+fn candidates_on(windows: bool, directory: &Path, name: &str) -> Vec<PathBuf> {
+    if !windows {
+        return vec![directory.join(name)];
     }
-    let mode = MetadataExt::mode(meta) & 0o777;
-    if mode.trailing_zeros() >= GROUP_AND_OTHER_BITS {
-        Ownership::Private
-    } else {
-        Ownership::Exposed(mode)
+    let mut found = Vec::new();
+    if Path::new(name).extension().is_some() {
+        found.push(directory.join(name));
+    }
+    found.extend(
+        ["exe", "cmd", "bat"]
+            .iter()
+            .map(|extension| directory.join(format!("{name}.{extension}"))),
+    );
+    found
+}
+
+pub(crate) fn cargo_target_dir(checkout: &Path) -> PathBuf {
+    match variable("CARGO_TARGET_DIR").map(PathBuf::from) {
+        Some(target) if target.is_absolute() => target,
+        Some(target) => checkout.join(target),
+        None => checkout.join("target"),
     }
 }
 
-#[cfg(not(unix))]
-#[must_use]
-pub const fn ownership(_meta: &std::fs::Metadata) -> Ownership {
-    Ownership::Private
+fn replaceable(executable: &Path) -> bool {
+    raw::options().write(true).open(executable).is_ok()
 }
 
-pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    create_private_dir_in(path)
+pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
+    if !cfg!(windows) {
+        return Ok(target.to_path_buf());
+    }
+    let current = fs::canonicalize(std::env::current_exe()?)?;
+    for slot in [
+        target.to_path_buf(),
+        target.join("domyjob-refresh"),
+        target.join("domyjob-refresh-2"),
+    ] {
+        let executable = slot.join("debug").join("domyjob.exe");
+        match fs::canonicalize(&executable) {
+            Ok(path) if path == current => {}
+            Ok(_) if replaceable(&executable) => return Ok(slot),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(slot),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::other(
+        "every local build slot is running; close other domyjob clients and retry",
+    ))
 }
 
-#[cfg(unix)]
-fn create_private_dir_in(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-}
-
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "reading the current user's SID from the process token needs the token API"
-)]
-fn current_user_sid() -> std::io::Result<crate::domain::WindowsSid> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let refuse = |detail: &str| std::io::Error::other(detail.to_owned());
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(refuse("the process token cannot be opened"));
-    }
-    let mut needed = 0u32;
-    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut needed) };
-    let Ok(capacity) = usize::try_from(needed) else {
-        return Err(refuse("the token is too large"));
-    };
-    let mut buffer = vec![0u8; capacity];
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    if asked == 0 || buffer.len() < size_of::<TOKEN_USER>() {
-        return Err(refuse("the token has no user"));
-    }
-    let user: TOKEN_USER = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast()) };
-    let mut wide: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut wide) } == 0 || wide.is_null() {
-        return Err(refuse("the SID cannot be rendered"));
-    }
-    let mut len = 0usize;
-    while unsafe { *wide.add(len) } != 0 {
-        len = len.saturating_add(1);
-    }
-    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    unsafe { LocalFree(wide.cast()) };
-    crate::domain::WindowsSid::try_from(text).map_err(|e| refuse(&e.to_string()))
-}
-
-#[cfg(windows)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one place that creates a private directory, then confines it with an ACL"
-)]
-fn create_private_dir_in(path: &Path) -> std::io::Result<()> {
-    use crate::template::Arg;
-    std::fs::create_dir_all(path)?;
-    let sid = current_user_sid()?;
-    let args = vec![
-        Arg::path(path),
-        Arg::literal("/inheritance:r"),
-        Arg::literal("/grant:r"),
-        Arg::concat(&[
-            Arg::literal("*"),
-            Arg::word(&sid),
-            Arg::literal(":(OI)(CI)F"),
-        ]),
-        Arg::literal("/grant:r"),
-        Arg::literal("*S-1-5-18:(OI)(CI)F"),
-        Arg::literal("/Q"),
+pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
+    const COMMON: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "TEMP",
+        "TMP",
+        "MISE_DATA_DIR",
+        "MISE_CONFIG_DIR",
     ];
-    let status = crate::spawn::Invocation::new(Arg::literal("icacls"), args)
-        .command()
-        .stdout(std::process::Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "icacls exited with {status}"
-        )))
-    }
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the options every private state file is opened with"
-)]
-#[must_use]
-pub fn private_options() -> std::fs::OpenOptions {
-    let mut options = std::fs::OpenOptions::new();
-    owner_only(&mut options);
-    options
-}
-
-#[cfg(unix)]
-fn owner_only(options: &mut std::fs::OpenOptions) {
-    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
-}
-
-#[cfg(not(unix))]
-const fn owner_only(_options: &mut std::fs::OpenOptions) {}
-
-#[cfg(unix)]
-pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir).and_then(|handle| handle.sync_all())
-}
-
-#[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the signature of systems that can sync a directory"
-)]
-pub const fn sync_dir(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-pub fn let_owner_change(perms: &mut std::fs::Permissions) {
-    std::os::unix::fs::PermissionsExt::set_mode(perms, 0o700);
-}
-
-#[cfg(not(unix))]
-pub fn let_owner_change(perms: &mut std::fs::Permissions) {
-    perms.set_readonly(false);
-}
-
-#[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests lock a path down the way a careless job would"
-)]
-pub fn lock_down(path: &Path) -> std::io::Result<()> {
-    let mut perms = std::fs::symlink_metadata(path)?.permissions();
-    forbid(&mut perms);
-    std::fs::set_permissions(path, perms)
-}
-
-#[cfg(all(test, unix))]
-fn forbid(perms: &mut std::fs::Permissions) {
-    std::os::unix::fs::PermissionsExt::set_mode(perms, 0o500);
-}
-
-#[cfg(all(test, not(unix)))]
-fn forbid(perms: &mut std::fs::Permissions) {
-    perms.set_readonly(true);
-}
-
-#[cfg(all(test, unix))]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests widen a state file the way a careless user would"
-)]
-pub fn expose(path: &Path) -> std::io::Result<bool> {
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
-    Ok(true)
-}
-
-#[cfg(all(test, not(unix)))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shares the signature of systems where group and other bits exist"
-)]
-pub const fn expose(_path: &Path) -> std::io::Result<bool> {
-    Ok(false)
-}
-
-#[cfg(test)]
-pub(crate) struct ReadOnly(std::path::PathBuf);
-
-#[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests make a directory read-only and must give it back even when they panic"
-)]
-impl ReadOnly {
-    pub(crate) fn make(dir: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
-        lock_down(dir)?;
-        Ok(Self(dir.to_path_buf()))
-    }
-}
-
-#[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "tests make a directory read-only and must give it back even when they panic"
-)]
-impl Drop for ReadOnly {
-    fn drop(&mut self) {
-        let Ok(meta) = std::fs::symlink_metadata(&self.0) else {
-            return;
-        };
-        let mut perms = meta.permissions();
-        let_owner_change(&mut perms);
-        match std::fs::set_permissions(&self.0, perms) {
-            Ok(()) | Err(_) => {}
+    command.env_clear();
+    for name in COMMON.iter().chain(Native::JOB_ENVIRONMENT) {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
         }
     }
 }
 
-#[cfg(unix)]
-#[must_use]
-pub fn elevated() -> bool {
-    rustix::process::geteuid().is_root()
+pub(crate) fn file_mode(metadata: &fs::Metadata) -> u32 {
+    Native::file_mode(metadata)
 }
 
-#[cfg(windows)]
-#[expect(
-    unsafe_code,
-    reason = "asking Windows whether this process token is elevated needs the token API"
-)]
-#[must_use]
-pub fn elevated() -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    let mut token: HANDLE = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return true;
+pub(crate) fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool) {
+    Native::creation_mode(options, executable);
+}
+
+pub(crate) fn ownership(file: &fs::File) -> io::Result<Ownership> {
+    Native::ownership(file)
+}
+
+pub(crate) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
+    Native::open_private_dir(path)
+}
+
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    Native::create_private_dir(path)
+}
+
+pub(crate) fn private_options() -> fs::OpenOptions {
+    let mut options = raw::options();
+    Native::owner_only(&mut options);
+    Native::no_follow(&mut options);
+    options
+}
+
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
     }
-    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-    let mut returned = 0u32;
-    let Ok(size) = u32::try_from(size_of::<TOKEN_ELEVATION>()) else {
-        return true;
-    };
-    let asked = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            (&raw mut elevation).cast(),
-            size,
-            &raw mut returned,
-        )
-    };
-    unsafe { CloseHandle(token) };
-    asked == 0 || elevation.TokenIsElevated != 0
+    fs::File::open(path)?.sync_all()
 }
 
-#[cfg(windows)]
-pub fn push_arg(command: &mut std::process::Command, word: &str, cmd: bool) {
-    use std::os::windows::process::CommandExt;
-    if cmd {
-        command.raw_arg(word);
-    } else {
-        command.arg(word);
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{candidates_on, prepare_job_environment};
+
+    #[test]
+    fn a_program_named_with_its_extension_is_found_as_written() {
+        let directory = Path::new("bin");
+        assert_eq!(
+            candidates_on(true, directory, "powershell.exe").first(),
+            Some(&PathBuf::from("bin").join("powershell.exe"))
+        );
+        assert_eq!(
+            candidates_on(true, directory, "codex"),
+            ["codex.exe", "codex.cmd", "codex.bat"].map(|file| directory.join(file))
+        );
+        assert_eq!(
+            candidates_on(false, directory, "sh"),
+            [directory.join("sh")]
+        );
     }
-}
 
-#[cfg(not(windows))]
-pub fn push_arg(command: &mut std::process::Command, word: &str, _cmd: bool) {
-    command.arg(word);
+    #[test]
+    fn a_job_does_not_inherit_ssh_connection_credentials() {
+        let mut command = crate::process::command("unused");
+        command.env("SSH_AUTH_SOCK", "should-not-be-forwarded");
+        command.env("GIT_ASKPASS", "should-not-be-forwarded");
+        prepare_job_environment(&mut command);
+        let names: Vec<_> = command.get_envs().map(|(name, _value)| name).collect();
+        assert!(!names.contains(&std::ffi::OsStr::new("SSH_AUTH_SOCK")));
+        assert!(!names.contains(&std::ffi::OsStr::new("GIT_ASKPASS")));
+    }
 }
