@@ -58,7 +58,7 @@ const COPYABLE_CAPABILITIES: &[&str] = &[
 ];
 
 fn capability(kind: &syn::Type) -> bool {
-    matches!(kind, syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| CAPABILITIES.contains(&part.ident.to_string().as_str())))
+    matches!(kind, syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| CAPABILITIES.contains(&identifier_name(&part.ident).as_str())))
 }
 
 fn capability_owner(owner: &str) -> bool {
@@ -83,7 +83,7 @@ impl<'ast> Visit<'ast> for RawResource {
     fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
         if path.path.segments.last().is_some_and(|part| {
             matches!(
-                part.ident.to_string().as_str(),
+                identifier_name(&part.ident).as_str(),
                 "HANDLE"
                     | "OwnedHandle"
                     | "BorrowedHandle"
@@ -137,20 +137,65 @@ fn file_lock(name: &str) -> bool {
     )
 }
 
+fn identifier_name(identifier: &syn::Ident) -> String {
+    let name = identifier.to_string();
+    name.strip_prefix("r#").unwrap_or(&name).to_owned()
+}
+
+fn path_is_ident(path: &syn::Path, name: &str) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && path.segments.first().is_some_and(|part| {
+            matches!(part.arguments, syn::PathArguments::None)
+                && identifier_name(&part.ident) == name
+        })
+}
+
 struct Ownership<'a> {
     owner: &'a str,
     raw: bool,
+    module_depth: usize,
+    function_depth: usize,
+    ci_command_owner: bool,
     findings: Vec<String>,
 }
 
 impl Ownership<'_> {
+    fn nested_callable(&mut self, visit: impl FnOnce(&mut Self)) {
+        let previous = self.ci_command_owner;
+        self.ci_command_owner = false;
+        self.function_depth = self.function_depth.saturating_add(1);
+        visit(self);
+        self.function_depth = self.function_depth.saturating_sub(1);
+        self.ci_command_owner = previous;
+    }
+
+    fn ci_command(&mut self, span: proc_macro2::Span) {
+        if self.owner == CI && !self.ci_command_owner {
+            self.findings.push(format!(
+                "{}: raw CI command creation belongs to the private policy factory",
+                span.start().line
+            ));
+        }
+    }
+
+    fn ci_constructor(&mut self, span: proc_macro2::Span) {
+        if self.owner == CI {
+            self.findings.push(format!(
+                "{}: CI Command constructors must use the private policy factory",
+                span.start().line
+            ));
+        }
+    }
+
     fn owned_type(
         &mut self,
         name: &syn::Ident,
         attributes: &[syn::Attribute],
         fields: &syn::Fields,
     ) {
-        if !capability_owner(self.owner) || !CAPABILITIES.contains(&name.to_string().as_str()) {
+        let type_name = identifier_name(name);
+        if !capability_owner(self.owner) || !CAPABILITIES.contains(&type_name.as_str()) {
             return;
         }
         for field in fields {
@@ -162,13 +207,13 @@ impl Ownership<'_> {
             }
         }
         for attribute in attributes {
-            if attribute.path().is_ident("cfg_attr") {
+            if path_is_ident(attribute.path(), "cfg_attr") {
                 self.findings.push(format!(
                     "{}: ownership capability declarations cannot conditionally change attributes",
                     name.span().start().line
                 ));
             }
-            if attribute.path().is_ident("derive")
+            if path_is_ident(attribute.path(), "derive")
                 && attribute
                     .parse_args_with(
                         syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
@@ -176,16 +221,14 @@ impl Ownership<'_> {
                     .is_ok_and(|paths| {
                         paths.iter().any(|path| {
                             path.segments.last().is_some_and(|part| {
-                                name == "Secret" && part.ident == "Debug"
+                                let derive_name = identifier_name(&part.ident);
+                                type_name == "Secret" && derive_name == "Debug"
                                     || !matches!(
-                                        part.ident.to_string().as_str(),
+                                        derive_name.as_str(),
                                         "Debug" | "Clone" | "Copy" | "PartialEq" | "Eq"
                                     )
-                                    || !COPYABLE_CAPABILITIES.contains(&name.to_string().as_str())
-                                        && matches!(
-                                            part.ident.to_string().as_str(),
-                                            "Clone" | "Copy"
-                                        )
+                                    || !COPYABLE_CAPABILITIES.contains(&type_name.as_str())
+                                        && matches!(derive_name.as_str(), "Clone" | "Copy")
                             })
                         })
                     })
@@ -248,10 +291,20 @@ impl Ownership<'_> {
 
     fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
         let mut previous = false;
+        let mut raw_path = false;
+        let mut constructor_path = false;
         for token in tokens {
             match token {
                 proc_macro2::TokenTree::Ident(ident) => {
-                    let name = ident.to_string();
+                    let name = identifier_name(&ident);
+                    if raw_path && name == "command" {
+                        self.ci_command(ident.span());
+                    }
+                    if constructor_path && name == "new" {
+                        self.ci_constructor(ident.span());
+                    }
+                    raw_path = name == "raw";
+                    constructor_path = name == "Command";
                     self.sdk(&name, ident.span());
                     if previous {
                         self.operation(&name, ident.span());
@@ -260,18 +313,53 @@ impl Ownership<'_> {
                 }
                 proc_macro2::TokenTree::Punct(punct) => {
                     previous = matches!(punct.as_char(), '.' | ':');
+                    raw_path &= punct.as_char() == ':';
+                    constructor_path &= punct.as_char() == ':';
                 }
                 proc_macro2::TokenTree::Group(group) => {
                     self.tokens(group.stream());
                     previous = false;
+                    raw_path = false;
+                    constructor_path = false;
                 }
-                proc_macro2::TokenTree::Literal(_) => previous = false,
+                proc_macro2::TokenTree::Literal(_) => {
+                    previous = false;
+                    raw_path = false;
+                    constructor_path = false;
+                }
             }
         }
     }
 }
 
 impl<'ast> Visit<'ast> for Ownership<'_> {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let previous = self.ci_command_owner;
+        self.ci_command_owner = self.owner == CI
+            && (self.module_depth == 0
+                && self.function_depth == 0
+                && identifier_name(&item.sig.ident) == "command"
+                && matches!(item.vis, syn::Visibility::Inherited)
+                || identifier_name(&item.sig.ident)
+                    == "ci_process_policy_overrides_inherited_automatic_provisioning"
+                    && item
+                        .attrs
+                        .iter()
+                        .any(|attribute| path_is_ident(attribute.path(), "test")));
+        self.function_depth = self.function_depth.saturating_add(1);
+        syn::visit::visit_item_fn(self, item);
+        self.function_depth = self.function_depth.saturating_sub(1);
+        self.ci_command_owner = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.nested_callable(|policy| syn::visit::visit_impl_item_fn(policy, item));
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        self.nested_callable(|policy| syn::visit::visit_trait_item_fn(policy, item));
+    }
+
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
         self.owned_type(&item.ident, &item.attrs, &syn::Fields::Unit);
         for variant in &item.variants {
@@ -301,7 +389,7 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
             && implementation
                 .trait_
                 .as_ref()
-                .is_some_and(|(path, _)| !path.is_ident("Drop"))
+                .is_some_and(|(path, _)| !path_is_ident(path, "Drop"))
         {
             self.findings.push(format!(
                 "{}: ownership capabilities only implement Drop explicitly; other traits cannot expose or duplicate their resource",
@@ -327,7 +415,8 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
 
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
         let raw = self.raw;
-        if module.ident == "raw" {
+        self.module_depth = self.module_depth.saturating_add(1);
+        if identifier_name(&module.ident) == "raw" {
             if !RAW_OWNERS.contains(&self.owner) {
                 self.findings.push(format!(
                     "{}: this file does not own a raw effect exception",
@@ -338,10 +427,14 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
         }
         syn::visit::visit_item_mod(self, module);
         self.raw = raw;
+        self.module_depth = self.module_depth.saturating_sub(1);
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        self.operation(&expression.method.to_string(), expression.method.span());
+        self.operation(
+            &identifier_name(&expression.method),
+            expression.method.span(),
+        );
         syn::visit::visit_expr_method_call(self, expression);
     }
 
@@ -349,22 +442,57 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
         if expression.path.segments.len() > 1
             && let Some(last) = expression.path.segments.last()
         {
-            self.operation(&last.ident.to_string(), last.ident.span());
+            self.operation(&identifier_name(&last.ident), last.ident.span());
+        }
+        if let Some(qualified) = &expression.qself
+            && let syn::Type::Path(kind) = qualified.ty.as_ref()
+            && kind
+                .path
+                .segments
+                .last()
+                .is_some_and(|part| identifier_name(&part.ident) == "Command")
+            && let Some(last) = expression.path.segments.last()
+            && identifier_name(&last.ident) == "new"
+        {
+            self.ci_constructor(last.ident.span());
         }
         syn::visit::visit_expr_path(self, expression);
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
+        if let Some(last) = path.segments.last()
+            && let Some(parent) = path.segments.iter().rev().nth(1)
+        {
+            match (
+                identifier_name(&parent.ident).as_str(),
+                identifier_name(&last.ident).as_str(),
+            ) {
+                ("raw", "command") => self.ci_command(last.ident.span()),
+                ("Command", "new") => self.ci_constructor(last.ident.span()),
+                _ => {}
+            }
+        }
         for part in &path.segments {
-            self.sdk(&part.ident.to_string(), part.ident.span());
+            self.sdk(&identifier_name(&part.ident), part.ident.span());
         }
         syn::visit::visit_path(self, path);
     }
 
     fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
+        if self.owner == CI
+            && let syn::UseTree::Name(name) = tree
+            && identifier_name(&name.ident) == "command"
+        {
+            self.findings.push(format!(
+                "{}: CI command imports cannot bypass the private policy factory",
+                name.ident.span().start().line
+            ));
+        }
         if capability_owner(self.owner) {
             let hidden_type = match tree {
-                syn::UseTree::Rename(rename) if rename.rename != "_" => Some(rename.ident.span()),
+                syn::UseTree::Rename(rename) if identifier_name(&rename.rename) != "_" => {
+                    Some(rename.ident.span())
+                }
                 syn::UseTree::Glob(glob) => Some(glob.star_token.span),
                 syn::UseTree::Path(_)
                 | syn::UseTree::Name(_)
@@ -380,11 +508,12 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
         }
         let hidden_import = match tree {
             syn::UseTree::Glob(glob) => Some(glob.star_token.span),
-            syn::UseTree::Rename(rename) if rename.rename != "_" => Some(rename.ident.span()),
+            syn::UseTree::Rename(rename) if identifier_name(&rename.rename) != "_" => {
+                Some(rename.ident.span())
+            }
             syn::UseTree::Name(name)
-                if name.ident != "io"
-                    && name.ident != "self"
-                    && name.ident.to_string().starts_with(char::is_lowercase) =>
+                if !matches!(identifier_name(&name.ident).as_str(), "io" | "self")
+                    && identifier_name(&name.ident).starts_with(char::is_lowercase) =>
             {
                 Some(name.ident.span())
             }
@@ -402,10 +531,10 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
             ));
         }
         match tree {
-            syn::UseTree::Path(path) => self.sdk(&path.ident.to_string(), path.ident.span()),
-            syn::UseTree::Name(name) => self.sdk(&name.ident.to_string(), name.ident.span()),
+            syn::UseTree::Path(path) => self.sdk(&identifier_name(&path.ident), path.ident.span()),
+            syn::UseTree::Name(name) => self.sdk(&identifier_name(&name.ident), name.ident.span()),
             syn::UseTree::Rename(rename) => {
-                self.sdk(&rename.ident.to_string(), rename.ident.span());
+                self.sdk(&identifier_name(&rename.ident), rename.ident.span());
             }
             syn::UseTree::Glob(_) | syn::UseTree::Group(_) => {}
         }
@@ -423,6 +552,9 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
     let mut policy = Ownership {
         owner,
         raw: false,
+        module_depth: 0,
+        function_depth: 0,
+        ci_command_owner: false,
         findings: Vec::new(),
     };
     policy.visit_file(file);
@@ -441,6 +573,135 @@ mod tests {
             !check(owner, &syn::parse_file(source).unwrap()).is_empty(),
             "{source}"
         );
+    }
+
+    #[test]
+    fn ci_commands_keep_one_policy_factory_and_an_explicit_override_control() {
+        for source in [
+            "fn command() { crate::raw::command(\"mise\"); }",
+            "fn r#command() { crate::r#raw::r#command(\"mise\"); }",
+            "#[test] fn ci_process_policy_overrides_inherited_automatic_provisioning() { crate::raw::command(\"mise\"); }",
+            "fn check() { command(\"mise\"); super::command(\"cargo\"); }",
+        ] {
+            assert_eq!(check(CI, &syn::parse_file(source).unwrap()).len(), 0);
+        }
+        for source in [
+            "fn check() { crate::raw::command(\"mise\"); }",
+            "fn check() { crate::raw::r#command(\"mise\"); }",
+            "fn check() { crate::r#raw::command(\"mise\"); }",
+            "fn check() { let create = raw::command; }",
+            "fn check() { let create = crate::r#raw::r#command; }",
+            "fn check() { forward!(crate::raw::command(\"mise\")); }",
+            "fn check() { forward!(raw::command(\"mise\")); }",
+            "fn check() { forward!(crate::r#raw::r#command(\"mise\")); }",
+            "mod nested { fn command() { crate::raw::command(\"mise\"); } }",
+            "fn bypass() { fn command() { crate::raw::command(\"mise\"); } }",
+            "impl Context { fn command() { crate::raw::command(\"mise\"); } }",
+            "fn command() { impl Context { fn bypass() { crate::raw::command(\"mise\"); } } }",
+            "fn command() { trait Context { fn bypass() { crate::raw::command(\"mise\"); } } }",
+            "pub fn command() { crate::raw::command(\"mise\"); }",
+            "fn ci_process_policy_overrides_inherited_automatic_provisioning() { crate::raw::command(\"mise\"); }",
+            "use crate::raw::command; fn check() { command(\"mise\"); }",
+            "use crate::raw::r#command;",
+            "use crate::r#raw::command;",
+            "use crate::raw::command as create;",
+            "use crate::raw as effects;",
+            "use crate::raw::*;",
+            "mod raw { fn check() { std::process::Command::new(\"mise\"); } }",
+            "fn command() { std::process::Command::new(\"mise\"); }",
+            "fn check() { let create = Command::new; }",
+            "fn check() { let create = <std::process::Command>::new; }",
+            "fn check() { forward!(std::process::r#Command::r#new(\"mise\")); }",
+        ] {
+            rejected(CI, source);
+        }
+        assert_eq!(
+            check(
+                RELEASE,
+                &syn::parse_file("fn check() { std::process::Command::new(\"tool\"); }").unwrap()
+            )
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn raw_identifier_spellings_preserve_ownership_rejections_and_valid_owners() {
+        for (owner, ordinary, raw) in [
+            (
+                RELEASE_ORCHESTRATION,
+                "struct Origin { pub resource: Resource }",
+                "struct r#Origin { pub resource: Resource }",
+            ),
+            (
+                RELEASE_ORCHESTRATION,
+                "#[derive(Clone)] struct Origin(Resource);",
+                "#[r#derive(r#Clone)] struct r#Origin(Resource);",
+            ),
+            (
+                KERNEL,
+                "#[cfg_attr(all(), derive(Default))] struct Success(());",
+                "#[r#cfg_attr(all(), r#derive(r#Default))] struct r#Success(());",
+            ),
+            (
+                KERNEL,
+                "impl Event { pub fn file(&self) -> File { todo!() } }",
+                "impl r#Event { pub fn file(&self) -> r#File { todo!() } }",
+            ),
+            (
+                "crates/domyjob/src/process/windows.rs",
+                "use windows_sys::Win32::Foundation::HANDLE;",
+                "use r#windows_sys::Win32::Foundation::HANDLE;",
+            ),
+            (
+                "crates/domyjob/src/process/windows.rs",
+                "forward!(windows_sys::Win32::Foundation::CloseHandle(h));",
+                "forward!(r#windows_sys::Win32::Foundation::CloseHandle(h));",
+            ),
+            (
+                REPLACEMENT,
+                "mod raw { fn f() { file.persist(path); } }",
+                "mod r#raw { fn f() { file.r#persist(path); } }",
+            ),
+            (
+                RELEASE,
+                "mod raw { fn f() { forward!(file.rename(path)); } }",
+                "mod r#raw { fn f() { forward!(file.r#rename(path)); } }",
+            ),
+        ] {
+            let expected = check(owner, &syn::parse_file(ordinary).unwrap());
+            assert!(!expected.is_empty(), "{ordinary}");
+            assert_eq!(
+                check(owner, &syn::parse_file(raw).unwrap()),
+                expected,
+                "{raw}"
+            );
+        }
+        for (owner, ordinary, raw) in [
+            (
+                RELEASE_ORCHESTRATION,
+                "struct Origin(Resource); impl Drop for Origin { fn drop(&mut self) {} }",
+                "struct r#Origin(Resource); impl r#Drop for r#Origin { fn drop(&mut self) {} }",
+            ),
+            (
+                KERNEL,
+                "#[derive(Clone, Copy)] struct EventRef(Resource);",
+                "#[r#derive(r#Clone, r#Copy)] struct r#EventRef(Resource);",
+            ),
+            (
+                KERNEL,
+                "use windows_sys::Win32::Foundation::HANDLE;",
+                "use r#windows_sys::Win32::Foundation::HANDLE;",
+            ),
+            (
+                REPLACEMENT,
+                "mod raw { fn f() { file.into_temp_path(); file.disable_cleanup(true); } }",
+                "mod r#raw { fn f() { file.r#into_temp_path(); file.r#disable_cleanup(true); } }",
+            ),
+        ] {
+            assert_eq!(check(owner, &syn::parse_file(ordinary).unwrap()).len(), 0);
+            assert_eq!(check(owner, &syn::parse_file(raw).unwrap()).len(), 0);
+        }
     }
 
     #[test]

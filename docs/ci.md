@@ -23,6 +23,7 @@ Workflows always produce their final required checks.
 CI jobs share cached Rust dependencies, separated by operating system, CPU architecture, toolchain, and dependency configuration.
 Only `main` saves these caches; pull requests restore them without saving, and release jobs use their independent builds.
 The CI workflow and command adapters disable mise's automatic tool installation, so checks use the tools explicitly provisioned by their workflow instead of introducing unrelated installation work during execution.
+The ownership gate reserves raw CI command construction for the private policy factory and the registered override test, rejecting alternate imports, function references, and literal macro paths.
 CI adapters run child Cargo and mise commands with a validated `CARGO_TARGET_DIR` inside `target/ci-build`, using `target/ci-build-alt` when the running task occupies the first directory.
 The child directory remains disjoint from the live task executable, including custom parent target directories and directory links, so Windows can rebuild `xtask` without replacing a running executable.
 Windows commands receive standard drive or UNC paths only after they resolve to the same validated canonical directories, avoiding MSVC incompatibility with verbatim path syntax.
