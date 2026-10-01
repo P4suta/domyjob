@@ -1,0 +1,83 @@
+name: Change scope
+
+on:
+  workflow_call:
+    outputs:
+      plan:
+        value: ${{ jobs.plan.outputs.plan }}
+      docs:
+        value: ${{ jobs.plan.outputs.docs }}
+      workflows:
+        value: ${{ jobs.plan.outputs.workflows }}
+      xtask:
+        value: ${{ jobs.plan.outputs.xtask }}
+      xtask_native:
+        value: ${{ jobs.plan.outputs.xtask_native }}
+      windows_contracts:
+        value: ${{ jobs.plan.outputs.windows_contracts }}
+      product:
+        value: ${{ jobs.plan.outputs.product }}
+      dependencies:
+        value: ${{ jobs.plan.outputs.dependencies }}
+      dependency_review:
+        value: ${{ jobs.plan.outputs.dependency_review }}
+      fuzz:
+        value: ${{ jobs.plan.outputs.fuzz }}
+      codeql_rust:
+        value: ${{ jobs.plan.outputs.codeql_rust }}
+      codeql_actions:
+        value: ${{ jobs.plan.outputs.codeql_actions }}
+      scorecard:
+        value: ${{ jobs.plan.outputs.scorecard }}
+      fleet:
+        value: ${{ jobs.plan.outputs.fleet }}
+      test_os:
+        value: ${{ jobs.plan.outputs.test_os }}
+      languages:
+        value: ${{ jobs.plan.outputs.languages }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      plan: ${{ steps.scope.outputs.plan }}
+      docs: ${{ steps.scope.outputs.docs }}
+      workflows: ${{ steps.scope.outputs.workflows }}
+      xtask: ${{ steps.scope.outputs.xtask }}
+      xtask_native: ${{ steps.scope.outputs.xtask_native }}
+      windows_contracts: ${{ steps.scope.outputs.windows_contracts }}
+      product: ${{ steps.scope.outputs.product }}
+      dependencies: ${{ steps.scope.outputs.dependencies }}
+      dependency_review: ${{ steps.scope.outputs.dependency_review }}
+      fuzz: ${{ steps.scope.outputs.fuzz }}
+      codeql_rust: ${{ steps.scope.outputs.codeql_rust }}
+      codeql_actions: ${{ steps.scope.outputs.codeql_actions }}
+      scorecard: ${{ steps.scope.outputs.scorecard }}
+      fleet: ${{ steps.scope.outputs.fleet }}
+      test_os: ${{ steps.scope.outputs.test_os }}
+      languages: ${{ steps.scope.outputs.languages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: domyjob-ci-v2
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Select checks from the exact Git range
+        id: scope
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: cargo xtask ci plan

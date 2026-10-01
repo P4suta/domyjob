@@ -26,9 +26,7 @@ commit-msg:
       run: cargo xtask commit-msg {1}
 
 pre-push:
-  parallel: true
   commands:
-    check:
-      run: mise run check
-    fleet:
-      run: mise run check:fleet
+    scope:
+      use_stdin: true
+      run: mise run check:scope

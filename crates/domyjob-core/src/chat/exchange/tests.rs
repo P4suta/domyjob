@@ -69,6 +69,6 @@ fn answers_from_another_peer_or_ahead_of_local_history_change_nothing() {
         let Ok(result) = accept(&mut local, &request, answer);
         assert_eq!(result, Err(rejection));
         assert_eq!(local.cursor(&from).map(|cursor| cursor.seen), Ok(0));
-        assert!(local.ordered().is_empty());
+        assert_eq!(local.ordered().len(), 0);
     }
 }

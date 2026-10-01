@@ -246,7 +246,10 @@ mod tests {
     fn every_rust_comment_is_found_and_nothing_else() {
         assert_eq!(in_rust("fn f() {}\n// a\n/// b\n//! c\n"), [2, 3, 4]);
         assert_eq!(in_rust("let a = 1; /* x /* y */ z */ let b = 2;\n"), [1]);
-        assert!(in_rust("// SPDX-License-Identifier: MIT\nfn f() {}\n").is_empty());
+        assert_eq!(
+            in_rust("// SPDX-License-Identifier: MIT\nfn f() {}\n").len(),
+            0
+        );
         let quiet = [
             "let url = \"https://example.com/a\";\n",
             "let raw = r#\"// not \"a\" comment\"#;\n",
@@ -326,12 +329,15 @@ mod tests {
             in_config("mise.toml", "# a\nb = \"#c\"\nd = 1 # e\n"),
             [1, 3]
         );
-        assert!(in_config("x.toml", "a = 'x#y'\n").is_empty());
+        assert_eq!(in_config("x.toml", "a = 'x#y'\n").len(), 0);
         let pin =
             "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
-        assert!(in_config(".github/workflows/ci.yml", pin).is_empty());
+        assert_eq!(in_config(".github/workflows/ci.yml", pin).len(), 0);
         assert_eq!(in_config(".github/workflows/ci.yml", "  # note\n"), [1]);
-        assert!(in_config("supply-chain/audits.toml", "# cargo-vet audits file\n").is_empty());
+        assert_eq!(
+            in_config("supply-chain/audits.toml", "# cargo-vet audits file\n").len(),
+            0
+        );
     }
 
     #[test]
@@ -345,9 +351,9 @@ f = plain#value
 "#;
         assert_eq!(in_config("x.toml", quoted), [1, 2, 3, 4, 5]);
         assert_eq!(in_config("x.toml", "a = \"\" # empty\n"), [1]);
-        assert!(in_config("x.toml", r#"a = "escaped \" # quoted""#).is_empty());
-        assert!(in_config("x.toml", r#"a = "text # quoted""#).is_empty());
-        assert!(in_config("x.toml", "a = 'text # quoted'").is_empty());
+        assert_eq!(in_config("x.toml", r#"a = "escaped \" # quoted""#).len(), 0);
+        assert_eq!(in_config("x.toml", r#"a = "text # quoted""#).len(), 0);
+        assert_eq!(in_config("x.toml", "a = 'text # quoted'").len(), 0);
         let digest = "3d3c42e5aac5ba805825da76410c181273ba90b1";
         let pin = format!("uses: actions/checkout@{digest} # v7.0.1\n");
         for path in ["ci.yml", "ci.yaml", "CI.YML", "CI.YAML"] {
@@ -363,6 +369,9 @@ f = plain#value
             let source = format!("uses: owner/action@{reference}");
             assert_eq!(in_config("ci.yml", &source), [1], "{reference}");
         }
-        assert!(in_config("supply-chain/config.toml", "# generated").is_empty());
+        assert_eq!(
+            in_config("supply-chain/config.toml", "# generated").len(),
+            0
+        );
     }
 }

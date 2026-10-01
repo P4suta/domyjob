@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
+pub mod ci;
 pub mod comments;
 pub mod dependencies;
+pub mod distribution;
 pub mod exceptions;
 pub mod fixes;
 pub mod ownership;
@@ -11,7 +13,7 @@ pub mod ownership;
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "repository tasks run their pinned tools and write only their caches and fixtures"
+        reason = "repository tasks run pinned tools and write owned caches, fixtures, and public CI outputs"
     )]
 
     use std::io;
@@ -33,8 +35,16 @@ mod raw {
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
     }
+
+    pub(super) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        io::Write::write_all(
+            &mut std::fs::OpenOptions::new().append(true).open(path)?,
+            bytes,
+        )
+    }
 }
 pub mod pure_core;
+pub mod release;
 pub mod windows_contracts;
 pub mod workflows;
 
@@ -161,6 +171,7 @@ fn effect_module(path: &str) -> bool {
         "crates/domyjob/src/platform.rs"
             | "crates/domyjob/src/process.rs"
             | "crates/domyjob/tests/e2e/os.rs"
+            | "xtask/src/ci.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
         || path.starts_with("crates/domyjob/tests/e2e/os/")
@@ -446,6 +457,7 @@ mod tests {
             "crates/domyjob/src/process.rs",
             "crates/domyjob/tests/e2e/os.rs",
             "crates/domyjob/src/platform/windows_acl.rs",
+            "xtask/src/ci.rs",
             "crates/domyjob/src/process/windows.rs",
             "crates/domyjob/tests/e2e/os/windows.rs",
         ] {
@@ -480,7 +492,7 @@ mod tests {
             ..SourcePolicy::default()
         };
         owner.visit_file(&source);
-        assert!(owner.findings.is_empty());
+        assert_eq!(owner.findings.len(), 0);
         let mut other = SourcePolicy::default();
         other.visit_file(&source);
         assert_eq!(
@@ -644,10 +656,10 @@ mod tests {
         };
         let mut sources = Vec::new();
         rust_files_with(root.path(), &mut sources, &scan).unwrap();
-        assert!(sources.is_empty());
+        assert_eq!(sources.len(), 0);
         let mut files = Vec::new();
         walk_with(root.path(), root.path(), &mut files, &scan).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 0);
     }
 
     #[test]

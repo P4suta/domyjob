@@ -1,3 +1,3 @@
 <!-- The title becomes the changelog line: write it as a Conventional Commit. -->
 
-- [ ] `mise run check` is green here, and `mise run check:fleet` on every operating system.
+- [ ] The checks selected by the change scope pass locally and in CI; see [validation policy](https://github.com/P4suta/domyjob/blob/main/docs/ci.md).

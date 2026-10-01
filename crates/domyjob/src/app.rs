@@ -774,7 +774,7 @@ mod tests {
         let mut log = [0_u8; 4];
         let error = relay_output(&mut output, log.as_mut_slice(), 8).expect_err("full log");
         assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
         assert_eq!(&log, b"0123");
     }
 

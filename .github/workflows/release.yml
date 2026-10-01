@@ -32,14 +32,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          version="$(cargo metadata --format-version 1 --no-deps --locked | jq --raw-output '.packages[] | select(.name == "domyjob") | .version')"
-          if [ "$EVENT_NAME" = "push" ] && [ "v${version}" != "${TAG}" ]; then
-            echo "the tag ${TAG} does not name version ${version}" >&2
-            exit 1
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+        run: cargo xtask release version
 
   build:
     name: build (${{ matrix.target }})
@@ -74,10 +67,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          rustup target add "$TARGET"
-          cargo build --locked --release --package domyjob --target "$TARGET"
+        run: cargo xtask release build
       - name: Sign and notarize the macOS binary
         if: runner.os == 'macOS'
         env:
@@ -88,28 +78,7 @@ jobs:
           APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: |
-          set -euo pipefail
-          binary="target/$TARGET/release/domyjob"
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          password="$(uuidgen)"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
-          codesign --force --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp "$binary"
-          codesign --verify --strict --verbose=2 "$binary"
-          key="$RUNNER_TEMP/notary.p8"
-          printf '%s' "$APPLE_NOTARY_KEY" > "$key"
-          ditto -c -k --keepParent "$binary" "$RUNNER_TEMP/domyjob.zip"
-          result="$(xcrun notarytool submit "$RUNNER_TEMP/domyjob.zip" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait --output-format json)"
-          if [ "$(jq --raw-output .status <<<"$result")" != "Accepted" ]; then
-            xcrun notarytool log "$(jq --raw-output .id <<<"$result")" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"
-            exit 1
-          fi
-          security delete-keychain "$keychain"
+        run: cargo xtask release sign-macos
       - name: Sign the Windows binary
         if: runner.os == 'Windows'
         uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
@@ -127,30 +96,13 @@ jobs:
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          $binary = "target/$env:TARGET/release/domyjob.exe"
-          $signature = Get-AuthenticodeSignature -FilePath $binary
-          if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) {
-            throw "The binary needs a valid Authenticode signature and timestamp: $($signature.Status)"
-          }
+        run: cargo xtask release verify-windows
       - name: Bundle
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          set -euo pipefail
-          name="domyjob-${VERSION}-${TARGET}"
-          mkdir -p "dist/${name}"
-          if [ -f "target/${TARGET}/release/domyjob.exe" ]; then
-            cp "target/${TARGET}/release/domyjob.exe" "dist/${name}/"
-          else
-            cp "target/${TARGET}/release/domyjob" "dist/${name}/"
-          fi
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/${name}/"
-          mkdir -p "dist/${name}/assets"
-          cp crates/domyjob/assets/icon.svg crates/domyjob/assets/icon.png crates/domyjob/assets/icon.ico crates/domyjob/assets/icon.icns crates/domyjob/assets/LICENSE crates/domyjob/assets/NOTICE "dist/${name}/assets/"
-          (cd dist && tar --create --gzip --file "${name}.tar.gz" "${name}")
+        run: cargo xtask release bundle
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
@@ -168,24 +120,21 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: rust
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist
       - name: Generate and verify checksums
-        run: |
-          set -euo pipefail
-          cd dist
-          archives=( *.tar.gz )
-          if [ "${#archives[@]}" -ne 5 ]; then
-            echo "expected five release archives, got ${#archives[@]}" >&2
-            exit 1
-          fi
-          for archive in "${archives[@]}"; do
-            sha256sum "$archive" > "$archive.sha256"
-          done
-          sha256sum --check -- *.sha256
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: cargo xtask release checksums
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*.tar.gz
@@ -201,6 +150,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag dist/*
+        run: gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag dist/*
