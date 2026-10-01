@@ -20,12 +20,17 @@ run = ["cargo fetch --locked", "lefthook install"]
 
 [tasks.fmt]
 description = "Format Rust and TOML"
-run = ["cargo fmt --all", "taplo fmt"]
+run = ["cargo fmt --all", "cargo fmt --manifest-path fuzz/Cargo.toml", "taplo fmt"]
 env = { RUST_LOG = "warn" }
 
 [tasks."fmt:check"]
 description = "Check Rust and TOML formatting"
-run = ["cargo fmt --all -- --check", "taplo fmt --check", "taplo lint"]
+run = [
+  "cargo fmt --all -- --check",
+  "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
+  "taplo fmt --check",
+  "taplo lint",
+]
 env = { RUST_LOG = "warn" }
 
 [tasks.clippy]
@@ -52,15 +57,20 @@ run = "cargo xtask windows-contracts"
 
 [tasks.lint]
 description = "Check formatting, types, architecture, spelling, workflows, and duplication"
-depends = ["fmt:check", "clippy", "clippy:targets", "gates", "windows-contracts"]
+depends = ["fmt:check", "clippy", "clippy:targets", "gates", "windows-contracts", "fuzz:check"]
 run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
 description = "Run the complete workspace test suite, each test in its own process"
 run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
+[tasks."fuzz:check"]
+description = "Type-check every fuzz target against the current core API"
+run = "cargo check --locked --manifest-path fuzz/Cargo.toml --bins"
+
 [tasks.fuzz]
 description = "Fuzz the wire ingress, job state transitions, and chat ledger convergence"
+depends = ["fuzz:check"]
 dir = "fuzz"
 run = [
   "mkdir -p corpus/wire",

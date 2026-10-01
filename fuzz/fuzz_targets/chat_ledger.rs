@@ -1,7 +1,7 @@
 #![no_main]
 
 use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
-use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome};
+use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Stamp};
 use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, Line, Origin, RoomId, RoomName, Text,
 };
@@ -50,7 +50,7 @@ fn message(from: &AgentId, conversation: Conversation, to: &[&AgentId], intent: 
         text: Text::try_from("text".to_owned()).unwrap(),
         audience: audience(to.iter().copied().chain([from])).unwrap(),
         intent,
-        at: 0,
+        at: Stamp::from_unix_millis(0),
     }
 }
 
@@ -66,7 +66,7 @@ fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Option<
             intent: Intent::Reply {
                 request: request.id().clone(),
             },
-            at: 0,
+            at: Stamp::from_unix_millis(0),
         },
         Some(outcome) => Body::Resolved {
             request: request.id().clone(),
@@ -85,7 +85,11 @@ struct World {
 
 impl World {
     fn write(&mut self, machine: usize, body: Body) -> Option<Event> {
-        Some(self.models[machine].write(body).expect("a valid local write is admitted"))
+        Some(
+            self.models[machine]
+                .write(body)
+                .expect("a valid local write is admitted"),
+        )
     }
 
     fn try_write(&mut self, machine: usize, body: Body) -> Option<Event> {
@@ -129,7 +133,10 @@ impl World {
                     return;
                 }
                 let conversation = Conversation::direct(&sender, &receiver).unwrap();
-                self.write(from, message(&sender, conversation, &[&receiver], Intent::Send {}));
+                self.write(
+                    from,
+                    message(&sender, conversation, &[&receiver], Intent::Send {}),
+                );
             }
             2 | 3 => {
                 let sender = agent(from, 0);
@@ -148,7 +155,9 @@ impl World {
                     responder: responder.clone(),
                     chain: Chain::default(),
                 };
-                if let Some(event) = self.write(from, message(&sender, conversation, &recipients, intent)) {
+                if let Some(event) =
+                    self.write(from, message(&sender, conversation, &recipients, intent))
+                {
                     self.asks.push((from, to, event));
                 }
             }
@@ -180,7 +189,9 @@ impl World {
 
 libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
     let mut world = World {
-        models: (0..MACHINES).map(|machine| Model::new(origin(machine))).collect(),
+        models: (0..MACHINES)
+            .map(|machine| Model::new(origin(machine)))
+            .collect(),
         asks: Vec::new(),
     };
     world
@@ -212,14 +223,30 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
             let (low, high) = (first.min(second), first.max(second));
             let (left, right) = world.models.split_at_mut(high);
             let progress = left[low].sync_with(&mut right[0], 64).unwrap();
-            assert_eq!(progress.received.rejected, None, "a converged exchange rejects nothing");
-            assert_eq!(progress.refused, None, "a converged exchange rejects nothing");
+            assert_eq!(
+                progress.received.rejected, None,
+                "a converged exchange rejects nothing"
+            );
+            assert_eq!(
+                progress.refused, None,
+                "a converged exchange rejects nothing"
+            );
         }
     }
     let reference = &world.models[0];
-    let ids = |model: &Model| model.ordered().iter().map(|event| event.id().clone()).collect::<Vec<_>>();
+    let ids = |model: &Model| {
+        model
+            .ordered()
+            .iter()
+            .map(|event| event.id().clone())
+            .collect::<Vec<_>>()
+    };
     for model in &world.models[1..] {
-        assert_eq!(ids(model), ids(reference), "every machine stores the same sequence");
+        assert_eq!(
+            ids(model),
+            ids(reference),
+            "every machine stores the same sequence"
+        );
         assert_eq!(model.profiles(), reference.profiles());
         assert_eq!(model.rooms(), reference.rooms());
     }
@@ -235,7 +262,10 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
             })
             .map(|model| model.resolutions().get(request.id()).cloned())
             .collect();
-        assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "every audience machine selects the same ending");
+        assert!(
+            seen.windows(2).all(|pair| pair[0] == pair[1]),
+            "every audience machine selects the same ending"
+        );
         for model in &world.models {
             let open = model.open_asks().iter().any(|(_, id)| id == request.id());
             let resolved = model.resolutions().contains_key(request.id());

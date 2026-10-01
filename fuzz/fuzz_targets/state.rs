@@ -10,7 +10,9 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
     for &byte in bytes.iter().take(256) {
         let event = match byte % 6 {
             0 => Event::Starting,
-            1 => Event::Spawned { pid: u32::from(byte) },
+            1 => Event::Spawned {
+                pid: u32::from(byte),
+            },
             2 => Event::Exited {
                 code: i32::from(byte) - 128,
             },

@@ -83,13 +83,14 @@ The wire protocol has no format of its own, because a client only ever talks to 
 
 ## Verification
 
-- `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, Windows compiler contracts, spelling, workflows, and duplication.
+- `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, Windows compiler contracts, every fuzz target's types, spelling, workflows, and duplication.
 - `mise run windows-contracts` rejects seven invalid Windows capability categories against the actual pinned SDK metadata and both leaf sources, then confirms a passing control.
   It checks each expected diagnostic code and primary source range, including separate ACL and SID lifetime failures, without executing SDK calls.
   The inventory must contain each required category exactly once and refer to the actual two SDK leaves.
   A diagnostic contributes at most one primary location, and the two lifetime sites must fail independently.
   Captured Cargo JSON, compiler diagnostics, and source digests are written under the active Cargo target directory's `windows-contracts` directory.
 - `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and every end-to-end scenario on one host, each test in its own process.
+- `mise run fuzz:check` compiles every target in the separate fuzz workspace against the current core API, so type migrations cannot leave a fuzzer unchecked until CI.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
 - `mise run mutants` measures changes to the core and xtask, including the repository's policy gates.
   `.rust-mutants.toml` records equivalent mutations with their reasons and checks that those expectations still name the current code.
