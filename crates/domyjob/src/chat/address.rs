@@ -181,7 +181,7 @@ mod tests {
     use domyjob_core::chat::card::{MachineCard, Os};
     use domyjob_core::chat::id::{AgentId, Conversation, Line, Origin, RoomId, RoomName};
 
-    use super::Book;
+    use super::{Book, local_agent, local_room};
     use crate::chat::store::StoreError;
 
     fn origin(digit: char) -> Origin {
@@ -249,5 +249,134 @@ mod tests {
         );
         assert_eq!(book.machine_label(&origin('b')), "linux");
         assert_eq!(book.machine_label(&origin('c')), "laptop");
+    }
+
+    #[test]
+    fn machine_spellings_resolve_and_labels_prefer_local_then_aliases() {
+        let mut book = book();
+        book.machines.insert(
+            origin('b'),
+            MachineCard {
+                label: Line::try_from("LINUX".to_owned()).unwrap(),
+                os: Os::Linux,
+            },
+        );
+        assert_eq!(
+            book.agent("reviewer@linux").unwrap(),
+            agent("reviewer", 'b')
+        );
+        assert_eq!(
+            book.agent("reviewer@LINUX").unwrap(),
+            agent("reviewer", 'b')
+        );
+        assert_eq!(
+            book.agent(&format!("reviewer@{}", origin('b'))).unwrap(),
+            agent("reviewer", 'b')
+        );
+        assert!(matches!(
+            book.agent("builder@missing-machine"),
+            Err(StoreError::Unknown(_))
+        ));
+        assert!(matches!(
+            book.agent(&format!("builder@{}", origin('b'))),
+            Err(StoreError::Unknown(_))
+        ));
+        assert_eq!(book.machine_label(&origin('a')), "local");
+        assert_eq!(book.machine_label(&origin('b')), "linux");
+        assert_eq!(book.machine_label(&origin('d')), "dddddddd");
+        assert_eq!(book.agent_label(&agent("reviewer", 'b')), "reviewer@linux");
+    }
+
+    #[test]
+    fn rooms_require_a_unique_known_address() {
+        let mut book = book();
+        let local = book.rooms.first().expect("known local room").clone();
+        let peer = RoomId::new(
+            origin('b'),
+            RoomName::try_from("release".to_owned()).unwrap(),
+        );
+        book.rooms.push(peer.clone());
+        assert!(matches!(
+            book.room("release"),
+            Err(StoreError::Ambiguous(_))
+        ));
+        assert_eq!(book.room("release@local").unwrap(), local);
+        assert_eq!(book.room("release@linux").unwrap(), peer);
+        assert_eq!(
+            book.room(&Conversation::Room(local.clone()).to_string())
+                .unwrap(),
+            local
+        );
+        let unknown = Conversation::Room(RoomId::new(
+            origin('c'),
+            RoomName::try_from("release".to_owned()).unwrap(),
+        ));
+        assert!(matches!(
+            book.room(&unknown.to_string()),
+            Err(StoreError::Unknown(_))
+        ));
+        assert!(matches!(
+            book.room("missing@local"),
+            Err(StoreError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn conversation_resolution_preserves_ambiguity_and_self_address_errors() {
+        let mut book = book();
+        let me = agent("reviewer", 'a');
+        book.agents.push(agent("release", 'c'));
+        assert!(matches!(
+            book.conversation(&me, "release"),
+            Err(StoreError::Ambiguous(_))
+        ));
+        assert!(matches!(
+            book.conversation(&me, "reviewer@local"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            book.conversation(&me, "reviewer"),
+            Err(StoreError::Ambiguous(_))
+        ));
+        let explicit = Conversation::direct(&me, &agent("other", 'd')).unwrap();
+        assert_eq!(
+            book.conversation(&me, &explicit.to_string()).unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn local_handles_require_identity_and_preserve_invalid_name_errors() {
+        let book = book();
+        assert_eq!(
+            local_agent(&book, "worker@local").unwrap(),
+            agent("worker", 'a')
+        );
+        assert_eq!(
+            local_agent(&book, &format!("worker@{}", origin('a'))).unwrap(),
+            agent("worker", 'a')
+        );
+        assert!(matches!(
+            local_agent(&book, "bad name"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            local_room(&book, "bad name"),
+            Err(StoreError::Invalid(_))
+        ));
+        let room = RoomId::new(
+            origin('a'),
+            RoomName::try_from("release".to_owned()).unwrap(),
+        );
+        assert_eq!(local_room(&book, "release").unwrap(), room);
+        let missing = Book::default();
+        assert!(matches!(
+            local_agent(&missing, "worker"),
+            Err(StoreError::Corrupt("the local machine is unknown"))
+        ));
+        assert!(matches!(
+            local_room(&missing, "release"),
+            Err(StoreError::Corrupt("the local machine is unknown"))
+        ));
     }
 }
