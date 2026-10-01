@@ -10,6 +10,6 @@ mod tests {
     #[test]
     fn the_newest_stay_and_the_rest_are_returned_oldest_last() {
         assert_eq!(beyond_newest(vec![3, 1, 4, 2], 2), [2, 1]);
-        assert!(beyond_newest(vec![1], 2).is_empty());
+        assert_eq!(beyond_newest(vec![1], 2).len(), 0);
     }
 }

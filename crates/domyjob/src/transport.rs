@@ -906,7 +906,7 @@ mod tests {
             .unwrap();
         let utf16 = data_encoding::BASE64.decode(base64.as_bytes()).unwrap();
         let (units, rest) = utf16.as_chunks::<2>();
-        assert!(rest.is_empty());
+        assert_eq!(rest.len(), 0);
         let units: Vec<u16> = units.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         let script = String::from_utf16(&units).unwrap();
         assert!(

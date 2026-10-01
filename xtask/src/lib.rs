@@ -490,7 +490,7 @@ mod tests {
             ..SourcePolicy::default()
         };
         owner.visit_file(&source);
-        assert!(owner.findings.is_empty());
+        assert_eq!(owner.findings.len(), 0);
         let mut other = SourcePolicy::default();
         other.visit_file(&source);
         assert_eq!(
@@ -654,10 +654,10 @@ mod tests {
         };
         let mut sources = Vec::new();
         rust_files_with(root.path(), &mut sources, &scan).unwrap();
-        assert!(sources.is_empty());
+        assert_eq!(sources.len(), 0);
         let mut files = Vec::new();
         walk_with(root.path(), root.path(), &mut files, &scan).unwrap();
-        assert!(files.is_empty());
+        assert_eq!(files.len(), 0);
     }
 
     #[test]

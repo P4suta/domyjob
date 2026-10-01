@@ -1165,7 +1165,7 @@ mod tests {
         );
         original_keychains(b"bare-path\n").unwrap_err();
         original_keychains(&[255]).unwrap_err();
-        assert!(original_keychains(b"\n \t\n").unwrap().is_empty());
+        assert_eq!(original_keychains(b"\n \t\n").unwrap().len(), 0);
     }
 
     fn configured_environment() -> BTreeMap<&'static str, String> {

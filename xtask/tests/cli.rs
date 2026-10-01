@@ -29,7 +29,7 @@ fn invoke(args: &[&str]) -> std::io::Result<Output> {
 fn cli_usage_and_workflow_checks_keep_their_exit_codes() {
     let usage = invoke(&["unknown"]).unwrap();
     assert_eq!(usage.status.code(), Some(2));
-    assert!(usage.stdout.is_empty());
+    assert_eq!(usage.stdout.len(), 0);
     assert!(
         String::from_utf8(usage.stderr)
             .unwrap()

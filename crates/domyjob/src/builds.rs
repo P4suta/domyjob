@@ -531,7 +531,7 @@ mod tests {
                 }),
             );
             if kind == io::ErrorKind::PermissionDenied {
-                assert!(result.unwrap().is_empty());
+                assert_eq!(result.unwrap().len(), 0);
             } else {
                 assert_eq!(result.unwrap_err().to_string(), "build removal failed");
             }

@@ -144,7 +144,7 @@ fn claims_finish_atomically_and_abandoned_claims_become_interrupted() {
         ]
     );
     assert!(a.claim(&worker).unwrap().is_none());
-    assert!(a.dispatchable().unwrap().is_empty());
+    assert_eq!(a.dispatchable().unwrap().len(), 0);
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn asks_to_unmanaged_or_unknown_local_agents_end_as_unavailable() {
         a.origin().clone(),
     );
     let question = write(&a, ask(&asker, &ghost));
-    assert!(a.dispatchable().unwrap().is_empty());
+    assert_eq!(a.dispatchable().unwrap().len(), 0);
     let ending = a
         .read(|read| super::views::resolution(read, question.id()))
         .unwrap()
@@ -211,10 +211,11 @@ fn inboxes_follow_direct_conversations_and_room_membership() {
     a.write(|tx| tx.mark_read(&member, events.last().unwrap()))
         .unwrap();
     let cursor = a.write(|tx| tx.read_cursor(&member)).unwrap();
-    assert!(
+    assert_eq!(
         a.read(|read| super::views::inbox(read, &member, &cursor, 50))
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
 }
 
@@ -232,10 +233,11 @@ fn cleaning_waits_for_acknowledgments_and_keeps_later_sync_continuous() {
     ));
     exchange(&a, &b);
     assert_eq!(a.clean(&conversation).unwrap(), 1);
-    assert!(
+    assert_eq!(
         a.read(|read| super::views::thread(read, &conversation, 50, None))
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
     let late = store(&root, "c");
     a.pin("c", late.origin(), false).unwrap();

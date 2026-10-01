@@ -48,10 +48,11 @@ mod tests {
 
     #[test]
     fn pure_core_gate_rejects_std_and_missing_crate_attribute() {
-        assert!(
+        assert_eq!(
             check("#![no_std]\nextern crate alloc;", true)
                 .unwrap()
-                .is_empty()
+                .len(),
+            0
         );
         assert_eq!(
             check("extern crate alloc;", true).unwrap(),

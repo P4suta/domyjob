@@ -446,7 +446,10 @@ mod tests {
     fn closing_and_retaining_staged_paths_has_one_owner() {
         let source =
             "mod raw { fn f(file: T) { file.into_temp_path(); file.disable_cleanup(true); } }";
-        assert!(check(REPLACEMENT, &syn::parse_file(source).unwrap()).is_empty());
+        assert_eq!(
+            check(REPLACEMENT, &syn::parse_file(source).unwrap()).len(),
+            0
+        );
         rejected("crates/domyjob/src/state_io.rs", source);
         rejected(REPLACEMENT, "fn f(file: T) { file.into_temp_path(); }");
         rejected(REPLACEMENT, "mod raw { fn f(file: T) { file.keep(); } }");
@@ -470,14 +473,17 @@ mod tests {
                 let private = format!(
                     "struct {name}(Resource); impl Drop for {name} {{ fn drop(&mut self) {{}} }}"
                 );
-                assert!(check(owner, &syn::parse_file(&private).unwrap()).is_empty());
+                assert_eq!(check(owner, &syn::parse_file(&private).unwrap()).len(), 0);
             }
         }
         rejected(RELEASE, "#[derive(Debug)] struct Secret(String);");
         rejected(RELEASE, "impl Debug for Secret {}");
         rejected(RELEASE, "impl Display for Secret {}");
         let staged = "mod raw { fn rename() { std::fs::rename(source, target); } }";
-        assert!(check(DISTRIBUTION, &syn::parse_file(staged).unwrap()).is_empty());
+        assert_eq!(
+            check(DISTRIBUTION, &syn::parse_file(staged).unwrap()).len(),
+            0
+        );
         rejected(RELEASE, staged);
     }
 
@@ -489,15 +495,16 @@ mod tests {
             "forward!(file.try_lock())",
         ] {
             let source = format!("mod raw {{ fn f() {{ {expression}; }} }}");
-            assert!(check(LOCK, &syn::parse_file(&source).unwrap()).is_empty());
+            assert_eq!(check(LOCK, &syn::parse_file(&source).unwrap()).len(), 0);
             rejected("crates/domyjob/src/builds.rs", &source);
         }
-        assert!(
+        assert_eq!(
             check(
                 "crates/domyjob/src/store.rs",
                 &syn::parse_file("fn f() { mutex.lock(); }").unwrap()
             )
-            .is_empty()
+            .len(),
+            0
         );
     }
 
@@ -512,12 +519,13 @@ mod tests {
             rejected("crates/domyjob/src/chat/cli.rs", source);
             rejected(MAIN, source);
         }
-        assert!(
+        assert_eq!(
             check(
                 MAIN,
                 &syn::parse_file("mod raw { fn f() { Output::of_process(); } }").unwrap()
             )
-            .is_empty()
+            .len(),
+            0
         );
     }
 
@@ -529,7 +537,7 @@ mod tests {
             "forward!(windows_sys::Win32::Foundation::CloseHandle(h));",
         ] {
             for owner in [KERNEL, DESCRIPTOR] {
-                assert!(check(owner, &syn::parse_file(source).unwrap()).is_empty());
+                assert_eq!(check(owner, &syn::parse_file(source).unwrap()).len(), 0);
             }
             rejected("crates/domyjob/src/process/windows.rs", source);
         }
@@ -559,7 +567,7 @@ mod tests {
         ] {
             rejected(KERNEL, source);
         }
-        assert!(
+        assert_eq!(
             check(
                 KERNEL,
                 &syn::parse_file(
@@ -567,7 +575,8 @@ mod tests {
                 )
                 .unwrap()
             )
-            .is_empty()
+            .len(),
+            0
         );
     }
 
@@ -586,6 +595,6 @@ mod tests {
                 rejected(owner, source);
             }
         }
-        assert!(check(KERNEL, &syn::parse_file("use std::os::windows::io::AsRawHandle as _; impl Drop for Event<Signal> { fn drop(&mut self) {} }").unwrap()).is_empty());
+        assert_eq!(check(KERNEL, &syn::parse_file("use std::os::windows::io::AsRawHandle as _; impl Drop for Event<Signal> { fn drop(&mut self) {} }").unwrap()).len(), 0);
     }
 }

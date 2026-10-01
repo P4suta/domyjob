@@ -229,7 +229,7 @@ mod tests {
                 pub(super) fn write(path: &Path) -> std::io::Result<()> { std::fs::write(path, b"") }
             }
         "#;
-        assert!(findings(owned).is_empty());
+        assert_eq!(findings(owned).len(), 0);
         for misplaced in [
             r#"#[expect(clippy::disallowed_methods, reason = "x")] fn write() {}"#,
             r#"#![expect(clippy::disallowed_methods, reason = "x")] fn write() {}"#,
@@ -248,7 +248,10 @@ mod tests {
         }
         let foreign =
             syn::parse_file(r#"#![expect(unsafe_code, reason = "x")] fn f() {}"#).unwrap();
-        assert!(check("crates/domyjob/src/process/windows/kernel.rs", &foreign).is_empty());
+        assert_eq!(
+            check("crates/domyjob/src/process/windows/kernel.rs", &foreign).len(),
+            0
+        );
     }
 
     #[test]
