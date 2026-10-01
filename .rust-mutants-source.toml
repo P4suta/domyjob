@@ -146,3 +146,21 @@ line = 227
 where = { cfg = 'all(windows, any(target_pointer_width = "32", target_pointer_width = "64"))' }
 reason = "The pinned windows-sys 0.61.2 ACL_SIZE_INFORMATION is a fixed repr(C) structure of three u32 fields with a 12-byte size, so converting its size to u32 cannot fail on supported Windows targets; this records a native size-bound argument without assigning a sealed verdict."
 outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/builds.rs"
+item = "hold_executable"
+rule = "question-to-unwrap"
+original = "?"
+line = 72
+reason = "installed_directory returns a build path only after build.parent() produced its versions path, so versions_of cannot fail for this private caller; this records a structural reachability argument for an unproven native observation without assigning a sealed verdict."
+outcome = "survived"
+
+[[mutation.expect]]
+path = "crates/domyjob/src/builds.rs"
+item = "pin"
+rule = "question-to-unwrap"
+original = "?"
+line = 131
+reason = "installed_directory returns a build path only after build.parent() produced its versions path, so versions_of cannot fail for this private caller; this records a structural reachability argument for an unproven native observation without assigning a sealed verdict."
+outcome = "survived"
