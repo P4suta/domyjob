@@ -39,6 +39,7 @@ The finalizer executes from the repository's trusted `main`; source ancestry ver
 GitHub Release immutability takes effect when the release is published.
 See [GitHub's immutable release documentation](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
 The repository also protects `v*` tags against updates and deletion, so merging the release pull request and creating its tag belong to the final publication step.
+Before signing and publication, the same tag policy check requires an authenticated [GraphQL ruleset bypass connection](https://docs.github.com/en/graphql/reference/repos#repositoryruleset) with an explicit zero `totalCount` and consistent empty page; this trusts GitHub's connection contract and never treats omitted REST bypass metadata as an empty list.
 The manual verification run below creates neither a tag nor a GitHub Release.
 
 Notarization has a seven-day queue deadline, independent of the 15-minute finalizer job limit.

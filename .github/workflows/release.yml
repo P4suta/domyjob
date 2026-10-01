@@ -34,6 +34,11 @@ jobs:
           TAG: ${{ github.ref_name }}
           SOURCE_REF: ${{ github.ref }}
         run: cargo xtask release version
+      - name: Verify the tag policy using the workflow token before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: cargo xtask release queue policy
 
   build:
     name: build (${{ matrix.target }})

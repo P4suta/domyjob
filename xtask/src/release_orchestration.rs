@@ -395,42 +395,55 @@ fn completed(
 ) -> Result<bool, OrchestrationError> {
     let name = format!("dist-verified-{run_id}-{attempt}");
     let artifacts = github.api(&format!("actions/artifacts?name={name}&per_page=100"))?;
-    if artifacts
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .is_none_or(|count| count > 100)
+    let markers = list(&artifacts, "artifacts")?;
+    if markers.len() > SCAN_LIMIT
+        || artifacts
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .is_none()
     {
-        return Err(invalid("completion marker list exceeds its scan bound"));
+        return Err(invalid("completion marker response exceeds its scan bound"));
     }
-    for artifact in list(&artifacts, "artifacts")? {
-        if text(artifact, "name")? != name
+    for artifact in markers {
+        if artifact.get("name").and_then(Value::as_str) != Some(name.as_str())
             || artifact.get("expired").and_then(Value::as_bool) != Some(false)
         {
             continue;
         }
-        let marker_run = artifact
+        let Some(id) = artifact
             .get("workflow_run")
-            .ok_or_else(|| invalid("completion marker run is missing"))?;
-        let id = number(marker_run, "id")?;
+            .and_then(|run| match number(run, "id") {
+                Ok(id) => Some(id),
+                Err(_untrusted_marker) => None,
+            })
+        else {
+            continue;
+        };
         let run = github.api(&format!("actions/runs/{id}"))?;
-        repositories(&run)?;
-        if number(&run, "workflow_id")? != workflow
-            || text(&run, "path")? != FINALIZE_WORKFLOW
-            || text(&run, "head_branch")? != "main"
-            || !matches!(
-                text(&run, "event")?,
-                "schedule" | "workflow_run" | "workflow_dispatch"
-            )
-        {
-            return Err(invalid(
-                "completion marker did not come from the trusted finalizer",
-            ));
-        }
-        if text(&run, "status")? == "completed" && text(&run, "conclusion")? == "success" {
+        if trusted_completion(&run, id, workflow).is_ok() {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn trusted_completion(run: &Value, id: u64, workflow: u64) -> Result<(), OrchestrationError> {
+    repositories(run)?;
+    if number(run, "id")? != id
+        || number(run, "workflow_id")? != workflow
+        || text(run, "path")? != FINALIZE_WORKFLOW
+        || text(run, "head_branch")? != "main"
+        || !matches!(
+            text(run, "event")?,
+            "schedule" | "workflow_run" | "workflow_dispatch"
+        )
+    {
+        return Err(invalid(
+            "completion marker is not from the trusted finalizer",
+        ));
+    }
+    exact(run, "status", "completed")?;
+    exact(run, "conclusion", "success")
 }
 
 #[derive(Clone, Copy)]
@@ -714,7 +727,7 @@ fn protects_reference(ruleset: &Value, reference: &str) -> Result<bool, Orchestr
     }
     exact(ruleset, "source_type", "Repository")?;
     exact(ruleset, "source", REPOSITORY)?;
-    if !list(ruleset, "bypass_actors")?.is_empty() {
+    if ruleset.get("bypass_actors").is_some() && !list(ruleset, "bypass_actors")?.is_empty() {
         return Ok(false);
     }
     let names = ruleset
@@ -739,6 +752,68 @@ fn protects_reference(ruleset: &Value, reference: &str) -> Result<bool, Orchestr
         }))
 }
 
+fn bypass_query(id: u64) -> String {
+    format!(
+        "query {{ repository(owner: \"P4suta\", name: \"domyjob\") {{ nameWithOwner ruleset(databaseId: {id}) {{ id databaseId target enforcement source {{ __typename ... on Repository {{ nameWithOwner }} }} bypassActors(first: 1) {{ totalCount nodes {{ id }} pageInfo {{ hasNextPage }} }} }} }} }}"
+    )
+}
+
+fn bypass_count(response: &Value, ruleset: &Value) -> Result<u64, OrchestrationError> {
+    if let Some(errors) = response.get("errors")
+        && !errors.as_array().is_some_and(Vec::is_empty)
+    {
+        return Err(invalid("ruleset GraphQL query reported errors"));
+    }
+    let repository = response
+        .pointer("/data/repository")
+        .ok_or_else(|| invalid("ruleset GraphQL repository is missing"))?;
+    exact(repository, "nameWithOwner", REPOSITORY)?;
+    let graphql = repository
+        .get("ruleset")
+        .ok_or_else(|| invalid("ruleset GraphQL metadata is missing"))?;
+    if number(graphql, "databaseId")? != number(ruleset, "id")? {
+        return Err(invalid("ruleset GraphQL database ID differs"));
+    }
+    exact(graphql, "id", text(ruleset, "node_id")?)?;
+    exact(graphql, "target", "TAG")?;
+    exact(graphql, "enforcement", "ACTIVE")?;
+    let source = graphql
+        .get("source")
+        .ok_or_else(|| invalid("ruleset GraphQL source is missing"))?;
+    exact(source, "__typename", "Repository")?;
+    exact(source, "nameWithOwner", REPOSITORY)?;
+    let actors = graphql
+        .get("bypassActors")
+        .ok_or_else(|| invalid("ruleset GraphQL bypass connection is missing"))?;
+    let count = actors
+        .get("totalCount")
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= 2_147_483_647)
+        .ok_or_else(|| invalid("ruleset GraphQL bypass count is missing"))?;
+    let nodes = list(actors, "nodes")?;
+    if nodes.len() != usize::from(count > 0)
+        || actors
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            != Some(count > 1)
+        || nodes
+            .iter()
+            .any(|node| !node.is_null() && !text(node, "id").is_ok_and(|id| !id.is_empty()))
+    {
+        return Err(invalid(
+            "ruleset GraphQL bypass count contradicts its first page",
+        ));
+    }
+    if ruleset.get("bypass_actors").is_some()
+        && u64::try_from(list(ruleset, "bypass_actors")?.len())
+            .map_err(|_error| invalid("ruleset REST bypass count exceeds its bound"))?
+            != count
+    {
+        return Err(invalid("ruleset REST and GraphQL bypass counts differ"));
+    }
+    Ok(count)
+}
+
 fn protected_tag(github: &impl Github, reference: &str) -> Result<(), OrchestrationError> {
     let response = github.api("rulesets?includes_parents=false&per_page=100")?;
     let rulesets = response
@@ -750,13 +825,43 @@ fn protected_tag(github: &impl Github, reference: &str) -> Result<(), Orchestrat
             continue;
         }
         let id = number(ruleset, "id")?;
-        if protects_reference(&github.api(&format!("rulesets/{id}"))?, reference)? {
+        if id > 2_147_483_647 {
+            return Err(invalid("ruleset database ID exceeds its GraphQL bound"));
+        }
+        let details = github.api(&format!("rulesets/{id}"))?;
+        if number(&details, "id")? != id {
+            return Err(invalid("ruleset REST database ID differs"));
+        }
+        if !protects_reference(&details, reference)? {
+            continue;
+        }
+        let bytes = github.execute(&[
+            "api".into(),
+            "--hostname".into(),
+            "github.com".into(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={}", bypass_query(id)).into(),
+        ])?;
+        if bypass_count(&domyjob_core::ingress::json(&bytes, LIMIT)?, &details)? == 0 {
             return Ok(());
         }
     }
     Err(invalid(
         "version tag lacks active update and deletion protection without bypass actors",
     ))
+}
+
+fn policy(github: &impl Github, version: &str) -> Result<(), OrchestrationError> {
+    if version.len() > 128 {
+        return Err(invalid("policy version exceeds its bound"));
+    }
+    let parsed = semver::Version::parse(version)
+        .map_err(|error| invalid(&format!("policy version must be valid SemVer: {error}")))?;
+    if parsed.to_string() != version {
+        return Err(invalid("policy version must use canonical bounded SemVer"));
+    }
+    protected_tag(github, &format!("refs/tags/v{version}"))
 }
 
 fn handoff(root: &Path) -> Result<(), OrchestrationError> {
@@ -838,6 +943,15 @@ fn publish(
     let Some(tag) = tag_binding(github, &origin.source)? else {
         return Ok(());
     };
+    if let Some(release) = release_for_tag(github, &tag)? {
+        resume_publication(github, &tag, verified, &release)?;
+        return verify_published(github, &tag, handoff);
+    }
+    create_release(github, &tag, origin, verified)?;
+    verify_published(github, &tag, handoff)
+}
+
+fn release_for_tag(github: &impl Github, tag: &str) -> Result<Option<Value>, OrchestrationError> {
     let releases = github.api("releases?per_page=100")?;
     let releases = releases
         .as_array()
@@ -845,17 +959,29 @@ fn publish(
         .ok_or_else(|| invalid("release inventory exceeds its scan bound"))?;
     let matching: Vec<_> = releases
         .iter()
-        .filter(|release| release.get("tag_name").and_then(Value::as_str) == Some(tag.as_str()))
+        .filter(|release| release.get("tag_name").and_then(Value::as_str) == Some(tag))
         .collect();
     if matching.len() > 1 {
         return Err(invalid("multiple releases name the original tag"));
     }
-    if let Some(release) = matching.first() {
-        resume_publication(github, &tag, verified, release)?;
-        return verify_published(github, &tag, handoff);
+    matching
+        .first()
+        .map(|release| reload_release(github, tag, release))
+        .transpose()
+}
+
+fn reload_release(
+    github: &impl Github,
+    tag: &str,
+    release: &Value,
+) -> Result<Value, OrchestrationError> {
+    let id = number(release, "id")?;
+    let current = github.api(&format!("releases/{id}"))?;
+    if number(&current, "id")? != id {
+        return Err(invalid("release identity changed before publication"));
     }
-    create_release(github, &tag, origin, verified)?;
-    verify_published(github, &tag, handoff)
+    exact(&current, "tag_name", tag)?;
+    Ok(current)
 }
 
 fn create_release(
@@ -891,8 +1017,8 @@ fn create_release(
     }
     verified.unchanged()?;
     github.execute(&arguments)?;
-    let draft = github.api(&format!("releases/tags/{tag}"))?;
-    exact(&draft, "tag_name", tag)?;
+    let draft = release_for_tag(github, tag)?
+        .ok_or_else(|| invalid("new draft release is missing from the release inventory"))?;
     if draft.get("draft").and_then(Value::as_bool) != Some(true) {
         return Err(invalid("new release was not created as a draft"));
     }
@@ -966,8 +1092,7 @@ fn resume_publication(
                 verified.unchanged()?;
                 github.execute(&arguments)?;
             }
-            let uploaded = github.api(&format!("releases/tags/{tag}"))?;
-            exact(&uploaded, "tag_name", tag)?;
+            let uploaded = reload_release(github, tag, release)?;
             if uploaded.get("draft").and_then(Value::as_bool) != Some(true) {
                 return Err(invalid("release ceased to be a draft before publication"));
             }
@@ -1029,6 +1154,7 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), OrchestrationError> {
         return Err(invalid("release queue repository differs"));
     }
     match words {
+        ["policy"] => policy(&NativeGithub, &environment("VERSION")?),
         ["handoff"] => handoff(root),
         ["discover"] => {
             if environment("GITHUB_REF")? != "refs/heads/main" {
@@ -1059,7 +1185,9 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), OrchestrationError> {
             }
             finalize(root, &NativeGithub, unix_now()?)
         }
-        _ => Err(invalid("usage: release queue handoff|discover|finalize")),
+        _ => Err(invalid(
+            "usage: release queue policy|handoff|discover|finalize",
+        )),
     }
 }
 
@@ -1070,10 +1198,11 @@ mod tests {
 
     use super::{
         BUILD_WORKFLOW, Discovery, FINALIZE_WORKFLOW, Github, OrchestrationError, Origin,
-        PREDICATE, REPOSITORY, Source, SourceClaims, Value, VerifiedHandoff, active_age, completed,
-        create_release, discover, finish, invalid, json, list, main_ancestry, missing_assets,
-        original_run, pending_artifact, positive, protects_reference, provenance, release_assets,
-        tag_binding, timestamp, validate_origin,
+        PREDICATE, REPOSITORY, Source, SourceClaims, Value, VerifiedHandoff, active_age,
+        bypass_count, bypass_query, completed, create_release, discover, finish, invalid, json,
+        list, main_ancestry, missing_assets, original_run, pending_artifact, policy, positive,
+        protected_tag, protects_reference, provenance, release_assets, release_for_tag,
+        reload_release, tag_binding, timestamp, validate_origin,
     };
     use std::ffi::OsString;
 
@@ -1412,8 +1541,31 @@ mod tests {
                 conclusion == "success"
             );
         }
-        set(&mut marker, "head_branch", json!("feature"));
-        github.set("actions/runs/99", marker);
+        for (name, value) in [
+            ("id", json!(100)),
+            ("head_branch", json!("feature")),
+            ("workflow_id", json!(11)),
+            ("event", json!("pull_request")),
+            ("head_repository", json!({"full_name":"other/fork"})),
+        ] {
+            let mut untrusted = marker.clone();
+            set(&mut untrusted, name, value);
+            github.set("actions/runs/99", untrusted);
+            assert!(!completed(&github, 42, 2, 12).unwrap());
+        }
+        set(&mut marker, "id", json!(98));
+        github.set("actions/runs/98", marker);
+        github.set(
+            "actions/artifacts?name=dist-verified-42-2&per_page=100",
+            json!({"total_count":101,"artifacts":[
+                {"name":"dist-verified-42-2","expired":false,"workflow_run":{"id":99}},
+                {"name":"dist-verified-42-2","expired":false,"workflow_run":{"id":98}}
+            ]}),
+        );
+        assert!(completed(&github, 42, 2, 12).unwrap());
+        github
+            .responses
+            .remove(&format!("repos/{REPOSITORY}/actions/runs/99"));
         completed(&github, 42, 2, 12).unwrap_err();
     }
 
@@ -1464,8 +1616,14 @@ mod tests {
     }
 
     fn protected() -> Value {
-        json!({"target":"tag","enforcement":"active","source_type":"Repository","source":REPOSITORY,"bypass_actors":[],
+        json!({"id":7,"node_id":"ruleset7","target":"tag","enforcement":"active","source_type":"Repository","source":REPOSITORY,"bypass_actors":[],
             "conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"update"}]})
+    }
+
+    fn graphql_protected() -> Value {
+        json!({"data":{"repository":{"nameWithOwner":REPOSITORY,"ruleset":{"id":"ruleset7","databaseId":7,
+            "target":"TAG","enforcement":"ACTIVE","source":{"__typename":"Repository","nameWithOwner":REPOSITORY},
+            "bypassActors":{"totalCount":0,"nodes":[],"pageInfo":{"hasNextPage":false}}}}}})
     }
 
     fn protect_tags(github: &mut FakeGithub) {
@@ -1474,6 +1632,130 @@ mod tests {
             json!([{"id":7,"target":"tag","enforcement":"active"}]),
         );
         github.set("rulesets/7", protected());
+        github
+            .responses
+            .insert(format!("query={}", bypass_query(7)), graphql_protected());
+    }
+
+    #[test]
+    fn limited_token_policy_requires_explicit_consistent_graphql_bypass_metadata() {
+        let mut github = fake();
+        protect_tags(&mut github);
+        let mut limited_rest = protected();
+        limited_rest
+            .as_object_mut()
+            .unwrap()
+            .remove("bypass_actors");
+        github.set("rulesets/7", limited_rest.clone());
+        policy(&github, "1.2.3").unwrap();
+        assert_eq!(
+            bypass_count(&graphql_protected(), &limited_rest).unwrap(),
+            0
+        );
+        assert!(
+            github
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.first().is_some_and(|word| word == "api"))
+        );
+        assert!(
+            !github
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.iter().any(|word| word
+                    .to_str()
+                    .is_some_and(|word| word.contains("git/ref") || word.contains("releases"))))
+        );
+        github
+            .responses
+            .remove(&format!("query={}", bypass_query(7)));
+        protected_tag(&github, "refs/tags/v1.2.3").unwrap_err();
+        for version in ["01.2.3", "1.2", "../../outside", "1.2.3\n"] {
+            let calls = github.calls.borrow().len();
+            policy(&github, version).unwrap_err();
+            assert_eq!(github.calls.borrow().len(), calls);
+        }
+        let calls = github.calls.borrow().len();
+        policy(&github, &format!("1.2.3+{}", "a".repeat(128))).unwrap_err();
+        assert_eq!(github.calls.borrow().len(), calls);
+    }
+
+    #[test]
+    fn graphql_ruleset_rejects_missing_mismatched_or_contradictory_metadata() {
+        for (pointer, value) in [
+            ("/data/repository", Value::Null),
+            ("/data/repository/nameWithOwner", json!("other/repository")),
+            ("/data/repository/ruleset", Value::Null),
+            ("/data/repository/ruleset/databaseId", json!(8)),
+            ("/data/repository/ruleset/id", json!("different")),
+            ("/data/repository/ruleset/target", json!("BRANCH")),
+            ("/data/repository/ruleset/enforcement", json!("EVALUATE")),
+            (
+                "/data/repository/ruleset/source/__typename",
+                json!("Organization"),
+            ),
+            (
+                "/data/repository/ruleset/source/nameWithOwner",
+                json!("other/repository"),
+            ),
+            ("/data/repository/ruleset/bypassActors", Value::Null),
+            (
+                "/data/repository/ruleset/bypassActors/totalCount",
+                json!(-1),
+            ),
+            (
+                "/data/repository/ruleset/bypassActors/totalCount",
+                json!(2_147_483_648_u64),
+            ),
+            (
+                "/data/repository/ruleset/bypassActors/totalCount",
+                Value::Null,
+            ),
+            (
+                "/data/repository/ruleset/bypassActors/nodes",
+                json!([{"id":"actor"}]),
+            ),
+            (
+                "/data/repository/ruleset/bypassActors/pageInfo/hasNextPage",
+                json!(true),
+            ),
+        ] {
+            let mut changed = graphql_protected();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            bypass_count(&changed, &protected()).unwrap_err();
+        }
+        let mut errors = graphql_protected();
+        set(&mut errors, "errors", json!([{"message":"not accessible"}]));
+        bypass_count(&errors, &protected()).unwrap_err();
+        set(&mut errors, "errors", Value::Null);
+        bypass_count(&errors, &protected()).unwrap_err();
+    }
+
+    #[test]
+    fn nonempty_graphql_bypass_connections_cannot_qualify_a_protected_tag() {
+        let mut github = fake();
+        protect_tags(&mut github);
+        let mut limited_rest = protected();
+        limited_rest
+            .as_object_mut()
+            .unwrap()
+            .remove("bypass_actors");
+        github.set("rulesets/7", limited_rest.clone());
+        for count in [1, 2] {
+            let mut response = graphql_protected();
+            *response
+                .pointer_mut("/data/repository/ruleset/bypassActors")
+                .unwrap() =
+                json!({"totalCount":count,"nodes":[null],"pageInfo":{"hasNextPage":count > 1}});
+            assert_eq!(bypass_count(&response, &limited_rest).unwrap(), count);
+            bypass_count(&response, &protected()).unwrap_err();
+            github
+                .responses
+                .insert(format!("query={}", bypass_query(7)), response);
+            protected_tag(&github, "refs/tags/v1.2.3").unwrap_err();
+        }
     }
 
     #[test]
@@ -1592,11 +1874,34 @@ mod tests {
             .iter()
             .map(|(name, _path, hash)| json!({"name":name,"state":"uploaded","digest":format!("sha256:{hash}")}))
             .collect();
-        github.set(
-            "releases/tags/v1.2.3",
-            json!({"tag_name":"v1.2.3","draft":true,"assets":assets}),
-        );
+        let draft = json!({"id":123,"tag_name":"v1.2.3","draft":true,"assets":assets});
+        github.set("releases?per_page=100", json!([draft]));
+        github.set("releases/123", draft);
         github
+    }
+
+    #[test]
+    fn draft_release_reloads_bind_ids_and_refuse_ambiguous_inventory() {
+        let mut github = fake();
+        let draft = json!({"id":123,"tag_name":"v1.2.3","draft":true,"assets":[]});
+        github.set("releases?per_page=100", json!([draft]));
+        github.set("releases/123", draft.clone());
+        assert_eq!(
+            release_for_tag(&github, "v1.2.3").unwrap(),
+            Some(draft.clone())
+        );
+        assert!(!github.calls.borrow().iter().any(|call| {
+            call.last()
+                .is_some_and(|value| value.to_string_lossy().contains("releases/tags/"))
+        }));
+        github.set("releases?per_page=100", json!([draft, draft]));
+        release_for_tag(&github, "v1.2.3").unwrap_err();
+        for (name, value) in [("id", json!(124)), ("tag_name", json!("v9.9.9"))] {
+            let mut changed = draft.clone();
+            set(&mut changed, name, value);
+            github.set("releases/123", changed);
+            reload_release(&github, "v1.2.3", &draft).unwrap_err();
+        }
     }
 
     #[test]
@@ -1639,7 +1944,7 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .ends_with("releases/tags/v1.2.3")
+                .ends_with("releases?per_page=100")
         );
         drop(calls);
         let endpoint = format!("compare/{}...{}", "a".repeat(40), "a".repeat(40));
@@ -1676,10 +1981,11 @@ mod tests {
             artifact_id: 88,
         };
         for draft in [
-            json!({"tag_name":"v1.2.3","draft":false,"assets":[]}),
-            json!({"tag_name":"v1.2.3","draft":true,"assets":[{"name":"unreviewed.exe","state":"uploaded","digest":format!("sha256:{}","b".repeat(64))}]}),
+            json!({"id":123,"tag_name":"v1.2.3","draft":false,"assets":[]}),
+            json!({"id":123,"tag_name":"v1.2.3","draft":true,"assets":[{"name":"unreviewed.exe","state":"uploaded","digest":format!("sha256:{}","b".repeat(64))}]}),
         ] {
-            github.set("releases/tags/v1.2.3", draft);
+            github.set("releases?per_page=100", json!([draft]));
+            github.set("releases/123", draft);
             assert_create_stays_draft(&github, &origin, &verified);
         }
     }
