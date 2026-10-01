@@ -5,6 +5,8 @@ const LOCK: &str = "crates/domyjob/src/lock.rs";
 const MAIN: &str = "crates/domyjob/src/main.rs";
 const KERNEL: &str = "crates/domyjob/src/process/windows/kernel.rs";
 const DESCRIPTOR: &str = "crates/domyjob/src/platform/windows_acl/descriptor.rs";
+const RELEASE: &str = "xtask/src/release.rs";
+const DISTRIBUTION: &str = "xtask/src/distribution.rs";
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -28,6 +30,10 @@ const CAPABILITIES: &[&str] = &[
     "Ace",
     "StagedFile",
     "OsLock",
+    "Secret",
+    "PrivateFiles",
+    "SigningKeychain",
+    "StagedArchive",
 ];
 
 const COPYABLE_CAPABILITIES: &[&str] = &[
@@ -45,7 +51,10 @@ fn capability(kind: &syn::Type) -> bool {
 }
 
 fn capability_owner(owner: &str) -> bool {
-    matches!(owner, KERNEL | DESCRIPTOR | LOCK | REPLACEMENT)
+    matches!(
+        owner,
+        KERNEL | DESCRIPTOR | LOCK | REPLACEMENT | RELEASE | DISTRIBUTION
+    )
 }
 
 #[derive(Default)]
@@ -91,6 +100,9 @@ const RAW_OWNERS: &[&str] = &[
     "crates/domyjob/src/workspace.rs",
     "xtask/src/lib.rs",
     "xtask/src/main.rs",
+    "xtask/src/release.rs",
+    "xtask/src/ci.rs",
+    "xtask/src/distribution.rs",
     "xtask/tests/cli.rs",
     REPLACEMENT,
     LOCK,
@@ -143,11 +155,16 @@ impl Ownership<'_> {
                     .is_ok_and(|paths| {
                         paths.iter().any(|path| {
                             path.segments.last().is_some_and(|part| {
-                                !matches!(
-                                    part.ident.to_string().as_str(),
-                                    "Debug" | "Clone" | "Copy" | "PartialEq" | "Eq"
-                                ) || !COPYABLE_CAPABILITIES.contains(&name.to_string().as_str())
-                                    && matches!(part.ident.to_string().as_str(), "Clone" | "Copy")
+                                name == "Secret" && part.ident == "Debug"
+                                    || !matches!(
+                                        part.ident.to_string().as_str(),
+                                        "Debug" | "Clone" | "Copy" | "PartialEq" | "Eq"
+                                    )
+                                    || !COPYABLE_CAPABILITIES.contains(&name.to_string().as_str())
+                                        && matches!(
+                                            part.ident.to_string().as_str(),
+                                            "Clone" | "Copy"
+                                        )
                             })
                         })
                     })
@@ -177,9 +194,14 @@ impl Ownership<'_> {
             }
             "rename"
                 if self.raw
-                    && !matches!(self.owner, REPLACEMENT | "crates/domyjob/src/state_io.rs") =>
+                    && !matches!(
+                        self.owner,
+                        REPLACEMENT | "crates/domyjob/src/state_io.rs" | DISTRIBUTION
+                    ) =>
             {
-                Some("rename belongs to staged replacement or checked state directories")
+                Some(
+                    "rename belongs to staged replacement, checked state directories, or release archive staging",
+                )
             }
             _ => None,
         };
@@ -388,7 +410,7 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTOR, KERNEL, LOCK, MAIN, REPLACEMENT, check};
+    use super::{DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, REPLACEMENT, check};
 
     fn rejected(owner: &str, source: &str) {
         assert!(
@@ -428,6 +450,35 @@ mod tests {
         rejected("crates/domyjob/src/state_io.rs", source);
         rejected(REPLACEMENT, "fn f(file: T) { file.into_temp_path(); }");
         rejected(REPLACEMENT, "mod raw { fn f(file: T) { file.keep(); } }");
+    }
+
+    #[test]
+    fn release_resources_cannot_expose_secrets_or_duplicate_cleanup_owners() {
+        for (owner, names) in [
+            (RELEASE, &["Secret", "PrivateFiles", "SigningKeychain"][..]),
+            (DISTRIBUTION, &["StagedArchive"][..]),
+        ] {
+            for name in names {
+                for source in [
+                    format!("struct {name} {{ pub resource: Resource }}"),
+                    format!("#[derive(Clone)] struct {name}(Resource);"),
+                    format!("#[derive(Default)] struct {name}(Resource);"),
+                    format!("impl Deref for {name} {{ type Target = Resource; }}"),
+                ] {
+                    rejected(owner, &source);
+                }
+                let private = format!(
+                    "struct {name}(Resource); impl Drop for {name} {{ fn drop(&mut self) {{}} }}"
+                );
+                assert!(check(owner, &syn::parse_file(&private).unwrap()).is_empty());
+            }
+        }
+        rejected(RELEASE, "#[derive(Debug)] struct Secret(String);");
+        rejected(RELEASE, "impl Debug for Secret {}");
+        rejected(RELEASE, "impl Display for Secret {}");
+        let staged = "mod raw { fn rename() { std::fs::rename(source, target); } }";
+        assert!(check(DISTRIBUTION, &syn::parse_file(staged).unwrap()).is_empty());
+        rejected(RELEASE, staged);
     }
 
     #[test]

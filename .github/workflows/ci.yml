@@ -14,7 +14,11 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   lint:
+    needs: [changes]
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -23,10 +27,19 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
-          install_args: rust actionlint taplo typos npm:jscpd
-      - run: mise run lint
+          install_args: ${{ needs.changes.outputs.product == 'true' && 'rust actionlint taplo typos npm:jscpd' || needs.changes.outputs.workflows == 'true' && 'rust actionlint typos' || 'rust typos' }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: domyjob-ci-v1
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask ci check
+        env:
+          PLAN_JSON: ${{ needs.changes.outputs.plan }}
 
   deny:
+    needs: [changes]
+    if: needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
@@ -40,6 +53,8 @@ jobs:
       - run: mise run audit
 
   vet:
+    needs: [changes]
+    if: needs.changes.outputs.dependencies == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -52,10 +67,12 @@ jobs:
       - run: mise run vet
 
   test:
+    needs: [changes]
+    if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-26.04, macos-26, windows-2025]
+        os: ${{ fromJSON(needs.changes.outputs.test_os) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -64,13 +81,19 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
-          install_args: rust aqua:nextest-rs/nextest/cargo-nextest
-      - run: mise run clippy
-      - if: runner.os == 'Windows'
-        run: mise x -- cargo xtask windows-contracts
-      - run: mise run test
+          install_args: ${{ needs.changes.outputs.product == 'true' && 'rust actionlint aqua:nextest-rs/nextest/cargo-nextest' || 'rust actionlint' }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: domyjob-ci-v1
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask ci test
+        env:
+          PLAN_JSON: ${{ needs.changes.outputs.plan }}
 
   fuzz:
+    needs: [changes]
+    if: needs.changes.outputs.fuzz == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -87,20 +110,26 @@ jobs:
   ci-success:
     name: ci-success
     if: always()
-    needs: [lint, deny, vet, test, fuzz]
+    needs: [changes, lint, deny, vet, test, fuzz]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
-      - name: Require every gating job
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          install_args: rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: domyjob-ci-v1
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Require every selected gating job
         env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          if jq --exit-status 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null; then
-            echo "all CI gates passed"
-          else
-            jq . <<<"$NEEDS"
-            exit 1
-          fi
+          PLAN_JSON: ${{ needs.changes.outputs.plan }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: cargo xtask ci gate ci
 
   required:
     name: required
@@ -110,9 +139,7 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Fail unless every needed job succeeded or was skipped
+      - name: Require the complete CI gate
         env:
-          RESULTS: ${{ toJSON(needs.*.result) }}
-        run: |
-          echo "${RESULTS}"
-          jq -e 'all(.[]; IN("success", "skipped"))' <<< "${RESULTS}"
+          CI_RESULT: ${{ needs.ci-success.result }}
+        run: test "$CI_RESULT" = success

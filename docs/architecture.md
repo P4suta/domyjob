@@ -74,4 +74,5 @@ and an end-to-end suite that simulates several machines on one host with fake SS
 `mise run fuzz` fuzzes wire ingress, job state transitions, and chat ledger convergence.
 `mise run check:fleet` sends this checkout to Linux and Windows and runs Clippy, gates, and tests there.
 The CI matrix runs Clippy and tests on macOS, Linux, and Windows.
+CI and the pre-push hook select the necessary checks using the shared [validation policy](ci.md).
 The `commit-msg` hook refuses a fix to product code that stages no test.

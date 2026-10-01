@@ -18,9 +18,16 @@ CI uses the latest available stable Ubuntu and macOS images, independently of th
    - `check` refuses a tag that does not name the workspace version.
    - `build` compiles `domyjob` for x86-64 and Arm Linux, x86-64 and Arm macOS, and x86-64 Windows.
      It signs the macOS binaries with the Developer ID certificate and the hardened runtime and waits for Apple to accept their notarization.
+     `cargo xtask release sign-macos` owns the temporary credentials and keychain, verifies the selected identity, and restores the original keychain search list when it finishes.
      It signs the Windows binary with SSL.com eSigner and requires a valid Authenticode signature with signer and timestamp certificates.
      Each binary is packed with the licenses, README, and icon assets into a `.tar.gz`.
    - `publish` requires five archives, generates and checks their SHA-256 sums on Ubuntu, records GitHub's build provenance attestation for every archive, and publishes the release.
+
+The workflow uses [GitHub CLI's draft-and-upload sequence](https://cli.github.com/manual/gh_release_create) to upload all assets before publication.
+GitHub Release immutability takes effect when the release is published.
+See [GitHub's immutable release documentation](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+The repository also protects `v*` tags against updates and deletion, so merging the release pull request and creating its tag belong to the final publication step.
+The manual verification run below creates neither a tag nor a GitHub Release.
 
 The Windows executable embeds the icon as a native resource during compilation, before signing.
 The resource compiler must succeed for every normal Windows build.

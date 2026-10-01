@@ -104,6 +104,10 @@ run = "cargo xtask dependencies vet"
 description = "Run local lint, tests, and dependency checks"
 run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mise run vet"]
 
+[tasks."check:scope"]
+description = "Validate the exact push ranges with the shared CI scope policy"
+run = "cargo xtask ci hook"
+
 [tasks."check:linux"]
 description = "Lint and test this checkout on Linux through domyjob"
 run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
@@ -115,3 +119,19 @@ run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe
 [tasks."check:fleet"]
 description = "Run this checkout's checks on Linux and Windows"
 run = ["mise run check:linux", "mise run check:win"]
+
+[tasks."check:xtask:linux"]
+description = "Lint and test repository tasks on Linux through domyjob"
+run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p xtask\" EXIT; mise x -- cargo clippy --locked -p xtask --all-targets -- -D warnings && mise x -- cargo xtask gates && mise x -- cargo xtask workflows && mise x -- cargo test --locked -p xtask'"
+
+[tasks."check:xtask:win"]
+description = "Lint and test repository tasks on Windows through domyjob"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise x -- cargo clippy --locked -p xtask --all-targets -- -D warnings; $code=$LASTEXITCODE; if ($code -eq 0) { mise x -- cargo xtask gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo xtask workflows; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo test --locked -p xtask; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p xtask; exit $code'"
+
+[tasks."check:xtask:fleet"]
+description = "Validate repository tasks on Linux and Windows without product tests"
+run = ["mise run check:xtask:linux", "mise run check:xtask:win"]
+
+[tasks."check:xtask:windows-contracts"]
+description = "Check changed Windows SDK compiler contracts through domyjob"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise x -- cargo xtask windows-contracts; exit $LASTEXITCODE'"

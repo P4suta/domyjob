@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
 
+pub mod ci;
 pub mod comments;
 pub mod dependencies;
+pub mod distribution;
 pub mod exceptions;
 pub mod fixes;
 pub mod ownership;
@@ -11,7 +13,7 @@ pub mod ownership;
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "repository tasks run their pinned tools and write only their caches and fixtures"
+        reason = "repository tasks run pinned tools and write owned caches, fixtures, and public CI outputs"
     )]
 
     use std::io;
@@ -33,8 +35,16 @@ mod raw {
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
     }
+
+    pub(super) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        io::Write::write_all(
+            &mut std::fs::OpenOptions::new().append(true).open(path)?,
+            bytes,
+        )
+    }
 }
 pub mod pure_core;
+pub mod release;
 pub mod windows_contracts;
 pub mod workflows;
 
