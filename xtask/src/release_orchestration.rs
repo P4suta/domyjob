@@ -1637,8 +1637,7 @@ mod tests {
             .insert(format!("query={}", bypass_query(7)), graphql_protected());
     }
 
-    #[test]
-    fn limited_token_policy_requires_explicit_consistent_graphql_bypass_metadata() {
+    fn limited_tag_policy() -> (FakeGithub, Value) {
         let mut github = fake();
         protect_tags(&mut github);
         let mut limited_rest = protected();
@@ -1647,6 +1646,12 @@ mod tests {
             .unwrap()
             .remove("bypass_actors");
         github.set("rulesets/7", limited_rest.clone());
+        (github, limited_rest)
+    }
+
+    #[test]
+    fn limited_token_policy_requires_explicit_consistent_graphql_bypass_metadata() {
+        let (mut github, limited_rest) = limited_tag_policy();
         policy(&github, "1.2.3").unwrap();
         assert_eq!(
             bypass_count(&graphql_protected(), &limited_rest).unwrap(),
@@ -1735,14 +1740,7 @@ mod tests {
 
     #[test]
     fn nonempty_graphql_bypass_connections_cannot_qualify_a_protected_tag() {
-        let mut github = fake();
-        protect_tags(&mut github);
-        let mut limited_rest = protected();
-        limited_rest
-            .as_object_mut()
-            .unwrap()
-            .remove("bypass_actors");
-        github.set("rulesets/7", limited_rest.clone());
+        let (mut github, limited_rest) = limited_tag_policy();
         for count in [1, 2] {
             let mut response = graphql_protected();
             *response

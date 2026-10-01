@@ -22,6 +22,7 @@ An individual mutation is evidence to investigate, rather than a requirement to 
 | An unrelated artifact stopped the entire continuation queue | A completion marker's name was treated as required authority before its originating workflow was verified | Inspect a bounded page of optional hints; only a successful trusted finalizer establishes completion, while API transport failures remain explicit errors |
 | A draft release could not be reread before publication | Test responses modeled the published-tag endpoint as also returning drafts | Select a unique release from the authenticated bounded inventory and reload its positive ID with exact ID and tag checks; drafts never use the published-tag lookup |
 | A policy fixture exposed data unavailable to the CI token | An administrator's ruleset response was assumed to match the runtime credential's API visibility | Verify the same ruleset's authenticated policy data and run the shared policy preflight with the actual CI token before signing or submitting |
+| A push passed locally but failed a mandatory CI static check | Scope selection reused one entry point but its xtask branch omitted duplication checking; the outgoing push and cumulative PR diff selected different branches | One compiled static-check owner serves full lint and every Rust or workflow scope; a failed static check stops scoped tests and remote work |
 
 The duplicate-descriptor contract demonstrates why close alone is insufficient.
 An inherited descriptor from another concurrently spawned child is a plausible explanation for the observed restored-control lock failure, but the responsible child was not captured.
@@ -56,6 +57,7 @@ Suspended process creation remains part of the existing launch factory's reviewe
 | Independent mutation evidence | Actual source splice; restored control; fresh artifact provenance; raw execution attribution; missing or conflicting evidence remains unaudited |
 | Release continuation | Exact original repository, run, attempt, main ancestry, source and artifact; original attestation; duplicate-field and bounded archive rejection; pending, rejected and accepted native outcomes; no automatic resubmission |
 | Release resource and publication ownership | Storage preflight before side effects; receipt retained on cleanup failure; owned credential and extraction cleanup; private capabilities without fabrication or cloning; manual origins never publish; exact draft assets before immutable publication |
+| Scoped verification | Full and scoped Rust checks share formatting, architecture, spelling, workflow and duplication checks; a static failure stops subsequent work; documentation alone retains spelling checks without product or remote tests |
 
 Compiler checks cover prohibited capability combinations and ownership lifetimes without executing invalid SDK operations.
 An operating-system capability proves the requested resource kind and granted access at construction, rather than promising that later operations cannot fail.
