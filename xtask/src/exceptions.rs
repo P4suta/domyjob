@@ -9,10 +9,13 @@ const EFFECT_LINTS: &[&str] = &[
 
 const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
     (
-        "crates/domyjob/src/platform/windows_acl.rs",
+        "crates/domyjob/src/platform/windows_acl/descriptor.rs",
         &["unsafe_code"],
     ),
-    ("crates/domyjob/src/process/windows.rs", &["unsafe_code"]),
+    (
+        "crates/domyjob/src/process/windows/kernel.rs",
+        &["unsafe_code"],
+    ),
     ("crates/domyjob/tests/e2e/os/windows.rs", &["unsafe_code"]),
     (
         "crates/domyjob/tests/e2e.rs",
@@ -63,13 +66,20 @@ fn expected(attribute: &syn::Attribute) -> Option<Expected> {
     ))
 }
 
+fn exception_tokens(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => ident == "expect" || ident == "allow",
+        proc_macro2::TokenTree::Group(group) => exception_tokens(group.stream()),
+        proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+    })
+}
+
 fn conditional_exception(attribute: &syn::Attribute) -> bool {
     attribute.path().is_ident("cfg_attr")
-        && attribute.meta.require_list().is_ok_and(|list| {
-            list.tokens.clone().into_iter().any(|token| {
-                matches!(&token, proc_macro2::TokenTree::Ident(ident) if ident == "expect" || ident == "allow")
-            })
-        })
+        && attribute
+            .meta
+            .require_list()
+            .is_ok_and(|list| exception_tokens(list.tokens.clone()))
 }
 
 fn thin(item: &syn::Item) -> bool {
@@ -225,6 +235,8 @@ mod tests {
             r#"#![expect(clippy::disallowed_methods, reason = "x")] fn write() {}"#,
             r#"fn f() { #[expect(clippy::cast_possible_truncation, reason = "x")] let a = 1; }"#,
             r#"#[cfg_attr(windows, expect(dead_code, reason = "x"))] fn f() {}"#,
+            r#"#[cfg_attr(all(), cfg_attr(all(), expect(dead_code, reason = "x")))] fn f() {}"#,
+            r#"#[cfg_attr(all(), cfg_attr(all(), allow(dead_code, reason = "x")))] fn f() {}"#,
             r#"pub mod raw { #![expect(clippy::disallowed_methods, reason = "x")] }"#,
             r#"mod raw { #![expect(clippy::too_many_lines, reason = "x")] }"#,
             r#"mod raw { #![expect(clippy::disallowed_methods, reason = "x")] pub fn f() {} }"#,
@@ -236,7 +248,7 @@ mod tests {
         }
         let foreign =
             syn::parse_file(r#"#![expect(unsafe_code, reason = "x")] fn f() {}"#).unwrap();
-        assert!(check("crates/domyjob/src/process/windows.rs", &foreign).is_empty());
+        assert!(check("crates/domyjob/src/process/windows/kernel.rs", &foreign).is_empty());
     }
 
     #[test]
@@ -256,6 +268,7 @@ mod tests {
         for source in [
             "#[inline] fn f() {}",
             "#[cfg_attr(windows, inline)] fn f() {}",
+            "#[cfg_attr(all(), cfg_attr(all(), inline))] fn f() {}",
             "#[derive(Debug)] struct Value;",
             "mod nested { #[inline] fn f() {} }",
         ] {
@@ -295,7 +308,7 @@ mod tests {
     fn malformed_expectations_cannot_grant_lint_exceptions() {
         for path in [
             "crates/domyjob/src/example.rs",
-            "crates/domyjob/src/process/windows.rs",
+            "crates/domyjob/src/process/windows/kernel.rs",
         ] {
             let file =
                 syn::parse_file("\n#![expect(unsafe_code reason = \"x\")]\nfn f() {}").unwrap();

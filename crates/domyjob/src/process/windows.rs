@@ -1,58 +1,10 @@
-#![expect(
-    unsafe_code,
-    reason = "Windows Job Objects, suspended starts, and readiness events require raw kernel handles"
-)]
-
 use std::io;
-use std::os::windows::io::AsRawHandle as _;
-use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
-};
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, EVENT_MODIFY_STATE,
-    GetExitCodeProcess, INFINITE, OpenEventW, OpenProcess, OpenThread,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, SetEvent,
-    THREAD_SUSPEND_RESUME, WaitForMultipleObjects, WaitForSingleObject,
-};
+mod kernel;
 
 use super::{Guard, ProcessError, ReadyToken, Stop};
-
-const WATCH: u32 = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-
-#[derive(Debug)]
-struct Owned(HANDLE);
-
-impl Owned {
-    fn new(handle: HANDLE) -> io::Result<Self> {
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(Self(handle))
-        }
-    }
-}
-
-impl Drop for Owned {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
-unsafe impl Send for Owned {}
-unsafe impl Sync for Owned {}
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
+use kernel::{Event, Job, Process, RunningJob, StartWake};
 
 fn event_name(token: &ReadyToken) -> String {
     format!("Local\\domyjob-ready-{}", token.as_str())
@@ -60,27 +12,31 @@ fn event_name(token: &ReadyToken) -> String {
 
 pub(super) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessError> {
     let token = token.ok_or(ProcessError::InvalidReadyToken)?;
-    let name = wide(&event_name(token));
-    let event = Owned::new(unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) })
-        .map_err(ProcessError::Ready)?;
-    if unsafe { SetEvent(event.0) } == 0 {
-        return Err(ProcessError::Ready(io::Error::last_os_error()));
-    }
-    Ok(())
+    let event = Event::open(&event_name(token)).map_err(ProcessError::Ready)?;
+    event
+        .signal()
+        .map(|_success| ())
+        .map_err(ProcessError::Ready)
 }
 
 pub(super) fn launch_worker(
     arguments: &[&str],
     errors: Option<std::fs::File>,
 ) -> Result<(), ProcessError> {
-    use std::os::windows::io::{AsHandle as _, IntoRawHandle as _};
+    launch_worker_using(arguments, errors, ReadyToken::fresh, std::env::current_exe)
+}
+
+fn launch_worker_using(
+    arguments: &[&str],
+    errors: Option<std::fs::File>,
+    fresh_token: impl FnOnce() -> Result<ReadyToken, ProcessError>,
+    executable: impl FnOnce() -> io::Result<std::path::PathBuf>,
+) -> Result<(), ProcessError> {
     use windows_spawn::{CreationFlags, SpawnOptions, Stdio};
 
-    let token = ReadyToken::fresh()?;
-    let name = wide(&event_name(&token));
-    let event = Owned::new(unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) })
-        .map_err(ProcessError::Ready)?;
-    let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
+    let token = fresh_token()?;
+    let event = Event::create(&event_name(&token)).map_err(ProcessError::Ready)?;
+    let executable = executable().map_err(|source| ProcessError::Spawn {
         what: "the worker",
         source,
     })?;
@@ -103,105 +59,56 @@ pub(super) fn launch_worker(
         what: "the worker",
         source,
     })?;
-    let handle = child
-        .as_handle()
-        .try_clone_to_owned()
-        .map_err(ProcessError::Wait)?;
+    let process = Process::duplicate_worker(&child).map_err(ProcessError::Wait)?;
     drop(child);
-    let process = Owned::new(handle.into_raw_handle()).map_err(ProcessError::Wait)?;
-    let handles = [event.0, process.0];
-    let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
-    if woke == WAIT_OBJECT_0 {
-        return Ok(());
+    match event
+        .as_wait()
+        .wait_for_start(&process)
+        .map_err(ProcessError::Wait)?
+    {
+        StartWake::Ready => Ok(()),
+        StartWake::Exited => Err(ProcessError::NotStarted(exit_description(&process))),
     }
-    if woke != WAIT_OBJECT_0.saturating_add(1) {
-        return Err(ProcessError::Wait(io::Error::last_os_error()));
+}
+
+fn exit_description(process: &Process<kernel::Watch>) -> String {
+    match process.exit_code() {
+        Ok(code) => format!("exit code {code:#x}"),
+        Err(_unavailable) => "unknown exit code".to_owned(),
     }
-    let mut code = 0_u32;
-    let known = unsafe { GetExitCodeProcess(process.0, &raw mut code) } != 0;
-    Err(ProcessError::NotStarted(if known {
-        format!("exit code {code:#x}")
-    } else {
-        "unknown exit code".to_owned()
-    }))
 }
 
 pub(super) fn isolate(command: &mut Command) {
-    command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
-fn resume_threads(pid: u32) -> io::Result<()> {
-    let snapshot = Owned::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
-    let size = u32::try_from(size_of::<THREADENTRY32>()).map_err(io::Error::other)?;
-    let mut entry = THREADENTRY32 {
-        dwSize: size,
-        ..THREADENTRY32::default()
-    };
-    let mut resumed = 0_usize;
-    let mut more = unsafe { Thread32First(snapshot.0, &raw mut entry) } != 0;
-    while more {
-        if entry.th32OwnerProcessID == pid {
-            let thread =
-                Owned::new(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) })?;
-            if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                return Err(io::Error::last_os_error());
-            }
-            resumed = resumed.saturating_add(1);
-        }
-        more = unsafe { Thread32Next(snapshot.0, &raw mut entry) } != 0;
-    }
-    if resumed == 0 {
-        return Err(io::Error::other("the job process has no thread to start"));
-    }
-    Ok(())
+    kernel::isolate(command);
 }
 
 #[derive(Debug)]
 pub(super) struct Tree {
-    job: Owned,
-    process: Owned,
+    job: RunningJob,
 }
 
 impl Tree {
     pub(super) fn adopt(child: &Child) -> io::Result<Self> {
-        let job = Owned::new(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
-        let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-            .map_err(io::Error::other)?;
-        if unsafe {
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                (&raw const information).cast(),
-                size,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let process = Owned::new(unsafe { OpenProcess(WATCH, 0, child.id()) })?;
-        resume_threads(child.id())?;
-        Ok(Self { job, process })
+        let job = Job::create()?
+            .configure()?
+            .assign(child)?
+            .watch()?
+            .resume()?;
+        Ok(Self { job })
     }
 
     pub(super) fn await_leader(&self) -> Result<(), ProcessError> {
-        if unsafe { WaitForSingleObject(self.process.0, INFINITE) } == WAIT_OBJECT_0 {
-            Ok(())
-        } else {
-            Err(ProcessError::Wait(io::Error::last_os_error()))
-        }
+        self.job
+            .await_leader()
+            .map(|_success| ())
+            .map_err(ProcessError::Wait)
     }
 
     pub(super) fn kill_all(&self) -> Result<(), ProcessError> {
-        if unsafe { TerminateJobObject(self.job.0, 1) } == 0 {
-            Err(ProcessError::Signal(io::Error::last_os_error()))
-        } else {
-            Ok(())
-        }
+        self.job
+            .terminate()
+            .map(|_success| ())
+            .map_err(ProcessError::Signal)
     }
 
     pub(super) fn kill_remaining(&self) -> Result<(), ProcessError> {
@@ -252,5 +159,91 @@ pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
         Err(ProcessError::Signal(io::Error::other(format!(
             "taskkill failed: {status}"
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Event, ProcessError, ReadyToken, announce_ready, event_name, launch_worker,
+        launch_worker_using,
+    };
+
+    #[test]
+    fn a_readiness_event_is_signalled_before_success_is_returned() {
+        let token = ReadyToken::fresh().expect("owned readiness token");
+        let event = Event::create(&event_name(&token)).expect("owned readiness event");
+        announce_ready(Some(&token)).expect("signal the owned event");
+        assert!(
+            event
+                .as_wait()
+                .is_signalled()
+                .expect("inspect the owned event")
+        );
+    }
+
+    #[test]
+    fn missing_entropy_stops_before_a_worker_is_prepared() {
+        let failure = getrandom::Error::new_custom(73);
+        let error = launch_worker_using(
+            &[],
+            None,
+            || Err(ProcessError::Entropy(failure)),
+            || panic!("an executable must not be requested without entropy"),
+        )
+        .expect_err("retain the entropy error");
+        let ProcessError::Entropy(source) = error else {
+            panic!("unexpected entropy failure: {error}");
+        };
+        assert_eq!(source, failure);
+    }
+
+    #[test]
+    fn an_executable_lookup_error_keeps_the_worker_context() {
+        let error = launch_worker_using(&[], None, ReadyToken::fresh, || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("retain the executable lookup error");
+        let ProcessError::Spawn { what, source } = error else {
+            panic!("unexpected executable lookup failure: {error}");
+        };
+        assert_eq!(what, "the worker");
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_missing_executable_keeps_the_real_spawn_error() {
+        let root = tempfile::tempdir().expect("owned executable directory");
+        let missing = root.path().join("missing-worker.exe");
+        let error = launch_worker_using(&[], None, ReadyToken::fresh, || Ok(missing))
+            .expect_err("a missing executable cannot start");
+        let ProcessError::Spawn { what, source } = error else {
+            panic!("unexpected spawn failure: {error}");
+        };
+        assert_eq!(what, "the worker");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn missing_readiness_inputs_retain_their_errors() {
+        assert!(matches!(
+            announce_ready(None),
+            Err(ProcessError::InvalidReadyToken)
+        ));
+        let token = ReadyToken::fresh().expect("unused readiness token");
+        let error = announce_ready(Some(&token)).expect_err("the event has not been created");
+        let ProcessError::Ready(source) = error else {
+            panic!("unexpected readiness failure: {error}");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_worker_that_exits_without_readiness_reports_its_exit_code() {
+        let error = launch_worker(&["--help"], None).expect_err("help exits without readiness");
+        let ProcessError::NotStarted(reason) = error else {
+            panic!("unexpected worker startup failure: {error}");
+        };
+        assert!(reason.starts_with("exit code "), "{reason}");
     }
 }

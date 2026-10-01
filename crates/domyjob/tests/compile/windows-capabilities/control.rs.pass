@@ -1,0 +1,39 @@
+#![allow(dead_code)]
+#![deny(unsafe_code)]
+
+#[path = r"@KERNEL@"]
+mod kernel;
+#[path = r"@DESCRIPTOR@"]
+mod descriptor;
+
+fn event_signal(event: &kernel::Event<kernel::Signal>) -> std::io::Result<kernel::Success> {
+    event.signal()
+}
+
+fn event_wait(event: &kernel::EventRef<'_, kernel::Wait>, process: &kernel::Process<kernel::Watch>) -> std::io::Result<kernel::StartWake> {
+    event.wait_for_start(process)
+}
+
+fn process_query(process: &kernel::Process<kernel::Watch>) -> std::io::Result<u32> {
+    process.exit_code()
+}
+
+fn configured_assignment(job: kernel::Job<kernel::New>, child: &std::process::Child) -> std::io::Result<kernel::AssignedJob<'_>> {
+    job.configure()?.assign(child)
+}
+
+fn watched_resumption(assigned: kernel::AssignedJob<'_>) -> std::io::Result<kernel::RunningJob> {
+    assigned.watch()?.resume()
+}
+
+fn borrowed_views(owner: &descriptor::FileSecurity) -> (Option<descriptor::Acl<'_>>, descriptor::SidRef<'_>) {
+    (owner.acl(), owner.owner())
+}
+
+fn checked_descriptor(user: &descriptor::Sid) -> std::io::Result<descriptor::SecurityDescriptor> {
+    descriptor::SecurityDescriptor::for_user(user)
+}
+
+fn wait_only_process(process: &kernel::ProcessRef<'_, kernel::Wait>) -> std::io::Result<kernel::Success> {
+    process.await_exit()
+}

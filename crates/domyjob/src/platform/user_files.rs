@@ -61,14 +61,10 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> Result<(), UserFileError> {
             .set_permissions(permissions)
             .map_err(failed("writing", &target))?;
     }
-    staged
-        .as_file()
-        .sync_all()
-        .map_err(failed("writing", &target))?;
-    let mut staged = staged.into_temp_path();
-    super::raw::rename(&staged, &target).map_err(failed("replacing", &target))?;
-    staged.disable_cleanup(true);
-    Ok(())
+    super::replacement::StagedFile::sync_and_close(staged)
+        .map_err(failed("writing", &target))?
+        .replace(&target)
+        .map_err(failed("replacing", &target))
 }
 
 pub(crate) fn remove(path: &Path) -> Result<bool, UserFileError> {
@@ -93,10 +89,10 @@ pub(crate) fn install_executable(source: &Path, target: &Path) -> Result<(), Use
         tempfile::NamedTempFile::new_in(directory).map_err(failed("installing", target))?;
     super::raw::copy(source, staged.path()).map_err(failed("copying", source))?;
     crate::platform::make_executable(staged.path()).map_err(failed("installing", target))?;
-    let mut staged = staged.into_temp_path();
-    super::raw::rename(&staged, target).map_err(failed("installing", target))?;
-    staged.disable_cleanup(true);
-    Ok(())
+    super::replacement::StagedFile::sync_and_close(staged)
+        .map_err(failed("installing", target))?
+        .replace(target)
+        .map_err(failed("installing", target))
 }
 
 #[cfg(test)]

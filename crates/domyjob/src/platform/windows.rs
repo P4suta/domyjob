@@ -1,10 +1,8 @@
 use std::fs;
 use std::io;
-use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use domyjob_core::chat::card::Os;
-use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
 use super::{Ownership, System, variable, windows_acl};
 
@@ -76,6 +74,6 @@ impl System for Windows {
     fn owner_only(_options: &mut fs::OpenOptions) {}
 
     fn no_follow(options: &mut fs::OpenOptions) {
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        windows_acl::no_follow(options);
     }
 }

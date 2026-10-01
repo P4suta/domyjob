@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "actual_source_placeholders": {
+    "@KERNEL@": "crates/domyjob/src/process/windows/kernel.rs",
+    "@DESCRIPTOR@": "crates/domyjob/src/platform/windows_acl/descriptor.rs"
+  },
+  "sdk_execution": false,
+  "fixtures": [
+    {
+      "category": "resource_kind",
+      "source": "resource_kind.rs.fail",
+      "expected_error_codes": [
+        "E0308"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0308": {
+          "start": 11,
+          "end": 11
+        }
+      }
+    },
+    {
+      "category": "event_access",
+      "source": "event_access.rs.fail",
+      "expected_error_codes": [
+        "E0599"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0599": {
+          "start": 10,
+          "end": 10
+        }
+      }
+    },
+    {
+      "category": "process_access",
+      "source": "process_access.rs.fail",
+      "expected_error_codes": [
+        "E0599"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0599": {
+          "start": 10,
+          "end": 10
+        }
+      }
+    },
+    {
+      "category": "configure_before_assign",
+      "source": "configure_before_assign.rs.fail",
+      "expected_error_codes": [
+        "E0599"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0599": {
+          "start": 10,
+          "end": 10
+        }
+      }
+    },
+    {
+      "category": "watch_before_resume",
+      "source": "watch_before_resume.rs.fail",
+      "expected_error_codes": [
+        "E0599"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0599": {
+          "start": 10,
+          "end": 10
+        }
+      }
+    },
+    {
+      "category": "descriptor_lifetime",
+      "source": "descriptor_lifetime.rs.fail",
+      "expected_error_codes": [
+        "E0597"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0597": {
+          "start": 13,
+          "end": 22
+        }
+      },
+      "expected_min_diagnostics": {
+        "E0597": 2
+      }
+    },
+    {
+      "category": "checked_construction",
+      "source": "checked_construction.rs.fail",
+      "expected_error_codes": [
+        "E0599",
+        "E0603"
+      ],
+      "require_primary_fixture_span": true,
+      "passing_control": "control.rs.pass",
+      "expected_primary_line_ranges": {
+        "E0599": {
+          "start": 10,
+          "end": 10
+        },
+        "E0603": {
+          "start": 11,
+          "end": 11
+        }
+      }
+    }
+  ]
+}

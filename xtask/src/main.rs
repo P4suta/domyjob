@@ -52,13 +52,20 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
     match words {
         ["gates"] => gates(root, |message| eprintln!("{message}")),
         ["workflows"] => workflows(root),
+        ["windows-contracts"] => match xtask::windows_contracts::run(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("windows-contracts: {error}");
+                ExitCode::FAILURE
+            }
+        },
         ["commit-msg", message] => commit_msg(root, Path::new(message)),
         ["dependencies", "deny"] => dependencies(root, xtask::dependencies::Check::Deny),
         ["dependencies", "audit"] => dependencies(root, xtask::dependencies::Check::Audit),
         ["dependencies", "vet"] => dependencies(root, xtask::dependencies::Check::Vet),
         _ => {
             eprintln!(
-                "usage: cargo xtask gates | workflows | commit-msg FILE | dependencies deny|audit|vet"
+                "usage: cargo xtask gates | workflows | windows-contracts | commit-msg FILE | dependencies deny|audit|vet"
             );
             ExitCode::from(2)
         }

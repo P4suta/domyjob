@@ -32,6 +32,8 @@ The job runner keeps its store in a directory named by its format, so builds of 
 a node removes another format's store once no process of that format runs and two other formats' stores were opened after it,
 and a stored format is the digest of a checked-in specimen rather than a version number.
 State records have a 1 MiB size bound and are written through a private, synchronized replacement path.
+State, configuration, and executable replacement consume a `StagedFile` whose writer has been synchronized and closed.
+Directory publication and disposal instead require a checked private-directory value, so the raw directory rename cannot accept a staged file path.
 The storage adapter checks ownership and Unix mode or Windows ACL before reading existing state.
 The command runs in a Unix process group or Windows Job Object, with a guard against a stranded Unix process group.
 Its standard output and standard error share one pipe, and the worker stores at most the first 256 MiB and counts the rest.
@@ -56,6 +58,7 @@ The remote command runs that path through the account's shell and exits with sta
 The client then installs the matching binary from a portable archive embedded in the client build and repeats the request, which every request tolerates.
 That archive remains available when the original checkout is unavailable.
 Every process started from an installed build holds a shared lock inside its build directory, and each node request removes the other builds whose lock it can take.
+The owning `OsLock` explicitly unlocks when released or dropped, even when a duplicate descriptor remains alive.
 A persistent Cargo target directory on each remote host reuses compiled dependencies.
 
 Automatic local rebuild requires a development checkout, while remote installation always uses the embedded source archive.
@@ -65,7 +68,7 @@ OpenSSH authenticates the host and user; domyjob does not expose a separate list
 
 ## Verification
 
-`mise run lint` checks formatting, Clippy for the host, Linux, and Windows, architecture gates, spelling, workflow syntax, and duplicate code.
+`mise run lint` checks formatting, Clippy for the host, Linux, and Windows, architecture gates, Windows compiler contracts, spelling, workflow syntax, and duplicate code.
 `mise run test` tests the complete workspace, including the stored format specimens, a search of every reachable state of a chat ask across three machines,
 and an end-to-end suite that simulates several machines on one host with fake SSH and AI clients.
 `mise run fuzz` fuzzes wire ingress, job state transitions, and chat ledger convergence.

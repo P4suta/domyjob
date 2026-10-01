@@ -66,6 +66,8 @@ jobs:
         with:
           install_args: rust aqua:nextest-rs/nextest/cargo-nextest
       - run: mise run clippy
+      - if: runner.os == 'Windows'
+        run: mise x -- cargo xtask windows-contracts
       - run: mise run test
 
   fuzz:

@@ -45,9 +45,14 @@ run = [
 description = "Enforce the pure core and platform effect boundaries"
 run = "cargo xtask gates"
 
+[tasks."windows-contracts"]
+description = "Reject invalid Windows capabilities with the actual SDK types"
+depends = ["clippy:targets"]
+run = "cargo xtask windows-contracts"
+
 [tasks.lint]
 description = "Check formatting, types, architecture, spelling, workflows, and duplication"
-depends = ["fmt:check", "clippy", "clippy:targets", "gates"]
+depends = ["fmt:check", "clippy", "clippy:targets", "gates", "windows-contracts"]
 run = ["typos", "cargo xtask workflows", "jscpd --config .jscpd.json --silent"]
 
 [tasks.test]
@@ -95,7 +100,7 @@ run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -l
 
 [tasks."check:win"]
 description = "Lint and test this checkout on Windows through domyjob"
-run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo xtask windows-contracts; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
 
 [tasks."check:fleet"]
 description = "Run this checkout's checks on Linux and Windows"

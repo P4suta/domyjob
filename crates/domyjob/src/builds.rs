@@ -1,6 +1,8 @@
-use std::fs::{self, File, TryLockError};
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::lock::OsLock;
 
 mod raw {
     #![expect(
@@ -55,41 +57,40 @@ fn lock_file(directory: &Path) -> io::Result<File> {
     raw::open_lock(&directory.join(LOCK))
 }
 
-pub(crate) fn hold_current() -> io::Result<Option<File>> {
-    hold_executable(std::env::current_exe(), File::lock_shared)
+pub(crate) fn hold_current() -> io::Result<Option<OsLock>> {
+    hold_executable(std::env::current_exe(), OsLock::shared_file)
 }
 
 fn hold_executable(
     executable: io::Result<PathBuf>,
-    lock_shared: impl FnOnce(&File) -> io::Result<()>,
-) -> io::Result<Option<File>> {
+    lock_shared: impl FnOnce(File) -> io::Result<OsLock>,
+) -> io::Result<Option<OsLock>> {
     let executable = fs::canonicalize(executable?)?;
     let Some(directory) = installed_directory(&executable) else {
         return Ok(None);
     };
-    let file = lock_file(&directory)?;
-    lock_shared(&file)?;
+    let guard = lock_shared(lock_file(&directory)?)?;
     let versions = versions_of(&directory)?;
     let place = next_place(versions)?;
     raw::write(&directory.join(STARTED), place.to_string().as_bytes())?;
-    Ok(Some(file))
+    Ok(Some(guard))
 }
 
 fn next_place(versions: &Path) -> io::Result<u64> {
-    next_place_using(versions, File::lock, raw::write)
+    next_place_using(versions, OsLock::exclusive_file, raw::write)
 }
 
 fn next_place_using(
     versions: &Path,
-    lock: impl FnOnce(&File) -> io::Result<()>,
+    lock: impl FnOnce(File) -> io::Result<OsLock>,
     write: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
 ) -> io::Result<u64> {
-    let order = raw::open_lock(&versions.join(ORDER_LOCK))?;
-    lock(&order)?;
+    let order = lock(raw::open_lock(&versions.join(ORDER_LOCK))?)?;
     let next = number(&versions.join(ORDER))?
         .unwrap_or(0)
         .saturating_add(1);
     write(&versions.join(ORDER), next.to_string().as_bytes())?;
+    order.release()?;
     Ok(next)
 }
 
@@ -113,10 +114,12 @@ fn number(path: &Path) -> io::Result<Option<u64>> {
 }
 
 fn running(directory: &Path) -> io::Result<bool> {
-    match lock_file(directory)?.try_lock() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(error)) => Err(error),
+    match OsLock::try_file(lock_file(directory)?)? {
+        Some(guard) => {
+            guard.release()?;
+            Ok(false)
+        }
+        None => Ok(true),
     }
 }
 
@@ -202,6 +205,7 @@ mod tests {
         is_build_tag, lock_file, next_place, next_place_using, pin, prune, prune_entries, raw,
         running,
     };
+    use crate::lock::OsLock;
     use crate::testing;
     use std::fs::{self, File};
     use std::io;
@@ -223,10 +227,9 @@ mod tests {
         (root, program, directory)
     }
 
-    fn assert_build_held(directory: &Path, held: File) {
+    fn assert_build_held(directory: &Path, held: OsLock) {
         assert!(running(directory).unwrap());
         assert_eq!(testing::read(&directory.join(STARTED)), "1");
-        held.unlock().unwrap();
         drop(held);
         assert!(!running(directory).unwrap());
     }
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn an_installed_start_retains_its_lock_and_records_its_order() {
         let (_root, program, directory) = installed_fixture();
-        let held = hold_executable(Ok(program), File::lock_shared)
+        let held = hold_executable(Ok(program), OsLock::shared_file)
             .unwrap()
             .unwrap();
         assert_build_held(&directory, held);
@@ -312,7 +315,7 @@ mod tests {
     fn an_installed_start_propagates_order_errors() {
         let (_root, program, directory) = installed_fixture();
         testing::mkdir(&directory.parent().unwrap().join(ORDER_LOCK));
-        hold_executable(Ok(program), File::lock_shared).unwrap_err();
+        hold_executable(Ok(program), OsLock::shared_file).unwrap_err();
         assert_not_started(&directory);
     }
 
@@ -320,7 +323,7 @@ mod tests {
     fn an_installed_start_propagates_started_record_errors() {
         let (_root, program, directory) = installed_fixture();
         testing::mkdir(&directory.join(STARTED));
-        hold_executable(Ok(program), File::lock_shared).unwrap_err();
+        hold_executable(Ok(program), OsLock::shared_file).unwrap_err();
         assert_eq!(testing::read(&directory.parent().unwrap().join(ORDER)), "1");
     }
 
@@ -355,7 +358,7 @@ mod tests {
     fn starting_order_propagates_record_write_errors() {
         let root = tempfile::tempdir().unwrap();
         testing::write(&root.path().join(ORDER), b"4");
-        let error = next_place_using(root.path(), File::lock, |path, bytes| {
+        let error = next_place_using(root.path(), OsLock::exclusive_file, |path, bytes| {
             assert_eq!(path, root.path().join(ORDER));
             assert_eq!(bytes, b"5");
             Err(io::Error::other("order record write failed"))
@@ -559,8 +562,8 @@ mod tests {
         }
         testing::write(&versions.join(PINNED), format!("{:016}", 4));
         testing::mkdir(&versions.join("notes"));
-        let running = lock_file(&versions.join(format!("{:016}", 2))).unwrap();
-        running.lock_shared().unwrap();
+        let running =
+            OsLock::shared_file(lock_file(&versions.join(format!("{:016}", 2))).unwrap()).unwrap();
         assert_eq!(
             prune(&versions, &format!("{:016}", 7)).unwrap(),
             [format!("{:016}", 1), format!("{:016}", 6)]
@@ -569,7 +572,6 @@ mod tests {
             assert!(testing::is_dir(&versions.join(format!("{kept:016}"))));
         }
         assert!(testing::is_dir(&versions.join("notes")));
-        running.unlock().unwrap();
         drop(running);
         assert_eq!(
             prune(&versions, &format!("{:016}", 7)).unwrap(),

@@ -14,12 +14,13 @@ keywords = ["xtask"]
 categories = ["development-tools"]
 
 [dependencies]
+blake3.workspace = true
+domyjob-core = { path = "../crates/domyjob-core" }
 proc-macro2.workspace = true
+serde_json.workspace = true
 syn.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

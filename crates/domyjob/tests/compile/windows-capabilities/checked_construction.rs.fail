@@ -1,0 +1,12 @@
+#![allow(dead_code)]
+#![deny(unsafe_code)]
+
+#[path = r"@KERNEL@"]
+mod kernel;
+#[path = r"@DESCRIPTOR@"]
+mod descriptor;
+
+fn rejected() {
+    let _success = kernel::Success::default();
+    let _unchecked = kernel::Success(());
+}

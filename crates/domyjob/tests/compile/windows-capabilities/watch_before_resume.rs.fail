@@ -1,0 +1,11 @@
+#![allow(dead_code)]
+#![deny(unsafe_code)]
+
+#[path = r"@KERNEL@"]
+mod kernel;
+#[path = r"@DESCRIPTOR@"]
+mod descriptor;
+
+fn rejected(assigned: kernel::AssignedJob<'_>) {
+    assigned.resume();
+}

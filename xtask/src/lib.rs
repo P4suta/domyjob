@@ -6,6 +6,7 @@ pub mod comments;
 pub mod dependencies;
 pub mod exceptions;
 pub mod fixes;
+pub mod ownership;
 
 mod raw {
     #![expect(
@@ -29,12 +30,12 @@ mod raw {
         std::fs::create_dir_all(path)
     }
 
-    #[cfg(test)]
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
     }
 }
 pub mod pure_core;
+pub mod windows_contracts;
 pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +128,6 @@ fn rust_files_with(
 #[derive(Debug, Default)]
 struct SourcePolicy {
     effect_module: bool,
-    output_owner: bool,
     findings: Vec<String>,
 }
 
@@ -152,26 +152,6 @@ impl<'ast> Visit<'ast> for SourcePolicy {
             ));
         }
         syn::visit::visit_attribute(self, attribute);
-    }
-
-    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
-        let names: Vec<String> = expression
-            .path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect();
-        if !self.output_owner && names.ends_with(&["Output".to_owned(), "of_process".to_owned()]) {
-            let line = expression
-                .path
-                .segments
-                .first()
-                .map_or(1, |part| part.ident.span().start().line);
-            self.findings.push(format!(
-                "{line}: only `main` takes standard output; pass the `Output` it created"
-            ));
-        }
-        syn::visit::visit_expr_path(self, expression);
     }
 }
 
@@ -364,11 +344,11 @@ fn gates_with(
         }
         let mut policy = SourcePolicy {
             effect_module: effect_module(&shown),
-            output_owner: shown == "crates/domyjob/src/main.rs",
             findings: Vec::new(),
         };
         policy.visit_file(&parsed);
         policy.findings.extend(exceptions::check(&shown, &parsed));
+        policy.findings.extend(ownership::check(&shown, &parsed));
         for finding in policy.findings {
             eprintln!("{shown}:{finding}");
             findings = findings.saturating_add(1);
@@ -457,11 +437,9 @@ mod tests {
             ]
         );
         let printing = syn::parse_file("\nfn f() { let output = Output::of_process(); }").unwrap();
-        let mut elsewhere = SourcePolicy::default();
-        elsewhere.visit_file(&printing);
         assert_eq!(
-            elsewhere.findings,
-            ["2: only `main` takes standard output; pass the `Output` it created",]
+            super::ownership::check("crates/domyjob/src/chat/cli.rs", &printing),
+            ["2: only main obtains process output"]
         );
         for path in [
             "crates/domyjob/src/platform.rs",
@@ -483,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_and_output_owners_accept_only_their_own_exceptions() {
+    fn platform_owners_accept_only_their_own_branches() {
         for source in [
             "#[inline] fn f() {}",
             "#[cfg(test)] mod tests {}",
@@ -499,7 +477,6 @@ mod tests {
         .unwrap();
         let mut owner = SourcePolicy {
             effect_module: true,
-            output_owner: true,
             ..SourcePolicy::default()
         };
         owner.visit_file(&source);
@@ -510,7 +487,6 @@ mod tests {
             other.findings,
             [
                 "1: platform branches belong in the platform or process adapter",
-                "1: only `main` takes standard output; pass the `Output` it created",
                 "2: platform branches belong in the platform or process adapter",
             ]
         );

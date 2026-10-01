@@ -8,6 +8,7 @@ use domyjob_core::chat::id::{Invalid, Line};
 
 pub(crate) use crate::file_kind::reparse_point;
 pub(crate) mod clock;
+pub(crate) mod replacement;
 pub(crate) mod service;
 pub(crate) mod user_files;
 
@@ -59,10 +60,6 @@ mod raw {
 
     pub(super) fn remove_file(path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
-    }
-
-    pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
     }
 }
 

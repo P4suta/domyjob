@@ -6,9 +6,9 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 
 | Rule | Bug class it removes | Enforced by |
 | --- | --- | --- |
-| Each effect has one owner, and only a private `raw` module inside it calls the reserved API | Effects scattered where no policy applies; exceptions that hide unrelated violations | Clippy `disallowed-methods`, `disallowed-types`, `disallowed-macros`; `cargo xtask gates` |
+| Each effect has one owner, and only a private `raw` module inside an explicitly approved file calls the reserved API | Effects scattered where no policy applies; exceptions that hide unrelated violations | Clippy `disallowed-methods`, `disallowed-types`, `disallowed-macros`; the ownership and exception gates |
 | No lint exception outside a `raw` module, except foreign-function modules and the end-to-end harness; malformed exception declarations are rejected | Convenience exceptions that accumulate and hide bugs; invalid declarations treated as permission | `cargo xtask gates` (`xtask/src/exceptions.rs`) |
-| Standard output is reachable only through the `Output` that `main` creates | A stray line corrupting the MCP or node protocol stream | `disallowed-macros`, `disallowed-methods`, gate on `Output::of_process` |
+| Standard output is reachable only through the `Output` that `main` creates | A stray line corrupting the MCP or node protocol stream; constructor aliases bypassing a spelling check | Resolved Clippy bans and the ownership gate, including aliases and macro tokens |
 | Every child process starts from `process::command`, with standard input and output closed | A child writing into its parent's protocol stream | `disallowed-methods` on `Command::new` and `Command::output` |
 | Every read and queue has a bound | Memory growth driven by a peer, a child, or a watcher | `disallowed-methods` on unbounded reads and `mpsc::channel`; `bounded` |
 | Errors are matched, never turned into absence | A failure mistaken for "nothing there" | `disallowed-methods` on `Result::ok`, `unwrap_or`, `Path::exists`, and similar |
@@ -19,7 +19,9 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 | Every wait drives this machine's progress at each wake-up | A wait that never ends because nothing reacts to a dead worker | `chat::pulse::Pulse` is the only way to watch the doorbell |
 | Setup changes a user's file where it lives, keeping its link and permissions | A dotfiles link replaced by a copy, or a configuration's mode changed behind the user's back | `platform::user_files`, the only writer of user files, and its test |
 | Removing what a job or another build left never stops new work: the tree leaves its place in one rename and is then removed as far as it can be | A file this user cannot delete, such as one a container wrote as root, stopping every later job | `state_io::set_aside` and `state_io::empty`, the only ways to remove a tree; the store's test |
-| A file is replaced with the standard library's rename, which Windows performs even while another process holds the file | A doorbell or state write refused on Windows while a watcher reads the file it replaces | `disallowed-methods` on tempfile's `persist` and `keep`; the state file test |
+| A `StagedFile` synchronizes and closes its writer before replacing the destination with standard rename | A doorbell or state write refused while a watcher reads it; inconsistent replacement sequences between state, configuration, and executable installation | Private owned staging type; Clippy and non-suppressible ownership checks; live-reader and failure-cleanup contracts |
+| Every file lock is acquired and released through an owning `OsLock` guard | A lock remaining held through a duplicated descriptor after the original file closes | Private guard without cloning or raw access; consuming release and explicit unlock in Drop; resolved File lock bans and ownership checks; duplicate-descriptor contracts |
+| Windows workflows use kind, access, and ownership capabilities; job configuration, assignment, watch setup, and resumption follow typed transitions | A valid handle used with the wrong rights; borrowed security data outliving its allocation; skipped SDK setup | Checked private kernel and descriptor leaves; shared native contracts; seven required compiler rejection categories with a passing control |
 | A stop or kill treats "already gone" as success | A finished process reported as a failure | Tests for each such case |
 | The chat protocol is safe and converges in every interleaving of an ask | Arrival-order bugs between machines | The exhaustive state search in `domyjob-core` |
 | No decision reads the wall clock: it comes out only as a `Stamp`, which can only be printed | Builds and stores removed after a period, and anything that behaves differently on a machine left idle or with a wrong clock | `platform::clock` hands out wall-clock time only as `Stamp`, which has no comparison, arithmetic, or number to read |
@@ -36,17 +38,29 @@ The one module that owns an effect wraps those entry points in a private module 
 whose functions forward in a single statement and whose first attribute expects the reserved lints.
 The owner adds its policy around them, such as private permissions for state files or closed streams for children,
 and everything outside `raw`, including the rest of the owner, stays fully linted.
-The gate refuses an exception anywhere else, and refuses a `raw` module that grows logic.
+The gate refuses an exception anywhere else, refuses a new unregistered `raw` owner, and refuses a `raw` module that grows logic.
+Replacement methods that are forbidden even to an owner are checked independently of Clippy expectations.
+Closing a staged writer and disabling its cleanup belong only to the replacement leaf.
+File locking belongs only to the lock adapter.
+The syntax checks protect reserved names and exception scopes, while Clippy resolves the actual types and methods.
+Neither check claims to perform a complete Rust type analysis on its own.
+Capability owners spell types and traits directly, without type aliases, renamed imports, or globs; extension-trait imports may use `as _`.
+Capability declarations cannot conditionally change their attributes, and their only explicit trait implementation is Drop.
+The gate rejects default construction, raw resource returns, and cloning of owned resources, permits only the named value and borrowed-view derives, and detects lint exceptions through nested conditional attributes.
 
 | Effect | Owner |
 | --- | --- |
 | Decoding JSON | `domyjob-core::ingress` |
 | Private state files | `state_io` |
+| Synchronized file replacement | `platform::replacement::StagedFile` |
+| File lock ownership | `lock::OsLock` |
 | Installed builds | `builds` |
 | Job workspaces | `workspace` |
 | User configuration files, permissions, raw file options | `platform` |
 | Time | `platform::clock` |
 | Child processes, readiness signals | `process` |
+| Windows kernel capabilities and SDK results | `process::windows::kernel` |
+| Windows security allocations and borrowed ACL/SID data | `platform::windows_acl::descriptor` |
 | Standard output | `output` |
 | Reading to the end of a stream | `bounded` |
 | Test fixtures | `testing` |
@@ -69,7 +83,12 @@ The wire protocol has no format of its own, because a client only ever talks to 
 
 ## Verification
 
-- `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, spelling, workflows, and duplication.
+- `mise run lint` checks formatting, Clippy for the host, Linux, and Windows, the gate, Windows compiler contracts, spelling, workflows, and duplication.
+- `mise run windows-contracts` rejects seven invalid Windows capability categories against the actual pinned SDK metadata and both leaf sources, then confirms a passing control.
+  It checks each expected diagnostic code and primary source range, including separate ACL and SID lifetime failures, without executing SDK calls.
+  The inventory must contain each required category exactly once and refer to the actual two SDK leaves.
+  A diagnostic contributes at most one primary location, and the two lifetime sites must fail independently.
+  Captured Cargo JSON, compiler diagnostics, and source digests are written under the active Cargo target directory's `windows-contracts` directory.
 - `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and every end-to-end scenario on one host, each test in its own process.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
 - `mise run mutants` measures changes to the core and xtask, including the repository's policy gates.
@@ -81,6 +100,9 @@ The wire protocol has no format of its own, because a client only ever talks to 
   These reasons do not turn native observations into sealed verdicts or make an unproven run pass.
   Native observations remain unproven leads and do not count toward the sealed mutation score.
   A native lead gives exit status 2; preserve that status when collecting logs or running multiple groups, and inspect every report rather than treating a completed job as a passing mutation run.
+  A mutation rejected by a required compiler or Clippy gate is a static rejection, not a native test detection.
+  Native failures, timeouts, failed restored controls, and missing evidence remain inconclusive or unaudited.
+  [Effect contracts](verification/effect-contracts.md) define the shared verification categories and the finite completion boundary.
 - `mise run check:fleet` runs the checks on Linux and Windows through domyjob.
 
 Either mutation task accepts a dedicated engine through `DOMYJOB_MUTATION_TOOL`, so the default installation can stay unchanged.

@@ -28,8 +28,8 @@ mod raw {
         std::fs::remove_dir_all(path)
     }
 
-    pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    pub(super) fn rename(from: &super::PrivateDirectory<'_>, to: &Path) -> io::Result<()> {
+        std::fs::rename(from.0, to)
     }
 }
 
@@ -129,6 +129,15 @@ pub(crate) fn private_dir(path: &Path) -> Result<(), StateError> {
     check_owner(path, &directory)
 }
 
+struct PrivateDirectory<'a>(&'a Path);
+
+impl<'a> PrivateDirectory<'a> {
+    fn checked(path: &'a Path) -> Result<Self, StateError> {
+        private_dir(path)?;
+        Ok(Self(path))
+    }
+}
+
 fn parent(path: &Path) -> Result<&Path, StateError> {
     path.parent()
         .ok_or_else(|| io_at(path, io::Error::other("state path has no parent")))
@@ -202,13 +211,9 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     staged
         .write_all(bytes)
         .map_err(|error| io_at(path, error))?;
-    staged
-        .as_file()
-        .sync_all()
+    platform::replacement::StagedFile::sync_and_close(staged)
+        .and_then(|staged| staged.replace(path))
         .map_err(|error| io_at(path, error))?;
-    let mut staged = staged.into_temp_path();
-    raw::rename(&staged, path).map_err(|error| io_at(path, error))?;
-    staged.disable_cleanup(true);
     platform::sync_dir(directory).map_err(|error| io_at(directory, error))?;
     Ok(())
 }
@@ -289,17 +294,17 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
 }
 
 pub(crate) fn set_aside(path: &Path, trash: &Path) -> Result<(), StateError> {
-    match fs::symlink_metadata(path) {
-        Ok(_metadata) => private_dir(path)?,
+    let directory = match fs::symlink_metadata(path) {
+        Ok(_metadata) => PrivateDirectory::checked(path)?,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(io_at(path, error)),
-    }
+    };
     private_dir(trash)?;
     let mut entropy = [0_u8; 16];
     getrandom::fill(&mut entropy)
         .map_err(|error| io_at(trash, io::Error::other(error.to_string())))?;
     let name = format!("{:032x}", u128::from_be_bytes(entropy));
-    raw::rename(path, &trash.join(name)).map_err(|error| io_at(path, error))
+    raw::rename(&directory, &trash.join(name)).map_err(|error| io_at(path, error))
 }
 
 #[derive(Debug)]
@@ -327,8 +332,8 @@ pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
 }
 
 pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
-    private_dir(from)?;
-    raw::rename(from, to).map_err(|error| io_at(to, error))
+    let directory = PrivateDirectory::checked(from)?;
+    raw::rename(&directory, to).map_err(|error| io_at(to, error))
 }
 
 #[cfg(test)]

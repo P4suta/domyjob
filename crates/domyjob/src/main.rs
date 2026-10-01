@@ -7,6 +7,17 @@ use domyjob_core::wire::CleanTarget;
 
 use crate::output::Output;
 
+mod raw {
+    #![expect(
+        clippy::disallowed_methods,
+        reason = "the main entry point alone obtains process output"
+    )]
+
+    pub(super) fn output() -> crate::output::Output {
+        crate::output::Output::of_process()
+    }
+}
+
 mod app;
 mod bounded;
 mod builds;
@@ -162,7 +173,7 @@ enum MainError {
 }
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
-    let output = Output::of_process();
+    let output = raw::output();
     match command {
         Command::Chat(args) => Ok(chat::cli::run(args, &output)?),
         Command::Mcp { actor, turn } => {
