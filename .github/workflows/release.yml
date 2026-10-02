@@ -55,7 +55,7 @@ jobs:
     permissions:
       contents: read
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04
@@ -123,6 +123,7 @@ jobs:
           WINDOWS_SIGNING_IDENTITY_SHA256: ${{ vars.WINDOWS_SIGNING_IDENTITY_SHA256 }}
         run: cargo xtask release bundle
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && hashFiles('dist/*.tar.gz', 'dist/*.pkg') != ''
         with:
           name: dist-${{ matrix.target }}
           path: |
@@ -130,7 +131,7 @@ jobs:
             dist/*.pkg
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: runner.os == 'macOS'
+        if: always() && runner.os == 'macOS' && hashFiles('notarization/*.json') != ''
         with:
           name: notary-${{ matrix.target }}
           path: notarization/*.json
