@@ -8,6 +8,7 @@ pub mod dependencies;
 pub mod distribution;
 pub mod exceptions;
 pub mod fixes;
+pub mod macos_package;
 pub mod ownership;
 
 mod raw {
@@ -47,6 +48,7 @@ pub mod pure_core;
 pub mod release;
 pub mod release_orchestration;
 pub mod release_queue;
+mod release_ready;
 pub mod windows_contracts;
 pub mod workflows;
 
@@ -174,6 +176,8 @@ fn effect_module(path: &str) -> bool {
             | "crates/domyjob/src/process.rs"
             | "crates/domyjob/tests/e2e/os.rs"
             | "xtask/src/ci.rs"
+            | "xtask/src/macos_package.rs"
+            | "xtask/src/release.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
         || path.starts_with("crates/domyjob/tests/e2e/os/")
@@ -460,6 +464,8 @@ mod tests {
             "crates/domyjob/tests/e2e/os.rs",
             "crates/domyjob/src/platform/windows_acl.rs",
             "xtask/src/ci.rs",
+            "xtask/src/macos_package.rs",
+            "xtask/src/release.rs",
             "crates/domyjob/src/process/windows.rs",
             "crates/domyjob/tests/e2e/os/windows.rs",
         ] {

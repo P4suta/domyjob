@@ -10,6 +10,9 @@ const DISTRIBUTION: &str = "xtask/src/distribution.rs";
 const CI: &str = "xtask/src/ci.rs";
 const RELEASE_QUEUE: &str = "xtask/src/release_queue.rs";
 const RELEASE_ORCHESTRATION: &str = "xtask/src/release_orchestration.rs";
+const MACOS_PACKAGE: &str = "xtask/src/macos_package.rs";
+const RELEASE_READY: &str = "xtask/src/release_ready.rs";
+const DEPENDENCIES: &str = "xtask/src/dependencies.rs";
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -44,6 +47,16 @@ const CAPABILITIES: &[&str] = &[
     "StagedReceipt",
     "Origin",
     "VerifiedHandoff",
+    "VerifiedDistribution",
+    "VerifiedReady",
+    "ReviewedDistribution",
+    "AuditedLockfile",
+    "VerifiedWindowsBinary",
+    "WindowsSigningIdentity",
+    "VerifiedPackage",
+    "StapledPackage",
+    "ReadyDistribution",
+    "ExtractedPackage",
     "ReceiptDestination",
 ];
 
@@ -73,6 +86,9 @@ fn capability_owner(owner: &str) -> bool {
             | CI
             | RELEASE_QUEUE
             | RELEASE_ORCHESTRATION
+            | MACOS_PACKAGE
+            | RELEASE_READY
+            | DEPENDENCIES
     )
 }
 
@@ -122,6 +138,8 @@ const RAW_OWNERS: &[&str] = &[
     "xtask/src/release.rs",
     RELEASE_QUEUE,
     RELEASE_ORCHESTRATION,
+    MACOS_PACKAGE,
+    RELEASE_READY,
     CI,
     "xtask/src/distribution.rs",
     "xtask/tests/cli.rs",
@@ -260,7 +278,10 @@ impl Ownership<'_> {
                 if self.raw
                     && !matches!(
                         self.owner,
-                        REPLACEMENT | "crates/domyjob/src/state_io.rs" | DISTRIBUTION
+                        REPLACEMENT
+                            | "crates/domyjob/src/state_io.rs"
+                            | DISTRIBUTION
+                            | RELEASE_READY
                     ) =>
             {
                 Some(
@@ -564,8 +585,8 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CI, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MAIN, RELEASE, RELEASE_ORCHESTRATION,
-        RELEASE_QUEUE, REPLACEMENT, check,
+        CI, DEPENDENCIES, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MACOS_PACKAGE, MAIN, RELEASE,
+        RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, check,
     };
 
     fn rejected(owner: &str, source: &str) {
@@ -754,10 +775,32 @@ mod tests {
                     "ReceiptDestination",
                 ][..],
             ),
-            (DISTRIBUTION, &["StagedArchive"][..]),
+            (
+                DISTRIBUTION,
+                &[
+                    "StagedArchive",
+                    "VerifiedWindowsBinary",
+                    "WindowsSigningIdentity",
+                ][..],
+            ),
+            (DEPENDENCIES, &["AuditedLockfile"][..]),
             (CI, &["ChildBuildDirectory"][..]),
             (RELEASE_QUEUE, &["ExtractedBundle", "StagedReceipt"][..]),
-            (RELEASE_ORCHESTRATION, &["Origin", "VerifiedHandoff"][..]),
+            (
+                RELEASE_ORCHESTRATION,
+                &[
+                    "Origin",
+                    "VerifiedHandoff",
+                    "VerifiedDistribution",
+                    "VerifiedReady",
+                    "ReviewedDistribution",
+                ][..],
+            ),
+            (
+                MACOS_PACKAGE,
+                &["VerifiedPackage", "StapledPackage", "ExtractedPackage"][..],
+            ),
+            (RELEASE_READY, &["ReadyDistribution"][..]),
         ] {
             for name in names {
                 for source in [
@@ -782,6 +825,11 @@ mod tests {
             check(DISTRIBUTION, &syn::parse_file(staged).unwrap()).len(),
             0
         );
+        assert_eq!(
+            check(RELEASE_READY, &syn::parse_file(staged).unwrap()).len(),
+            0
+        );
+        rejected(MACOS_PACKAGE, staged);
         rejected(RELEASE, staged);
     }
 

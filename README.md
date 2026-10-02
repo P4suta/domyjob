@@ -14,6 +14,7 @@ mise x -- cargo install --locked --path crates/domyjob
 ```
 
 Remote machines need OpenSSH, mise, Rust, and Cargo.
+See the [installation guide](docs/installing.md) for macOS installers and other distribution options.
 
 ## Jobs
 

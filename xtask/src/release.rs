@@ -7,13 +7,20 @@ use std::process::Stdio;
 use tempfile::{NamedTempFile, TempDir};
 
 const SECURITY: &str = "/usr/bin/security";
-const SECRET_ENVIRONMENT: [&str; 6] = [
+pub(crate) const SECRET_ENVIRONMENT: [&str; 13] = [
     "APPLE_CERTIFICATE",
     "APPLE_CERTIFICATE_PASSWORD",
     "APPLE_SIGNING_IDENTITY",
     "APPLE_NOTARY_KEY",
     "APPLE_NOTARY_KEY_ID",
     "APPLE_NOTARY_ISSUER_ID",
+    "APPLE_INSTALLER_CERTIFICATE",
+    "APPLE_INSTALLER_CERTIFICATE_PASSWORD",
+    "APPLE_INSTALLER_IDENTITY",
+    "SSLDOTCOM_USERNAME",
+    "SSLDOTCOM_PASSWORD",
+    "SSLDOTCOM_CREDENTIAL_ID",
+    "SSLDOTCOM_TOTP_SECRET",
 ];
 
 struct Secret(Vec<u8>);
@@ -78,6 +85,40 @@ impl From<Failure> for SigningError {
     }
 }
 
+fn finish_operation<T>(
+    result: Result<T, Failure>,
+    cleanup: Vec<Failure>,
+) -> Result<T, SigningError> {
+    if cleanup.is_empty() {
+        result.map_err(SigningError::from)
+    } else {
+        Err(SigningError {
+            primary: result.err(),
+            cleanup,
+        })
+    }
+}
+
+fn decode_certificate(
+    encoded: String,
+    field: &'static str,
+    stage: &'static str,
+) -> Result<Secret, Failure> {
+    let encoded = Secret(encoded.into_bytes());
+    let compact = Secret(
+        encoded
+            .0
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect(),
+    );
+    data_encoding::BASE64
+        .decode(&compact.0)
+        .map(Secret)
+        .map_err(|_error| Failure::new(stage, format!("{field} is not valid base64")))
+}
+
 struct Configuration {
     target: String,
     temporary_root: PathBuf,
@@ -87,6 +128,42 @@ struct Configuration {
     notary_key: Secret,
     notary_key_id: String,
     notary_issuer: String,
+}
+
+struct InstallerConfiguration {
+    certificate: Secret,
+    password: Secret,
+    identity: String,
+}
+
+impl InstallerConfiguration {
+    fn read_with(read: impl Fn(&'static str) -> Result<String, Failure>) -> Result<Self, Failure> {
+        let certificate = decode_certificate(
+            read("APPLE_INSTALLER_CERTIFICATE")?,
+            "APPLE_INSTALLER_CERTIFICATE",
+            "installer configuration",
+        )?;
+        if certificate.0.is_empty() {
+            return Err(Failure::new(
+                "installer configuration",
+                "installer certificate must not be empty",
+            ));
+        }
+        let password = Secret(read("APPLE_INSTALLER_CERTIFICATE_PASSWORD")?.into_bytes());
+        validate_token(password.text()?)?;
+        let identity =
+            configured_identity(&read("APPLE_INSTALLER_IDENTITY")?).map_err(|_error| {
+                Failure::new(
+                    "installer identity",
+                    "APPLE_INSTALLER_IDENTITY must be an exact 40-digit SHA-1",
+                )
+            })?;
+        Ok(Self {
+            certificate,
+            password,
+            identity,
+        })
+    }
 }
 
 fn environment(name: &'static str) -> Result<String, Failure> {
@@ -120,18 +197,11 @@ impl Configuration {
                 "TARGET must name a macOS release target",
             ));
         }
-        let encoded = Secret(read("APPLE_CERTIFICATE")?.into_bytes());
-        let compact = Secret(
-            encoded
-                .0
-                .iter()
-                .copied()
-                .filter(|byte| !byte.is_ascii_whitespace())
-                .collect(),
-        );
-        let certificate = Secret(data_encoding::BASE64.decode(&compact.0).map_err(|_error| {
-            Failure::new("configuration", "APPLE_CERTIFICATE is not valid base64")
-        })?);
+        let certificate = decode_certificate(
+            read("APPLE_CERTIFICATE")?,
+            "APPLE_CERTIFICATE",
+            "configuration",
+        )?;
         let notary_key = Secret(read("APPLE_NOTARY_KEY")?.into_bytes());
         if certificate.0.is_empty() || notary_key.0.is_empty() {
             return Err(Failure::new(
@@ -256,26 +326,49 @@ fn path_text(path: &Path) -> Result<&str, Failure> {
 struct PrivateFiles {
     directory: TempDir,
     certificate: Option<NamedTempFile>,
+    installer_certificate: Option<NamedTempFile>,
     notary_key: Option<NamedTempFile>,
     archive: Option<NamedTempFile>,
 }
 
+fn private_directory(root: &Path) -> Result<TempDir, Failure> {
+    raw::temporary_directory(root).map_err(|_error| {
+        Failure::new(
+            "private directory",
+            "could not create the owned temporary directory",
+        )
+    })
+}
+
 impl PrivateFiles {
+    #[cfg(test)]
     fn create(configuration: &Configuration) -> Result<Self, SigningError> {
-        let directory =
-            raw::temporary_directory(&configuration.temporary_root).map_err(|_error| {
-                Failure::new(
-                    "private directory",
-                    "could not create the owned temporary directory",
-                )
-            })?;
+        Self::create_with(configuration, None)
+    }
+
+    fn create_with(
+        configuration: &Configuration,
+        installer: Option<&InstallerConfiguration>,
+    ) -> Result<Self, SigningError> {
+        let directory = private_directory(&configuration.temporary_root)?;
         let mut files = Self {
             directory,
             certificate: None,
+            installer_certificate: None,
             notary_key: None,
             archive: None,
         };
-        match files.prepare(configuration) {
+        match files.prepare(configuration).and_then(|()| {
+            if let Some(installer) = installer {
+                private_write(
+                    &mut files.installer_certificate,
+                    files.directory.path(),
+                    ".p12",
+                    &installer.certificate,
+                )?;
+            }
+            Ok(())
+        }) {
             Ok(()) => Ok(files),
             Err(primary) => Err(SigningError {
                 primary: Some(primary),
@@ -316,6 +409,11 @@ impl PrivateFiles {
         private_path(self.notary_key.as_ref())
     }
 
+    fn installer_certificate_path(&self) -> Result<&Path, Failure> {
+        private_path(self.installer_certificate.as_ref())
+    }
+
+    #[cfg(test)]
     fn archive_path(&self) -> Result<&Path, Failure> {
         private_path(self.archive.as_ref())
     }
@@ -324,6 +422,7 @@ impl PrivateFiles {
         let mut failures = Vec::new();
         for (stage, file) in [
             ("private certificate", self.certificate),
+            ("private installer certificate", self.installer_certificate),
             ("private notarization key", self.notary_key),
             ("notarization archive", self.archive),
         ] {
@@ -428,10 +527,20 @@ impl<'a, D: Driver> SigningKeychain<'a, D> {
         })
     }
 
+    #[cfg(test)]
     fn prepare(
         &mut self,
         configuration: &Configuration,
         files: &PrivateFiles,
+    ) -> Result<(), Failure> {
+        self.prepare_with(configuration, files, None)
+    }
+
+    fn prepare_with(
+        &mut self,
+        configuration: &Configuration,
+        files: &PrivateFiles,
+        installer: Option<&InstallerConfiguration>,
     ) -> Result<(), Failure> {
         let password = keychain_password()?;
         let path = path_text(&self.path)?;
@@ -470,13 +579,44 @@ impl<'a, D: Driver> SigningKeychain<'a, D> {
         self.driver
             .run("configure keychain search list", SECURITY, &search)?;
         self.protected("import certificate", &import)?;
+        if let Some(installer) = installer {
+            if installer
+                .identity
+                .eq_ignore_ascii_case(&configuration.identity)
+            {
+                return Err(Failure::new(
+                    "installer identity",
+                    "Application and Installer identities must be distinct",
+                ));
+            }
+            let installer_import = security_input(&[
+                "import",
+                path_text(files.installer_certificate_path()?)?,
+                "-k",
+                path,
+                "-P",
+                installer.password.text()?,
+                "-T",
+                "/usr/bin/productbuild",
+            ])?;
+            self.protected("import installer certificate", &installer_import)?;
+        }
         self.protected("configure private key access", &partition)?;
         let identities = self.driver.run(
             "validate signing identity",
             SECURITY,
             &arguments(&["find-identity", "-v", "-p", "codesigning", path]),
         )?;
-        require_identity(&identities, &configuration.identity)
+        require_identity(&identities, &configuration.identity)?;
+        if let Some(installer) = installer {
+            let installer_identities = self.driver.run(
+                "validate installer identity",
+                SECURITY,
+                &arguments(&["find-identity", "-v", path]),
+            )?;
+            require_installer_identity(&installer_identities, &installer.identity)?;
+        }
+        Ok(())
     }
 
     fn protected(&self, stage: &'static str, input: &Secret) -> Result<(), Failure> {
@@ -554,6 +694,35 @@ fn require_identity(output: &[u8], identity: &str) -> Result<(), Failure> {
     }
 }
 
+fn require_installer_identity(output: &[u8], identity: &str) -> Result<(), Failure> {
+    require_identity(output, identity)?;
+    let text = std::str::from_utf8(output).map_err(|_error| {
+        Failure::new(
+            "installer identity",
+            "security returned an invalid identity listing",
+        )
+    })?;
+    if text.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next().is_some_and(|ordinal| ordinal.ends_with(')'))
+            && words
+                .next()
+                .is_some_and(|value| value.eq_ignore_ascii_case(identity))
+            && words
+                .collect::<Vec<_>>()
+                .join(" ")
+                .starts_with("\"Developer ID Installer:")
+    }) {
+        Ok(())
+    } else {
+        Err(Failure::new(
+            "installer identity",
+            "the configured identity is not Developer ID Installer",
+        ))
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct Submission {
     id: String,
@@ -605,12 +774,11 @@ fn submission_id(output: &[u8]) -> Result<String, Failure> {
     Ok(id.to_ascii_lowercase())
 }
 
-fn sign_and_submit<D: Driver>(
+fn sign_binary<D: Driver>(
     keychain: &SigningKeychain<'_, D>,
     root: &Path,
     configuration: &Configuration,
-    files: &PrivateFiles,
-) -> Result<Submission, Failure> {
+) -> Result<(String, String), Failure> {
     let driver = keychain.driver;
     let binary = root
         .join("target")
@@ -644,6 +812,22 @@ fn sign_and_submit<D: Driver>(
     )?;
     let cdhash = native_cdhash(&metadata)?;
     let binary_sha256 = driver.hash(Path::new(binary))?;
+    Ok((binary_sha256, cdhash))
+}
+
+#[cfg(test)]
+fn sign_and_submit<D: Driver>(
+    keychain: &SigningKeychain<'_, D>,
+    root: &Path,
+    configuration: &Configuration,
+    files: &PrivateFiles,
+) -> Result<Submission, Failure> {
+    let driver = keychain.driver;
+    let (binary_sha256, cdhash) = sign_binary(keychain, root, configuration)?;
+    let binary = root
+        .join("target")
+        .join(&configuration.target)
+        .join("release/domyjob");
     driver.run(
         "create notarization archive",
         "/usr/bin/ditto",
@@ -651,22 +835,12 @@ fn sign_and_submit<D: Driver>(
             "-c",
             "-k",
             "--keepParent",
-            binary,
+            path_text(&binary)?,
             path_text(files.archive_path()?)?,
         ]),
     )?;
     let zip_sha256 = driver.hash(files.archive_path()?)?;
-    let authentication = [
-        "--key",
-        path_text(files.notary_key_path()?)?,
-        "--key-id",
-        &configuration.notary_key_id,
-        "--issuer",
-        &configuration.notary_issuer,
-    ];
-    let mut submit = arguments(&["notarytool", "submit", path_text(files.archive_path()?)?]);
-    submit.extend(arguments(&authentication));
-    submit.extend(arguments(&["--no-wait", "--output-format", "json"]));
+    let submit = submission_arguments(files.archive_path()?, files, configuration)?;
     let output = driver.run("submit notarization", "/usr/bin/xcrun", &submit)?;
     Ok(Submission {
         id: submission_id(&output)?,
@@ -676,34 +850,38 @@ fn sign_and_submit<D: Driver>(
     })
 }
 
+fn with_signing<D: Driver, T>(
+    configuration: &Configuration,
+    installer: Option<&InstallerConfiguration>,
+    driver: &D,
+    operation: impl FnOnce(&SigningKeychain<'_, D>, &PrivateFiles) -> Result<T, Failure>,
+) -> Result<T, SigningError> {
+    let files = PrivateFiles::create_with(configuration, installer)?;
+    let captured =
+        SigningKeychain::capture(driver, files.directory.path().join("signing.keychain-db"));
+    let (result, mut cleanup) = match captured {
+        Ok(mut keychain) => {
+            let result = keychain
+                .prepare_with(configuration, &files, installer)
+                .and_then(|()| operation(&keychain, &files));
+            (result, keychain.finish())
+        }
+        Err(primary) => (Err(primary), Vec::new()),
+    };
+    cleanup.extend(files.finish());
+    finish_operation(result, cleanup)
+}
+
+#[cfg(test)]
 fn run_signing<D: Driver, T>(
     root: &Path,
     configuration: &Configuration,
     driver: &D,
     preserve: impl FnOnce(Submission) -> Result<T, Failure>,
 ) -> Result<T, SigningError> {
-    let files = PrivateFiles::create(configuration)?;
-    let captured =
-        SigningKeychain::capture(driver, files.directory.path().join("signing.keychain-db"));
-    let (result, mut cleanup) = match captured {
-        Ok(mut keychain) => {
-            let result = keychain
-                .prepare(configuration, &files)
-                .and_then(|()| sign_and_submit(&keychain, root, configuration, &files))
-                .and_then(preserve);
-            (result, keychain.finish())
-        }
-        Err(primary) => (Err(primary), Vec::new()),
-    };
-    cleanup.extend(files.finish());
-    if cleanup.is_empty() {
-        result.map_err(SigningError::from)
-    } else {
-        Err(SigningError {
-            primary: result.err(),
-            cleanup,
-        })
-    }
+    with_signing(configuration, None, driver, |keychain, files| {
+        sign_and_submit(keychain, root, configuration, files).and_then(preserve)
+    })
 }
 
 pub fn macos(root: &Path) -> Result<(), SigningError> {
@@ -725,7 +903,26 @@ pub fn macos(root: &Path) -> Result<(), SigningError> {
     })
     .map_err(|_error| Failure::new("configuration", "the release source identity is invalid"))?;
     let configuration = Configuration::read()?;
-    submit_and_preserve(root, source, &configuration, &Native)
+    let installer = InstallerConfiguration::read_with(environment)?;
+    if installer
+        .identity
+        .eq_ignore_ascii_case(&configuration.identity)
+    {
+        return Err(Failure::new(
+            "installer identity",
+            "Application and Installer identities must be distinct",
+        )
+        .into());
+    }
+    submit_package_and_preserve(
+        root,
+        source,
+        PackageInputs {
+            configuration: &configuration,
+            installer: &installer,
+        },
+        &Native,
+    )
 }
 
 #[derive(Debug)]
@@ -799,6 +996,7 @@ impl ReceiptDestination {
     }
 }
 
+#[cfg(test)]
 fn submit_and_preserve<D: Driver>(
     root: &Path,
     source: crate::release_queue::Source,
@@ -817,6 +1015,7 @@ fn submit_and_preserve<D: Driver>(
             submission_zip_sha256: submission.zip_sha256,
             signing_identity_sha1: configuration.identity.to_ascii_lowercase(),
             cdhash: submission.cdhash,
+            package: None,
         })
         .map_err(|_error| {
             Failure::new(
@@ -826,6 +1025,112 @@ fn submit_and_preserve<D: Driver>(
         })?;
         destination.preserve(&receipt)
     })
+}
+
+#[derive(Clone, Copy)]
+struct PackageInputs<'a> {
+    configuration: &'a Configuration,
+    installer: &'a InstallerConfiguration,
+}
+
+fn submit_package_and_preserve<D: Driver>(
+    root: &Path,
+    source: crate::release_queue::Source,
+    inputs: PackageInputs<'_>,
+    driver: &D,
+) -> Result<(), SigningError> {
+    use crate::macos_package::{PackageBuild, PackageError, PackageSigning};
+    use crate::release_queue::{PackageClaims, PendingClaims, PendingNotarization};
+
+    let PackageInputs {
+        configuration,
+        installer,
+    } = inputs;
+    let destination = ReceiptDestination::prepare(root, &configuration.target)?;
+    with_signing(configuration, Some(installer), driver, |keychain, files| {
+        let (binary_sha256, cdhash) = sign_binary(keychain, root, configuration)?;
+        let binary = root
+            .join("target")
+            .join(&configuration.target)
+            .join("release/domyjob");
+        let mut execute = |stage, program: &str, arguments: &[OsString]| {
+            driver
+                .run(stage, program, arguments)
+                .map_err(|_error| PackageError::Native(stage))
+        };
+        let package = crate::macos_package::build_with(
+            PackageBuild {
+                root,
+                target: &configuration.target,
+                version: source.version(),
+                binary: &binary,
+                signing: Some(PackageSigning {
+                    keychain: &keychain.path,
+                    identity: &installer.identity,
+                }),
+            },
+            &mut execute,
+        )
+        .map_err(|_error| {
+            Failure::new("package signing", "could not build the signed installer")
+        })?;
+        crate::macos_package::verify_installer_with(&package, &installer.identity, &mut execute)
+            .map_err(|_error| {
+                Failure::new(
+                    "package signing",
+                    "installer signature or timestamp is invalid",
+                )
+            })?;
+        let package_sha256 = driver.hash(&package)?;
+        let submit = submission_arguments(&package, files, configuration)?;
+        let output = driver.run("submit notarization", "/usr/bin/xcrun", &submit)?;
+        if driver.hash(&package)? != package_sha256 {
+            return Err(Failure::new(
+                "notarization receipt",
+                "submitted package changed during submission",
+            ));
+        }
+        let receipt = PendingNotarization::new(PendingClaims {
+            source,
+            target: configuration.target.clone(),
+            submission_id: submission_id(&output)?,
+            binary_sha256,
+            submission_zip_sha256: package_sha256.clone(),
+            signing_identity_sha1: configuration.identity.to_ascii_lowercase(),
+            cdhash,
+            package: Some(PackageClaims {
+                sha256: package_sha256,
+                installer_identity_sha1: installer.identity.to_ascii_lowercase(),
+                identifier: crate::macos_package::IDENTIFIER.to_owned(),
+            }),
+        })
+        .map_err(|_error| {
+            Failure::new(
+                "notarization receipt",
+                "the package submission receipt is invalid",
+            )
+        })?;
+        destination.preserve(&receipt)
+    })
+}
+
+fn submission_arguments(
+    submission: &Path,
+    files: &PrivateFiles,
+    configuration: &Configuration,
+) -> Result<Vec<OsString>, Failure> {
+    let authentication = [
+        "--key",
+        path_text(files.notary_key_path()?)?,
+        "--key-id",
+        &configuration.notary_key_id,
+        "--issuer",
+        &configuration.notary_issuer,
+    ];
+    let mut submit = arguments(&["notarytool", "submit", path_text(submission)?]);
+    submit.extend(arguments(&authentication));
+    submit.extend(arguments(&["--no-wait", "--output-format", "json"]));
+    Ok(submit)
 }
 
 fn keychain_password() -> Result<Secret, Failure> {
@@ -888,13 +1193,7 @@ struct NotaryKeyFile {
 
 impl NotaryKeyFile {
     fn create(configuration: &NotaryAuthentication) -> Result<Self, SigningError> {
-        let directory =
-            raw::temporary_directory(&configuration.temporary_root).map_err(|_error| {
-                Failure::new(
-                    "private directory",
-                    "could not create the owned temporary directory",
-                )
-            })?;
+        let directory = private_directory(&configuration.temporary_root)?;
         let mut owner = Self {
             directory,
             key: None,
@@ -1031,6 +1330,15 @@ fn verified_metadata(output: &[u8], expected_cdhash: &str) -> Result<(), Failure
         ));
     }
     Ok(())
+}
+
+pub(crate) fn verify_package_metadata(
+    output: &[u8],
+    expected_cdhash: &str,
+) -> Result<(), crate::macos_package::PackageError> {
+    verified_metadata(output, expected_cdhash).map_err(|_error| {
+        crate::macos_package::PackageError::Invalid("package binary signature metadata differs")
+    })
 }
 
 fn verify_existing_binary<D: Driver>(
@@ -1185,7 +1493,39 @@ fn status_with<D: Driver>(
                 "could not validate and extract the saved binaries",
             )
         })?;
-        let result = query_and_verify(&bundle, configuration, &key_file, driver);
+        let result =
+            query_and_verify(&bundle, configuration, &key_file, driver).and_then(|outcome| {
+                if matches!(outcome, NotaryOutcome::Accepted(_)) {
+                    for target in crate::release_queue::MAC_TARGETS {
+                        let receipt = handoff.receipt(target).map_err(|_error| {
+                            Failure::new("package notarization", "saved package receipt is invalid")
+                        })?;
+                        if receipt.package().is_some() {
+                            let package = handoff.package(target).map_err(|_error| {
+                                Failure::new("package notarization", "saved package is missing")
+                            })?;
+                            crate::macos_package::verify_pending_with(
+                                package,
+                                receipt,
+                                &mut |stage, program, arguments| {
+                                    driver.run(stage, program, arguments).map_err(|_error| {
+                                        crate::macos_package::PackageError::Invalid(
+                                            "native package verification failed",
+                                        )
+                                    })
+                                },
+                            )
+                            .map_err(|_error| {
+                                Failure::new(
+                                    "package notarization",
+                                    "the accepted package does not match its saved receipt",
+                                )
+                            })?;
+                        }
+                    }
+                }
+                Ok(outcome)
+            });
         if bundle.close().is_err() {
             cleanup.push(Failure::new(
                 "verification cleanup",
@@ -1195,14 +1535,7 @@ fn status_with<D: Driver>(
         result
     })();
     cleanup.extend(key_file.finish());
-    if cleanup.is_empty() {
-        result.map_err(SigningError::from)
-    } else {
-        Err(SigningError {
-            primary: result.err(),
-            cleanup,
-        })
-    }
+    finish_operation(result, cleanup)
 }
 
 pub(crate) fn notary_status(
@@ -1505,6 +1838,249 @@ mod tests {
         if let Some(path) = fake.owned_keychain.borrow().as_ref() {
             assert!(!path.try_exists().unwrap());
         }
+    }
+
+    const INSTALLER_IDENTITY: &str = "FEDCBA9876543210FEDCBA9876543210FEDCBA98";
+    #[cfg(target_os = "macos")]
+    const INSTALLER_DER: &[u8] = b"synthetic-public-installer-certificate";
+
+    fn installer() -> super::InstallerConfiguration {
+        super::InstallerConfiguration {
+            certificate: Secret(CERTIFICATE.to_vec()),
+            password: Secret(PASSWORD.as_bytes().to_vec()),
+            identity: INSTALLER_IDENTITY.to_owned(),
+        }
+    }
+
+    #[test]
+    fn installer_identity_rejects_application_store_and_other_fingerprints() {
+        for name in [
+            "Developer ID Application",
+            "3rd Party Mac Developer Installer",
+            "Apple Distribution",
+        ] {
+            super::require_installer_identity(
+                format!("  1) {INSTALLER_IDENTITY} \"{name}: Synthetic Publisher\"\n").as_bytes(),
+                INSTALLER_IDENTITY,
+            )
+            .unwrap_err();
+        }
+        let valid =
+            format!("  1) {INSTALLER_IDENTITY} \"Developer ID Installer: Synthetic Publisher\"\n");
+        super::require_installer_identity(valid.as_bytes(), INSTALLER_IDENTITY).unwrap();
+        super::require_installer_identity(valid.as_bytes(), IDENTITY).unwrap_err();
+    }
+
+    #[test]
+    fn installer_credentials_are_separate_and_invalid_values_are_redacted() {
+        let mut values = BTreeMap::from([
+            (
+                "APPLE_INSTALLER_CERTIFICATE",
+                data_encoding::BASE64.encode(CERTIFICATE),
+            ),
+            ("APPLE_INSTALLER_CERTIFICATE_PASSWORD", PASSWORD.to_owned()),
+            (
+                "APPLE_INSTALLER_IDENTITY",
+                INSTALLER_IDENTITY.to_ascii_lowercase(),
+            ),
+        ]);
+        let read = |inputs: &BTreeMap<&str, String>| {
+            super::InstallerConfiguration::read_with(|name| {
+                inputs
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| Failure::new("synthetic input", "missing installer input"))
+            })
+        };
+        let configured = read(&values).unwrap();
+        assert_eq!(configured.identity, INSTALLER_IDENTITY);
+        assert_eq!(configured.certificate.0, CERTIFICATE);
+        for (name, invalid) in [
+            ("APPLE_INSTALLER_CERTIFICATE", "private-invalid-base64"),
+            ("APPLE_INSTALLER_CERTIFICATE_PASSWORD", "private\npassword"),
+            ("APPLE_INSTALLER_IDENTITY", "private-invalid-identity"),
+        ] {
+            let original = values.insert(name, invalid.to_owned()).unwrap();
+            let error = read(&values).err().unwrap();
+            assert!(!format!("{error:?}").contains(invalid));
+            values.insert(name, original);
+        }
+    }
+
+    #[test]
+    fn installer_import_failure_restores_keychains_and_removes_private_inputs() {
+        for stage in [
+            "import installer certificate",
+            "configure private key access",
+            "validate installer identity",
+        ] {
+            let private = tempfile::tempdir().unwrap();
+            let configuration = configuration(private.path());
+            let installer = installer();
+            let fake = Fake::new(vec![stage]);
+            let error = super::with_signing(
+                &configuration,
+                Some(&installer),
+                &fake,
+                |_keychain, _files| Ok(()),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.primary.unwrap().stage, stage);
+            assert!(fake.stages().contains(&"restore keychain search list"));
+            assert_owned_files_removed(private.path(), &fake);
+            for call in fake
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.stage == "import installer certificate")
+            {
+                assert!(call.protected);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct PackageFake {
+        signing: Fake,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Driver for PackageFake {
+        fn hash(&self, path: &Path) -> Result<String, Failure> {
+            Native.hash(path)
+        }
+
+        fn invoke(&self, invocation: Invocation<'_>) -> Result<Vec<u8>, Failure> {
+            match invocation.stage {
+                "build component package" | "expand package" => {
+                    self.signing.record(&invocation);
+                    Native.invoke(invocation)
+                }
+                "build product package" => {
+                    self.signing.record(&invocation);
+                    let mut args = Vec::new();
+                    let mut words = invocation.args.iter();
+                    while let Some(word) = words.next() {
+                        if word == "--sign" || word == "--keychain" {
+                            words.next();
+                        } else if word != "--timestamp" {
+                            args.push(word.clone());
+                        }
+                    }
+                    Native.invoke(Invocation {
+                        args: &args,
+                        ..invocation
+                    })
+                }
+                "validate installer identity" => {
+                    self.signing.record(&invocation);
+                    Ok(format!("  1) {INSTALLER_IDENTITY} \"Developer ID Installer: Synthetic Publisher\"\n").into_bytes())
+                }
+                "verify installer signature" => {
+                    self.signing.record(&invocation);
+                    let digest = data_encoding::HEXUPPER
+                        .encode(&<sha2::Sha256 as sha2::Digest>::digest(INSTALLER_DER));
+                    let fingerprint = digest
+                        .as_bytes()
+                        .chunks(2)
+                        .map(|part| std::str::from_utf8(part).unwrap())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    Ok(format!("Status: signed by a developer certificate issued by Apple for distribution\nSigned with a trusted timestamp on: 2026-10-02 00:00:00 +0000\nCertificate Chain:\n1. Developer ID Installer: Synthetic Publisher\nSHA256 Fingerprint:\n{fingerprint}\n").into_bytes())
+                }
+                "read installer certificate" => {
+                    self.signing.record(&invocation);
+                    let destination = invocation
+                        .args
+                        .iter()
+                        .find_map(|argument| {
+                            argument
+                                .to_str()
+                                .and_then(|value| value.strip_prefix("--dump-toc="))
+                        })
+                        .unwrap();
+                    crate::raw::write(Path::new(destination), format!("<xar><toc><signature><X509Certificate>{}</X509Certificate></signature></toc></xar>", data_encoding::BASE64.encode(INSTALLER_DER)).as_bytes()).map_err(|_error| Failure::new("synthetic response", "could not write the public certificate fixture"))?;
+                    Ok(Vec::new())
+                }
+                "check installer fingerprint" => {
+                    self.signing.record(&invocation);
+                    Ok(format!("SHA1 Fingerprint={INSTALLER_IDENTITY}\n").into_bytes())
+                }
+                _ => self.signing.invoke(invocation),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn package_submission_preserves_schema_two_receipt_without_waiting() {
+        let (_fixture, handoff) = crate::release_queue::handoff_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        let configuration = configuration(private.path());
+        let installer = installer();
+        let binary = root
+            .path()
+            .join("target/aarch64-apple-darwin/release/domyjob");
+        super::raw::create_directory(binary.parent().unwrap()).unwrap();
+        crate::raw::write(&binary, b"synthetic unsigned test binary").unwrap();
+        for name in ["README.md", "LICENSE-MIT", "LICENSE-APACHE"] {
+            crate::raw::write(&root.path().join(name), name.as_bytes()).unwrap();
+        }
+        let fake = PackageFake {
+            signing: Fake::new(Vec::new()),
+        };
+        super::submit_package_and_preserve(
+            root.path(),
+            handoff.source().clone(),
+            super::PackageInputs {
+                configuration: &configuration,
+                installer: &installer,
+            },
+            &fake,
+        )
+        .unwrap();
+        let receipt = crate::release_queue::PendingNotarization::load(
+            &root.path().join("notarization/aarch64-apple-darwin.json"),
+            handoff.source(),
+            &configuration.target,
+        )
+        .unwrap();
+        assert_eq!(
+            receipt.package().unwrap().installer_identity_sha1(),
+            INSTALLER_IDENTITY.to_ascii_lowercase()
+        );
+        assert_eq!(
+            receipt.package().unwrap().sha256(),
+            Native
+                .hash(
+                    &root
+                        .path()
+                        .join("dist/domyjob-1.2.3-aarch64-apple-darwin.pkg")
+                )
+                .unwrap()
+        );
+        let calls = fake.signing.calls.borrow();
+        let submit = calls
+            .iter()
+            .find(|call| call.stage == "submit notarization")
+            .unwrap();
+        assert!(submit.args.iter().any(|argument| argument == "--no-wait"));
+        assert!(
+            submit
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().ends_with(".pkg"))
+        );
+        assert!(!submit.args.iter().any(|argument| argument == "--wait"));
+        assert!(
+            !fake
+                .signing
+                .stages()
+                .contains(&"create notarization archive")
+        );
+        assert_owned_files_removed(private.path(), &fake.signing);
     }
 
     #[test]

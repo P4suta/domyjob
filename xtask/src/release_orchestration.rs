@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 use crate::release_queue::{Handoff, PendingManifest, Source, SourceClaims};
 
@@ -59,6 +60,34 @@ fn list<'a>(value: &'a Value, name: &str) -> Result<&'a [Value], OrchestrationEr
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .ok_or_else(|| invalid(&format!("missing array field {name}")))
+}
+
+fn artifact_array(response: &Value, complete: bool) -> Result<&[Value], OrchestrationError> {
+    let artifacts = list(response, "artifacts")?;
+    let count = response
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid("artifact inventory count is missing"))?;
+    if artifacts.len() > SCAN_LIMIT || complete && count > 100 {
+        return Err(invalid("artifact inventory exceeds its scan bound"));
+    }
+    Ok(artifacts)
+}
+
+fn live_named(artifact: &Value, name: &str) -> bool {
+    artifact.get("name").and_then(Value::as_str) == Some(name)
+        && artifact.get("expired").and_then(Value::as_bool) == Some(false)
+}
+
+fn artifact_digest(artifact: &Value) -> Result<&str, OrchestrationError> {
+    let digest = text(artifact, "digest")?;
+    if !digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(invalid("artifact has no SHA-256 digest"));
+    }
+    Ok(digest)
 }
 
 fn exact(value: &Value, name: &str, expected: &str) -> Result<(), OrchestrationError> {
@@ -150,18 +179,7 @@ impl Github for NativeGithub {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for name in [
-            "APPLE_CERTIFICATE",
-            "APPLE_CERTIFICATE_PASSWORD",
-            "APPLE_SIGNING_IDENTITY",
-            "APPLE_NOTARY_KEY",
-            "APPLE_NOTARY_KEY_ID",
-            "APPLE_NOTARY_ISSUER_ID",
-            "SSLDOTCOM_USERNAME",
-            "SSLDOTCOM_PASSWORD",
-            "SSLDOTCOM_CREDENTIAL_ID",
-            "SSLDOTCOM_TOTP_SECRET",
-        ] {
+        for name in crate::release::SECRET_ENVIRONMENT {
             command.env_remove(name);
         }
         let mut child = command.spawn()?;
@@ -201,6 +219,156 @@ struct Origin {
 struct VerifiedHandoff<'a> {
     handoff: &'a Handoff,
     manifest_sha256: String,
+}
+
+#[derive(Debug)]
+enum VerifiedDistribution<'a> {
+    Legacy(&'a VerifiedHandoff<'a>),
+    Packages(&'a VerifiedReady<'a>),
+}
+
+#[derive(Debug)]
+struct ReviewedDistribution<'a> {
+    verified: &'a VerifiedDistribution<'a>,
+    audit: crate::dependencies::AuditedLockfile,
+    lock_sha256: String,
+}
+
+impl<'a> ReviewedDistribution<'a> {
+    fn new(
+        root: &Path,
+        github: &impl Github,
+        verified: &'a VerifiedDistribution<'a>,
+    ) -> Result<Self, OrchestrationError> {
+        verified.unchanged()?;
+        let lock = source_lockfile(github, verified.source())?;
+        let audit = crate::dependencies::audit_snapshot(root, &lock)
+            .map_err(|error| invalid(&format!("original release dependency audit: {error}")))?;
+        Self::bind(verified, audit, &lock)
+    }
+
+    fn bind(
+        verified: &'a VerifiedDistribution<'a>,
+        audit: crate::dependencies::AuditedLockfile,
+        lock: &[u8],
+    ) -> Result<Self, OrchestrationError> {
+        let reviewed = Self {
+            verified,
+            audit,
+            lock_sha256: data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(lock)),
+        };
+        reviewed.unchanged()?;
+        Ok(reviewed)
+    }
+
+    const fn source(&self) -> &Source {
+        self.verified.source()
+    }
+
+    fn files(&self) -> Result<Vec<(String, std::path::PathBuf, String)>, OrchestrationError> {
+        self.verified.files()
+    }
+
+    fn unchanged(&self) -> Result<(), OrchestrationError> {
+        if self.audit.digest() != self.lock_sha256 {
+            return Err(invalid(
+                "dependency audit belongs to another lockfile snapshot",
+            ));
+        }
+        self.verified.unchanged()
+    }
+}
+
+fn source_lockfile(github: &impl Github, source: &Source) -> Result<Vec<u8>, OrchestrationError> {
+    let response = github.api(&format!("contents/Cargo.lock?ref={}", source.source_sha()))?;
+    for (name, expected) in [
+        ("name", "Cargo.lock"),
+        ("path", "Cargo.lock"),
+        ("type", "file"),
+        ("encoding", "base64"),
+    ] {
+        exact(&response, name, expected)?;
+    }
+    let size = number(&response, "size")?;
+    if size > 1_048_576 {
+        return Err(invalid(
+            "original release lockfile exceeds its content bound",
+        ));
+    }
+    let content: Vec<_> = text(&response, "content")?
+        .bytes()
+        .filter(|byte| *byte != b'\n')
+        .collect();
+    let bytes = data_encoding::BASE64
+        .decode(&content)
+        .map_err(|_error| invalid("original release lockfile is not canonical base64"))?;
+    let expected_size = usize::try_from(size)
+        .map_err(|_error| invalid("original release lockfile size is not representable"))?;
+    if bytes.len() != expected_size {
+        return Err(invalid(
+            "original release lockfile content differs from its size",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug)]
+struct VerifiedReady<'a> {
+    pending: &'a VerifiedHandoff<'a>,
+    ready: &'a crate::release_ready::ReadyDistribution,
+}
+
+impl<'a> VerifiedReady<'a> {
+    fn new(
+        github: &impl Github,
+        pending: &'a VerifiedHandoff<'a>,
+        ready: &'a crate::release_ready::ReadyDistribution,
+    ) -> Result<Self, OrchestrationError> {
+        verify_ready(github, ready, pending.handoff)?;
+        let verified = Self { pending, ready };
+        verified.unchanged()?;
+        Ok(verified)
+    }
+
+    fn unchanged(&self) -> Result<(), OrchestrationError> {
+        self.pending.unchanged()?;
+        self.ready.unchanged(self.pending.handoff)
+    }
+}
+
+impl VerifiedDistribution<'_> {
+    const fn source(&self) -> &Source {
+        match self {
+            Self::Legacy(pending) => pending.handoff.source(),
+            Self::Packages(verified) => verified.ready.source(),
+        }
+    }
+
+    fn files(&self) -> Result<Vec<(String, std::path::PathBuf, String)>, OrchestrationError> {
+        match self {
+            Self::Legacy(pending) => release_assets(pending.handoff),
+            Self::Packages(verified) => verified.ready.files(),
+        }
+    }
+
+    fn unchanged(&self) -> Result<(), OrchestrationError> {
+        match self {
+            Self::Legacy(pending) => {
+                if pending
+                    .handoff
+                    .receipt(crate::release_queue::MAC_TARGETS[0])?
+                    .package()
+                    .is_some()
+                {
+                    return Err(invalid(
+                        "package publication requires verified staple and derivation provenance",
+                    ));
+                }
+                pending.unchanged()
+            }
+            Self::Packages(verified) => verified.unchanged(),
+        }
+    }
 }
 
 impl<'a> VerifiedHandoff<'a> {
@@ -346,14 +514,7 @@ fn pending_artifact(
 ) -> Result<Option<u64>, OrchestrationError> {
     let run_id = number(run, "id")?;
     let artifacts = github.api(&format!("actions/runs/{run_id}/artifacts?per_page=100"))?;
-    let all = list(&artifacts, "artifacts")?;
-    if artifacts
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .is_none_or(|count| count > 100)
-    {
-        return Err(invalid("original artifact list exceeds its scan bound"));
-    }
+    let all = artifact_array(&artifacts, true)?;
     let mut found = None;
     for artifact in all {
         if text(artifact, "name")? != "dist-pending" {
@@ -374,12 +535,7 @@ fn pending_artifact(
         {
             return Err(invalid("pending artifact belongs to another run or source"));
         }
-        let digest = text(artifact, "digest")?;
-        if !digest.strip_prefix("sha256:").is_some_and(|hash| {
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            return Err(invalid("pending artifact has no SHA-256 digest"));
-        }
+        artifact_digest(artifact)?;
         if found.replace(number(artifact, "id")?).is_some() {
             return Err(invalid("multiple pending distribution artifacts"));
         }
@@ -395,19 +551,9 @@ fn completed(
 ) -> Result<bool, OrchestrationError> {
     let name = format!("dist-verified-{run_id}-{attempt}");
     let artifacts = github.api(&format!("actions/artifacts?name={name}&per_page=100"))?;
-    let markers = list(&artifacts, "artifacts")?;
-    if markers.len() > SCAN_LIMIT
-        || artifacts
-            .get("total_count")
-            .and_then(Value::as_u64)
-            .is_none()
-    {
-        return Err(invalid("completion marker response exceeds its scan bound"));
-    }
+    let markers = artifact_array(&artifacts, false)?;
     for artifact in markers {
-        if artifact.get("name").and_then(Value::as_str) != Some(name.as_str())
-            || artifact.get("expired").and_then(Value::as_bool) != Some(false)
-        {
+        if !live_named(artifact, &name) {
             continue;
         }
         let Some(id) = artifact
@@ -428,16 +574,8 @@ fn completed(
 }
 
 fn trusted_completion(run: &Value, id: u64, workflow: u64) -> Result<(), OrchestrationError> {
-    repositories(run)?;
-    if number(run, "id")? != id
-        || number(run, "workflow_id")? != workflow
-        || text(run, "path")? != FINALIZE_WORKFLOW
-        || text(run, "head_branch")? != "main"
-        || !matches!(
-            text(run, "event")?,
-            "schedule" | "workflow_run" | "workflow_dispatch"
-        )
-    {
+    finalizer_identity(run, workflow)?;
+    if number(run, "id")? != id {
         return Err(invalid(
             "completion marker is not from the trusted finalizer",
         ));
@@ -587,13 +725,23 @@ fn main_ancestry(github: &impl Github, source: &Source) -> Result<(), Orchestrat
     Ok(())
 }
 
+#[cfg(test)]
 fn provenance(entries: &Value, source: &Source, hash: &str) -> Result<(), OrchestrationError> {
+    provenance_for(entries, source, hash, BUILD_WORKFLOW)
+}
+
+fn provenance_for(
+    entries: &Value,
+    source: &Source,
+    hash: &str,
+    signer_workflow: &str,
+) -> Result<(), OrchestrationError> {
     let entries = entries
         .as_array()
         .filter(|entries| !entries.is_empty())
         .ok_or_else(|| invalid("no verified attestations"))?;
     let workflow = format!(
-        "https://github.com/{REPOSITORY}/{BUILD_WORKFLOW}@{}",
+        "https://github.com/{REPOSITORY}/{signer_workflow}@{}",
         source.source_ref()
     );
     let invocation = format!(
@@ -651,6 +799,35 @@ fn verify_provenance(
     source: &Source,
     hash: &str,
 ) -> Result<(), OrchestrationError> {
+    verify_provenance_for(
+        github,
+        AttestationSubject {
+            file,
+            source,
+            hash,
+            workflow: BUILD_WORKFLOW,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AttestationSubject<'a> {
+    file: &'a Path,
+    source: &'a Source,
+    hash: &'a str,
+    workflow: &'a str,
+}
+
+fn verify_provenance_for(
+    github: &impl Github,
+    subject: AttestationSubject<'_>,
+) -> Result<(), OrchestrationError> {
+    let AttestationSubject {
+        file,
+        source,
+        hash,
+        workflow: signer_workflow,
+    } = subject;
     let bytes = github.execute(&[
         "attestation".into(),
         "verify".into(),
@@ -660,7 +837,7 @@ fn verify_provenance(
         "--repo".into(),
         REPOSITORY.into(),
         "--signer-workflow".into(),
-        format!("{REPOSITORY}/{BUILD_WORKFLOW}").into(),
+        format!("{REPOSITORY}/{signer_workflow}").into(),
         "--source-digest".into(),
         source.source_sha().into(),
         "--source-ref".into(),
@@ -675,7 +852,12 @@ fn verify_provenance(
         "--format".into(),
         "json".into(),
     ])?;
-    provenance(&domyjob_core::ingress::json(&bytes, LIMIT)?, source, hash)
+    provenance_for(
+        &domyjob_core::ingress::json(&bytes, LIMIT)?,
+        source,
+        hash,
+        signer_workflow,
+    )
 }
 
 fn tag_binding(
@@ -877,7 +1059,11 @@ fn handoff(root: &Path) -> Result<(), OrchestrationError> {
     Ok(())
 }
 
-fn finalize(root: &Path, github: &impl Github, now: u64) -> Result<(), OrchestrationError> {
+fn selected_origin(
+    root: &Path,
+    github: &impl Github,
+    now: u64,
+) -> Result<Origin, OrchestrationError> {
     let dist = root.join("dist");
     let manifest = PendingManifest::load(&dist.join("manifest.json"))?;
     let source = manifest.source().clone();
@@ -888,12 +1074,17 @@ fn finalize(root: &Path, github: &impl Github, now: u64) -> Result<(), Orchestra
             "downloaded manifest differs from the selected queue entry",
         ));
     }
-    let origin = validate_origin(
+    validate_origin(
         github,
         source,
         positive(&environment("QUEUE_ARTIFACT_ID")?)?,
         now,
-    )?;
+    )
+}
+
+fn finalize(root: &Path, github: &impl Github, now: u64) -> Result<(), OrchestrationError> {
+    let dist = root.join("dist");
+    let origin = selected_origin(root, github, now)?;
     let handoff = Handoff::inspect(&dist, &origin.source)?;
     let finalizer = workflow_id(github, "release-finalize.yml", FINALIZE_WORKFLOW)?;
     if completed(
@@ -905,11 +1096,258 @@ fn finalize(root: &Path, github: &impl Github, now: u64) -> Result<(), Orchestra
         return output("accepted", "false");
     }
     let verified = VerifiedHandoff::new(github, &handoff)?;
+    let modern = handoff
+        .receipt(crate::release_queue::MAC_TARGETS[0])?
+        .package()
+        .is_some();
     let accepted = finish(crate::release::notary_status(&handoff)?, |token| {
-        publish(github, &origin, &verified, token)
+        if modern {
+            prepare_ready(root, github, &verified, token)
+        } else {
+            Publisher { root, github }.publish(
+                &origin,
+                &VerifiedDistribution::Legacy(&verified),
+                token,
+            )
+        }
     })?;
     verified.unchanged()?;
+    output("modern", if modern { "true" } else { "false" })?;
+    output(
+        "distribution_path",
+        if modern { "ready/*" } else { "dist/*" },
+    )?;
     output("accepted", if accepted { "true" } else { "false" })
+}
+
+fn producer(version: &str) -> Result<crate::release_ready::Finalizer, OrchestrationError> {
+    crate::release_ready::Finalizer::try_from(SourceClaims {
+        source_sha: environment("GITHUB_SHA")?,
+        origin_run_id: positive(&environment("GITHUB_RUN_ID")?)?,
+        run_attempt: positive(&environment("GITHUB_RUN_ATTEMPT")?)?,
+        source_ref: "refs/heads/main".to_owned(),
+        event: environment("GITHUB_EVENT_NAME")?,
+        version: version.to_owned(),
+    })
+}
+
+fn finalizer_identity(run: &Value, workflow: u64) -> Result<(), OrchestrationError> {
+    repositories(run)?;
+    if number(run, "workflow_id")? != workflow
+        || text(run, "path")? != FINALIZE_WORKFLOW
+        || text(run, "head_branch")? != "main"
+        || !matches!(
+            text(run, "event")?,
+            "schedule" | "workflow_run" | "workflow_dispatch"
+        )
+    {
+        return Err(invalid("ready artifact is not from the trusted finalizer"));
+    }
+    Source::new(SourceClaims {
+        source_sha: text(run, "head_sha")?.to_owned(),
+        origin_run_id: number(run, "id")?,
+        run_attempt: number(run, "run_attempt")?,
+        source_ref: "refs/heads/main".to_owned(),
+        event: "workflow_dispatch".to_owned(),
+        version: "0.0.0".to_owned(),
+    })?;
+    Ok(())
+}
+
+struct ReadyArtifact {
+    run_id: u64,
+    artifact_id: u64,
+    digest: String,
+}
+
+fn saved_ready_run(
+    github: &impl Github,
+    source: &Source,
+) -> Result<Option<ReadyArtifact>, OrchestrationError> {
+    let name = format!(
+        "dist-ready-{}-{}",
+        source.origin_run_id(),
+        source.run_attempt()
+    );
+    let response = github.api(&format!("actions/artifacts?name={name}&per_page=100"))?;
+    let artifacts = artifact_array(&response, true)?;
+    let workflow = workflow_id(github, "release-finalize.yml", FINALIZE_WORKFLOW)?;
+    let mut selected: Option<ReadyArtifact> = None;
+    for artifact in artifacts {
+        if !live_named(artifact, &name) {
+            continue;
+        }
+        let run_id = number(
+            artifact
+                .get("workflow_run")
+                .ok_or_else(|| invalid("ready artifact run is missing"))?,
+            "id",
+        )?;
+        let run = github.api(&format!("actions/runs/{run_id}"))?;
+        if finalizer_identity(&run, workflow).is_err() {
+            continue;
+        }
+        let digest = artifact_digest(artifact)?;
+        if selected.as_ref().is_none_or(|old| old.run_id < run_id) {
+            selected = Some(ReadyArtifact {
+                run_id,
+                artifact_id: number(artifact, "id")?,
+                digest: digest.to_owned(),
+            });
+        }
+    }
+    Ok(selected)
+}
+
+fn ready_artifact_binding(
+    github: &impl Github,
+    source: &Source,
+    selected: &ReadyArtifact,
+) -> Result<(), OrchestrationError> {
+    let response = github.api(&format!(
+        "actions/runs/{}/artifacts?per_page=100",
+        selected.run_id
+    ))?;
+    let name = format!(
+        "dist-ready-{}-{}",
+        source.origin_run_id(),
+        source.run_attempt()
+    );
+    let artifacts = artifact_array(&response, true)?;
+    let matching: Vec<_> = artifacts
+        .iter()
+        .filter(|artifact| artifact.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        .collect();
+    let [artifact] = matching.as_slice() else {
+        return Err(invalid(
+            "saved ready run needs exactly one artifact with its original name",
+        ));
+    };
+    if number(artifact, "id")? != selected.artifact_id
+        || text(artifact, "digest")? != selected.digest
+        || artifact.get("expired").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(invalid("saved ready artifact was replaced or expired"));
+    }
+    Ok(())
+}
+
+fn verify_ready(
+    github: &impl Github,
+    ready: &crate::release_ready::ReadyDistribution,
+    handoff: &Handoff,
+) -> Result<(), OrchestrationError> {
+    let producer = ready.producer().source();
+    let run = github.api(&format!(
+        "actions/runs/{}/attempts/{}",
+        producer.origin_run_id(),
+        producer.run_attempt()
+    ))?;
+    let workflow = workflow_id(github, "release-finalize.yml", FINALIZE_WORKFLOW)?;
+    if number(&run, "id")? != producer.origin_run_id()
+        || number(&run, "run_attempt")? != producer.run_attempt()
+        || text(&run, "head_sha")? != producer.source_sha()
+        || text(&run, "event")? != ready.producer().event()
+    {
+        return Err(invalid(
+            "ready derivation producer differs from its original attempt",
+        ));
+    }
+    finalizer_identity(&run, workflow)?;
+    main_ancestry(github, producer)?;
+    let comparison = github.api(&format!(
+        "compare/{}...{}",
+        handoff.source().source_sha(),
+        producer.source_sha()
+    ))?;
+    if !matches!(text(&comparison, "status")?, "identical" | "ahead")
+        || text(
+            comparison
+                .get("merge_base_commit")
+                .ok_or_else(|| invalid("derivation ancestry is missing"))?,
+            "sha",
+        )? != handoff.source().source_sha()
+    {
+        return Err(invalid(
+            "derivation producer predates or diverges from the original build",
+        ));
+    }
+    let (manifest, manifest_hash) = ready.build_manifest();
+    verify_provenance(github, &manifest, handoff.source(), &manifest_hash)?;
+    for (path, hash) in ready.subjects() {
+        verify_provenance_for(
+            github,
+            AttestationSubject {
+                file: &path,
+                source: producer,
+                hash: &hash,
+                workflow: FINALIZE_WORKFLOW,
+            },
+        )?;
+    }
+    ready.verify_native(handoff)
+}
+
+fn prepare_ready(
+    root: &Path,
+    github: &impl Github,
+    verified: &VerifiedHandoff<'_>,
+    accepted: &crate::release::AcceptedToken,
+) -> Result<(), OrchestrationError> {
+    let handoff = verified.handoff;
+    let destination = root.join("ready");
+    match std::fs::symlink_metadata(&destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Err(invalid("ready output already exists before preparation")),
+    }
+    if let Some(selected) = saved_ready_run(github, handoff.source())? {
+        ready_artifact_binding(github, handoff.source(), &selected)?;
+        github.execute(&[
+            "run".into(),
+            "download".into(),
+            selected.run_id.to_string().into(),
+            "--repo".into(),
+            REPOSITORY.into(),
+            "--name".into(),
+            format!(
+                "dist-ready-{}-{}",
+                handoff.source().origin_run_id(),
+                handoff.source().run_attempt()
+            )
+            .into(),
+            "--dir".into(),
+            destination.as_os_str().to_owned(),
+        ])?;
+        ready_artifact_binding(github, handoff.source(), &selected)?;
+        let ready = crate::release_ready::ReadyDistribution::inspect(&destination, handoff)?;
+        verify_ready(github, &ready, handoff)?;
+        output("reused_ready", "true")?;
+    } else {
+        crate::release_ready::ReadyDistribution::create(
+            handoff,
+            accepted,
+            producer(handoff.source().version())?,
+            &destination,
+        )?;
+        output("reused_ready", "false")?;
+    }
+    verified.unchanged()
+}
+
+fn publish_ready(root: &Path, github: &impl Github, now: u64) -> Result<(), OrchestrationError> {
+    let origin = selected_origin(root, github, now)?;
+    let handoff = Handoff::inspect(&root.join("dist"), &origin.source)?;
+    let pending = VerifiedHandoff::new(github, &handoff)?;
+    let ready = crate::release_ready::ReadyDistribution::inspect(&root.join("ready"), &handoff)?;
+    let proof = VerifiedReady::new(github, &pending, &ready)?;
+    let verified = VerifiedDistribution::Packages(&proof);
+    if !finish(crate::release::notary_status(&handoff)?, |accepted| {
+        Publisher { root, github }.publish(&origin, &verified, accepted)
+    })? {
+        return Err(invalid("ready distribution lost notarization acceptance"));
+    }
+    verified.unchanged()
 }
 
 fn finish(
@@ -925,30 +1363,38 @@ fn finish(
     }
 }
 
-fn publish(
-    github: &impl Github,
-    origin: &Origin,
-    verified: &VerifiedHandoff<'_>,
-    accepted: &crate::release::AcceptedToken,
-) -> Result<(), OrchestrationError> {
-    let handoff = verified.handoff;
-    if accepted.source() != &origin.source || handoff.source() != &origin.source {
-        return Err(invalid(
-            "accepted notarization token belongs to another source",
-        ));
+struct Publisher<'a, G> {
+    root: &'a Path,
+    github: &'a G,
+}
+
+impl<G: Github> Publisher<'_, G> {
+    fn publish(
+        &self,
+        origin: &Origin,
+        verified: &VerifiedDistribution<'_>,
+        accepted: &crate::release::AcceptedToken,
+    ) -> Result<(), OrchestrationError> {
+        let github = self.github;
+        if accepted.source() != &origin.source || verified.source() != &origin.source {
+            return Err(invalid(
+                "accepted notarization token belongs to another source",
+            ));
+        }
+        let now = unix_now()?;
+        validate_origin(github, origin.source.clone(), origin.artifact_id, now)?;
+        verified.unchanged()?;
+        let Some(tag) = tag_binding(github, &origin.source)? else {
+            return Ok(());
+        };
+        let reviewed = ReviewedDistribution::new(self.root, github, verified)?;
+        if let Some(release) = release_for_tag(github, &tag)? {
+            resume_publication(github, &tag, &reviewed, &release)?;
+            return verify_published(github, &tag, &reviewed);
+        }
+        create_release(github, &tag, origin, &reviewed)?;
+        verify_published(github, &tag, &reviewed)
     }
-    let now = unix_now()?;
-    validate_origin(github, origin.source.clone(), origin.artifact_id, now)?;
-    verified.unchanged()?;
-    let Some(tag) = tag_binding(github, &origin.source)? else {
-        return Ok(());
-    };
-    if let Some(release) = release_for_tag(github, &tag)? {
-        resume_publication(github, &tag, verified, &release)?;
-        return verify_published(github, &tag, handoff);
-    }
-    create_release(github, &tag, origin, verified)?;
-    verify_published(github, &tag, handoff)
 }
 
 fn release_for_tag(github: &impl Github, tag: &str) -> Result<Option<Value>, OrchestrationError> {
@@ -988,10 +1434,9 @@ fn create_release(
     github: &impl Github,
     tag: &str,
     origin: &Origin,
-    verified: &VerifiedHandoff<'_>,
+    verified: &ReviewedDistribution<'_>,
 ) -> Result<(), OrchestrationError> {
-    let handoff = verified.handoff;
-    if handoff.source() != &origin.source {
+    if verified.source() != &origin.source {
         return Err(invalid("new release belongs to another original source"));
     }
     let mut arguments = vec![
@@ -1006,14 +1451,8 @@ fn create_release(
         "--verify-tag".into(),
         "--draft".into(),
     ];
-    for (name, path, _hash) in handoff.archives() {
-        arguments.push(path.as_os_str().to_owned());
-        arguments.push(
-            handoff
-                .dir()
-                .join(format!("{name}.sha256"))
-                .into_os_string(),
-        );
+    for (_name, path, _hash) in verified.files()? {
+        arguments.push(path.into_os_string());
     }
     verified.unchanged()?;
     github.execute(&arguments)?;
@@ -1067,12 +1506,11 @@ fn missing_assets(
 fn resume_publication(
     github: &impl Github,
     tag: &str,
-    verified: &VerifiedHandoff<'_>,
+    verified: &ReviewedDistribution<'_>,
     release: &Value,
 ) -> Result<(), OrchestrationError> {
-    let handoff = verified.handoff;
     exact(release, "tag_name", tag)?;
-    let expected = release_assets(handoff)?;
+    let expected = verified.files()?;
     let missing = missing_assets(release, &expected)?;
     match release.get("draft").and_then(Value::as_bool) {
         Some(false) if missing.is_empty() => Ok(()),
@@ -1099,12 +1537,12 @@ fn resume_publication(
             if !missing_assets(&uploaded, &expected)?.is_empty() {
                 return Err(invalid("draft release upload is incomplete"));
             }
-            if tag_binding(github, handoff.source())?.as_deref() != Some(tag) {
+            if tag_binding(github, verified.source())?.as_deref() != Some(tag) {
                 return Err(invalid(
                     "draft publication does not match the original protected tag",
                 ));
             }
-            main_ancestry(github, handoff.source())?;
+            main_ancestry(github, verified.source())?;
             verified.unchanged()?;
             github.execute(&[
                 "release".into(),
@@ -1123,18 +1561,18 @@ fn resume_publication(
 fn verify_published(
     github: &impl Github,
     tag: &str,
-    handoff: &Handoff,
+    verified: &ReviewedDistribution<'_>,
 ) -> Result<(), OrchestrationError> {
     let release = github.api(&format!("releases/tags/{tag}"))?;
     exact(&release, "tag_name", tag)?;
     if release.get("draft").and_then(Value::as_bool) != Some(false)
-        || !missing_assets(&release, &release_assets(handoff)?)?.is_empty()
+        || !missing_assets(&release, &verified.files()?)?.is_empty()
     {
         return Err(invalid(
             "release publication did not preserve the complete original distribution",
         ));
     }
-    if tag_binding(github, handoff.source())?.as_deref() != Some(tag) {
+    if tag_binding(github, verified.source())?.as_deref() != Some(tag) {
         return Err(invalid(
             "published release does not match the original protected tag",
         ));
@@ -1185,8 +1623,14 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), OrchestrationError> {
             }
             finalize(root, &NativeGithub, unix_now()?)
         }
+        ["publish"] => {
+            if environment("GITHUB_REF")? != "refs/heads/main" {
+                return Err(invalid("publisher must execute from trusted main"));
+            }
+            publish_ready(root, &NativeGithub, unix_now()?)
+        }
         _ => Err(invalid(
-            "usage: release queue policy|handoff|discover|finalize",
+            "usage: release queue policy|handoff|discover|finalize|publish",
         )),
     }
 }
@@ -1203,6 +1647,10 @@ mod tests {
         list, main_ancestry, missing_assets, original_run, pending_artifact, policy, positive,
         protected_tag, protects_reference, provenance, release_assets, release_for_tag,
         reload_release, tag_binding, timestamp, validate_origin,
+    };
+    use super::{
+        ReadyArtifact, ReviewedDistribution, VerifiedDistribution, provenance_for,
+        ready_artifact_binding, saved_ready_run, source_lockfile,
     };
     use std::ffi::OsString;
 
@@ -1878,6 +2326,53 @@ mod tests {
         github
     }
 
+    fn reviewed_fixture<'a>(verified: &'a VerifiedDistribution<'a>) -> ReviewedDistribution<'a> {
+        let lock = b"version = 4\n";
+        ReviewedDistribution::bind(
+            verified,
+            crate::dependencies::audited_lockfile_fixture(lock),
+            lock,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publication_audit_fetches_the_original_lockfile_and_rejects_substitution() {
+        let original = source("push");
+        let endpoint = format!("contents/Cargo.lock?ref={}", original.source_sha());
+        let lock = b"version = 4\n";
+        let metadata = json!({
+            "name":"Cargo.lock", "path":"Cargo.lock", "type":"file", "encoding":"base64",
+            "size":lock.len(), "content":data_encoding::BASE64.encode(lock)
+        });
+        let mut github = fake();
+        github.set(&endpoint, metadata.clone());
+        assert_eq!(source_lockfile(&github, &original).unwrap(), lock);
+        for (name, value) in [
+            ("path", json!("other/Cargo.lock")),
+            ("type", json!("symlink")),
+            ("encoding", json!("none")),
+            ("size", json!(0)),
+            ("size", json!(lock.len() + 1)),
+            ("size", json!(1_048_577)),
+            ("content", json!("not base64")),
+        ] {
+            let mut changed = metadata.clone();
+            set(&mut changed, name, value);
+            github.set(&endpoint, changed);
+            source_lockfile(&github, &original).unwrap_err();
+        }
+        let (_directory, handoff) = tagged_handoff_fixture();
+        let verified = VerifiedHandoff::new(&publication_fake(&handoff), &handoff).unwrap();
+        let distribution = VerifiedDistribution::Legacy(&verified);
+        ReviewedDistribution::bind(
+            &distribution,
+            crate::dependencies::audited_lockfile_fixture(lock),
+            b"another lockfile snapshot",
+        )
+        .unwrap_err();
+    }
+
     #[test]
     fn draft_release_reloads_bind_ids_and_refuse_ambiguous_inventory() {
         let mut github = fake();
@@ -1912,7 +2407,13 @@ mod tests {
         };
         let verified = VerifiedHandoff::new(&github, &handoff).unwrap();
         github.calls.borrow_mut().clear();
-        create_release(&github, "v1.2.3", &origin, &verified).unwrap();
+        create_release(
+            &github,
+            "v1.2.3",
+            &origin,
+            &reviewed_fixture(&VerifiedDistribution::Legacy(&verified)),
+        )
+        .unwrap();
         let calls = github.calls.borrow();
         let create = calls.first().unwrap();
         assert_eq!(create.get(1).unwrap(), "create");
@@ -1959,7 +2460,13 @@ mod tests {
         verified: &VerifiedHandoff<'_>,
     ) {
         github.calls.borrow_mut().clear();
-        create_release(github, "v1.2.3", origin, verified).unwrap_err();
+        create_release(
+            github,
+            "v1.2.3",
+            origin,
+            &reviewed_fixture(&VerifiedDistribution::Legacy(verified)),
+        )
+        .unwrap_err();
         assert!(
             github
                 .calls
@@ -1998,6 +2505,99 @@ mod tests {
         .unwrap();
         assert!(!accepted);
         assert!(!called.get());
+    }
+
+    #[test]
+    fn package_handoff_cannot_use_the_legacy_publication_path() {
+        let (_directory, handoff) = crate::release_queue::package_handoff_fixture();
+        let verified = VerifiedHandoff::new(&fake(), &handoff).unwrap();
+        VerifiedDistribution::Legacy(&verified)
+            .unchanged()
+            .unwrap_err();
+    }
+
+    #[test]
+    fn finalizer_attestation_cannot_be_substituted_for_original_build_provenance() {
+        let mut entry = attestation();
+        let signer = entry
+            .pointer_mut("/0/verificationResult/signature/certificate/buildSignerURI")
+            .unwrap();
+        *signer = json!(format!(
+            "https://github.com/{REPOSITORY}/{FINALIZE_WORKFLOW}@refs/heads/main"
+        ));
+        let original = source("workflow_dispatch");
+        provenance(&entry, &original, &"b".repeat(64)).unwrap_err();
+        provenance_for(&entry, &original, &"b".repeat(64), FINALIZE_WORKFLOW).unwrap();
+        provenance_for(
+            &attestation(),
+            &original,
+            &"b".repeat(64),
+            FINALIZE_WORKFLOW,
+        )
+        .unwrap_err();
+    }
+
+    fn ready_artifact() -> Value {
+        json!({"id":500,"name":"dist-ready-42-2","expired":false,"digest":format!("sha256:{}","d".repeat(64)),"workflow_run":{"id":99}})
+    }
+
+    #[test]
+    fn saved_ready_name_is_bound_to_one_exact_live_artifact_before_reuse() {
+        let mut github = fake();
+        let selected = ReadyArtifact {
+            run_id: 99,
+            artifact_id: 500,
+            digest: format!("sha256:{}", "d".repeat(64)),
+        };
+        let path = "actions/runs/99/artifacts?per_page=100";
+        github.set(
+            path,
+            json!({"total_count":1,"artifacts":[ready_artifact()]}),
+        );
+        ready_artifact_binding(&github, &source("workflow_dispatch"), &selected).unwrap();
+        for (key, value) in [
+            ("id", json!(501)),
+            ("digest", json!(format!("sha256:{}", "e".repeat(64)))),
+            ("expired", json!(true)),
+        ] {
+            let mut changed = ready_artifact();
+            set(&mut changed, key, value);
+            github.set(path, json!({"total_count":1,"artifacts":[changed]}));
+            ready_artifact_binding(&github, &source("workflow_dispatch"), &selected).unwrap_err();
+        }
+        github.set(
+            path,
+            json!({"total_count":2,"artifacts":[ready_artifact(),ready_artifact()]}),
+        );
+        ready_artifact_binding(&github, &source("workflow_dispatch"), &selected).unwrap_err();
+    }
+
+    #[test]
+    fn unrelated_artifact_with_a_ready_name_cannot_block_a_trusted_candidate() {
+        let mut github = fake();
+        let mut trusted = run();
+        for (name, value) in [
+            ("id", json!(99)),
+            ("workflow_id", json!(12)),
+            ("path", json!(FINALIZE_WORKFLOW)),
+            ("event", json!("schedule")),
+            ("conclusion", json!("failure")),
+        ] {
+            set(&mut trusted, name, value);
+        }
+        github.set("actions/runs/99", trusted);
+        github.set("actions/runs/100", run());
+        let mut unrelated = ready_artifact();
+        set(&mut unrelated, "workflow_run", json!({"id":100}));
+        github.set(
+            "actions/artifacts?name=dist-ready-42-2&per_page=100",
+            json!({"total_count":2,"artifacts":[unrelated,ready_artifact()]}),
+        );
+        let selected = saved_ready_run(&github, &source("workflow_dispatch"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.run_id, 99);
+        assert_eq!(selected.artifact_id, 500);
     }
 
     #[test]
