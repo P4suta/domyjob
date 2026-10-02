@@ -33,11 +33,19 @@ Release tooling pins crc32fast to 1.5.0 because later versions' wide SIMD CRC in
      The macOS archives preserve the signed executable for internal verification rather than public distribution.
    - `handoff` requires five archives, two signed installers, and two submission receipts, generates and checks all seven asset SHA-256 sums, and records GitHub's build provenance attestation for every original asset and the source manifest in the original build run.
      It preserves `dist-pending` for 14 days and finishes without publishing a release.
-4. `.github/workflows/release-finalize.yml` checks existing submissions after a completed build, once an hour, or on an explicit manual request.
+4. `.github/workflows/release-finalize.yml` checks existing submissions after a completed build, on an adaptive schedule, or on an explicit manual request.
+   The initial build-completion check always queries the saved submissions once and can recheck both IDs together within a shared two-minute grace period, at 30-second intervals.
+   The grace period bounds added waiting and the start of another query; an in-flight native command and accepted-artifact verification remain bounded by the 15-minute job timeout.
+   Subsequent checks finish after one query of each ID.
+   Scheduled discovery checks runs younger than one hour every five minutes, runs younger than six hours every fifteen minutes, and older runs hourly.
+   These ages use the original build run creation time; the build itself consumes part of the early window.
+   The three schedules partition the five-minute slots, and Rust selects the eligible age range from the actual schedule event instead of the runner's current minute.
+   GitHub may delay or drop scheduled events, so these are requested intervals rather than a completion-time guarantee.
+   See [GitHub's schedule event documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
    Ubuntu discovery scans at most the latest 100 build runs; macOS jobs start only for eligible pending runs.
-   `cargo xtask release queue finalize` verifies the original run, attempt, source, artifacts, checksums, and provenance before querying each Apple submission once.
+   `cargo xtask release queue finalize` verifies the original run, attempt, source, artifacts, checksums, and provenance before querying Apple for the saved submissions.
    It requires the original source commit to remain an ancestor of current `main` and checks this again before publication.
-   A pending result finishes successfully without rebuilding, signing, submitting, or publishing anything.
+   A pending result finishes successfully after the bounded initial grace period or the later single check, without rebuilding, signing, submitting, or publishing anything.
    After both submissions are accepted, the task checks the saved signatures and notarization, then copies the pending distribution into a separate `ready/` directory.
    It staples and validates Apple's tickets on those installer copies, rechecks their signatures and payloads, and generates the final checksums without modifying the original pending artifacts.
    `release-derivation.json` records the original source, run, attempt, and pending manifest digest, the finalizer's source, run, and attempt, and the original and final asset digests.
@@ -251,7 +259,7 @@ Both pending and ready distributions retain all seven internal assets and checks
 The ready distribution has sixteen files: seven assets, seven checksum files, `build-manifest.json`, and `release-derivation.json`.
 Manual signing and notarization use the production services and consume the signing service's normal allowance.
 
-The finalizer runs automatically after the build and checks again hourly while the queue remains eligible.
+The finalizer runs automatically after the build with a two-minute initial grace period and checks again at five-minute, fifteen-minute, then hourly intervals while the queue remains eligible.
 To check the same original submissions immediately without rebuilding or using another signing allowance, dispatch the finalizer on `main`:
 
 ```sh

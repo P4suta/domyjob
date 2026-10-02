@@ -1495,10 +1495,61 @@ fn query_and_verify<D: Driver>(
     }))
 }
 
+trait PollClock {
+    fn elapsed_seconds(&self) -> u64;
+    fn wait(&self, seconds: u64);
+}
+
+struct NativePollClock<F> {
+    elapsed: F,
+}
+
+impl<F: Fn() -> u64> PollClock for NativePollClock<F> {
+    fn elapsed_seconds(&self) -> u64 {
+        (self.elapsed)()
+    }
+
+    fn wait(&self, seconds: u64) {
+        raw::sleep(seconds);
+    }
+}
+
+enum NotaryCheck<'a> {
+    Once,
+    Initial(&'a dyn PollClock),
+}
+
+impl NotaryCheck<'_> {
+    fn query(
+        self,
+        mut query: impl FnMut() -> Result<NotaryOutcome, Failure>,
+    ) -> Result<NotaryOutcome, Failure> {
+        let Self::Initial(clock) = self else {
+            return query();
+        };
+        for attempt in 0..5 {
+            if attempt > 0 && clock.elapsed_seconds() >= 120 {
+                return Ok(NotaryOutcome::Pending);
+            }
+            match query()? {
+                NotaryOutcome::Accepted(token) => return Ok(NotaryOutcome::Accepted(token)),
+                NotaryOutcome::Pending => {}
+            }
+            let elapsed = clock.elapsed_seconds();
+            if attempt == 4 || elapsed >= 120 {
+                return Ok(NotaryOutcome::Pending);
+            }
+            clock.wait(30.min(120_u64.saturating_sub(elapsed)));
+        }
+        Ok(NotaryOutcome::Pending)
+    }
+}
+
 fn status_with<D: Driver>(
     handoff: &crate::release_queue::Handoff,
     configuration: &NotaryAuthentication,
     driver: &D,
+    check: NotaryCheck<'_>,
 ) -> Result<NotaryOutcome, SigningError> {
     let key_file = NotaryKeyFile::create(configuration)?;
     let mut cleanup = Vec::new();
@@ -1509,8 +1560,9 @@ fn status_with<D: Driver>(
                 "could not validate and extract the saved binaries",
             )
         })?;
-        let result =
-            query_and_verify(&bundle, configuration, &key_file, driver).and_then(|outcome| {
+        let result = check
+            .query(|| query_and_verify(&bundle, configuration, &key_file, driver))
+            .and_then(|outcome| {
                 if matches!(outcome, NotaryOutcome::Accepted(_)) {
                     for target in crate::release_queue::MAC_TARGETS {
                         let receipt = handoff.receipt(target).map_err(|_error| {
@@ -1557,6 +1609,23 @@ fn status_with<D: Driver>(
 pub(crate) fn notary_status(
     handoff: &crate::release_queue::Handoff,
 ) -> Result<NotaryOutcome, SigningError> {
+    native_status(handoff, NotaryCheck::Once)
+}
+
+pub(crate) fn notary_status_initial(
+    handoff: &crate::release_queue::Handoff,
+) -> Result<NotaryOutcome, SigningError> {
+    let started = raw::instant();
+    let clock = NativePollClock {
+        elapsed: || raw::elapsed(&started),
+    };
+    native_status(handoff, NotaryCheck::Initial(&clock))
+}
+
+fn native_status(
+    handoff: &crate::release_queue::Handoff,
+    check: NotaryCheck<'_>,
+) -> Result<NotaryOutcome, SigningError> {
     if std::env::consts::OS != "macos" {
         return Err(Failure::new(
             "notarization verification",
@@ -1564,7 +1633,7 @@ pub(crate) fn notary_status(
         )
         .into());
     }
-    status_with(handoff, &NotaryAuthentication::read()?, &Native)
+    status_with(handoff, &NotaryAuthentication::read()?, &Native, check)
 }
 
 fn bounded(mut stream: impl Read) -> Result<Vec<u8>, ()> {
@@ -1671,7 +1740,8 @@ impl Driver for Native {
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "the release adapter runs native signing tools with protected input and owns private temporary resources"
+        clippy::disallowed_types,
+        reason = "the release adapter owns native signing tools, protected inputs, private temporary resources, and a bounded initial status wait"
     )]
 
     use std::io;
@@ -1715,12 +1785,29 @@ mod raw {
     pub(super) fn json(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
         serde_json::from_slice(bytes)
     }
+
+    pub(super) fn instant() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    pub(super) fn elapsed(started: &std::time::Instant) -> u64 {
+        started.elapsed().as_secs()
+    }
+
+    pub(super) fn sleep(seconds: u64) {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_file(path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::cell::{Cell, RefCell};
+    use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsString;
     use std::io::Read as _;
     use std::path::{Path, PathBuf};
@@ -2486,6 +2573,7 @@ mod tests {
         fn record(&self, invocation: &Invocation<'_>) {
             self.calls.borrow_mut().push(invocation.stage);
             assert!(invocation.args.iter().all(|value| value != "submit"));
+            assert!(invocation.args.iter().all(|value| value != "--sign"));
             assert_ne!(invocation.program, SECURITY);
             if invocation.stage == "verify online notarization" {
                 assert!(
@@ -2535,22 +2623,285 @@ mod tests {
         }
     }
 
+    fn status_configuration(root: &Path) -> super::NotaryAuthentication {
+        super::NotaryAuthentication {
+            key: Secret(NOTARY_KEY.to_vec()),
+            key_id: "synthetic-key-id".to_owned(),
+            issuer: "synthetic-issuer".to_owned(),
+            temporary_root: root.to_path_buf(),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePollClock {
+        elapsed: Cell<u64>,
+        waits: RefCell<Vec<u64>>,
+        interrupted: bool,
+    }
+
+    impl FakePollClock {
+        fn advance(&self, seconds: u64) {
+            self.elapsed.set(self.elapsed.get().saturating_add(seconds));
+        }
+    }
+
+    impl super::PollClock for FakePollClock {
+        fn elapsed_seconds(&self) -> u64 {
+            self.elapsed.get()
+        }
+
+        fn wait(&self, seconds: u64) {
+            self.waits.borrow_mut().push(seconds);
+            if !self.interrupted {
+                self.advance(seconds);
+            }
+        }
+    }
+
+    struct PollFake<'a> {
+        native: StatusFake,
+        replies: RefCell<VecDeque<&'static str>>,
+        clock: &'a FakePollClock,
+        query_seconds: u64,
+        key_paths: RefCell<Vec<PathBuf>>,
+    }
+
+    impl<'a> PollFake<'a> {
+        fn new(clock: &'a FakePollClock, replies: &[&'static str], query_seconds: u64) -> Self {
+            Self {
+                native: StatusFake {
+                    mode: "accepted",
+                    calls: RefCell::new(Vec::new()),
+                },
+                replies: RefCell::new(replies.iter().copied().collect()),
+                clock,
+                query_seconds,
+                key_paths: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn check(
+            &self,
+            handoff: &crate::release_queue::Handoff,
+            root: &Path,
+        ) -> Result<super::NotaryOutcome, super::SigningError> {
+            super::status_with(
+                handoff,
+                &status_configuration(root),
+                self,
+                super::NotaryCheck::Initial(self.clock),
+            )
+        }
+    }
+
+    impl Driver for PollFake<'_> {
+        fn invoke(&self, invocation: Invocation<'_>) -> Result<Vec<u8>, Failure> {
+            if invocation.stage != "read notarization status" {
+                return self.native.invoke(invocation);
+            }
+            self.native.record(&invocation);
+            let key_argument = invocation
+                .args
+                .iter()
+                .position(|argument| argument == "--key")
+                .ok_or_else(|| Failure::new("synthetic response", "missing fixture key flag"))?;
+            let key_path = PathBuf::from(
+                invocation
+                    .args
+                    .get(key_argument.saturating_add(1))
+                    .ok_or_else(|| {
+                        Failure::new("synthetic response", "missing fixture key path")
+                    })?,
+            );
+            self.key_paths.borrow_mut().push(key_path.clone());
+            self.clock.advance(self.query_seconds);
+            let reply =
+                self.replies.borrow_mut().pop_front().ok_or_else(|| {
+                    Failure::new("synthetic response", "fixture replies exhausted")
+                })?;
+            if reply == "error" {
+                return Err(Failure::new(invocation.stage, "synthetic provider failure"));
+            }
+            if reply == "cleanup-error" {
+                super::raw::remove_file(&key_path).map_err(|_error| {
+                    Failure::new("synthetic response", "could not remove fixture key")
+                })?;
+                super::raw::create_directory(&key_path).map_err(|_error| {
+                    Failure::new(
+                        "synthetic response",
+                        "could not create fixture key directory",
+                    )
+                })?;
+            }
+            serde_json::to_vec(&serde_json::json!({
+                "id": if reply == "wrong-id" { "different" } else { "01234567-89ab-4cde-8fab-0123456789ab" },
+                "status": if reply == "cleanup-error" { "In Progress" } else { reply },
+            })).map_err(|_error| Failure::new("synthetic response", "could not encode fixture JSON"))
+        }
+    }
+
+    #[test]
+    fn initial_poll_accepts_only_both_saved_submissions_and_reuses_private_inputs() {
+        for (elapsed, replies) in [
+            (0, &["Accepted", "In Progress", "Accepted", "Accepted"][..]),
+            (120, &["Accepted", "Accepted"][..]),
+        ] {
+            let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+            let root = tempfile::tempdir().unwrap();
+            let clock = FakePollClock {
+                elapsed: Cell::new(elapsed),
+                ..FakePollClock::default()
+            };
+            let driver = PollFake::new(&clock, replies, 0);
+            let outcome = driver.check(&handoff, root.path()).unwrap();
+            let super::NotaryOutcome::Accepted(token) = outcome else {
+                panic!("both accepted submissions must finish the initial poll");
+            };
+            assert_eq!(token.source(), handoff.source());
+            assert_eq!(
+                *clock.waits.borrow(),
+                if elapsed == 0 { vec![30] } else { vec![] }
+            );
+            let paths = driver.key_paths.borrow();
+            assert_eq!(paths.len(), replies.len());
+            assert!(paths.iter().all(|path| Some(path) == paths.first()));
+            assert_eq!(
+                driver.native.calls.borrow().get(..replies.len()).unwrap(),
+                vec!["read notarization status"; replies.len()]
+            );
+            assert_eq!(
+                driver
+                    .native
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|stage| **stage == "verify online notarization")
+                    .count(),
+                2
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn initial_poll_shares_one_deadline_across_both_targets() {
+        let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let clock = FakePollClock::default();
+        let driver = PollFake::new(
+            &clock,
+            &["Accepted", "In Progress", "Accepted", "In Progress"],
+            25,
+        );
+        assert!(matches!(
+            driver.check(&handoff, root.path()).unwrap(),
+            super::NotaryOutcome::Pending
+        ));
+        assert_eq!(clock.elapsed.get(), 130);
+        assert_eq!(*clock.waits.borrow(), [30]);
+        assert_eq!(driver.native.calls.borrow().len(), 4);
+        assert!(
+            driver
+                .native
+                .calls
+                .borrow()
+                .iter()
+                .all(|stage| *stage == "read notarization status")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn initial_poll_stops_at_its_time_or_attempt_bound_without_verifying_pending_bytes() {
+        for (interrupted, elapsed, queries, waits) in [
+            (false, 0, 8, vec![30; 4]),
+            (true, 0, 10, vec![30; 4]),
+            (false, 119, 2, vec![1]),
+            (false, 120, 2, vec![]),
+        ] {
+            let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+            let root = tempfile::tempdir().unwrap();
+            let clock = FakePollClock {
+                elapsed: Cell::new(elapsed),
+                interrupted,
+                ..FakePollClock::default()
+            };
+            let driver = PollFake::new(&clock, &["In Progress"; 10], 0);
+            assert!(matches!(
+                driver.check(&handoff, root.path()).unwrap(),
+                super::NotaryOutcome::Pending
+            ));
+            assert_eq!(*clock.waits.borrow(), waits);
+            assert_eq!(driver.native.calls.borrow().len(), queries);
+            assert_eq!(clock.elapsed.get(), if interrupted { 0 } else { 120 });
+            assert!(
+                driver
+                    .native
+                    .calls
+                    .borrow()
+                    .iter()
+                    .all(|stage| *stage == "read notarization status")
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn initial_poll_rejections_and_provider_failures_stop_without_another_wait() {
+        for elapsed in [0, 120] {
+            for reply in ["Invalid", "Unknown", "wrong-id", "error"] {
+                let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+                let root = tempfile::tempdir().unwrap();
+                let clock = FakePollClock {
+                    elapsed: Cell::new(elapsed),
+                    ..FakePollClock::default()
+                };
+                let driver = PollFake::new(&clock, &["Accepted", reply], 0);
+                let error = driver
+                    .check(&handoff, root.path())
+                    .map(|_outcome| ())
+                    .unwrap_err();
+                assert!(error.cleanup.is_empty());
+                assert!(clock.waits.borrow().is_empty());
+                assert_eq!(driver.native.calls.borrow().len(), 2);
+                assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn initial_poll_cleanup_failure_cannot_become_a_successful_pending_check() {
+        for reply in ["In Progress", "error"] {
+            let (_inputs, handoff) = crate::release_queue::handoff_fixture();
+            let root = tempfile::tempdir().unwrap();
+            let clock = FakePollClock::default();
+            let driver = PollFake::new(&clock, &["cleanup-error", reply], 60);
+            let error = driver
+                .check(&handoff, root.path())
+                .map(|_outcome| ())
+                .unwrap_err();
+            assert_eq!(error.primary.is_some(), reply == "error");
+            assert_eq!(error.cleanup.len(), 1);
+            assert_eq!(
+                error.cleanup.first().unwrap().stage,
+                "private notarization key"
+            );
+            assert!(clock.waits.borrow().is_empty());
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn pending_status_exits_without_rebuilding_signing_or_submitting() {
         let (_inputs, handoff) = crate::release_queue::handoff_fixture();
         let private_root = tempfile::tempdir().unwrap();
-        let credentials = super::NotaryAuthentication {
-            key: Secret(NOTARY_KEY.to_vec()),
-            key_id: "synthetic-key-id".to_owned(),
-            issuer: "synthetic-issuer".to_owned(),
-            temporary_root: private_root.path().to_path_buf(),
-        };
+        let credentials = status_configuration(private_root.path());
         let driver = StatusFake {
             mode: "pending",
             calls: RefCell::new(Vec::new()),
         };
         assert!(matches!(
-            super::status_with(&handoff, &credentials, &driver).unwrap(),
+            super::status_with(&handoff, &credentials, &driver, super::NotaryCheck::Once).unwrap(),
             super::NotaryOutcome::Pending
         ));
         assert_eq!(
@@ -2572,17 +2923,12 @@ mod tests {
         ] {
             let (_inputs, handoff) = crate::release_queue::handoff_fixture();
             let private_root = tempfile::tempdir().unwrap();
-            let credentials = super::NotaryAuthentication {
-                key: Secret(NOTARY_KEY.to_vec()),
-                key_id: "synthetic-key-id".to_owned(),
-                issuer: "synthetic-issuer".to_owned(),
-                temporary_root: private_root.path().to_path_buf(),
-            };
+            let credentials = status_configuration(private_root.path());
             let driver = StatusFake {
                 mode,
                 calls: RefCell::new(Vec::new()),
             };
-            match super::status_with(&handoff, &credentials, &driver) {
+            match super::status_with(&handoff, &credentials, &driver, super::NotaryCheck::Once) {
                 Ok(super::NotaryOutcome::Accepted(token)) => {
                     assert_eq!(mode, "accepted");
                     assert_eq!(token.source(), handoff.source());
