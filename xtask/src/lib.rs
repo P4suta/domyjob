@@ -29,6 +29,11 @@ mod raw {
         std::fs::read_to_string(path)
     }
 
+    #[cfg(test)]
+    pub(super) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
     }
@@ -779,7 +784,7 @@ mod tests {
         if std::env::var_os("DOMYJOB_GIT_CONTEXT_PROBE").is_some() {
             let root = tempfile::tempdir().unwrap();
             super::git(root.path(), &["init", "--quiet", "--initial-branch=main"]).unwrap();
-            assert!(root.path().join(".git").is_dir());
+            assert!(raw::metadata(&root.path().join(".git")).unwrap().is_dir());
             raw::write(&root.path().join("fixture"), b"owned").unwrap();
             super::git(root.path(), &["add", "fixture"]).unwrap();
             assert_eq!(
@@ -805,7 +810,11 @@ mod tests {
             .env("GIT_COMMON_DIR", foreign.path())
             .env("GIT_WORK_TREE", child_root.path())
             .env("GIT_INDEX_FILE", child_root.path().join("foreign-index"))
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(std::process::Child::wait_with_output)
             .unwrap();
         assert!(
             output.status.success(),
@@ -817,14 +826,20 @@ mod tests {
             raw::read_to_string(&foreign.path().join("config")).unwrap(),
             original
         );
-        assert!(!child_root.path().join("foreign-index").exists());
+        assert!(
+            matches!(raw::metadata(&child_root.path().join("foreign-index")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
     }
 
     #[test]
     fn every_repository_variable_reported_by_git_is_removed_at_the_process_boundary() {
         let output = super::git_command()
             .args(["rev-parse", "--local-env-vars"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(std::process::Child::wait_with_output)
             .unwrap();
         assert!(output.status.success());
         let command = super::git_command();
