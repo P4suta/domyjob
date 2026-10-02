@@ -1,8 +1,8 @@
-use reqwest::{blocking::Client, header};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write as _,
+    process::{Child, Command, Stdio},
 };
 use zeroize::Zeroizing;
 
@@ -16,16 +16,14 @@ enum TransferError {
     UnresolvedInput,
     DestinationConflict,
     VerificationFailed,
-    FetchFailed,
-    FetchRefused,
     InvalidResponse,
     RuntimeArguments,
     MissingToken,
     InvalidToken,
     InvalidEncoding,
-    ClientInitialization,
     WriteFailed,
-    WriteRefused,
+    ProcessFailed,
+    ResponseTooLarge,
 }
 
 impl std::fmt::Display for TransferError {
@@ -41,16 +39,14 @@ impl std::fmt::Display for TransferError {
             Self::VerificationFailed => {
                 "Private source/destination comparison failed; values withheld"
             }
-            Self::FetchFailed => "Doppler fetch failed; response withheld",
-            Self::FetchRefused => "Doppler fetch refused; response withheld",
             Self::InvalidResponse => "Doppler response invalid; response withheld",
             Self::RuntimeArguments => "Transfer accepts no runtime target arguments",
             Self::MissingToken => "Scoped migration token missing",
             Self::InvalidToken => "Config-scoped service token required; value withheld",
             Self::InvalidEncoding => "Source environment encoding invalid; values withheld",
-            Self::ClientInitialization => "Secure client initialization failed",
             Self::WriteFailed => "Doppler transfer failed; response withheld",
-            Self::WriteRefused => "Doppler transfer refused; response withheld",
+            Self::ProcessFailed => "Pinned Doppler CLI failed; output withheld",
+            Self::ResponseTooLarge => "Doppler response exceeds the private buffer bound",
         })
     }
 }
@@ -68,12 +64,6 @@ struct Target {
 }
 
 struct Inputs(BTreeMap<String, Zeroizing<String>>);
-
-#[derive(Deserialize)]
-struct Response {
-    success: bool,
-    secrets: BTreeMap<String, Secret>,
-}
 
 #[derive(Deserialize)]
 struct Secret {
@@ -197,22 +187,128 @@ fn verify(inputs: &Inputs, current: &BTreeMap<String, Secret>) -> Result<()> {
     }
 }
 
-fn read(client: &Client, target: &Target) -> Result<BTreeMap<String, Secret>> {
-    let response = client
-        .get("https://api.doppler.com/v3/configs/config/secrets")
-        .query(&[("project", &target.project), ("config", &target.config)])
-        .send()
-        .map_err(|_| TransferError::FetchFailed)?;
-    if !response.status().is_success() {
-        return Err(TransferError::FetchRefused);
+const PRIVATE_BUFFER_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn bounded_bytes(reader: impl std::io::Read, limit: u64) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    let count = std::io::copy(&mut reader.take(limit + 1), &mut *bytes)
+        .map_err(|_| TransferError::ProcessFailed)?;
+    if count > limit {
+        return Err(TransferError::ResponseTooLarge);
     }
-    let body: Response = response
-        .json()
-        .map_err(|_| TransferError::InvalidResponse)?;
-    if !body.success {
-        return Err(TransferError::FetchRefused);
+    Ok(bytes)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this bounded private CLI ingress alone decodes Doppler JSON without exposing errors"
+)]
+fn decode_cli(bytes: &[u8]) -> Result<BTreeMap<String, Secret>> {
+    serde_json::from_slice(bytes).map_err(|_| TransferError::InvalidResponse)
+}
+
+struct Cli<'a> {
+    target: &'a Target,
+    token: Zeroizing<String>,
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
-    Ok(body.secrets)
+}
+
+impl<'a> Cli<'a> {
+    fn new(target: &'a Target, token: String) -> Result<Self> {
+        let token = Zeroizing::new(token);
+        if !token.starts_with("dp.st.") {
+            return Err(TransferError::InvalidToken);
+        }
+        Ok(Self { target, token })
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this private CLI adapter alone creates children with closed standard streams"
+    )]
+    fn command(&self) -> Command {
+        let mut command = Command::new("doppler");
+        command.env_clear();
+        for name in [
+            "PATH",
+            "HOME",
+            "SYSTEMROOT",
+            "USERPROFILE",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .env("DOPPLER_TOKEN", self.token.as_str())
+            .args([
+                "--no-check-version",
+                "--silent",
+                "--api-host",
+                "https://api.doppler.com",
+                "--timeout",
+                "10s",
+                "--attempts",
+                "1",
+                "secrets",
+                "--project",
+                &self.target.project,
+                "--config",
+                &self.target.config,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn capture(&self, command: &mut Command, input: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
+        let mut child = ChildGuard(command.spawn().map_err(|_| TransferError::ProcessFailed)?);
+        if let Some(input) = input {
+            let mut stdin = child.0.stdin.take().ok_or(TransferError::ProcessFailed)?;
+            stdin
+                .write_all(input)
+                .map_err(|_| TransferError::WriteFailed)?;
+        }
+        let stdout = child.0.stdout.take().ok_or(TransferError::ProcessFailed)?;
+        let bytes = bounded_bytes(stdout, PRIVATE_BUFFER_LIMIT)?;
+        let status = child.0.wait().map_err(|_| TransferError::ProcessFailed)?;
+        if !status.success() {
+            return Err(TransferError::ProcessFailed);
+        }
+        Ok(bytes)
+    }
+
+    fn read(&self) -> Result<BTreeMap<String, Secret>> {
+        let bytes = self.capture(self.command().args(["--json", "--raw"]), None)?;
+        decode_cli(&bytes)
+    }
+
+    fn write(&self, missing: &BTreeMap<&str, &str>) -> Result<()> {
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(missing).map_err(|_| TransferError::WriteFailed)?);
+        if bytes.len() as u64 > PRIVATE_BUFFER_LIMIT {
+            return Err(TransferError::ResponseTooLarge);
+        }
+        self.capture(
+            self.command()
+                .args(["upload", "/dev/stdin"])
+                .stdin(Stdio::piped()),
+            Some(&bytes),
+        )?;
+        Ok(())
+    }
 }
 
 fn run() -> Result<usize> {
@@ -225,33 +321,16 @@ fn run() -> Result<usize> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(TransferError::InvalidEncoding),
     })?;
-    let token = Zeroizing::new(
+    let client = Cli::new(
+        &target,
         std::env::var("DOPPLER_MIGRATION_TOKEN").map_err(|_| TransferError::MissingToken)?,
-    );
-    if !token.starts_with("dp.st.") {
-        return Err(TransferError::InvalidToken);
-    }
-    let mut headers = header::HeaderMap::new();
-    let mut authorization = header::HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
-        .map_err(|_| TransferError::InvalidToken)?;
-    authorization.set_sensitive(true);
-    headers.insert(header::AUTHORIZATION, authorization);
-    let client = Client::builder()
-        .default_headers(headers)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| TransferError::ClientInitialization)?;
-    let current = read(&client, &target)?;
+    )?;
+    let current = client.read()?;
     let missing = vacant_values(&inputs, &current)?;
     if !missing.is_empty() {
-        let response = client.post("https://api.doppler.com/v3/configs/config/secrets")
-            .json(&serde_json::json!({"project": target.project, "config": target.config, "secrets": missing}))
-            .send().map_err(|_| TransferError::WriteFailed)?;
-        if !response.status().is_success() {
-            return Err(TransferError::WriteRefused);
-        }
+        client.write(&missing)?;
     }
-    verify(&inputs, &read(&client, &target)?)?;
+    verify(&inputs, &client.read()?)?;
     Ok(inputs.0.len())
 }
 
@@ -423,5 +502,40 @@ mod tests {
             target().authorize(|_| Err(TransferError::InvalidEncoding)),
             Err(TransferError::InvalidEncoding)
         ));
+    }
+
+    #[test]
+    fn private_response_reads_are_bounded_and_overflow_is_rejected() {
+        let bytes = bounded_bytes(&b"abcd"[..], 4).expect("exact bound");
+        assert_eq!(&*bytes, b"abcd");
+        assert!(matches!(
+            bounded_bytes(&b"abcde"[..], 4),
+            Err(TransferError::ResponseTooLarge)
+        ));
+    }
+
+    #[test]
+    fn cli_credentials_are_never_arguments_or_unselected_environment_inputs() {
+        let target = target();
+        let cli = Cli::new(&target, "dp.st.fixture".into()).expect("scoped fixture");
+        let command = cli.command();
+        assert!(command.get_args().all(|arg| arg != "dp.st.fixture"));
+        let names: BTreeSet<_> = command.get_envs().map(|(name, _)| name).collect();
+        assert!(!names.contains(std::ffi::OsStr::new("DOPPLER_MIGRATION_TOKEN")));
+        assert!(!names.contains(std::ffi::OsStr::new("APPLE_CERTIFICATE")));
+        assert!(Cli::new(&target, "dp.ct.invalid".into()).is_err());
+    }
+
+    #[test]
+    fn json_transport_preserves_certificate_line_endings_and_trailing_newlines() {
+        let certificate = "line one\r\nline two\n";
+        let encoded = serde_json::to_vec(&BTreeMap::from([("CERTIFICATE", certificate)]))
+            .expect("certificate fixture");
+        assert_eq!(encoded, br#"{"CERTIFICATE":"line one\r\nline two\n"}"#);
+        let decoded = decode_cli(br#"{"CERTIFICATE":{"raw":"line one\r\nline two\n","computed":"line one\r\nline two\n","note":""}}"#)
+            .expect("official CLI response fixture");
+        assert_eq!(decoded["CERTIFICATE"].raw, certificate);
+        assert_eq!(decoded["CERTIFICATE"].computed, certificate);
+        assert!(decode_cli(br#"{"CERTIFICATE":{"raw":null,"computed":null}}"#).is_err());
     }
 }
