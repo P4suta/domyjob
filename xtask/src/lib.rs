@@ -29,6 +29,11 @@ mod raw {
         std::fs::read_to_string(path)
     }
 
+    #[cfg(test)]
+    pub(super) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
     }
@@ -193,6 +198,31 @@ fn read(path: &Path) -> Result<String, GateError> {
     })
 }
 
+pub(crate) fn git_command() -> std::process::Command {
+    let mut command = raw::command("git");
+    for name in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 pub(crate) fn git(root: &Path, arguments: &[&str]) -> Result<String, String> {
     git_with(root, arguments, |command| {
         command
@@ -206,7 +236,7 @@ fn git_with(
     arguments: &[&str],
     execute: impl FnOnce(&mut std::process::Command) -> std::io::Result<std::process::Output>,
 ) -> Result<String, String> {
-    let mut command = raw::command("git");
+    let mut command = git_command();
     command
         .current_dir(root)
         .args(arguments)
@@ -408,7 +438,7 @@ mod tests {
     }
 
     pub(crate) fn failed_status() -> std::process::ExitStatus {
-        raw::command("git")
+        super::git_command()
             .arg("--invalid-xtask-fixture")
             .stderr(std::process::Stdio::null())
             .status()
@@ -747,5 +777,83 @@ mod tests {
         let process_error =
             super::git_with(root.path(), &["status"], |_| Err(denied())).unwrap_err();
         assert_eq!(process_error, "denied fixture");
+    }
+
+    #[test]
+    fn git_child_commands_ignore_hook_repository_context() {
+        if std::env::var_os("DOMYJOB_GIT_CONTEXT_PROBE").is_some() {
+            let root = tempfile::tempdir().unwrap();
+            super::git(root.path(), &["init", "--quiet", "--initial-branch=main"]).unwrap();
+            assert!(raw::metadata(&root.path().join(".git")).unwrap().is_dir());
+            raw::write(&root.path().join("fixture"), b"owned").unwrap();
+            super::git(root.path(), &["add", "fixture"]).unwrap();
+            assert_eq!(
+                super::git(root.path(), &["config", "--get", "core.bare"])
+                    .unwrap()
+                    .trim(),
+                "false"
+            );
+            return;
+        }
+        let foreign = tempfile::tempdir().unwrap();
+        super::git(foreign.path(), &["init", "--quiet", "--bare"]).unwrap();
+        let original = raw::read_to_string(&foreign.path().join("config")).unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let output = raw::command(std::env::current_exe().unwrap().to_str().unwrap())
+            .args([
+                "--exact",
+                "tests::git_child_commands_ignore_hook_repository_context",
+                "--nocapture",
+            ])
+            .env("DOMYJOB_GIT_CONTEXT_PROBE", "1")
+            .env("GIT_DIR", foreign.path())
+            .env("GIT_COMMON_DIR", foreign.path())
+            .env("GIT_WORK_TREE", child_root.path())
+            .env("GIT_INDEX_FILE", child_root.path().join("foreign-index"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(std::process::Child::wait_with_output)
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            raw::read_to_string(&foreign.path().join("config")).unwrap(),
+            original
+        );
+        assert!(
+            matches!(raw::metadata(&child_root.path().join("foreign-index")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn every_repository_variable_reported_by_git_is_removed_at_the_process_boundary() {
+        let output = super::git_command()
+            .args(["rev-parse", "--local-env-vars"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(std::process::Child::wait_with_output)
+            .unwrap();
+        assert!(output.status.success());
+        let command = super::git_command();
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name.to_str().unwrap()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for name in String::from_utf8(output.stdout).unwrap().lines() {
+            assert!(
+                removed.contains(name),
+                "Git repository context {name} is not isolated"
+            );
+        }
+        assert!(removed.contains("GIT_NAMESPACE"));
+        assert!(raw::command("cargo").get_envs().next().is_none());
     }
 }
