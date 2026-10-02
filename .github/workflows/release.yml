@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
-          install_args: rust
+          install_args: rust aqua:EmbarkStudios/cargo-deny aqua:rustsec/rustsec/cargo-audit cargo:cargo-vet
       - name: Read and validate the workspace version
         id: version
         env:
@@ -39,6 +39,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: cargo xtask release queue policy
+      - name: Check dependency licenses, bans, and sources
+        run: cargo xtask dependencies deny
+      - name: Check dependencies against the current RustSec advisory database
+        run: cargo xtask dependencies audit
+      - name: Verify dependency audit evidence
+        run: cargo xtask dependencies vet
 
   build:
     name: build (${{ matrix.target }})
@@ -74,7 +80,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo xtask release build
-      - name: Sign and submit the macOS binary for notarization
+      - name: Sign the macOS binary and installer, then submit the package for notarization
         if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
@@ -82,6 +88,9 @@ jobs:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
           APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
@@ -99,22 +108,26 @@ jobs:
           file_path: ${{ github.workspace }}/target/${{ matrix.target }}/release/domyjob.exe
           override: true
           environment_name: PROD
-      - name: Verify the Windows signature and timestamp
+      - name: Verify the Windows signature, expected publisher, and timestamp
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           TARGET: ${{ matrix.target }}
+          WINDOWS_SIGNING_IDENTITY_SHA256: ${{ vars.WINDOWS_SIGNING_IDENTITY_SHA256 }}
         run: cargo xtask release verify-windows
       - name: Bundle
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.check.outputs.version }}
+          WINDOWS_SIGNING_IDENTITY_SHA256: ${{ vars.WINDOWS_SIGNING_IDENTITY_SHA256 }}
         run: cargo xtask release bundle
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.pkg
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: runner.os == 'macOS'
@@ -162,6 +175,7 @@ jobs:
         with:
           subject-path: |
             dist/*.tar.gz
+            dist/*.pkg
             dist/manifest.json
       - name: Preserve the pending archives and receipts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

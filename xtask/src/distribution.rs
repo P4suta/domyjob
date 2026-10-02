@@ -4,8 +4,6 @@ use std::io::{Read as _, Seek as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde_json::Value;
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
@@ -23,10 +21,20 @@ const RESOURCES: &[&str] = &[
 const WINDOWS_VERIFY: &str = r"
 $ErrorActionPreference = 'Stop'
 $signature = Get-AuthenticodeSignature -LiteralPath $env:DOMYJOB_RELEASE_BINARY
+$leafSha256 = $null
+if ($null -ne $signature.SignerCertificate) {
+  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $leafSha256 = [System.BitConverter]::ToString($sha256.ComputeHash($signature.SignerCertificate.RawData)).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha256.Dispose()
+  }
+}
 [ordered]@{
   status = $signature.Status.ToString()
   signerCertificatePresent = $null -ne $signature.SignerCertificate
   timestampCertificatePresent = $null -ne $signature.TimeStamperCertificate
+  leafSha256 = $leafSha256
 } | ConvertTo-Json -Compress
 ";
 
@@ -373,34 +381,96 @@ fn build(
     Ok(())
 }
 
-fn windows_signature(bytes: &[u8]) -> Result<(), DistributionError> {
-    let signature: Value = domyjob_core::ingress::json(bytes, 4096)?;
-    let valid = signature
-        .as_object()
-        .is_some_and(|object| object.len() == 3)
-        && signature.get("status").and_then(Value::as_str) == Some("Valid")
-        && signature
-            .get("signerCertificatePresent")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && signature
-            .get("timestampCertificatePresent")
-            .and_then(Value::as_bool)
-            == Some(true);
+#[derive(Debug)]
+struct WindowsSigningIdentity(String);
+
+impl WindowsSigningIdentity {
+    fn parse(value: String) -> Result<Self, DistributionError> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(DistributionError::Invalid(
+                "WINDOWS_SIGNING_IDENTITY_SHA256 must be exactly 64 lowercase hexadecimal digits"
+                    .to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WindowsSignature {
+    status: String,
+    signer_certificate_present: bool,
+    timestamp_certificate_present: bool,
+    leaf_sha256: Option<String>,
+}
+
+fn windows_signature(
+    bytes: &[u8],
+    identity: &WindowsSigningIdentity,
+) -> Result<(), DistributionError> {
+    let signature: WindowsSignature = domyjob_core::ingress::json(bytes, 4096)?;
+    let valid = signature.status == "Valid"
+        && signature.signer_certificate_present
+        && signature.timestamp_certificate_present
+        && signature.leaf_sha256.as_deref() == Some(identity.0.as_str());
     if valid {
         Ok(())
     } else {
         Err(DistributionError::Invalid(
-            "the binary needs a valid Authenticode signature and timestamp".to_owned(),
+            "the binary needs a valid Authenticode signature from the configured publisher and a timestamp"
+                .to_owned(),
         ))
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedWindowsBinary {
+    path: PathBuf,
+    digest: String,
+}
+
+fn windows_binary_digest(path: &Path) -> Result<String, DistributionError> {
+    crate::release_queue::sha256_file_bounded(path)
+        .map_err(|error| DistributionError::Invalid(error.to_string()))
+}
+
+impl VerifiedWindowsBinary {
+    fn unchanged(&self) -> Result<(), DistributionError> {
+        if windows_binary_digest(&self.path)? == self.digest {
+            Ok(())
+        } else {
+            Err(DistributionError::Invalid(
+                "the verified Windows binary changed before distribution".to_owned(),
+            ))
+        }
+    }
+
+    fn stage(
+        mut self,
+        destination: &Path,
+        copy: &impl Fn(&Path, &Path) -> std::io::Result<u64>,
+    ) -> Result<Self, DistributionError> {
+        self.unchanged()?;
+        copy_checked(&self.path, destination, copy)?;
+        self.unchanged()?;
+        self.path = destination.to_path_buf();
+        self.unchanged()?;
+        Ok(self)
     }
 }
 
 fn verify_windows(
     root: &Path,
     target: Target,
+    identity: &WindowsSigningIdentity,
     execute: &mut impl FnMut(&mut Command) -> Result<Vec<u8>, DistributionError>,
-) -> Result<(), DistributionError> {
+) -> Result<VerifiedWindowsBinary, DistributionError> {
     if target != Target::Windows {
         return Err(DistributionError::Invalid(
             "verify-windows requires the Windows release target".to_owned(),
@@ -408,10 +478,17 @@ fn verify_windows(
     }
     let binary = checked_path(root, &target.binary_path())?;
     regular(&binary, 1, FILE_LIMIT)?;
+    let digest = windows_binary_digest(&binary)?;
     let mut powershell = command(root, "pwsh");
     powershell.args(["-NoProfile", "-NonInteractive", "-Command", WINDOWS_VERIFY]);
-    powershell.env("DOMYJOB_RELEASE_BINARY", binary);
-    windows_signature(&execute(&mut powershell)?)
+    powershell.env("DOMYJOB_RELEASE_BINARY", &binary);
+    windows_signature(&execute(&mut powershell)?, identity)?;
+    let verified = VerifiedWindowsBinary {
+        path: binary,
+        digest,
+    };
+    verified.unchanged()?;
+    Ok(verified)
 }
 
 fn copy_checked(
@@ -458,14 +535,73 @@ impl StagedArchive {
     }
 }
 
+#[derive(Debug)]
+enum BundleBinary {
+    Other(PathBuf),
+    Windows(VerifiedWindowsBinary),
+}
+
+impl BundleBinary {
+    fn prepare(
+        root: &Path,
+        target: Target,
+        identity: Option<&WindowsSigningIdentity>,
+        execute: &mut impl FnMut(&mut Command) -> Result<Vec<u8>, DistributionError>,
+    ) -> Result<Self, DistributionError> {
+        if target == Target::Windows {
+            let identity = identity.ok_or_else(|| {
+                DistributionError::Invalid("missing WINDOWS_SIGNING_IDENTITY_SHA256".to_owned())
+            })?;
+            verify_windows(root, target, identity, execute).map(Self::Windows)
+        } else {
+            let binary = checked_path(root, &target.binary_path())?;
+            regular(&binary, 1, FILE_LIMIT)?;
+            Ok(Self::Other(binary))
+        }
+    }
+
+    fn stage(
+        self,
+        destination: &Path,
+        copy: &impl Fn(&Path, &Path) -> std::io::Result<u64>,
+    ) -> Result<Self, DistributionError> {
+        match self {
+            Self::Windows(verified) => verified.stage(destination, copy).map(Self::Windows),
+            Self::Other(binary) => {
+                copy_checked(&binary, destination, copy)?;
+                Ok(Self::Other(destination.to_path_buf()))
+            }
+        }
+    }
+
+    fn unchanged(&self) -> Result<(), DistributionError> {
+        match self {
+            Self::Windows(verified) => verified.unchanged(),
+            Self::Other(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BundleInputs<'a> {
+    target: Target,
+    identity: Option<&'a WindowsSigningIdentity>,
+}
+
+impl<'a> BundleInputs<'a> {
+    const fn new(target: Target, identity: Option<&'a WindowsSigningIdentity>) -> Self {
+        Self { target, identity }
+    }
+}
+
 fn bundle(
     root: &Path,
-    target: Target,
+    inputs: BundleInputs<'_>,
     execute: &mut impl FnMut(&mut Command) -> Result<Vec<u8>, DistributionError>,
     copy: &impl Fn(&Path, &Path) -> std::io::Result<u64>,
 ) -> Result<(), DistributionError> {
-    let binary = checked_path(root, &target.binary_path())?;
-    regular(&binary, 1, FILE_LIMIT)?;
+    let BundleInputs { target, identity } = inputs;
+    let binary = BundleBinary::prepare(root, target, identity, execute)?;
     let sources: Vec<_> = RESOURCES
         .iter()
         .map(|name| checked_path(root, Path::new(name)))
@@ -482,7 +618,7 @@ fn bundle(
     let package = staging.directory.path().join(target.package());
     let assets = package.join("assets");
     raw::create_dir_all(&assets).map_err(|source| io_error("creating", &assets, source))?;
-    copy_checked(&binary, &package.join(target.binary()), copy)?;
+    let binary = binary.stage(&package.join(target.binary()), copy)?;
     for source in &sources {
         let basename = source.file_name().ok_or_else(|| {
             DistributionError::Invalid("release resource needs a filename".to_owned())
@@ -499,12 +635,34 @@ fn bundle(
     tar.args(["--create", "--gzip", "--format=ustar", "--file"])
         .arg(&staging.path)
         .arg(target.package());
+    binary.unchanged()?;
     execute(&mut tar)?;
+    binary.unchanged()?;
     staging.publish(&final_archive)
 }
 
 fn archives() -> Vec<String> {
     Target::ALL.into_iter().map(Target::archive).collect()
+}
+
+fn checksum_archives(dist: &Path) -> Result<Vec<String>, DistributionError> {
+    let mut names = archives();
+    let packages: Vec<_> = [Target::MacArm, Target::MacX86]
+        .into_iter()
+        .map(|target| format!("{}.pkg", target.package()))
+        .collect();
+    let mut has_packages = false;
+    for package in &packages {
+        match std::fs::symlink_metadata(dist.join(package)) {
+            Ok(_) => has_packages = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error("inspecting package", &dist.join(package), source)),
+        }
+    }
+    if has_packages {
+        names.extend(packages);
+    }
+    Ok(names)
 }
 
 fn inventory(dist: &Path, archives: &[String]) -> Result<bool, DistributionError> {
@@ -527,7 +685,7 @@ fn inventory(dist: &Path, archives: &[String]) -> Result<bool, DistributionError
     } else if names == all_names {
         true
     } else {
-        return Err(DistributionError::Invalid("expected exactly five known release archives, with either zero or five matching checksum files".to_owned()));
+        return Err(DistributionError::Invalid("expected the five release archives and either zero or two Mac packages, with a complete set of matching checksum files or none".to_owned()));
     };
     for name in archives {
         regular(&dist.join(name), 1, FILE_LIMIT)?;
@@ -591,7 +749,7 @@ fn checksums(
     execute: &mut impl FnMut(&mut Command) -> Result<Vec<u8>, DistributionError>,
 ) -> Result<(), DistributionError> {
     let dist = root.join("dist");
-    let archives = archives();
+    let archives = checksum_archives(&dist)?;
     if inventory(&dist, &archives)? {
         check_checksums(&dist, &checksum_inputs(&dist, &archives)?, execute)?;
         inventory(&dist, &archives)?;
@@ -649,12 +807,29 @@ fn run_with(
         }
         ["verify-windows"] => {
             let target = Target::parse(&text_environment(environment, "TARGET")?)?;
-            verify_windows(root, target, execute)
+            let identity = WindowsSigningIdentity::parse(text_environment(
+                environment,
+                "WINDOWS_SIGNING_IDENTITY_SHA256",
+            )?)?;
+            verify_windows(root, target, &identity, execute).map(|_verified| ())
         }
         ["bundle"] => {
             let target = Target::parse(&text_environment(environment, "TARGET")?)?;
             version(&text_environment(environment, "VERSION")?)?;
-            bundle(root, target, execute, &raw::copy)
+            let identity = if target == Target::Windows {
+                Some(WindowsSigningIdentity::parse(text_environment(
+                    environment,
+                    "WINDOWS_SIGNING_IDENTITY_SHA256",
+                )?)?)
+            } else {
+                None
+            };
+            bundle(
+                root,
+                BundleInputs::new(target, identity.as_ref()),
+                execute,
+                &raw::copy,
+            )
         }
         ["checksums"] => {
             version(&text_environment(environment, "VERSION")?)?;
@@ -669,8 +844,21 @@ fn run_with(
 #[cfg(test)]
 pub(crate) fn native_archive_fixture() -> Result<tempfile::TempDir, DistributionError> {
     let root = tests::fixture();
+    let identity = WindowsSigningIdentity::parse(tests::WINDOWS_IDENTITY.to_owned())?;
     for target in Target::ALL {
-        bundle(root.path(), target, &mut execute, &raw::copy)?;
+        bundle(
+            root.path(),
+            BundleInputs::new(target, Some(&identity)),
+            &mut |command| {
+                if command.get_program() == "pwsh" {
+                    serde_json::to_vec(&tests::valid_windows_signature())
+                        .map_err(|error| DistributionError::Invalid(error.to_string()))
+                } else {
+                    execute(command)
+                }
+            },
+            &raw::copy,
+        )?;
     }
     Ok(root)
 }
@@ -682,9 +870,10 @@ mod tests {
     use std::process::Command;
 
     use super::{
-        DistributionError, RESOURCES, Target, VERSION, WINDOWS_VERIFY, archives, build, bundle,
-        checked_path, checksums, command, copy_checked, execute, raw, read, regular, run_with,
-        verify_windows, version, windows_signature, write_version,
+        BundleInputs, DistributionError, RESOURCES, Target, VERSION, WINDOWS_VERIFY,
+        WindowsSigningIdentity, archives, build, bundle, checked_path, checksum_archives,
+        checksums, command, copy_checked, execute, raw, read, regular, run_with, verify_windows,
+        version, windows_signature, write_version,
     };
     use serde_json::json;
 
@@ -710,6 +899,20 @@ mod tests {
             raw::write(&root.path().join("dist").join(archive), b"archive").unwrap();
         }
         root
+    }
+
+    fn assert_dist_entries(root: &Path, expected: usize) {
+        assert_eq!(
+            std::fs::read_dir(root.join("dist")).unwrap().count(),
+            expected
+        );
+    }
+
+    fn assert_checksums_rejected_before_commands(root: &Path) {
+        assert!(matches!(
+            checksums(root, &mut |_| panic!("unexpected checksum command")),
+            Err(DistributionError::Invalid(_))
+        ));
     }
 
     fn env(values: &[(&str, &str)], name: &str) -> Result<OsString, DistributionError> {
@@ -894,43 +1097,149 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
+    pub(super) const WINDOWS_IDENTITY: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    pub(super) fn valid_windows_signature() -> serde_json::Value {
+        json!({
+            "status": "Valid",
+            "signerCertificatePresent": true,
+            "timestampCertificatePresent": true,
+            "leafSha256": WINDOWS_IDENTITY,
+        })
+    }
+
     #[test]
-    fn windows_verification_requires_valid_signature_and_both_certificates() {
-        let valid = json!({"status": "Valid", "signerCertificatePresent": true, "timestampCertificatePresent": true});
-        windows_signature(&serde_json::to_vec(&valid).unwrap()).unwrap();
+    fn windows_publisher_configuration_is_required_and_canonical_before_native_commands() {
+        WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
+        let root = tempfile::tempdir().unwrap();
         for invalid in [
-            json!({"status": "NotSigned", "signerCertificatePresent": true, "timestampCertificatePresent": true}),
-            json!({"status": "Valid", "signerCertificatePresent": false, "timestampCertificatePresent": true}),
-            json!({"status": "Valid", "signerCertificatePresent": true, "timestampCertificatePresent": false}),
-            json!({"status": "Valid", "signerCertificatePresent": "true", "timestampCertificatePresent": true}),
-            json!({"status": "Valid", "signerCertificatePresent": true}),
-            json!([valid]),
+            String::new(),
+            "a".repeat(40),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            WINDOWS_IDENTITY.to_ascii_uppercase(),
+            format!(" {WINDOWS_IDENTITY}"),
+            format!("{WINDOWS_IDENTITY}\n"),
         ] {
             assert!(matches!(
-                windows_signature(&serde_json::to_vec(&invalid).unwrap()),
+                run_with(
+                    root.path(),
+                    &["verify-windows"],
+                    &|name| env(
+                        &[
+                            ("TARGET", Target::Windows.name()),
+                            ("WINDOWS_SIGNING_IDENTITY_SHA256", &invalid),
+                        ],
+                        name,
+                    ),
+                    &mut |_| panic!("invalid identity reached native verification"),
+                ),
                 Err(DistributionError::Invalid(_))
             ));
         }
         assert!(matches!(
-            windows_signature(b"invalid"),
+            run_with(
+                root.path(),
+                &["verify-windows"],
+                &|name| env(&[("TARGET", Target::Windows.name())], name),
+                &mut |_| panic!("missing identity reached native verification"),
+            ),
+            Err(DistributionError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn windows_verification_rejects_an_os_valid_signature_from_another_publisher() {
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
+        let valid = valid_windows_signature();
+        windows_signature(&serde_json::to_vec(&valid).unwrap(), &identity).unwrap();
+        let mut wrong_publisher = valid.clone();
+        *wrong_publisher.get_mut("leafSha256").unwrap() = json!("f".repeat(64));
+        assert!(matches!(
+            windows_signature(&serde_json::to_vec(&wrong_publisher).unwrap(), &identity),
+            Err(DistributionError::Invalid(_))
+        ));
+        for (key, changed) in [
+            ("status", json!("NotSigned")),
+            ("signerCertificatePresent", json!(false)),
+            ("timestampCertificatePresent", json!(false)),
+            ("signerCertificatePresent", json!("true")),
+            ("leafSha256", json!("f".repeat(64))),
+            ("leafSha256", json!(WINDOWS_IDENTITY.to_ascii_uppercase())),
+            ("leafSha256", json!(null)),
+            ("leafSha256", json!(123)),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.get_mut(key).unwrap() = changed;
+            windows_signature(&serde_json::to_vec(&invalid).unwrap(), &identity).unwrap_err();
+        }
+        for missing in [
+            "status",
+            "signerCertificatePresent",
+            "timestampCertificatePresent",
+            "leafSha256",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            windows_signature(&serde_json::to_vec(&invalid).unwrap(), &identity).unwrap_err();
+        }
+        let mut extra = valid.clone();
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("untrusted".to_owned(), json!(true));
+        for invalid in [extra, json!([valid])] {
+            assert!(matches!(
+                windows_signature(&serde_json::to_vec(&invalid).unwrap(), &identity),
+                Err(DistributionError::Json(_))
+            ));
+        }
+        let duplicate = format!(
+            r#"{{"status":"Valid","signerCertificatePresent":true,"timestampCertificatePresent":true,"leafSha256":"{}","leafSha256":"{WINDOWS_IDENTITY}"}}"#,
+            "f".repeat(64),
+        );
+        assert!(matches!(
+            windows_signature(duplicate.as_bytes(), &identity),
             Err(DistributionError::Json(_))
         ));
+        assert!(matches!(
+            windows_signature(b"invalid", &identity),
+            Err(DistributionError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn windows_verification_binds_the_regular_binary_to_the_configured_identity() {
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
         let root = fixture();
         let expected_binary = root.path().join(Target::Windows.binary_path());
-        verify_windows(root.path(), Target::Windows, &mut |command| {
+        verify_windows(root.path(), Target::Windows, &identity, &mut |command| {
             assert_eq!(command.get_program(), "pwsh");
-            assert_eq!(arguments(command), ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_VERIFY]);
-            assert!(command.get_envs().any(|(name, value)| name == "DOMYJOB_RELEASE_BINARY" && value == Some(expected_binary.as_os_str())));
-            Ok(serde_json::to_vec(&json!({"status": "Valid", "signerCertificatePresent": true, "timestampCertificatePresent": true})).unwrap())
-        }).unwrap();
+            assert_eq!(
+                arguments(command),
+                ["-NoProfile", "-NonInteractive", "-Command", WINDOWS_VERIFY]
+            );
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == "DOMYJOB_RELEASE_BINARY"
+                        && value == Some(expected_binary.as_os_str()))
+            );
+            Ok(serde_json::to_vec(&valid_windows_signature()).unwrap())
+        })
+        .unwrap();
         assert!(matches!(
-            verify_windows(root.path(), Target::MacArm, &mut |_| panic!(
+            verify_windows(root.path(), Target::MacArm, &identity, &mut |_| panic!(
                 "unexpected command"
             )),
             Err(DistributionError::Invalid(_))
         ));
         assert!(matches!(
-            verify_windows(root.path(), Target::Windows, &mut |_| Err(failed("pwsh"))),
+            verify_windows(root.path(), Target::Windows, &identity, &mut |_| Err(
+                failed("pwsh")
+            )),
             Err(DistributionError::Failed { .. })
         ));
     }
@@ -939,8 +1248,15 @@ mod tests {
     fn bundle_preserves_resources_and_windows_exe_before_publishing_archive() {
         let root = fixture();
         let target = Target::Windows;
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
         let mut tar_seen = false;
-        bundle(root.path(), target, &mut |command| {
+        let mut verification_seen = false;
+        bundle(root.path(), BundleInputs::new(target, Some(&identity)), &mut |command| {
+            if command.get_program() == "pwsh" {
+                verification_seen = true;
+                return Ok(serde_json::to_vec(&valid_windows_signature()).unwrap());
+            }
+            assert!(verification_seen);
             tar_seen = true;
             assert_eq!(command.get_program(), "tar");
             assert!(command.get_envs().any(|(name, value)| name == "COPYFILE_DISABLE" && value == Some(std::ffi::OsStr::new("1"))));
@@ -969,30 +1285,117 @@ mod tests {
     }
 
     #[test]
+    fn windows_bundle_cannot_skip_the_expected_publisher_check() {
+        let root = fixture();
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
+        bundle(
+            root.path(),
+            BundleInputs::new(Target::Windows, None),
+            &mut |_| panic!("missing publisher policy reached native tools"),
+            &raw::copy,
+        )
+        .unwrap_err();
+        let mut wrong_publisher = valid_windows_signature();
+        *wrong_publisher.get_mut("leafSha256").unwrap() = json!("f".repeat(64));
+        let result = bundle(
+            root.path(),
+            BundleInputs::new(Target::Windows, Some(&identity)),
+            &mut |command| {
+                assert_eq!(command.get_program(), "pwsh");
+                Ok(serde_json::to_vec(&wrong_publisher).unwrap())
+            },
+            &raw::copy,
+        );
+        assert!(matches!(result, Err(DistributionError::Invalid(_))));
+        assert!(!root.path().join("dist").try_exists().unwrap());
+    }
+
+    #[test]
+    fn windows_verification_rejects_changes_while_native_verification_runs() {
+        let root = fixture();
+        let binary = root.path().join(Target::Windows.binary_path());
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
+        let result = verify_windows(root.path(), Target::Windows, &identity, &mut |_| {
+            raw::write(&binary, b"modified!!!").unwrap();
+            Ok(serde_json::to_vec(&valid_windows_signature()).unwrap())
+        });
+        assert!(matches!(result, Err(DistributionError::Invalid(_))));
+    }
+
+    #[test]
+    fn windows_bundle_rejects_same_length_changes_during_copy_resources_or_tar() {
+        let identity = WindowsSigningIdentity::parse(WINDOWS_IDENTITY.to_owned()).unwrap();
+        for phase in ["copy", "resources", "tar"] {
+            let root = fixture();
+            let mut tar_seen = false;
+            let result = bundle(
+                root.path(),
+                BundleInputs::new(Target::Windows, Some(&identity)),
+                &mut |command| {
+                    if command.get_program() == "pwsh" {
+                        return Ok(serde_json::to_vec(&valid_windows_signature()).unwrap());
+                    }
+                    assert_eq!(command.get_program(), "tar");
+                    tar_seen = true;
+                    let staging = command.get_current_dir().unwrap();
+                    let package = staging.join(Target::Windows.package());
+                    if phase == "tar" {
+                        raw::write(&package.join("domyjob.exe"), b"modified!!!").unwrap();
+                    }
+                    raw::write(&staging.join(Target::Windows.archive()), b"archive").unwrap();
+                    Ok(Vec::new())
+                },
+                &|source, destination| {
+                    let copied = raw::copy(source, destination)?;
+                    if phase == "copy"
+                        && source.file_name() == Some(std::ffi::OsStr::new("domyjob.exe"))
+                    {
+                        raw::write(destination, b"modified!!!")?;
+                    }
+                    if phase == "resources"
+                        && source.file_name() == Some(std::ffi::OsStr::new("README.md"))
+                    {
+                        raw::write(
+                            &destination.parent().unwrap().join("domyjob.exe"),
+                            b"modified!!!",
+                        )?;
+                    }
+                    Ok(copied)
+                },
+            );
+            assert!(
+                matches!(result, Err(DistributionError::Invalid(_))),
+                "{phase}"
+            );
+            assert_eq!(tar_seen, phase == "tar");
+            assert_dist_entries(root.path(), 0);
+        }
+    }
+
+    #[test]
     fn bundle_copy_and_tar_failures_leave_no_archive_or_staging() {
         let root = fixture();
         let target = Target::LinuxX86;
         assert!(matches!(
             bundle(
                 root.path(),
-                target,
+                BundleInputs::new(target, None),
                 &mut |_| panic!("unexpected tar"),
                 &|_, _| Err(crate::tests::denied())
             ),
             Err(DistributionError::Io { .. })
         ));
-        assert_eq!(
-            std::fs::read_dir(root.path().join("dist")).unwrap().count(),
-            0
-        );
+        assert_dist_entries(root.path(), 0);
         assert!(matches!(
-            bundle(root.path(), target, &mut |_| Err(failed("tar")), &raw::copy),
+            bundle(
+                root.path(),
+                BundleInputs::new(target, None),
+                &mut |_| Err(failed("tar")),
+                &raw::copy
+            ),
             Err(DistributionError::Failed { .. })
         ));
-        assert_eq!(
-            std::fs::read_dir(root.path().join("dist")).unwrap().count(),
-            0
-        );
+        assert_dist_entries(root.path(), 0);
         assert!(matches!(
             copy_checked(
                 &root.path().join("missing"),
@@ -1041,10 +1444,7 @@ mod tests {
     #[test]
     fn missing_archives_and_incomplete_checksums_stop_before_commands() {
         let missing = dist_fixture(4);
-        assert!(matches!(
-            checksums(missing.path(), &mut |_| panic!("unexpected command")),
-            Err(DistributionError::Invalid(_))
-        ));
+        assert_checksums_rejected_before_commands(missing.path());
         let partial = dist_fixture(5);
         let first = archives().into_iter().next().unwrap();
         raw::write(
@@ -1052,15 +1452,9 @@ mod tests {
             b"incomplete",
         )
         .unwrap();
-        assert!(matches!(
-            checksums(partial.path(), &mut |_| panic!("unexpected command")),
-            Err(DistributionError::Invalid(_))
-        ));
+        assert_checksums_rejected_before_commands(partial.path());
         raw::write(&partial.path().join("dist/unexpected.tar.gz"), b"unknown").unwrap();
-        assert!(matches!(
-            checksums(partial.path(), &mut |_| panic!("unexpected command")),
-            Err(DistributionError::Invalid(_))
-        ));
+        assert_checksums_rejected_before_commands(partial.path());
     }
 
     #[test]
@@ -1099,6 +1493,83 @@ mod tests {
         })
         .unwrap();
         assert_eq!(checks, 1);
+    }
+
+    #[test]
+    fn installer_checksums_require_both_architectures_and_cover_all_seven_files() {
+        let root = dist_fixture(5);
+        let dist = root.path().join("dist");
+        let arm = format!("{}.pkg", Target::MacArm.package());
+        let intel = format!("{}.pkg", Target::MacX86.package());
+        raw::write(&dist.join(&arm), b"signed arm installer").unwrap();
+        assert!(matches!(
+            checksums(root.path(), &mut |_| panic!(
+                "partial package inventory reached hashing"
+            )),
+            Err(DistributionError::Invalid(_))
+        ));
+        raw::write(&dist.join(&intel), b"signed intel installer").unwrap();
+        let names = checksum_archives(&dist).unwrap();
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&arm) && names.contains(&intel));
+        let mut hashes = Vec::new();
+        let mut checks = 0;
+        checksums(root.path(), &mut |command| {
+            let arguments = arguments(command);
+            if arguments.iter().any(|word| word == "--check") {
+                checks += 1;
+                assert_eq!(
+                    command
+                        .get_args()
+                        .skip_while(|word| *word != "--")
+                        .skip(1)
+                        .count(),
+                    7
+                );
+                Ok(Vec::new())
+            } else {
+                let name = arguments.last().unwrap().clone();
+                hashes.push(name.clone());
+                Ok(format!("{}  {name}\n", "a".repeat(64)).into_bytes())
+            }
+        })
+        .unwrap();
+        assert_eq!(hashes, names);
+        assert_eq!(checks, 2);
+        assert_eq!(std::fs::read_dir(&dist).unwrap().count(), 14);
+        assert_eq!(
+            read(&dist.join(arm), 1024).unwrap(),
+            b"signed arm installer"
+        );
+        assert_eq!(
+            read(&dist.join(intel), 1024).unwrap(),
+            b"signed intel installer"
+        );
+    }
+
+    #[test]
+    fn tar_bundle_preserves_an_existing_signed_installer() {
+        let root = fixture();
+        let dist = root.path().join("dist");
+        raw::create_dir_all(&dist).unwrap();
+        let installer = dist.join(format!("{}.pkg", Target::MacArm.package()));
+        raw::write(&installer, b"original signed installer").unwrap();
+        bundle(
+            root.path(),
+            BundleInputs::new(Target::MacArm, None),
+            &mut |command| {
+                let staging = command.get_current_dir().unwrap();
+                raw::write(&staging.join(Target::MacArm.archive()), b"completed tar").unwrap();
+                Ok(Vec::new())
+            },
+            &raw::copy,
+        )
+        .unwrap();
+        assert_eq!(
+            read(&installer, 1024).unwrap(),
+            b"original signed installer"
+        );
+        assert_eq!(std::fs::read_dir(dist).unwrap().count(), 2);
     }
 
     #[test]

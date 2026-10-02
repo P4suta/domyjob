@@ -452,9 +452,12 @@ fn classify(paths: &[String]) -> Plan {
             } else if matches!(
                 path.as_str(),
                 "xtask/src/release.rs"
+                    | "xtask/src/macos_package.rs"
+                    | "xtask/src/release_ready.rs"
                     | "xtask/src/release_queue.rs"
                     | "xtask/src/release_orchestration.rs"
                     | "xtask/src/distribution.rs"
+                    | "xtask/src/dependencies.rs"
                     | "xtask/src/ci.rs"
             ) || path.starts_with("xtask/src/release/")
                 || path.starts_with("xtask/tests/")
@@ -1101,6 +1104,9 @@ mod tests {
         assert!(!native.has(Check::WindowsContracts));
         for path in [
             "xtask/src/distribution.rs",
+            "xtask/src/dependencies.rs",
+            "xtask/src/macos_package.rs",
+            "xtask/src/release_ready.rs",
             "xtask/src/release_queue.rs",
             "xtask/src/release_orchestration.rs",
         ] {

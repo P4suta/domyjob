@@ -173,8 +173,7 @@ impl From<Source> for SourceClaims {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug)]
 pub(crate) struct PendingClaims {
     pub(crate) source: Source,
     pub(crate) target: String,
@@ -183,6 +182,34 @@ pub(crate) struct PendingClaims {
     pub(crate) submission_zip_sha256: String,
     pub(crate) signing_identity_sha1: String,
     pub(crate) cdhash: String,
+    pub(crate) package: Option<PackageClaims>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PackageClaims {
+    pub(crate) sha256: String,
+    pub(crate) installer_identity_sha1: String,
+    pub(crate) identifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPackage {
+    sha256: String,
+    installer_identity_sha1: String,
+    identifier: String,
+}
+
+impl PendingPackage {
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+    pub(crate) fn installer_identity_sha1(&self) -> &str {
+        &self.installer_identity_sha1
+    }
+    pub(crate) fn identifier(&self) -> &str {
+        &self.identifier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -195,14 +222,25 @@ pub(crate) struct PendingNotarization {
     submission_zip_sha256: String,
     signing_identity_sha1: String,
     cdhash: String,
+    package: Option<PendingPackage>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PendingInput {
     schema_version: u8,
-    #[serde(flatten)]
-    claims: PendingClaims,
+    source: Source,
+    target: String,
+    submission_id: String,
+    binary_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submission_zip_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    submission_sha256: Option<String>,
+    signing_identity_sha1: String,
+    cdhash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package: Option<PackageClaims>,
 }
 
 fn uuid(value: &str) -> bool {
@@ -229,12 +267,30 @@ impl PendingNotarization {
         )?;
         require(
             hex(&claims.binary_sha256, 64) && hex(&claims.submission_zip_sha256, 64),
-            "binary and submission ZIP hashes must be SHA-256",
+            "binary and submission hashes must be SHA-256",
         )?;
         require(
             hex(&claims.signing_identity_sha1, 40) && hex(&claims.cdhash, 40),
             "signing identity and CDHash must be 40 lowercase hex characters",
         )?;
+        let package = claims
+            .package
+            .map(|package| -> Result<PendingPackage, QueueError> {
+                require(
+                    hex(&package.sha256, 64)
+                        && package.sha256 == claims.submission_zip_sha256
+                        && hex(&package.installer_identity_sha1, 40)
+                        && package.installer_identity_sha1 != claims.signing_identity_sha1
+                        && package.identifier == crate::macos_package::IDENTIFIER,
+                    "package must bind the submitted digest and a distinct Installer identity",
+                )?;
+                Ok(PendingPackage {
+                    sha256: package.sha256,
+                    installer_identity_sha1: package.installer_identity_sha1,
+                    identifier: package.identifier,
+                })
+            })
+            .transpose()?;
         Ok(Self {
             source: claims.source,
             target: claims.target,
@@ -243,6 +299,7 @@ impl PendingNotarization {
             submission_zip_sha256: claims.submission_zip_sha256,
             signing_identity_sha1: claims.signing_identity_sha1,
             cdhash: claims.cdhash,
+            package,
         })
     }
 
@@ -277,33 +334,59 @@ impl PendingNotarization {
     pub(crate) fn cdhash(&self) -> &str {
         &self.cdhash
     }
+    pub(crate) const fn package(&self) -> Option<&PendingPackage> {
+        self.package.as_ref()
+    }
 }
 
 impl TryFrom<PendingInput> for PendingNotarization {
     type Error = QueueError;
 
     fn try_from(input: PendingInput) -> Result<Self, Self::Error> {
-        require(
-            input.schema_version == 1,
-            "unknown notarization receipt schema",
-        )?;
-        Self::new(input.claims)
+        let submission_zip_sha256 = match (
+            input.schema_version,
+            input.submission_zip_sha256,
+            input.submission_sha256,
+            input.package.as_ref(),
+        ) {
+            (1, Some(hash), None, None) | (2, None, Some(hash), Some(_)) => hash,
+            _ => {
+                return Err(invalid(
+                    "unknown or inconsistent notarization receipt schema",
+                ));
+            }
+        };
+        Self::new(PendingClaims {
+            source: input.source,
+            target: input.target,
+            submission_id: input.submission_id,
+            binary_sha256: input.binary_sha256,
+            submission_zip_sha256,
+            signing_identity_sha1: input.signing_identity_sha1,
+            cdhash: input.cdhash,
+            package: input.package,
+        })
     }
 }
 
 impl From<PendingNotarization> for PendingInput {
     fn from(receipt: PendingNotarization) -> Self {
+        let modern = receipt.package.is_some();
         Self {
-            schema_version: 1,
-            claims: PendingClaims {
-                source: receipt.source,
-                target: receipt.target,
-                submission_id: receipt.submission_id,
-                binary_sha256: receipt.binary_sha256,
-                submission_zip_sha256: receipt.submission_zip_sha256,
-                signing_identity_sha1: receipt.signing_identity_sha1,
-                cdhash: receipt.cdhash,
-            },
+            schema_version: if modern { 2 } else { 1 },
+            source: receipt.source,
+            target: receipt.target,
+            submission_id: receipt.submission_id,
+            binary_sha256: receipt.binary_sha256,
+            submission_zip_sha256: (!modern).then(|| receipt.submission_zip_sha256.clone()),
+            submission_sha256: modern.then_some(receipt.submission_zip_sha256),
+            signing_identity_sha1: receipt.signing_identity_sha1,
+            cdhash: receipt.cdhash,
+            package: receipt.package.map(|package| PackageClaims {
+                sha256: package.sha256,
+                installer_identity_sha1: package.installer_identity_sha1,
+                identifier: package.identifier,
+            }),
         }
     }
 }
@@ -347,7 +430,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, QueueError>
     raw::json(bytes).map_err(QueueError::Json)
 }
 
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, QueueError> {
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, QueueError> {
     regular(path, limit)?;
     let mut input = raw::open(path).map_err(|source| io_error("opening release input", source))?;
     let mut bytes = Vec::new();
@@ -446,6 +529,10 @@ fn archive_name(source: &Source, target: &str) -> String {
     format!("domyjob-{}-{target}.tar.gz", source.version())
 }
 
+fn package_name(source: &Source, target: &str) -> String {
+    format!("domyjob-{}-{target}.pkg", source.version())
+}
+
 fn receipt_name(target: &str) -> String {
     format!("{target}.json")
 }
@@ -455,6 +542,7 @@ fn receipt_name(target: &str) -> String {
 pub(crate) struct PendingManifest {
     source: Source,
     archives: Vec<ArchiveRecord>,
+    packages: Vec<ArchiveRecord>,
     notarizations: Vec<PendingNotarization>,
 }
 
@@ -465,6 +553,8 @@ struct ManifestInput {
     repository: String,
     source: Source,
     archives: Vec<ArchiveRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    packages: Vec<ArchiveRecord>,
     notarizations: Vec<PendingNotarization>,
 }
 
@@ -478,12 +568,50 @@ impl PendingManifest {
     }
 }
 
+impl ManifestInput {
+    fn validate_packages(&self) -> Result<(), QueueError> {
+        let modern = self.schema_version == 2;
+        require(
+            self.notarizations
+                .iter()
+                .all(|receipt| receipt.package().is_some() == modern),
+            "manifest cannot mix ZIP and package notarizations",
+        )?;
+        let targets: BTreeSet<_> = self
+            .packages
+            .iter()
+            .map(|package| package.target.as_str())
+            .collect();
+        require(
+            if modern {
+                self.packages.len() == MAC_TARGETS.len() && targets == BTreeSet::from(MAC_TARGETS)
+            } else {
+                self.packages.is_empty()
+            },
+            "manifest needs either no packages or exactly two Mac packages",
+        )?;
+        for package in &self.packages {
+            require(
+                package.archive == package_name(&self.source, &package.target)
+                    && self.notarizations.iter().any(|receipt| {
+                        receipt.target() == package.target
+                            && receipt
+                                .package()
+                                .is_some_and(|claim| claim.sha256() == package.sha256)
+                    }),
+                "manifest package name or submission digest mismatch",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl TryFrom<ManifestInput> for PendingManifest {
     type Error = QueueError;
 
     fn try_from(input: ManifestInput) -> Result<Self, Self::Error> {
         require(
-            input.schema_version == 1 && input.repository == REPOSITORY,
+            matches!(input.schema_version, 1 | 2) && input.repository == REPOSITORY,
             "unknown manifest schema or repository",
         )?;
         let targets: BTreeSet<_> = input
@@ -519,9 +647,11 @@ impl TryFrom<ManifestInput> for PendingManifest {
                 .all(|receipt| receipt.source() == &input.source),
             "manifest notarization source mismatch",
         )?;
+        input.validate_packages()?;
         Ok(Self {
             source: input.source,
             archives: input.archives,
+            packages: input.packages,
             notarizations: input.notarizations,
         })
     }
@@ -530,22 +660,42 @@ impl TryFrom<ManifestInput> for PendingManifest {
 impl From<PendingManifest> for ManifestInput {
     fn from(manifest: PendingManifest) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: if manifest.packages.is_empty() { 1 } else { 2 },
             repository: REPOSITORY.to_owned(),
             source: manifest.source,
             archives: manifest.archives,
+            packages: manifest.packages,
             notarizations: manifest.notarizations,
         }
     }
 }
 
-fn inventory(directory: &Path, expected: &BTreeMap<String, bool>) -> Result<(), QueueError> {
+fn directory(directory: &Path) -> Result<(), QueueError> {
     let metadata = raw::metadata(directory)
         .map_err(|source| io_error("inspecting handoff directory", source))?;
     require(
         metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
         "handoff directory must not be a symlink",
-    )?;
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InventoryKind {
+    directory: bool,
+    regular: bool,
+}
+
+impl InventoryKind {
+    const fn matches(self, expected: Option<&bool>) -> bool {
+        matches!(
+            (expected, self.directory, self.regular),
+            (Some(true), true, false) | (Some(false), false, true)
+        )
+    }
+}
+
+fn inventory(directory: &Path, expected: &BTreeMap<String, bool>) -> Result<(), QueueError> {
+    self::directory(directory)?;
     let mut observed = BTreeSet::new();
     for item in
         raw::read_dir(directory).map_err(|source| io_error("listing handoff files", source))?
@@ -559,13 +709,11 @@ fn inventory(directory: &Path, expected: &BTreeMap<String, bool>) -> Result<(), 
             .file_type()
             .map_err(|source| io_error("inspecting handoff entry", source))?;
         require(
-            expected.get(&name).is_some_and(|is_directory| {
-                if *is_directory {
-                    kind.is_dir() && !kind.is_symlink()
-                } else {
-                    kind.is_file() && !kind.is_symlink()
-                }
-            }),
+            InventoryKind {
+                directory: kind.is_dir(),
+                regular: kind.is_file(),
+            }
+            .matches(expected.get(&name)),
             "unexpected handoff file, alias, or link",
         )?;
         observed.insert(name);
@@ -576,17 +724,7 @@ fn inventory(directory: &Path, expected: &BTreeMap<String, bool>) -> Result<(), 
     )
 }
 
-fn handoff_inventory(directory: &Path, source: &Source, manifest: bool) -> Result<(), QueueError> {
-    let mut expected = BTreeMap::from([("notarization".to_owned(), true)]);
-    for target in TARGETS {
-        let archive = archive_name(source, target);
-        expected.insert(format!("{archive}.sha256"), false);
-        expected.insert(archive, false);
-    }
-    if manifest {
-        expected.insert(MANIFEST.to_owned(), false);
-    }
-    inventory(directory, &expected)?;
+fn notarization_inventory(directory: &Path) -> Result<(), QueueError> {
     inventory(
         &directory.join("notarization"),
         &MAC_TARGETS
@@ -596,12 +734,45 @@ fn handoff_inventory(directory: &Path, source: &Source, manifest: bool) -> Resul
     )
 }
 
+fn handoff_inventory(
+    directory: &Path,
+    source: &Source,
+    manifest: Option<&PendingManifest>,
+    packages: bool,
+) -> Result<(), QueueError> {
+    let mut expected = BTreeMap::from([("notarization".to_owned(), true)]);
+    for target in TARGETS {
+        let archive = archive_name(source, target);
+        expected.insert(format!("{archive}.sha256"), false);
+        expected.insert(archive, false);
+    }
+    if packages {
+        for target in MAC_TARGETS {
+            let package = package_name(source, target);
+            expected.insert(format!("{package}.sha256"), false);
+            expected.insert(package, false);
+        }
+    }
+    if manifest.is_some() {
+        expected.insert(MANIFEST.to_owned(), false);
+    }
+    inventory(directory, &expected)?;
+    notarization_inventory(directory)
+}
+
 fn inspect_archive(
     directory: &Path,
     source: &Source,
     target: &str,
 ) -> Result<ArchiveRecord, QueueError> {
-    let archive = archive_name(source, target);
+    inspect_record(directory, archive_name(source, target), target)
+}
+
+fn inspect_record(
+    directory: &Path,
+    archive: String,
+    target: &str,
+) -> Result<ArchiveRecord, QueueError> {
     let sha256 = sha256_file_bounded(&directory.join(&archive))?;
     let checksum = read_bounded(&directory.join(format!("{archive}.sha256")), 512)?;
     require(
@@ -619,11 +790,8 @@ pub(crate) fn create_handoff(
     directory: &Path,
     source: &Source,
 ) -> Result<PendingManifest, QueueError> {
-    handoff_inventory(directory, source, false)?;
-    let archives = TARGETS
-        .into_iter()
-        .map(|target| inspect_archive(directory, source, target))
-        .collect::<Result<Vec<_>, _>>()?;
+    self::directory(directory)?;
+    notarization_inventory(directory)?;
     let notarizations = MAC_TARGETS
         .into_iter()
         .map(|target| {
@@ -634,11 +802,34 @@ pub(crate) fn create_handoff(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let modern = notarizations
+        .iter()
+        .any(|receipt| receipt.package().is_some());
+    require(
+        notarizations
+            .iter()
+            .all(|receipt| receipt.package().is_some() == modern),
+        "handoff cannot mix ZIP and package notarizations",
+    )?;
+    handoff_inventory(directory, source, None, modern)?;
+    let archives = TARGETS
+        .into_iter()
+        .map(|target| inspect_archive(directory, source, target))
+        .collect::<Result<Vec<_>, _>>()?;
+    let packages = if modern {
+        MAC_TARGETS
+            .into_iter()
+            .map(|target| inspect_record(directory, package_name(source, target), target))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let manifest = PendingManifest::try_from(ManifestInput {
-        schema_version: 1,
+        schema_version: if modern { 2 } else { 1 },
         repository: REPOSITORY.to_owned(),
         source: source.clone(),
         archives,
+        packages,
         notarizations,
     })?;
     store_json(&directory.join(MANIFEST), &manifest)?;
@@ -650,12 +841,19 @@ pub(crate) struct Handoff {
     directory: PathBuf,
     manifest: PendingManifest,
     archives: Vec<(ArchiveRecord, PathBuf)>,
+    packages: Vec<(ArchiveRecord, PathBuf)>,
 }
 
 impl Handoff {
     pub(crate) fn inspect(directory: &Path, source: &Source) -> Result<Self, QueueError> {
-        handoff_inventory(directory, source, true)?;
+        self::directory(directory)?;
         let manifest = PendingManifest::load(&directory.join(MANIFEST))?;
+        handoff_inventory(
+            directory,
+            source,
+            Some(&manifest),
+            !manifest.packages.is_empty(),
+        )?;
         require(
             manifest.source() == source,
             "manifest source differs from the verified origin",
@@ -664,6 +862,12 @@ impl Handoff {
             require(
                 inspect_archive(directory, source, &archive.target)? == *archive,
                 "archive differs from the manifest",
+            )?;
+        }
+        for package in &manifest.packages {
+            require(
+                inspect_record(directory, package.archive.clone(), &package.target)? == *package,
+                "package differs from the manifest",
             )?;
         }
         for receipt in &manifest.notarizations {
@@ -681,10 +885,16 @@ impl Handoff {
             .iter()
             .map(|archive| (archive.clone(), directory.join(&archive.archive)))
             .collect();
+        let packages = manifest
+            .packages
+            .iter()
+            .map(|package| (package.clone(), directory.join(&package.archive)))
+            .collect();
         Ok(Self {
             directory: directory.to_path_buf(),
             manifest,
             archives,
+            packages,
         })
     }
 
@@ -695,13 +905,23 @@ impl Handoff {
         &self.directory
     }
     pub(crate) fn archives(&self) -> impl Iterator<Item = (&str, &Path, &str)> {
-        self.archives.iter().map(|(archive, path)| {
-            (
-                archive.archive.as_str(),
-                path.as_path(),
-                archive.sha256.as_str(),
-            )
-        })
+        self.archives
+            .iter()
+            .chain(&self.packages)
+            .map(|(archive, path)| {
+                (
+                    archive.archive.as_str(),
+                    path.as_path(),
+                    archive.sha256.as_str(),
+                )
+            })
+    }
+    pub(crate) fn package(&self, target: &str) -> Result<&Path, QueueError> {
+        self.packages
+            .iter()
+            .find(|(package, _)| package.target == target)
+            .map(|(_, path)| path.as_path())
+            .ok_or_else(|| invalid("unknown package target"))
     }
     pub(crate) fn archive(&self, target: &str) -> Result<&Path, QueueError> {
         self.archives
@@ -856,13 +1076,11 @@ fn extract_archive(path: &Path, source: &Source, target: &str) -> Result<Vec<u8>
         let name = entry_path(&entry.path_bytes())?;
         let kind = entry.header().entry_type();
         require(
-            expected.get(&name).is_some_and(|is_directory| {
-                if *is_directory {
-                    kind.is_dir() && !kind.is_symlink()
-                } else {
-                    kind.is_file() && !kind.is_symlink()
-                }
-            }),
+            InventoryKind {
+                directory: kind.is_dir(),
+                regular: kind.is_file(),
+            }
+            .matches(expected.get(&name)),
             "archive entry is unexpected, aliased, or linked",
         )?;
         require(
@@ -969,6 +1187,11 @@ pub(crate) fn handoff_fixture() -> (tempfile::TempDir, Handoff) {
 }
 
 #[cfg(test)]
+pub(crate) fn package_handoff_fixture() -> (tempfile::TempDir, Handoff) {
+    tests::build_package_handoff_fixture()
+}
+
+#[cfg(test)]
 mod tests {
     use std::path::Path;
 
@@ -977,10 +1200,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DEADLINE, ExtractedBundle, Handoff, MAC_TARGETS, NotaryState, PendingClaims,
+        DEADLINE, ExtractedBundle, Handoff, MAC_TARGETS, NotaryState, PackageClaims, PendingClaims,
         PendingManifest, PendingNotarization, QueueError, RESOURCES, Source, SourceClaims, TARGETS,
-        archive_name, create_handoff, decode, extract_archive, handoff_fixture, raw, receipt_name,
-        sha256_file_bounded,
+        archive_name, create_handoff, decode, extract_archive, handoff_fixture, package_name, raw,
+        receipt_name, sha256_file_bounded,
     };
 
     fn claims() -> SourceClaims {
@@ -1007,6 +1230,7 @@ mod tests {
             submission_zip_sha256: "b".repeat(64),
             signing_identity_sha1: "c".repeat(40),
             cdhash: "d".repeat(40),
+            package: None,
         })
         .unwrap()
     }
@@ -1128,11 +1352,163 @@ mod tests {
     }
 
     pub(super) fn build_handoff_fixture() -> (tempfile::TempDir, Handoff) {
-        let directory = fixture();
+        inspect_fixture(fixture())
+    }
+
+    fn inspect_fixture(directory: tempfile::TempDir) -> (tempfile::TempDir, Handoff) {
         let original = source();
         create_handoff(directory.path(), &original).unwrap();
         let handoff = Handoff::inspect(directory.path(), &original).unwrap();
         (directory, handoff)
+    }
+
+    fn package_fixture() -> tempfile::TempDir {
+        let directory = fixture();
+        let original = source();
+        for target in MAC_TARGETS {
+            let name = package_name(&original, target);
+            let path = directory.path().join(&name);
+            write(&path, b"signed installer fixture");
+            let digest = sha256_file_bounded(&path).unwrap();
+            write(
+                &directory.path().join(format!("{name}.sha256")),
+                format!("{digest}  {name}\n").as_bytes(),
+            );
+            let receipt_path = directory
+                .path()
+                .join("notarization")
+                .join(receipt_name(target));
+            let legacy = PendingNotarization::load(&receipt_path, &original, target).unwrap();
+            raw::remove_file(&receipt_path).unwrap();
+            PendingNotarization::new(PendingClaims {
+                source: original.clone(),
+                target: target.to_owned(),
+                submission_id: legacy.submission_id().to_owned(),
+                binary_sha256: legacy.binary_sha256().to_owned(),
+                submission_zip_sha256: digest.clone(),
+                signing_identity_sha1: legacy.signing_identity_sha1().to_owned(),
+                cdhash: legacy.cdhash().to_owned(),
+                package: Some(PackageClaims {
+                    sha256: digest,
+                    installer_identity_sha1: "e".repeat(40),
+                    identifier: crate::macos_package::IDENTIFIER.to_owned(),
+                }),
+            })
+            .unwrap()
+            .store(&receipt_path)
+            .unwrap();
+        }
+        directory
+    }
+
+    pub(super) fn build_package_handoff_fixture() -> (tempfile::TempDir, Handoff) {
+        inspect_fixture(package_fixture())
+    }
+
+    #[test]
+    fn package_handoff_binds_both_installers_and_preserves_tar_extraction() {
+        let (directory, handoff) = super::package_handoff_fixture();
+        assert_eq!(handoff.archives().count(), 7);
+        let manifest = serde_json::to_value(&handoff.manifest).unwrap();
+        assert_eq!(manifest.get("schemaVersion").unwrap(), 2);
+        assert_eq!(
+            manifest.get("packages").unwrap().as_array().unwrap().len(),
+            2
+        );
+        for target in MAC_TARGETS {
+            let receipt = handoff.receipt(target).unwrap();
+            let package = receipt.package().unwrap();
+            assert_eq!(
+                sha256_file_bounded(handoff.package(target).unwrap()).unwrap(),
+                package.sha256()
+            );
+            assert_eq!(package.installer_identity_sha1(), "e".repeat(40));
+            assert_eq!(package.identifier(), crate::macos_package::IDENTIFIER);
+            let wire = serde_json::to_value(receipt).unwrap();
+            assert_eq!(wire.get("schemaVersion").unwrap(), 2);
+            assert_eq!(wire.get("submissionSha256").unwrap(), package.sha256());
+            assert!(wire.get("submissionZipSha256").is_none());
+            assert_eq!(
+                decode::<PendingNotarization>(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+                *receipt
+            );
+        }
+        ExtractedBundle::extract(&handoff).unwrap().close().unwrap();
+        assert_eq!(directory.path(), handoff.dir());
+        assert_invalid(handoff.package("x86_64-pc-windows-msvc"));
+    }
+
+    #[test]
+    fn package_receipts_reject_ambiguous_schema_or_unbound_identity_and_digest() {
+        let (_directory, handoff) = super::package_handoff_fixture();
+        let receipt = handoff.receipt(MAC_TARGETS.first().unwrap()).unwrap();
+        for (field, replacement) in [
+            ("schemaVersion", json!(1)),
+            ("submissionZipSha256", json!("a".repeat(64))),
+            ("submissionSha256", json!("a".repeat(64))),
+            (
+                "package",
+                json!({"sha256": "a".repeat(64), "installerIdentitySha1": "e".repeat(40), "identifier": crate::macos_package::IDENTIFIER}),
+            ),
+            (
+                "package",
+                json!({"sha256": receipt.package().unwrap().sha256(), "installerIdentitySha1": receipt.signing_identity_sha1(), "identifier": crate::macos_package::IDENTIFIER}),
+            ),
+            (
+                "package",
+                json!({"sha256": receipt.package().unwrap().sha256(), "installerIdentitySha1": "e".repeat(40), "identifier": "foreign.package"}),
+            ),
+            ("package", json!(null)),
+        ] {
+            let mut wire = serde_json::to_value(receipt).unwrap();
+            wire.as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), replacement);
+            assert_invalid(decode::<PendingNotarization>(
+                &serde_json::to_vec(&wire).unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn package_handoff_rejects_partial_installers_mixed_receipts_and_manifest_tampering() {
+        let directory = package_fixture();
+        let original = source();
+        let first = MAC_TARGETS.first().unwrap();
+        let name = package_name(&original, first);
+        raw::remove_file(&directory.path().join(&name)).unwrap();
+        assert_invalid(create_handoff(directory.path(), &original));
+
+        let mixed_directory = package_fixture();
+        let receipt_path = mixed_directory
+            .path()
+            .join("notarization")
+            .join(receipt_name(first));
+        let binary_hash = PendingNotarization::load(&receipt_path, &original, first)
+            .unwrap()
+            .binary_sha256()
+            .to_owned();
+        raw::remove_file(&receipt_path).unwrap();
+        pending(&original, first, binary_hash)
+            .store(&receipt_path)
+            .unwrap();
+        assert_invalid(create_handoff(mixed_directory.path(), &original));
+
+        let (_directory, handoff) = super::package_handoff_fixture();
+        for (pointer, replacement) in [
+            ("/schemaVersion", json!(1)),
+            ("/packages/0/archive", json!("../foreign.pkg")),
+            ("/packages/0/sha256", json!("a".repeat(64))),
+            ("/packages", json!([])),
+        ] {
+            let mut wire = serde_json::to_value(&handoff.manifest).unwrap();
+            *wire.pointer_mut(pointer).unwrap() = replacement;
+            assert_invalid(decode::<PendingManifest>(
+                &serde_json::to_vec(&wire).unwrap(),
+            ));
+        }
+        write(handoff.package(first).unwrap(), b"tampered installer");
+        assert_invalid(Handoff::inspect(handoff.dir(), &original));
     }
 
     #[test]
@@ -1172,6 +1548,10 @@ mod tests {
         let receipt = pending(&source(), MAC_TARGETS.first().unwrap(), "a".repeat(64));
         let body = serde_json::to_vec(&receipt).unwrap();
         assert_eq!(decode::<PendingNotarization>(&body).unwrap(), receipt);
+        let wire = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(wire.get("schemaVersion").unwrap(), 1);
+        assert_eq!(wire.get("submissionZipSha256").unwrap(), &"b".repeat(64));
+        assert!(wire.get("submissionSha256").is_none() && wire.get("package").is_none());
         assert_eq!(
             receipt.submission_id(),
             "01234567-89ab-4cde-8fab-0123456789ab"
@@ -1295,6 +1675,9 @@ mod tests {
         let original = source();
         let manifest = PendingManifest::load(&directory.path().join("manifest.json")).unwrap();
         assert_eq!(manifest.source().version(), "1.2.3");
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire.get("schemaVersion").unwrap(), 1);
+        assert!(wire.get("packages").is_none());
         assert_eq!(handoff.source(), &original);
         assert_eq!(handoff.dir(), directory.path());
         assert_eq!(handoff.archives().count(), 5);
