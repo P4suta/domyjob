@@ -276,6 +276,26 @@ fn arguments(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+pub(crate) struct CodesignRequirement(String);
+
+impl CodesignRequirement {
+    fn inline(source: &str) -> Self {
+        Self(format!("-R={source}"))
+    }
+
+    pub(crate) fn leaf(fingerprint: &str) -> Self {
+        Self::inline(&format!("certificate leaf = H\"{fingerprint}\""))
+    }
+
+    pub(crate) fn notarized() -> Self {
+        Self::inline("notarized")
+    }
+
+    pub(crate) fn argument(&self) -> &str {
+        &self.0
+    }
+}
+
 fn validate_token(value: &str) -> Result<(), Failure> {
     if value.bytes().any(|byte| matches!(byte, 0 | b'\n' | b'\r')) {
         return Err(Failure::new(
@@ -1389,11 +1409,7 @@ fn verify_existing_binary<D: Driver>(
             "--verify",
             "--strict",
             "--verbose=2",
-            "-R",
-            &format!(
-                "certificate leaf = H\"{}\"",
-                receipt.signing_identity_sha1()
-            ),
+            CodesignRequirement::leaf(receipt.signing_identity_sha1()).argument(),
             path_text(binary)?,
         ]),
     )?;
@@ -1414,7 +1430,7 @@ fn verify_existing_binary<D: Driver>(
             "--verify",
             "--strict",
             "--verbose=2",
-            "-R=notarized",
+            CodesignRequirement::notarized().argument(),
             "--check-notarization",
             path_text(binary)?,
         ]),
@@ -2693,6 +2709,48 @@ mod tests {
         assert!(error.to_string().contains("native command exited"));
         assert!(!error.to_string().contains("private-diagnostic-marker"));
         assert!(!format!("{error:?}").contains("private-diagnostic-marker"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_inline_requirements_accept_the_signed_identifier_and_reject_another() {
+        let directory = super::raw::temporary_directory(&std::env::temp_dir()).unwrap();
+        let binary = directory.path().join("requirement-fixture");
+        let binary = binary.to_str().unwrap();
+        Native
+            .run(
+                "copy native requirement fixture",
+                "/bin/cp",
+                &arguments(&[std::env::current_exe().unwrap().to_str().unwrap(), binary]),
+            )
+            .unwrap();
+        Native
+            .run(
+                "sign native requirement fixture",
+                "/usr/bin/codesign",
+                &arguments(&[
+                    "--force",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    "io.github.domyjob.requirement-fixture",
+                    binary,
+                ]),
+            )
+            .unwrap();
+        for (source, accepted) in [
+            ("identifier \"io.github.domyjob.requirement-fixture\"", true),
+            ("identifier \"io.github.domyjob.different-fixture\"", false),
+        ] {
+            let requirement = super::CodesignRequirement::inline(source);
+            let result = Native.run(
+                "verify native requirement fixture",
+                "/usr/bin/codesign",
+                &arguments(&["--verify", "--strict", requirement.argument(), binary]),
+            );
+            assert_eq!(result.is_ok(), accepted);
+        }
+        directory.close().unwrap();
     }
 
     #[test]

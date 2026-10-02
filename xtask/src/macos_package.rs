@@ -831,11 +831,7 @@ fn verify_binary(
             "--verify",
             "--strict",
             "--verbose=2",
-            "-R",
-            &format!(
-                "certificate leaf = H\"{}\"",
-                receipt.signing_identity_sha1()
-            ),
+            crate::release::CodesignRequirement::leaf(receipt.signing_identity_sha1()).argument(),
             text(binary)?,
         ]),
     )?;
