@@ -5,7 +5,9 @@ on:
     workflows: [release]
     types: [completed]
   schedule:
-    - cron: "17 * * * *"
+    - cron: "7,12,22,27,37,42,52,57 * * * *"
+    - cron: "17,32,47 * * * *"
+    - cron: "2 * * * *"
   workflow_dispatch:
     inputs:
       run_id:
@@ -45,6 +47,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           QUEUE_RUN_ID: ${{ inputs.run_id || '' }}
           QUEUE_TRIGGER_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+          QUEUE_SCHEDULE: ${{ github.event.schedule || '' }}
         run: cargo xtask release queue discover
 
   finalize:

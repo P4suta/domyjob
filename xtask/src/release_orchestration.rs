@@ -589,6 +589,42 @@ struct Discovery<'a> {
     event: &'a str,
     requested: &'a str,
     trigger: &'a str,
+    schedule: &'a str,
+}
+
+const FAST_SCHEDULE: &str = "7,12,22,27,37,42,52,57 * * * *";
+const MEDIUM_SCHEDULE: &str = "17,32,47 * * * *";
+const HOURLY_SCHEDULE: &str = "2 * * * *";
+
+#[derive(Clone, Copy)]
+enum DiscoveryCadence {
+    Immediate,
+    Fast,
+    Medium,
+    Hourly,
+}
+
+impl DiscoveryCadence {
+    fn parse(event: &str, schedule: &str) -> Result<Self, OrchestrationError> {
+        match (event, schedule) {
+            ("schedule", FAST_SCHEDULE) => Ok(Self::Fast),
+            ("schedule", MEDIUM_SCHEDULE) => Ok(Self::Medium),
+            ("schedule", HOURLY_SCHEDULE) => Ok(Self::Hourly),
+            ("schedule", _) => Err(invalid("unknown release queue schedule")),
+            (_, "") => Ok(Self::Immediate),
+            _ => Err(invalid(
+                "a non-scheduled event cannot claim a queue schedule",
+            )),
+        }
+    }
+
+    const fn includes(self, age: u64) -> bool {
+        match self {
+            Self::Immediate | Self::Hourly => true,
+            Self::Fast => age < 3600,
+            Self::Medium => age < 21_600,
+        }
+    }
 }
 
 fn discover(
@@ -600,7 +636,9 @@ fn discover(
         event,
         requested,
         trigger,
+        schedule,
     } = input;
+    let cadence = DiscoveryCadence::parse(event, schedule)?;
     let workflow = workflow_id(github, "release.yml", BUILD_WORKFLOW)?;
     let finalizer = workflow_id(github, "release-finalize.yml", FINALIZE_WORKFLOW)?;
     let explicit = match event {
@@ -649,6 +687,12 @@ fn discover(
                 ));
             }
             expired.push(id);
+            continue;
+        }
+        let age = now
+            .checked_sub(timestamp(text(&run, "created_at")?)?)
+            .ok_or_else(|| invalid("queue origin lies in the future"))?;
+        if !cadence.includes(age) {
             continue;
         }
         pending.push(json!({"run_id":id.to_string(),"run_attempt":attempt.to_string(),"artifact_id":artifact.to_string()}));
@@ -1100,7 +1144,12 @@ fn finalize(root: &Path, github: &impl Github, now: u64) -> Result<(), Orchestra
         .receipt(crate::release_queue::MAC_TARGETS[0])?
         .package()
         .is_some();
-    let accepted = finish(crate::release::notary_status(&handoff)?, |token| {
+    let outcome = if environment("GITHUB_EVENT_NAME")? == "workflow_run" {
+        crate::release::notary_status_initial(&handoff)?
+    } else {
+        crate::release::notary_status(&handoff)?
+    };
+    let accepted = finish(outcome, |token| {
         if modern {
             prepare_ready(root, github, &verified, token)
         } else {
@@ -1604,6 +1653,7 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), OrchestrationError> {
                     event: &environment("GITHUB_EVENT_NAME")?,
                     requested: &environment("QUEUE_RUN_ID")?,
                     trigger: &environment("QUEUE_TRIGGER_RUN_ID")?,
+                    schedule: &environment("QUEUE_SCHEDULE")?,
                 },
                 unix_now()?,
             )?;
@@ -1873,6 +1923,134 @@ mod tests {
         original_run(&tagged, 11).unwrap();
     }
 
+    fn scheduled_discovery(
+        github: &FakeGithub,
+        schedule: &str,
+        now: u64,
+    ) -> Result<Value, OrchestrationError> {
+        discover(
+            github,
+            Discovery {
+                event: "schedule",
+                requested: "",
+                trigger: "",
+                schedule,
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn discovery_cadence_preserves_age_boundaries_and_expiry() {
+        let github = fake();
+        let created = timestamp("2026-10-01T00:00:00Z").unwrap();
+        for (schedule, age, included) in [
+            (super::FAST_SCHEDULE, 3599, true),
+            (super::FAST_SCHEDULE, 3600, false),
+            (super::MEDIUM_SCHEDULE, 3600, true),
+            (super::MEDIUM_SCHEDULE, 21_599, true),
+            (super::MEDIUM_SCHEDULE, 21_600, false),
+            (super::HOURLY_SCHEDULE, 21_600, true),
+            (super::HOURLY_SCHEDULE, 604_799, true),
+            (super::HOURLY_SCHEDULE, 604_800, false),
+            (super::FAST_SCHEDULE, 604_800, false),
+        ] {
+            let plan = scheduled_discovery(&github, schedule, created + age).unwrap();
+            assert_eq!(list(&plan, "include").unwrap().len(), usize::from(included));
+            assert_eq!(
+                list(&plan, "expiredRunIds").unwrap().len(),
+                usize::from(age == 604_800)
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_uses_the_triggering_schedule_instead_of_the_execution_minute() {
+        let github = fake();
+        let created = timestamp("2026-10-01T00:00:00Z").unwrap();
+        for (schedule, age) in [
+            (super::FAST_SCHEDULE, 17 * 60),
+            (super::MEDIUM_SCHEDULE, 4 * 3600 + 43 * 60),
+            (super::HOURLY_SCHEDULE, 8 * 3600 + 28 * 60),
+        ] {
+            let plan = scheduled_discovery(&github, schedule, created + age).unwrap();
+            assert_eq!(list(&plan, "include").unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_ambiguous_schedules_and_future_origins() {
+        let github = fake();
+        let created = timestamp("2026-10-01T00:00:00Z").unwrap();
+        for (event, schedule, now) in [
+            ("schedule", "", created),
+            ("schedule", "17 * * * *", created),
+            ("workflow_dispatch", super::FAST_SCHEDULE, created),
+            ("workflow_run", super::MEDIUM_SCHEDULE, created),
+            ("schedule", super::HOURLY_SCHEDULE, created - 1),
+        ] {
+            discover(
+                &github,
+                Discovery {
+                    event,
+                    requested: "",
+                    trigger: if event == "workflow_run" { "42" } else { "" },
+                    schedule,
+                },
+                now,
+            )
+            .unwrap_err();
+        }
+    }
+
+    #[test]
+    fn immediate_discovery_bypasses_cadence_but_keeps_the_deadline() {
+        let github = fake();
+        let created = timestamp("2026-10-01T00:00:00Z").unwrap();
+        for (event, requested, trigger) in [
+            ("workflow_dispatch", "42", ""),
+            ("workflow_dispatch", "", ""),
+            ("workflow_run", "", "42"),
+        ] {
+            let input = Discovery {
+                event,
+                requested,
+                trigger,
+                schedule: "",
+            };
+            let plan = discover(&github, input, created + 21_600).unwrap();
+            assert_eq!(list(&plan, "include").unwrap().len(), 1);
+            if event == "workflow_dispatch" && requested == "42" {
+                discover(&github, input, created + 604_800).unwrap_err();
+            } else {
+                let expired = discover(&github, input, created + 604_800).unwrap();
+                assert_eq!(list(&expired, "include").unwrap(), Vec::<Value>::new());
+                assert_eq!(list(&expired, "expiredRunIds").unwrap(), [json!(42)]);
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_discovery_stops_only_for_its_trusted_completed_attempt() {
+        let mut github = fake();
+        let mut marker = run();
+        for (name, value) in [
+            ("id", json!(99)),
+            ("workflow_id", json!(12)),
+            ("path", json!(FINALIZE_WORKFLOW)),
+            ("event", json!("schedule")),
+        ] {
+            set(&mut marker, name, value);
+        }
+        github.set("actions/runs/99", marker);
+        let created = timestamp("2026-10-01T00:00:00Z").unwrap();
+        for (name, included) in [("dist-verified-42-2", false), ("dist-verified-42-1", true)] {
+            github.set("actions/artifacts?name=dist-verified-42-2&per_page=100", json!({"total_count":1,"artifacts":[{"name":name,"expired":false,"workflow_run":{"id":99}}]}));
+            let plan = scheduled_discovery(&github, super::FAST_SCHEDULE, created + 300).unwrap();
+            assert_eq!(list(&plan, "include").unwrap().len(), usize::from(included));
+        }
+    }
+
     #[test]
     fn discovery_is_bounded_and_expiry_is_visible_without_resubmission() {
         let github = fake();
@@ -1881,6 +2059,7 @@ mod tests {
             &github,
             Discovery {
                 event: "schedule",
+                schedule: super::HOURLY_SCHEDULE,
                 requested: "",
                 trigger: "",
             },
@@ -1895,6 +2074,7 @@ mod tests {
             &github,
             Discovery {
                 event: "schedule",
+                schedule: super::HOURLY_SCHEDULE,
                 requested: "",
                 trigger: "",
             },
@@ -1907,6 +2087,7 @@ mod tests {
             &github,
             Discovery {
                 event: "workflow_dispatch",
+                schedule: "",
                 requested: "42",
                 trigger: "",
             },
@@ -1917,6 +2098,7 @@ mod tests {
             &github,
             Discovery {
                 event: "pull_request",
+                schedule: "",
                 requested: "42",
                 trigger: "",
             },
@@ -1927,6 +2109,7 @@ mod tests {
             &github,
             Discovery {
                 event: "schedule",
+                schedule: super::HOURLY_SCHEDULE,
                 requested: "42",
                 trigger: "",
             },
