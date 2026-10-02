@@ -475,7 +475,7 @@ fn classify(paths: &[String]) -> Plan {
 
 fn git(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, CiError> {
     let output = capture(
-        command("git")
+        crate::git_command()
             .current_dir(root)
             .args(["-c", "core.fsmonitor=false"])
             .args(arguments),
