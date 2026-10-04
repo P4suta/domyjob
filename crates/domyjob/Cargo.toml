@@ -25,7 +25,7 @@ blake3 = { workspace = true, features = ["std", "mmap"] }
 cap-std.workspace = true
 clap.workspace = true
 data-encoding.workspace = true
-domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
+domyjob-core = { version = "0.0.1", path = "../domyjob-core" }
 getrandom.workspace = true
 ignore.workspace = true
 notify.workspace = true
@@ -46,7 +46,7 @@ windows-sys.workspace = true
 
 [build-dependencies]
 blake3.workspace = true
-domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
+domyjob-core = { version = "0.0.1", path = "../domyjob-core" }
 tar.workspace = true
 thiserror.workspace = true
 winresource = { version = "0.1", default-features = false }

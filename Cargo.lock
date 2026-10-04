@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "domyjob"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "cap-std",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "domyjob-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "serde",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "blake3",
  "crc32fast",

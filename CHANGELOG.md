@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/P4suta/domyjob/compare/v0.0.0...v0.0.1) - 2026-10-04
+
+### Fixed
+
+- *(resources)* enforce bounded Linux job admission ([#37](https://github.com/P4suta/domyjob/pull/37))
+
 ## [0.0.0](https://github.com/P4suta/domyjob/releases/tag/v0.0.0) - 2026-10-02
 
 ### Added
