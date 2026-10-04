@@ -644,6 +644,7 @@ fn observe(reference: &JobReference, observation: Observation) -> Result<JobStat
 fn print_state(reference: &JobReference, state: &JobState, output: &Output) -> std::io::Result<()> {
     let phase = match state.kind() {
         PhaseKind::Accepted => "accepted",
+        PhaseKind::Queued => "queued",
         PhaseKind::Starting => "starting",
         PhaseKind::Running => "running",
         PhaseKind::Finished => "finished",
@@ -657,6 +658,7 @@ fn print_state(reference: &JobReference, state: &JobState, output: &Output) -> s
         }
         Some(Outcome::Lost) => " lost".to_owned(),
         Some(Outcome::Killed) => " killed".to_owned(),
+        Some(Outcome::MemoryLimitExceeded) => " memory limit exceeded".to_owned(),
     };
     output.line(format_args!(
         "{}:{} {phase}{result}",
@@ -680,9 +682,12 @@ pub(crate) fn wait(reference: &JobReference, output: &Output) -> Result<ExitCode
             Ok(0) | Err(_) => Ok(ExitCode::FAILURE),
             Ok(code) => Ok(ExitCode::from(code)),
         },
-        Some(Outcome::LaunchFailed { .. } | Outcome::Lost | Outcome::Killed) => {
-            Ok(ExitCode::FAILURE)
-        }
+        Some(
+            Outcome::LaunchFailed { .. }
+            | Outcome::Lost
+            | Outcome::Killed
+            | Outcome::MemoryLimitExceeded,
+        ) => Ok(ExitCode::FAILURE),
         None => Err(TransportError::UnexpectedReply),
     }
 }
@@ -696,7 +701,8 @@ pub(crate) fn kill(reference: &JobReference, output: &Output) -> Result<ExitCode
             Outcome::Succeeded
             | Outcome::Failed { .. }
             | Outcome::LaunchFailed { .. }
-            | Outcome::Lost,
+            | Outcome::Lost
+            | Outcome::MemoryLimitExceeded,
         ) => Ok(ExitCode::FAILURE),
         None => Err(TransportError::UnexpectedReply),
     }

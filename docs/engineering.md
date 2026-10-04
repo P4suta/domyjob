@@ -21,6 +21,7 @@ When a new class of bug appears, the fix adds a rule to this list, not only a pa
 | Removing what a job or another build left never stops new work: the tree leaves its place in one rename and is then removed as far as it can be | A file this user cannot delete, such as one a container wrote as root, stopping every later job | `state_io::set_aside` and `state_io::empty`, the only ways to remove a tree; the store's test |
 | A `StagedFile` synchronizes and closes its writer before replacing the destination with standard rename | A doorbell or state write refused while a watcher reads it; inconsistent replacement sequences between state, configuration, and executable installation | Private owned staging type; Clippy and non-suppressible ownership checks; live-reader and failure-cleanup contracts |
 | Every file lock is acquired and released through an owning `OsLock` guard | A lock remaining held through a duplicated descriptor after the original file closes | Private guard without cloning or raw access; consuming release and explicit unlock in Drop; resolved File lock bans and ownership checks; duplicate-descriptor contracts |
+| A required Linux resource policy grants an owned permit before job launch and verifies effective aggregate limits | Separate clients or builds launching unrestricted workloads and exhausting the management host | Private `AdmissionPermit`, policy validation, OS lock contracts, source-bound Kani proofs, and native cgroup contracts |
 | Windows workflows use kind, access, and ownership capabilities; job configuration, assignment, watch setup, and resumption follow typed transitions | A valid handle used with the wrong rights; borrowed security data outliving its allocation; skipped SDK setup | Checked private kernel and descriptor leaves; shared native contracts; seven required compiler rejection categories with a passing control |
 | A stop or kill treats "already gone" as success | A finished process reported as a failure | Tests for each such case |
 | The chat protocol is safe and converges in every interleaving of an ask | Arrival-order bugs between machines | The exhaustive state search in `domyjob-core` |
@@ -59,6 +60,7 @@ The gate rejects default construction, raw resource returns, and cloning of owne
 | User configuration files, permissions, raw file options | `platform` |
 | Time | `platform::clock` |
 | Child processes, readiness signals | `process` |
+| Admission retries and Linux workload scopes | `process::resources` |
 | Windows kernel capabilities and SDK results | `process::windows::kernel` |
 | Windows security allocations and borrowed ACL/SID data | `platform::windows_acl::descriptor` |
 | Standard output | `output` |
@@ -90,6 +92,9 @@ The wire protocol has no format of its own, because a client only ever talks to 
   A diagnostic contributes at most one primary location, and the two lifetime sites must fail independently.
   Captured Cargo JSON, compiler diagnostics, and source digests are written under the active Cargo target directory's `windows-contracts` directory.
 - `mise run test` runs unit tests, the format specimens, the exhaustive chat state search, and every end-to-end scenario on one host, each test in its own process.
+- `mise run resource-proofs` verifies production resource bounds and state transitions with pinned Kani, requires the expected harnesses and covers, and rejects a false assertion as a negative control.
+- `mise run resource-contracts` requires a native Linux user systemd manager and checks small isolated scopes for OOM outcomes and complete cancellation cleanup.
+  [The host resource decision](adr/0002-bound-linux-jobs-at-the-host.md) records the exact proof scope and external trust boundaries.
 - `mise run fuzz:check` compiles every target in the separate fuzz workspace against the current core API, so type migrations cannot leave a fuzzer unchecked until CI.
 - `mise run fuzz` explores ingress, job state, and chat ledger histories beyond the exhaustive scenario.
 - `mise run mutants` measures changes to the core and xtask, including the repository's policy gates.

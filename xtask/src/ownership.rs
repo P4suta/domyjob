@@ -13,6 +13,7 @@ const RELEASE_ORCHESTRATION: &str = "xtask/src/release_orchestration.rs";
 const MACOS_PACKAGE: &str = "xtask/src/macos_package.rs";
 const RELEASE_READY: &str = "xtask/src/release_ready.rs";
 const DEPENDENCIES: &str = "xtask/src/dependencies.rs";
+const RESOURCES: &str = "crates/domyjob/src/process/resources.rs";
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -36,6 +37,7 @@ const CAPABILITIES: &[&str] = &[
     "Ace",
     "StagedFile",
     "OsLock",
+    "AdmissionPermit",
     "Secret",
     "PrivateFiles",
     "SigningKeychain",
@@ -89,6 +91,7 @@ fn capability_owner(owner: &str) -> bool {
             | MACOS_PACKAGE
             | RELEASE_READY
             | DEPENDENCIES
+            | RESOURCES
     )
 }
 
@@ -130,6 +133,7 @@ const RAW_OWNERS: &[&str] = &[
     "crates/domyjob/src/platform.rs",
     "crates/domyjob/src/platform/clock.rs",
     "crates/domyjob/src/process.rs",
+    RESOURCES,
     "crates/domyjob/src/state_io.rs",
     "crates/domyjob/src/testing.rs",
     "crates/domyjob/src/workspace.rs",
@@ -273,6 +277,9 @@ impl Ownership<'_> {
             }
             name if self.raw && file_lock(name) && self.owner != LOCK => {
                 Some("file lock operations are owned by OsLock")
+            }
+            "spawn_io" | "spawn_stdio" if self.owner == "crates/domyjob/src/app.rs" => {
+                Some("job launch requires an admitted Launch and spawn_job_stdio")
             }
             "rename"
                 if self.raw
@@ -586,13 +593,41 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 mod tests {
     use super::{
         CI, DEPENDENCIES, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MACOS_PACKAGE, MAIN, RELEASE,
-        RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, check,
+        RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, RESOURCES, check,
     };
 
     fn rejected(owner: &str, source: &str) {
         assert!(
             !check(owner, &syn::parse_file(source).unwrap()).is_empty(),
             "{source}"
+        );
+    }
+
+    #[test]
+    fn admission_cannot_be_cloned_exposed_or_bypassed_at_job_launch() {
+        for source in [
+            "struct AdmissionPermit { pub slot: OsLock }",
+            "#[derive(Clone)] struct AdmissionPermit(OsLock);",
+            "impl Default for AdmissionPermit { fn default() -> Self { todo!() } }",
+        ] {
+            rejected(RESOURCES, source);
+        }
+        for name in ["spawn_io", "spawn_stdio"] {
+            rejected(
+                "crates/domyjob/src/app.rs",
+                &format!("fn launch() {{ Group::{name}(command, output, errors); }}"),
+            );
+        }
+        assert_eq!(
+            check(
+                "crates/domyjob/src/app.rs",
+                &syn::parse_file(
+                    "fn launch() { Group::spawn_job_stdio(admitted, output, errors); }"
+                )
+                .unwrap()
+            )
+            .len(),
+            0
         );
     }
 

@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::identity;
 use crate::platform;
+use crate::process::resources::{self, AdmissionPermit, Launch, Limits};
 use crate::process::{self, Group, ProcessError, ReadyToken, Stop as _};
 use crate::state_io as state_file;
 use crate::store::{ReceivedArchive, Store, StoreError};
@@ -85,7 +86,42 @@ impl CancellationWatch {
     }
 
     fn wait(self, store: &Store, job: &JobId, group: &Group) -> Result<Event, AppError> {
-        self.wait_using((store, job), || group.wait(), || group.kill())
+        let event = self.wait_using((store, job), || group.wait(), || group.kill())?;
+        Ok(group.completion(event)?)
+    }
+
+    fn admit(
+        &self,
+        store: &Store,
+        job: &JobId,
+        limits: &Limits,
+    ) -> Result<Option<AdmissionPermit>, AppError> {
+        self.admit_using(store, job, || limits.try_admit())
+    }
+
+    fn admit_using(
+        &self,
+        store: &Store,
+        job: &JobId,
+        mut acquire: impl FnMut() -> std::io::Result<Option<AdmissionPermit>>,
+    ) -> Result<Option<AdmissionPermit>, AppError> {
+        loop {
+            if store.cancel_requested(job)? {
+                return Ok(None);
+            }
+            if let Some(permit) = acquire()? {
+                return Ok(Some(permit));
+            }
+            match resources::wait_for_capacity(&self.receiver) {
+                Ok(Wake::Changed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(Wake::Broken(message)) => {
+                    return Err(std::io::Error::other(message).into());
+                }
+                Ok(Wake::Finished) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::other("admission watcher disconnected").into());
+                }
+            }
+        }
     }
 
     fn wait_using(
@@ -207,7 +243,7 @@ fn finish_logged(
 }
 
 fn spawn_logged(
-    process: Process,
+    process: Launch,
     log: File,
     limit: u64,
 ) -> Result<(Group, Relay, process::OutputStop), ProcessError> {
@@ -220,7 +256,7 @@ fn spawn_logged(
 }
 
 fn spawn_logged_using(
-    (process, log): (Process, File),
+    (process, log): (Launch, File),
     limit: u64,
     pipe: impl FnOnce() -> std::io::Result<(
         process::OutputReader,
@@ -235,7 +271,7 @@ fn spawn_logged_using(
     };
     let (reader, writer, stop) = pipe().map_err(piping)?;
     let errors = clone(&writer).map_err(piping)?;
-    let group = Group::spawn_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
+    let group = Group::spawn_job_stdio(process, Stdio::from(writer), Stdio::from(errors))?;
     Ok((
         group,
         std::thread::spawn(move || relay_output(reader, log, limit)),
@@ -359,7 +395,7 @@ fn kill_using(
     let state = store.status(job)?;
     let stopped = match state.kind() {
         PhaseKind::Accepted => transition(store, job, &Event::Killed)?,
-        PhaseKind::Starting | PhaseKind::Running => {
+        PhaseKind::Queued | PhaseKind::Starting | PhaseKind::Running => {
             cancel(store, job)?;
             wait(store, job)?
         }
@@ -375,13 +411,16 @@ fn run_worker_using(
         Option<&ReadyToken>,
         impl FnOnce(Option<&ReadyToken>) -> Result<(), ProcessError>,
     ),
-    start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+    (start_watch, load_limits): (
+        impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+        impl FnOnce() -> std::io::Result<Limits>,
+    ),
 ) -> Result<(), AppError> {
     run_worker_at_using(
         (store, job),
         (ready_event, announce),
         start_watch,
-        platform::home,
+        (platform::home, load_limits),
     )
 }
 
@@ -392,7 +431,10 @@ fn run_worker_at_using(
         impl FnOnce(Option<&ReadyToken>) -> Result<(), ProcessError>,
     ),
     start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
-    home: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+    (home, load_limits): (
+        impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+        impl FnOnce() -> std::io::Result<Limits>,
+    ),
 ) -> Result<(), AppError> {
     let Some(_alive) = store.worker_lock(job)? else {
         return Ok(());
@@ -407,17 +449,31 @@ fn run_worker_at_using(
         )));
     };
     let cancellation = start_watch(store, job)?;
-    store.transition(job, &Event::Starting)?;
+    let limits = load_limits()?;
+    let initial = if limits.required() {
+        Event::Queued
+    } else {
+        Event::Starting
+    };
+    store.transition(job, &initial)?;
     announce(ready_event)?;
-    if store.cancel_requested(job)? {
+    let Some(permit) = cancellation.admit(store, job, &limits)? else {
         store.transition(job, &Event::Killed)?;
         return Ok(());
+    };
+    if limits.required() {
+        store.transition(job, &Event::Starting)?;
     }
     let directory = match input {
         Input::Home => home()?,
         Input::Snapshot(_) => store.workspace(job)?,
     };
     let process = job_command(&command, &directory);
+    let process = limits.prepare(permit, job, process)?;
+    if store.cancel_requested(job)? {
+        store.transition(job, &Event::Killed)?;
+        return Ok(());
+    }
     let log = state_file::open_append(&store.log_path(job)).map_err(StoreError::from)?;
     run_logged_using(
         (store, job),
@@ -428,9 +484,9 @@ fn run_worker_at_using(
 
 fn run_logged_using(
     (store, job): (&Store, &JobId),
-    (process, log, cancellation): (Process, File, CancellationWatch),
+    (process, log, cancellation): (Launch, File, CancellationWatch),
     (spawn, finish): (
-        impl FnOnce(Process, File, u64) -> Result<(Group, Relay, process::OutputStop), ProcessError>,
+        impl FnOnce(Launch, File, u64) -> Result<(Group, Relay, process::OutputStop), ProcessError>,
         impl FnOnce(
             (&Store, &JobId),
             &Event,
@@ -455,18 +511,31 @@ fn run_logged_using(
 }
 
 pub(crate) fn worker(job: &JobId, event: Option<&ReadyToken>) -> Result<(), AppError> {
-    worker_using(job, event, Store::open, CancellationWatch::start)
+    worker_using(
+        job,
+        event,
+        Store::open,
+        (CancellationWatch::start, Limits::load),
+    )
 }
 
 fn worker_using(
     job: &JobId,
     event: Option<&ReadyToken>,
     open_store: impl Fn() -> Result<Store, StoreError>,
-    start_watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+    (start_watch, load_limits): (
+        impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+        impl FnOnce() -> std::io::Result<Limits>,
+    ),
 ) -> Result<(), AppError> {
     let result = (|| {
         let store = open_store()?;
-        run_worker_using(&store, job, (event, process::announce_ready), start_watch)
+        run_worker_using(
+            &store,
+            job,
+            (event, process::announce_ready),
+            (start_watch, load_limits),
+        )
     })();
     if let Err(error) = &result
         && let Ok(store) = open_store()
@@ -496,15 +565,99 @@ mod tests {
 
     use super::{
         AppError, CancellationWatch, Wake, chat_using, finish_logged, handle_using, kill_using,
-        relay_output, run_logged_using, run_worker_at_using, run_worker_using, spawn_logged,
-        spawn_logged_using, start_worker_using, worker_using,
+        relay_output, run_logged_using, run_worker_at_using, spawn_logged, spawn_logged_using,
+        start_worker_using,
     };
+    use crate::process::resources::{Launch, Limits};
     use crate::process::{self, ProcessError, Stop as _};
     use crate::state_io as state_file;
     use crate::store::{Store, StoreError};
     use crate::watch_event;
 
     const MARKER: &str = "[domyjob: 3 bytes of output were discarded after the 256 MiB limit]\n";
+
+    fn unlimited_limits() -> Limits {
+        Limits::fixture(None, std::path::PathBuf::new())
+    }
+
+    fn run_worker_using(
+        store: &Store,
+        job: &JobId,
+        ready: (
+            Option<&process::ReadyToken>,
+            impl FnOnce(Option<&process::ReadyToken>) -> Result<(), ProcessError>,
+        ),
+        watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+    ) -> Result<(), AppError> {
+        super::run_worker_using(store, job, ready, (watch, || Ok(unlimited_limits())))
+    }
+
+    fn worker_using(
+        job: &JobId,
+        event: Option<&process::ReadyToken>,
+        open: impl Fn() -> Result<Store, StoreError>,
+        watch: impl FnOnce(&Store, &JobId) -> Result<CancellationWatch, AppError>,
+    ) -> Result<(), AppError> {
+        super::worker_using(job, event, open, (watch, || Ok(unlimited_limits())))
+    }
+
+    #[test]
+    fn a_queued_job_announces_readiness_and_can_be_cancelled_without_launching() {
+        let (temporary, store, job) = accepted_job();
+        let policy = domyjob_core::ingress::foreign_json(
+            r#"{"version":1,"max_concurrent_jobs":2,"slice":"domyjob.slice","memory_high_bytes":67108864,"memory_max_bytes":100663296,"memory_swap_max_bytes":0}"#,
+        ).unwrap();
+        run_worker_at_using(
+            (&store, &job),
+            (None, |_event| {
+                assert_eq!(store.status(&job).unwrap().kind(), PhaseKind::Queued);
+                store.request_cancel(&job).unwrap();
+                Ok(())
+            }),
+            controlled_watcher,
+            (
+                || panic!("a cancelled queued job cannot prepare its command"),
+                || {
+                    Ok(Limits::fixture(
+                        Some(policy),
+                        temporary.path().join("admission"),
+                    ))
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.status(&job).unwrap().outcome(),
+            Some(&Outcome::Killed)
+        );
+    }
+
+    #[test]
+    fn admission_wakes_for_cancellation_and_preserves_watcher_errors() {
+        for broken in [true, false] {
+            let (_temporary, store, job) = accepted_job();
+            let watcher = controlled_watcher(&store, &job).unwrap();
+            let result = watcher.admit_using(&store, &job, || {
+                if broken {
+                    watcher
+                        .sender
+                        .send(Wake::Broken("watch failed".to_owned()))
+                        .unwrap();
+                } else {
+                    store.request_cancel(&job).unwrap();
+                    watcher.sender.send(Wake::Changed).unwrap();
+                }
+                Ok(None)
+            });
+            if broken {
+                assert!(
+                    matches!(result, Err(AppError::Io(ref error)) if error.to_string() == "watch failed")
+                );
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+    }
 
     fn accepted_job() -> (tempfile::TempDir, Store, JobId) {
         accepted_job_using(|temporary| {
@@ -847,7 +1000,7 @@ mod tests {
                 .expect("job log");
             let refused = || std::io::Error::other("pipe refused");
             let result = spawn_logged_using(
-                (process::stdout_then_stderr(), log),
+                (Launch::fixture(process::stdout_then_stderr()), log),
                 4,
                 || {
                     if creating {
@@ -871,7 +1024,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary job directory");
         let log = state_file::open_append(&temporary.path().join("job").join("output.log"))
             .expect("job log");
-        let result = spawn_logged(process::command(""), log, 4);
+        let result = spawn_logged(Launch::fixture(process::command("")), log, 4);
         assert!(matches!(result, Err(ProcessError::Spawn { .. })));
     }
 
@@ -1469,11 +1622,14 @@ mod tests {
             (&store, &job),
             (None, |_event| Ok(())),
             controlled_watcher,
-            || {
-                Err(std::io::Error::other(
-                    "the user home directory is unavailable",
-                ))
-            },
+            (
+                || {
+                    Err(std::io::Error::other(
+                        "the user home directory is unavailable",
+                    ))
+                },
+                || Ok(unlimited_limits()),
+            ),
         );
         assert!(matches!(result, Err(AppError::Io(ref cause))
             if cause.to_string() == "the user home directory is unavailable"));
@@ -1511,7 +1667,10 @@ mod tests {
             (&store, &job),
             (None, |_event| Ok(())),
             controlled_watcher,
-            || panic!("snapshot jobs do not use the user's home"),
+            (
+                || panic!("snapshot jobs do not use the user's home"),
+                || Ok(unlimited_limits()),
+            ),
         );
         assert!(matches!(result, Err(AppError::Store(StoreError::Corrupt))));
         assert_eq!(store.log_tail(&job).expect("job log").0.for_terminal(), "");
@@ -1520,13 +1679,13 @@ mod tests {
     fn running_log_fixture(
         store: &Store,
         job: &JobId,
-    ) -> (std::process::Command, std::fs::File, CancellationWatch) {
+    ) -> (Launch, std::fs::File, CancellationWatch) {
         store
             .transition(job, &Event::Starting)
             .expect("starting job");
         let log = state_file::open_append(&store.log_path(job)).expect("job log");
         (
-            process::stdout_then_stderr(),
+            Launch::fixture(process::stdout_then_stderr()),
             log,
             controlled_watcher(store, job).expect("watcher"),
         )
@@ -1592,7 +1751,8 @@ mod tests {
         let path = root.path().join("job").join("output.log");
         let log = state_file::open_append(&path).expect("job log");
         let (_group, relay, _stop) =
-            spawn_logged(process::stdout_then_stderr(), log, 4).expect("started job");
+            spawn_logged(Launch::fixture(process::stdout_then_stderr()), log, 4)
+                .expect("started job");
         let relayed = relay.join().expect("relay thread").expect("relayed output");
         assert_eq!(relayed, counts);
         assert_eq!(crate::testing::read(&path).into_bytes(), expected);

@@ -47,6 +47,11 @@ pub mod domain;
 pub mod ingress;
 pub mod jsonc;
 pub mod mcp_clients;
+pub mod resource_budget;
+pub mod resource_policy;
+
+#[cfg(kani)]
+mod resource_proofs;
 pub mod service;
 pub mod state;
 pub mod wire;

@@ -54,6 +54,7 @@ pub mod release;
 pub mod release_orchestration;
 pub mod release_queue;
 mod release_ready;
+pub mod resource_proofs;
 pub mod windows_contracts;
 pub mod workflows;
 
@@ -163,7 +164,7 @@ impl<'ast> Visit<'ast> for SourcePolicy {
             ));
         }
         let platform_branch = attribute.path().is_ident("cfg")
-            && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string() != "test")
+            && matches!(&attribute.meta, syn::Meta::List(list) if !matches!(list.tokens.to_string().as_str(), "test" | "kani"))
             || attribute.path().is_ident("cfg_attr");
         if platform_branch && !self.effect_module {
             self.findings.push(format!(
