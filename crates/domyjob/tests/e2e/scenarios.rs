@@ -8,7 +8,7 @@ use crate::world::{
 };
 use crate::{Failure, Scenario};
 
-pub(crate) const ALL: [Scenario; 12] = [
+pub(crate) const ALL: [Scenario; 13] = [
     Scenario {
         name: "fake_ssh_stands_in_for_openssh",
         machines: &["alpha", "beta"],
@@ -68,6 +68,11 @@ pub(crate) const ALL: [Scenario; 12] = [
         name: "jobs_run_through_the_node_wrapper",
         machines: &["alpha", "beta"],
         run: jobs_run_through_the_node_wrapper,
+    },
+    Scenario {
+        name: "resource_probe_recognizes_its_parent_scope",
+        machines: &[],
+        run: resource_probe_recognizes_its_parent_scope,
     },
 ];
 
@@ -968,6 +973,60 @@ fn jobs_run_through_the_node_wrapper(world: &World) -> Result<(), Failure> {
     linux_host_admission(world, &alpha)
 }
 
+fn resource_parent_scope(cgroups: &str) -> Option<domyjob_core::domain::JobId> {
+    cgroups.lines().find_map(|line| {
+        let (_, scope) = line.strip_prefix("0::")?.rsplit_once("/domyjob.slice/")?;
+        let id = scope.strip_prefix("domyjob-job-")?.strip_suffix(".scope")?;
+        domyjob_core::domain::JobId::try_from(id.to_owned()).ok()
+    })
+}
+
+fn resource_probe_recognizes_its_parent_scope(_world: &World) -> Result<(), Failure> {
+    let scope = "domyjob-job-00000000000000000000000000000001.scope";
+    for (membership, expected) in [
+        (format!("0::/user.slice/domyjob.slice/{scope}\n"), true),
+        (
+            format!("1:memory:/user.slice/domyjob.slice/{scope}\n"),
+            false,
+        ),
+        (format!("0::/user.slice/other.slice/{scope}\n"), false),
+        (
+            format!("0::/user.slice/domyjob.slice/{scope}/child\n"),
+            false,
+        ),
+        (
+            "0::/user.slice/domyjob.slice/domyjob-job-invalid.scope\n".to_owned(),
+            false,
+        ),
+        (
+            "0::/user.slice/app.slice/verification.scope\n".to_owned(),
+            false,
+        ),
+    ] {
+        ensure!(
+            resource_parent_scope(&membership).is_some() == expected,
+            "incorrect inherited admission for {membership:?}"
+        );
+    }
+    Ok(())
+}
+
+const RESOURCE_PROBE_MILLISECONDS: u32 = 60_000;
+
+fn resource_probe_capacity(limit: u32) -> Result<u32, Failure> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|error| Failure::new(format!("reading the verification job's cgroup: {error}")))?;
+    let inherited = u32::from(resource_parent_scope(&membership).is_some());
+    let probes = limit
+        .checked_sub(inherited)
+        .ok_or_else(|| Failure::new("the verification job exceeds the host admission budget"))?;
+    ensure!(
+        probes > 0,
+        "the verification job leaves no admission capacity"
+    );
+    Ok(probes)
+}
+
 fn linux_host_admission(world: &World, alpha: &Machine<'_>) -> Result<(), Failure> {
     if !cfg!(target_os = "linux") {
         return Ok(());
@@ -979,6 +1038,7 @@ fn linux_host_admission(world: &World, alpha: &Machine<'_>) -> Result<(), Failur
     };
     let policy: domyjob_core::resource_policy::Policy = domyjob_core::ingress::json(&bytes, 16_384)
         .map_err(|error| Failure::new(format!("validating the host policy: {error}")))?;
+    let probes = resource_probe_capacity(policy.budget().concurrent)?;
     let beta = world.machine("beta");
     let sleeper = world.root().join("bin/sleeper");
     let program = sleeper
@@ -986,15 +1046,22 @@ fn linux_host_admission(world: &World, alpha: &Machine<'_>) -> Result<(), Failur
         .ok_or_else(|| Failure::new("non-UTF8 sleeper path"))?;
     let mut jobs = Vec::new();
     let result = (|| {
-        for slot in 0..policy.budget().concurrent {
+        for slot in 0..probes {
             let (client, target) = if slot == 0 {
                 (alpha, "beta")
             } else {
                 (&beta, "alpha")
             };
-            let milliseconds = 600_000_u32.saturating_add(slot).to_string();
+            let milliseconds = RESOURCE_PROBE_MILLISECONDS.saturating_add(slot).to_string();
             let job = resource_probe(client, target, (program, &milliseconds), &mut jobs)?;
             job_phase(alpha, &job, "running")?;
+        }
+        for job in &jobs {
+            let status = alpha.run(&["status", job])?;
+            ensure!(
+                status.exited(0)?.stdout.contains("running"),
+                "admitted probes must run together: {status}"
+            );
         }
         let queued = resource_probe(alpha, "beta", (program, "0"), &mut jobs)?;
         job_phase(alpha, &queued, "queued")?;
@@ -1060,7 +1127,10 @@ fn interrupt_resource_probe(world: &World, program: &str, job: &str) -> Result<(
         let found: Vec<_> = world
             .processes()?
             .into_iter()
-            .filter(|(_, command)| command.contains(program) && command.contains(" 600000"))
+            .filter(|(_, command)| {
+                command.contains(program)
+                    && command.contains(&format!(" {RESOURCE_PROBE_MILLISECONDS}"))
+            })
             .collect();
         let started = found
             .iter()
