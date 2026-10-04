@@ -101,7 +101,10 @@ impl Tree {
 pub(super) struct Reaper(std::process::ChildStdin);
 
 impl Guard for Reaper {
-    fn stand_guard(tree: &Tree) -> Result<Self, ProcessError> {
+    fn stand_guard(
+        tree: &Tree,
+        scope: Option<&super::resources::Scope>,
+    ) -> Result<Self, ProcessError> {
         let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
             what: "the reaper",
             source,
@@ -115,6 +118,9 @@ impl Guard for Reaper {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
+        if let Some(scope) = scope {
+            command.arg("--reap-scope").arg(scope.name());
+        }
         let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
             what: "the reaper",
             source,
@@ -133,7 +139,7 @@ impl Guard for Reaper {
         let _sent = self.0.write_all(b"d");
     }
 
-    fn reap(group: i32) {
+    fn reap(group: i32, scope: Option<&super::resources::Scope>) {
         let mut input = io::stdin().lock();
         let mut buffer = [0_u8; 256];
         loop {
@@ -145,6 +151,9 @@ impl Guard for Reaper {
         }
         if let Some(group) = Pid::from_raw(group) {
             let _stopped = kill_process_group(group, Signal::KILL);
+        }
+        if let Some(scope) = scope {
+            let _stopped = scope.stop().and_then(|()| scope.cleanup());
         }
     }
 }

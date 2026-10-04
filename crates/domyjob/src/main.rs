@@ -116,6 +116,14 @@ enum Command {
     Node {
         #[arg(long, hide = true)]
         reap: Option<ReaperGroup>,
+        #[arg(long, hide = true, requires = "reap")]
+        reap_scope: Option<String>,
+    },
+    #[command(hide = true)]
+    JobExec {
+        scope: String,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
     #[command(hide = true)]
     Worker {
@@ -216,12 +224,21 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
             transport::logs(&JobReference::try_from(job)?, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Node { reap } => {
+        Command::Node { reap, reap_scope } => {
             if let Some(group) = reap {
-                process::reap(group.0.get());
+                let scope = reap_scope
+                    .map(process::resources::Scope::parse)
+                    .transpose()?;
+                process::reap(group.0.get(), scope.as_ref());
             } else {
                 transport::node(&output)?;
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::JobExec { scope, command } => {
+            let scope = process::resources::Scope::parse(scope)?;
+            let command = JobCommand::try_from(command)?;
+            process::resources::exec(&scope, &command)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Worker { job, ready_event } => {
@@ -241,7 +258,10 @@ fn internal() -> bool {
     let word = |index: usize| words.get(index).and_then(|word| word.to_str());
     matches!(
         (word(0), word(1)),
-        (Some("node" | "worker" | "chat-worker" | "mcp"), _) | (Some("chat"), Some("serve"))
+        (
+            Some("node" | "worker" | "chat-worker" | "job-exec" | "mcp"),
+            _
+        ) | (Some("chat"), Some("serve"))
     )
 }
 
@@ -285,7 +305,7 @@ mod tests {
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Command::Node { reap: Some(_) }
+                command: Command::Node { reap: Some(_), .. }
             })
         ));
         for value in ["0", "-1", "2147483648", "invalid"] {

@@ -9,6 +9,7 @@ use crate::domain::RemoteText;
 #[serde(rename_all = "snake_case")]
 pub enum PhaseKind {
     Accepted,
+    Queued,
     Starting,
     Running,
     Finished,
@@ -22,11 +23,13 @@ pub enum Outcome {
     LaunchFailed { reason: RemoteText },
     Lost,
     Killed,
+    MemoryLimitExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     Accepted,
+    Queued,
     Starting,
     Running { pid: u32 },
     Finished { outcome: Outcome },
@@ -48,6 +51,7 @@ struct RawJobState {
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
 enum RawPhase {
     Accepted,
+    Queued,
     Starting,
     Running { pid: u32 },
     Finished { outcome: Outcome },
@@ -57,12 +61,21 @@ enum RawPhase {
 #[error("a running job must have a nonzero process identifier")]
 pub struct InvalidStoredState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CommandCompletionError {
+    #[error("the scoped command has not recorded completion")]
+    Unfinished,
+    #[error("the execution record has a supervisor-only outcome")]
+    InvalidOutcome,
+}
+
 impl TryFrom<RawJobState> for JobState {
     type Error = InvalidStoredState;
 
     fn try_from(value: RawJobState) -> Result<Self, Self::Error> {
         let phase = match value.phase {
             RawPhase::Accepted => Phase::Accepted,
+            RawPhase::Queued => Phase::Queued,
             RawPhase::Starting => Phase::Starting,
             RawPhase::Running { pid: 0 } => return Err(InvalidStoredState),
             RawPhase::Running { pid } => Phase::Running { pid },
@@ -76,6 +89,7 @@ impl From<JobState> for RawJobState {
     fn from(value: JobState) -> Self {
         let phase = match value.phase {
             Phase::Accepted => RawPhase::Accepted,
+            Phase::Queued => RawPhase::Queued,
             Phase::Starting => RawPhase::Starting,
             Phase::Running { pid } => RawPhase::Running { pid },
             Phase::Finished { outcome } => RawPhase::Finished { outcome },
@@ -86,12 +100,14 @@ impl From<JobState> for RawJobState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    Queued,
     Starting,
     Spawned { pid: u32 },
     Exited { code: i32 },
     LaunchFailed { reason: RemoteText },
     SupervisorGone,
     Killed,
+    MemoryLimitExceeded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -103,23 +119,27 @@ pub struct InvalidTransition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventKind {
+    Queued,
     Starting,
     Spawned,
     Exited,
     LaunchFailed,
     SupervisorGone,
     Killed,
+    MemoryLimitExceeded,
 }
 
 impl Event {
     const fn kind(&self) -> EventKind {
         match self {
+            Self::Queued => EventKind::Queued,
             Self::Starting => EventKind::Starting,
             Self::Spawned { .. } => EventKind::Spawned,
             Self::Exited { .. } => EventKind::Exited,
             Self::LaunchFailed { .. } => EventKind::LaunchFailed,
             Self::SupervisorGone => EventKind::SupervisorGone,
             Self::Killed => EventKind::Killed,
+            Self::MemoryLimitExceeded => EventKind::MemoryLimitExceeded,
         }
     }
 }
@@ -142,6 +162,7 @@ impl JobState {
     pub const fn kind(&self) -> PhaseKind {
         match self.phase {
             Phase::Accepted => PhaseKind::Accepted,
+            Phase::Queued => PhaseKind::Queued,
             Phase::Starting => PhaseKind::Starting,
             Phase::Running { .. } => PhaseKind::Running,
             Phase::Finished { .. } => PhaseKind::Finished,
@@ -152,7 +173,7 @@ impl JobState {
     pub const fn outcome(&self) -> Option<&Outcome> {
         match &self.phase {
             Phase::Finished { outcome } => Some(outcome),
-            Phase::Accepted | Phase::Starting | Phase::Running { .. } => None,
+            Phase::Accepted | Phase::Queued | Phase::Starting | Phase::Running { .. } => None,
         }
     }
 
@@ -160,51 +181,82 @@ impl JobState {
     pub const fn pid(&self) -> Option<u32> {
         match self.phase {
             Phase::Running { pid } => Some(pid),
-            Phase::Accepted | Phase::Starting | Phase::Finished { .. } => None,
+            Phase::Accepted | Phase::Queued | Phase::Starting | Phase::Finished { .. } => None,
+        }
+    }
+
+    pub fn command_completion(&self) -> Result<Event, CommandCompletionError> {
+        match self.outcome() {
+            Some(Outcome::Succeeded) => Ok(Event::Exited { code: 0 }),
+            Some(Outcome::Failed { code }) => Ok(Event::Exited { code: code.get() }),
+            Some(Outcome::LaunchFailed { reason }) => Ok(Event::LaunchFailed {
+                reason: reason.clone(),
+            }),
+            Some(Outcome::Lost | Outcome::Killed | Outcome::MemoryLimitExceeded) => {
+                Err(CommandCompletionError::InvalidOutcome)
+            }
+            None => Err(CommandCompletionError::Unfinished),
         }
     }
 
     pub fn advance(&mut self, event: &Event) -> Result<(), InvalidTransition> {
         let next = match (&self.phase, event) {
-            (Phase::Accepted, Event::Starting) => Phase::Starting,
+            (Phase::Accepted, Event::Queued) => Phase::Queued,
+            (Phase::Accepted | Phase::Queued, Event::Starting) => Phase::Starting,
             (Phase::Starting, Event::Spawned { pid }) if *pid != 0 => Phase::Running { pid: *pid },
-            (Phase::Accepted | Phase::Starting, Event::LaunchFailed { reason }) => {
-                Phase::Finished {
-                    outcome: Outcome::LaunchFailed {
-                        reason: reason.clone(),
-                    },
-                }
-            }
-            (Phase::Accepted | Phase::Starting | Phase::Running { .. }, Event::SupervisorGone) => {
-                Phase::Finished {
-                    outcome: Outcome::Lost,
-                }
-            }
+            (
+                Phase::Accepted | Phase::Queued | Phase::Starting | Phase::Running { .. },
+                Event::LaunchFailed { reason },
+            ) => Phase::Finished {
+                outcome: Outcome::LaunchFailed {
+                    reason: reason.clone(),
+                },
+            },
+            (
+                Phase::Accepted | Phase::Queued | Phase::Starting | Phase::Running { .. },
+                Event::SupervisorGone,
+            ) => Phase::Finished {
+                outcome: Outcome::Lost,
+            },
             (Phase::Running { .. }, Event::Exited { code }) => Phase::Finished {
                 outcome: match NonZeroI32::new(*code) {
                     Some(code) => Outcome::Failed { code },
                     None => Outcome::Succeeded,
                 },
             },
-            (Phase::Accepted | Phase::Starting | Phase::Running { .. }, Event::Killed) => {
-                Phase::Finished {
-                    outcome: Outcome::Killed,
-                }
-            }
-            (Phase::Accepted, Event::Spawned { .. } | Event::Exited { .. })
-            | (Phase::Starting, Event::Starting | Event::Spawned { .. } | Event::Exited { .. })
-            | (
-                Phase::Running { .. },
-                Event::Starting | Event::Spawned { .. } | Event::LaunchFailed { .. },
+            (
+                Phase::Accepted | Phase::Queued | Phase::Starting | Phase::Running { .. },
+                Event::Killed,
+            ) => Phase::Finished {
+                outcome: Outcome::Killed,
+            },
+            (Phase::Running { .. }, Event::MemoryLimitExceeded) => Phase::Finished {
+                outcome: Outcome::MemoryLimitExceeded,
+            },
+            (
+                Phase::Accepted | Phase::Queued,
+                Event::Spawned { .. } | Event::Exited { .. } | Event::MemoryLimitExceeded,
             )
+            | (Phase::Queued, Event::Queued)
+            | (
+                Phase::Starting,
+                Event::Queued
+                | Event::Starting
+                | Event::Spawned { .. }
+                | Event::Exited { .. }
+                | Event::MemoryLimitExceeded,
+            )
+            | (Phase::Running { .. }, Event::Queued | Event::Starting | Event::Spawned { .. })
             | (
                 Phase::Finished { .. },
-                Event::Starting
+                Event::Queued
+                | Event::Starting
                 | Event::Spawned { .. }
                 | Event::Exited { .. }
                 | Event::LaunchFailed { .. }
                 | Event::SupervisorGone
-                | Event::Killed,
+                | Event::Killed
+                | Event::MemoryLimitExceeded,
             ) => {
                 return Err(InvalidTransition {
                     phase: self.kind(),
@@ -220,6 +272,18 @@ impl JobState {
 #[cfg(test)]
 mod tests {
     use super::{Event, JobState, Outcome, PhaseKind};
+
+    #[test]
+    fn queued_jobs_and_memory_exhaustion_are_distinct_stored_states() {
+        let queued: JobState = crate::ingress::foreign_json(r#"{"phase":{"phase":"queued"}}"#)
+            .expect("queued jobs survive serialization");
+        assert!(queued.outcome().is_none());
+        let exhausted: JobState = crate::ingress::foreign_json(
+            r#"{"phase":{"phase":"finished","outcome":{"outcome":"memory_limit_exceeded"}}}"#,
+        )
+        .expect("memory exhaustion is not an ordinary process exit");
+        assert!(exhausted.outcome().is_some());
+    }
 
     #[test]
     fn a_new_job_starts_accepted() {

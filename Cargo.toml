@@ -15,7 +15,7 @@ readme = "README.md"
 [workspace.lints.rust]
 unsafe_code = "deny"
 non_ascii_idents = "deny"
-unexpected_cfgs = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(kani)'] }
 
 unused = { level = "deny", priority = -1 }
 future_incompatible = { level = "deny", priority = -1 }

@@ -20,7 +20,12 @@ run = ["cargo fetch --locked", "lefthook install"]
 
 [tasks.fmt]
 description = "Format Rust and TOML"
-run = ["cargo fmt --all", "cargo fmt --manifest-path fuzz/Cargo.toml", "taplo fmt"]
+run = [
+  "cargo fmt --all",
+  "cargo fmt --manifest-path fuzz/Cargo.toml",
+  "rustfmt --edition 2024 verification/resource-negative.rs",
+  "taplo fmt",
+]
 env = { RUST_LOG = "warn" }
 
 [tasks."fmt:check"]
@@ -28,6 +33,7 @@ description = "Check Rust and TOML formatting"
 run = [
   "cargo fmt --all -- --check",
   "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
+  "rustfmt --edition 2024 --check verification/resource-negative.rs",
   "taplo fmt --check",
   "taplo lint",
 ]
@@ -68,6 +74,14 @@ run = "cargo xtask ci static"
 description = "Run the complete workspace test suite, each test in its own process"
 run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
+[tasks."resource-proofs"]
+description = "Prove resource bounds and job transitions and reject a false control"
+run = "cargo xtask resource-proofs"
+
+[tasks."resource-contracts"]
+description = "Check small memory-limited scopes on a native Linux user systemd manager"
+run = "cargo nextest run --locked -p domyjob --bin domyjob --run-ignored only -E 'test(native_resource_)' --no-tests=fail --test-threads 1"
+
 [tasks."fuzz:check"]
 description = "Type-check every fuzz target against the current core API"
 run = "cargo check --locked --manifest-path fuzz/Cargo.toml --bins"
@@ -106,7 +120,14 @@ run = "cargo xtask dependencies vet"
 
 [tasks.check]
 description = "Run local lint, tests, and dependency checks"
-run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mise run vet"]
+run = [
+  "mise run lint",
+  "mise run test",
+  "cargo xtask resource-contracts",
+  "mise run deny",
+  "mise run audit",
+  "mise run vet",
+]
 
 [tasks."check:scope"]
 description = "Validate the exact push ranges with the shared CI scope policy"

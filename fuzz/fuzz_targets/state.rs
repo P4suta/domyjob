@@ -8,7 +8,7 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
     let mut state = JobState::accepted();
     let reason = RemoteText::try_from(String::from("launch failed")).unwrap();
     for &byte in bytes.iter().take(256) {
-        let event = match byte % 6 {
+        let event = match byte % 8 {
             0 => Event::Starting,
             1 => Event::Spawned {
                 pid: u32::from(byte),
@@ -20,7 +20,9 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
                 reason: reason.clone(),
             },
             4 => Event::SupervisorGone,
-            _ => Event::Killed,
+            5 => Event::Killed,
+            6 => Event::Queued,
+            _ => Event::MemoryLimitExceeded,
         };
         let before = state.clone();
         let result = state.advance(&event);

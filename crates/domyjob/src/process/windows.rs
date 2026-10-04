@@ -120,13 +120,16 @@ impl Tree {
 pub(super) struct Reaper;
 
 impl Guard for Reaper {
-    fn stand_guard(_tree: &Tree) -> Result<Self, ProcessError> {
+    fn stand_guard(
+        _tree: &Tree,
+        _scope: Option<&super::resources::Scope>,
+    ) -> Result<Self, ProcessError> {
         Ok(Self)
     }
 
     fn stand_down(self) {}
 
-    fn reap(_group: i32) {}
+    fn reap(_group: i32, _scope: Option<&super::resources::Scope>) {}
 }
 
 pub(crate) type OutputReader = io::PipeReader;

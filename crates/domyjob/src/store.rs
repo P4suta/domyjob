@@ -596,7 +596,7 @@ impl Store {
         let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
         let mut state = self.read_state(job)?;
         match state.kind() {
-            PhaseKind::Accepted | PhaseKind::Starting => {
+            PhaseKind::Accepted | PhaseKind::Queued | PhaseKind::Starting => {
                 state.advance(&Event::LaunchFailed { reason })?;
                 self.write_state(job, &state)?;
             }
@@ -610,7 +610,7 @@ impl Store {
         let mut state = self.read_state(job)?;
         match state.kind() {
             PhaseKind::Accepted | PhaseKind::Finished => Ok(state),
-            PhaseKind::Starting | PhaseKind::Running => {
+            PhaseKind::Queued | PhaseKind::Starting | PhaseKind::Running => {
                 match OsLock::probe(&self.paths(job).alive_lock())? {
                     Probe::Held => Ok(state),
                     Probe::Absent | Probe::Free => {
@@ -796,6 +796,9 @@ mod tests {
         let reason = RemoteText::try_from("no such program".to_owned()).unwrap();
         let mut running = JobState::accepted();
         let mut states = vec![running.clone()];
+        let mut queued = running.clone();
+        queued.advance(&Event::Queued).unwrap();
+        states.push(queued);
         running.advance(&Event::Starting).unwrap();
         states.push(running.clone());
         let mut launch_failed = running.clone();
@@ -810,6 +813,7 @@ mod tests {
             Event::Exited { code: 3 },
             Event::SupervisorGone,
             Event::Killed,
+            Event::MemoryLimitExceeded,
         ] {
             let mut finished = running.clone();
             finished.advance(&ending).unwrap();

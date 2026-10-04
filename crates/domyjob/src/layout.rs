@@ -6,6 +6,16 @@ use domyjob_core::domain::MachineName;
 
 use crate::platform;
 
+pub(crate) fn admission() -> io::Result<PathBuf> {
+    if cfg!(target_os = "linux") {
+        let user = platform::user_id().ok_or_else(|| io::Error::other("user UID unavailable"))?;
+        return Ok(Path::new("/run/user")
+            .join(user.to_string())
+            .join("domyjob/admission"));
+    }
+    Ok(platform::home()?.join(".local/state/domyjob/admission"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct State(PathBuf);
 

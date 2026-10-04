@@ -99,6 +99,20 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["resource-proofs"] => match xtask::resource_proofs::run(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("resource-proofs: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        ["resource-contracts"] => match xtask::resource_proofs::native(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("resource-contracts: {error}");
+                ExitCode::FAILURE
+            }
+        },
         ["commit-msg", message] => commit_msg(root, Path::new(message)),
         ["dependencies", "deny"] => dependencies(root, xtask::dependencies::Check::Deny),
         ["dependencies", "audit"] => dependencies(root, xtask::dependencies::Check::Audit),

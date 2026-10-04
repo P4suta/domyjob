@@ -7,6 +7,7 @@ use domyjob_core::domain::JobId;
 use thiserror::Error;
 
 pub(crate) mod chat;
+pub(crate) mod resources;
 
 #[cfg(unix)]
 mod unix;
@@ -205,17 +206,18 @@ pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
 }
 
 trait Guard: Sized {
-    fn stand_guard(tree: &os::Tree) -> Result<Self, ProcessError>;
+    fn stand_guard(tree: &os::Tree, scope: Option<&resources::Scope>)
+    -> Result<Self, ProcessError>;
     fn stand_down(self);
-    fn reap(group: i32);
+    fn reap(group: i32, scope: Option<&resources::Scope>);
 }
 
 pub(crate) trait Stop {
     fn stop(self) -> io::Result<()>;
 }
 
-pub(crate) fn reap(group: i32) {
-    <os::Reaper as Guard>::reap(group);
+pub(crate) fn reap(group: i32, scope: Option<&resources::Scope>) {
+    <os::Reaper as Guard>::reap(group, scope);
 }
 
 #[derive(Debug)]
@@ -230,9 +232,12 @@ pub(crate) struct Group {
     tree: os::Tree,
     id: u32,
     reaper: Mutex<Option<os::Reaper>>,
+    scope: Option<resources::Scope>,
+    _permit: Option<resources::AdmissionPermit>,
 }
 
 impl Group {
+    #[cfg(test)]
     pub(crate) fn spawn_stdio(
         command: Command,
         output: Stdio,
@@ -242,11 +247,35 @@ impl Group {
     }
 
     pub(crate) fn spawn_io(
-        mut command: Command,
+        command: Command,
         input: Stdio,
         output: Stdio,
         errors: Stdio,
     ) -> Result<Self, ProcessError> {
+        Self::spawn_owned(command, (input, output, errors), None)
+    }
+
+    pub(crate) fn spawn_job_stdio(
+        launch: resources::Launch,
+        output: Stdio,
+        errors: Stdio,
+    ) -> Result<Self, ProcessError> {
+        Self::spawn_owned(
+            launch.command,
+            (Stdio::null(), output, errors),
+            Some((launch.scope, launch.permit)),
+        )
+    }
+
+    fn spawn_owned(
+        mut command: Command,
+        (input, output, errors): (Stdio, Stdio, Stdio),
+        job: Option<(Option<resources::Scope>, resources::AdmissionPermit)>,
+    ) -> Result<Self, ProcessError> {
+        let (scope, permit) = match job {
+            Some((scope, permit)) => (scope, Some(permit)),
+            None => (None, None),
+        };
         command.stdin(input).stdout(output).stderr(errors);
         os::isolate(&mut command);
         let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
@@ -270,7 +299,7 @@ impl Group {
                 });
             }
         };
-        let reaper = match os::Reaper::stand_guard(&tree) {
+        let reaper = match os::Reaper::stand_guard(&tree, scope.as_ref()) {
             Ok(reaper) => reaper,
             Err(error) => {
                 let _stopped = tree.kill_all();
@@ -283,6 +312,8 @@ impl Group {
             tree,
             id,
             reaper: Mutex::new(Some(reaper)),
+            scope,
+            _permit: permit,
         })
     }
 
@@ -306,6 +337,13 @@ impl Group {
         self.tree.kill_remaining()?;
         let status = child.wait().map_err(ProcessError::Wait);
         drop(guard);
+        if self.scope.is_none() {
+            self.stand_down()?;
+        }
+        status
+    }
+
+    fn stand_down(&self) -> Result<(), ProcessError> {
         let reaper = self
             .reaper
             .lock()
@@ -314,10 +352,13 @@ impl Group {
         if let Some(reaper) = reaper {
             reaper.stand_down();
         }
-        status
+        Ok(())
     }
 
     pub(crate) fn kill(&self) -> Result<(), ProcessError> {
+        if let Some(scope) = &self.scope {
+            scope.stop().map_err(ProcessError::Signal)?;
+        }
         let guard = self
             .child
             .lock()
@@ -325,6 +366,28 @@ impl Group {
         match &*guard {
             ChildState::Running(_) => self.tree.kill_all(),
             ChildState::Reaped => Ok(()),
+        }
+    }
+
+    pub(crate) fn completion(
+        &self,
+        event: domyjob_core::state::Event,
+    ) -> Result<domyjob_core::state::Event, ProcessError> {
+        let completion = match &self.scope {
+            Some(scope) => scope.completion(&event).map_err(ProcessError::Wait),
+            None => Ok(event),
+        }?;
+        self.stand_down()?;
+        Ok(completion)
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(scope) = &self.scope
+            && let Err(error) = scope.stop().and_then(|()| scope.cleanup())
+        {
+            eprintln!("domyjob: stopping {} failed: {error}", scope.name());
         }
     }
 }

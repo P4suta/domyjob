@@ -654,6 +654,9 @@ fn static_checks(
 ) -> Result<(), CiError> {
     execute("mise", &["run", "fmt:check"])?;
     execute("cargo", &["xtask", "gates"])?;
+    if std::env::consts::OS == "linux" {
+        execute("cargo", &["xtask", "resource-proofs"])?;
+    }
     execute("typos", &[])?;
     execute("cargo", &["xtask", "workflows"])?;
     execute("jscpd", &["--config", ".jscpd.json", "--silent"])
@@ -710,7 +713,9 @@ fn test(root: &Path, plan: &Plan) -> Result<(), CiError> {
         if std::env::consts::OS == "windows" {
             execute(root, "cargo", &["xtask", "windows-contracts"])?;
         }
-        execute(root, "mise", &["run", "test"])
+        execute(root, "mise", &["run", "test"])?;
+        crate::resource_proofs::native(root)
+            .map_err(|error| CiError::Io(std::io::Error::other(error)))
     } else if plan.has(Check::Xtask) {
         xtask_clippy(root)?;
         xtask_tests(root, plan)
