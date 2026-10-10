@@ -9,6 +9,9 @@ use thiserror::Error;
 pub(crate) mod chat;
 pub(crate) mod resources;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod login;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -55,6 +58,9 @@ pub(crate) enum ProcessError {
     },
     #[error("the worker exited before announcing readiness: {0}")]
     NotStarted(String),
+    #[cfg(target_os = "macos")]
+    #[error("macOS login-session hand-off refused: {0}")]
+    Login(String),
     #[error("waiting for a process: {0}")]
     Wait(io::Error),
     #[error("signalling a process: {0}")]
@@ -194,11 +200,44 @@ pub(crate) fn terminate(pid: u32) -> Result<(), ProcessError> {
 }
 
 pub(crate) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
-    os::launch_worker(&["worker", job.as_str()], None)
+    #[cfg(target_os = "macos")]
+    {
+        login::launch_worker(job)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        os::launch_worker(&["worker", job.as_str()], None)
+    }
 }
 
 pub(crate) fn launch_chat_worker(agent: &str, log: std::fs::File) -> Result<(), ProcessError> {
     os::launch_worker(&["chat-worker", "--agent", agent], Some(log))
+}
+
+pub(crate) const fn refuses_submission(error: &ProcessError) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        matches!(error, ProcessError::Login(_))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+pub(crate) fn start_login_agent() -> io::Result<()> {
+    let start: fn() -> io::Result<()> = {
+        #[cfg(target_os = "macos")]
+        {
+            login::start
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            || Ok(())
+        }
+    };
+    start()
 }
 
 pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessError> {

@@ -300,6 +300,9 @@ fn start_worker_using(
     if let Err(error) = launch(job) {
         let reason = launch_failure_reason(&error)?;
         store.finish_launch_failure(job, reason)?;
+        if process::refuses_submission(&error) {
+            return Err(error.into());
+        }
     }
     Ok(())
 }

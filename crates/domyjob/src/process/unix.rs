@@ -16,8 +16,15 @@ pub(super) fn launch_worker(
         source,
     })?;
     let mut command = super::command(executable);
+    command.args(arguments);
+    launch_worker_command(command, errors)
+}
+
+pub(super) fn launch_worker_command(
+    mut command: Command,
+    errors: Option<std::fs::File>,
+) -> Result<(), ProcessError> {
     command
-        .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(errors.map_or_else(Stdio::null, Stdio::from))

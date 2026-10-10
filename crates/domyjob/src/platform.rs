@@ -122,6 +122,19 @@ pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
     Native::make_executable(path)
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn login_directory() -> io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let directory = home()?;
+    let hash = blake3::hash(directory.as_os_str().as_bytes());
+    let tag: String = hash.to_hex().chars().take(16).collect();
+    let user = user_id().ok_or_else(|| io::Error::other("user UID unavailable"))?;
+    Ok(PathBuf::from(format!(
+        "/private/tmp/domyjob-login-{user}-{tag}"
+    )))
+}
+
 pub(crate) fn user_id() -> Option<u32> {
     Native::user_id()
 }
@@ -210,7 +223,7 @@ pub(crate) fn local_refresh_target(target: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
+pub(crate) fn job_environment_names() -> impl Iterator<Item = &'static str> {
     const COMMON: &[&str] = &[
         "PATH",
         "HOME",
@@ -220,12 +233,15 @@ pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
         "MISE_DATA_DIR",
         "MISE_CONFIG_DIR",
     ];
+    COMMON.iter().chain(Native::JOB_ENVIRONMENT).copied()
+}
+
+pub(crate) fn prepare_job_environment(command: &mut std::process::Command) {
     command.env_clear();
-    for name in COMMON.iter().chain(Native::JOB_ENVIRONMENT) {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
+    command.envs(
+        job_environment_names()
+            .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
+    );
 }
 
 pub(crate) fn file_mode(metadata: &fs::Metadata) -> u32 {

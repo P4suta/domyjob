@@ -45,6 +45,7 @@ pub(crate) fn serve() -> Result<(), ServeError> {
         eprintln!("domyjob: the chat service is already running");
         return Ok(());
     };
+    crate::process::start_login_agent().map_err(StoreError::from)?;
     crate::state_io::write_bytes(
         &store.paths().service_pid(),
         std::process::id().to_string().as_bytes(),

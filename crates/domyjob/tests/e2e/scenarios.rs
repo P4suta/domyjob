@@ -951,6 +951,7 @@ fn arrives(alpha: &Machine<'_>, text: &str) -> Result<(), Failure> {
 
 fn jobs_run_through_the_node_wrapper(world: &World) -> Result<(), Failure> {
     let alpha = world.machine("alpha");
+    crate::os::job_handoff(world, &alpha)?;
     let on = alpha.run(&["on", "beta", "--wait", "--", "sleeper", "0", "7"])?;
     ensure!(
         on.code == Some(7) && on.stdout.contains("sleeper slept 0ms"),
@@ -1161,7 +1162,7 @@ fn interrupt_resource_probe(world: &World, program: &str, job: &str) -> Result<(
     })
 }
 
-fn job_phase(client: &Machine<'_>, job: &str, phase: &str) -> Result<(), Failure> {
+pub(crate) fn job_phase(client: &Machine<'_>, job: &str, phase: &str) -> Result<(), Failure> {
     wait_for(&format!("job {job} to become {phase}"), || {
         let status = client.run(&["status", job])?;
         Ok(status.exited(0)?.stdout.contains(phase).then_some(()))
