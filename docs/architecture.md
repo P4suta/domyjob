@@ -38,7 +38,12 @@ The storage adapter checks ownership and Unix mode or Windows ACL before reading
 The command runs in a Unix process group or Windows Job Object, with a guard against a stranded Unix process group.
 Its standard output and standard error share one pipe, and the worker stores at most the first 256 MiB and counts the rest.
 When the process tree exits, the worker stores what is already in the pipe and finishes, even if an escaped descendant still holds the pipe open.
-The node clears the SSH session environment before launching a job and adds a small explicit set of operating-system and toolchain variables.
+Jobs receive a cleared environment with a small explicit set of operating-system and toolchain variables.
+On macOS, the node hands the matching worker executable, job identity, state root, and allowed environment to the existing chat LaunchAgent over a private Unix socket.
+The LaunchAgent starts the worker inside the desktop login session and acknowledges its existing readiness signal.
+The environment crosses the socket in memory, and credentials remain in the keychain or 1Password.
+A missing login session or unavailable agent refuses submission with its cause; Linux and Windows retain direct worker launch.
+See [the login-session decision](adr/0003-run-macos-jobs-in-login-session.md) for the boundary and verification scope.
 
 ## Transport and source
 
