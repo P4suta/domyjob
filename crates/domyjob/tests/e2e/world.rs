@@ -58,7 +58,7 @@ impl World {
             background: Mutex::new(Vec::new()),
         };
         fs::create_dir_all(world.bin()).context("creating bin")?;
-        for fake in FAKES {
+        for fake in FAKES.iter().chain(crate::os::extra_fakes()) {
             fs::hard_link(binaries.join("harness"), world.program(fake))
                 .context(&format!("installing the fake {fake}"))?;
         }

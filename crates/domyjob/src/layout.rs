@@ -20,6 +20,10 @@ pub(crate) fn admission() -> io::Result<PathBuf> {
 pub(crate) struct State(PathBuf);
 
 impl State {
+    pub(crate) fn root(&self) -> &Path {
+        &self.0
+    }
+
     pub(crate) fn here() -> io::Result<Self> {
         if let Some(explicit) = platform::variable("DOMYJOB_STATE") {
             return Ok(Self(PathBuf::from(explicit)));
@@ -46,7 +50,8 @@ impl State {
     }
 
     pub(crate) fn runner(&self) -> PathBuf {
-        self.0.join(format!("runner-{}", crate::formats::runner()))
+        self.root()
+            .join(format!("runner-{}", crate::formats::runner()))
     }
 
     pub(crate) fn chat(&self) -> Chat {

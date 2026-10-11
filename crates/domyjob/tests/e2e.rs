@@ -48,6 +48,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(code) = os::fake_tool(&executable) {
+        return code;
+    }
     match executable.file_stem().and_then(OsStr::to_str) {
         Some("ssh") => ssh::main(),
         Some("claude") => provider::main(provider::Tool::Claude),

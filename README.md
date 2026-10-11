@@ -14,6 +14,8 @@ mise x -- cargo install --locked --path crates/domyjob
 ```
 
 Remote machines need OpenSSH, mise, Rust, and Cargo.
+On macOS, run `domyjob chat service install` in the user's desktop login session before accepting jobs.
+The user must remain logged in so jobs can reach the login keychain.
 See the [installation guide](docs/installing.md) for macOS installers and other distribution options.
 
 ## Jobs
