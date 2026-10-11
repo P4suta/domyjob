@@ -21,6 +21,7 @@ use crate::store::{ReceivedArchive, Store, StoreError};
 use crate::watch_event::{self, Notice};
 
 const MAX_LOG_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_FAILURE_DETAIL_CHARS: usize = 4096;
 
 #[derive(Debug, Error)]
 pub(crate) enum AppError {
@@ -280,7 +281,11 @@ fn spawn_logged_using(
 }
 
 fn launch_failure_reason(error: &impl Display) -> Result<RemoteText, AppError> {
-    let detail: String = error.to_string().chars().take(4096).collect();
+    let detail: String = error
+        .to_string()
+        .chars()
+        .take(MAX_FAILURE_DETAIL_CHARS)
+        .collect();
     RemoteText::try_from(detail).map_err(|_invalid| AppError::InvalidErrorText)
 }
 
@@ -546,7 +551,11 @@ fn worker_using(
         if let Ok(path) = store.supervisor_log_path(job)
             && let Ok(mut file) = state_file::open_append(&path)
         {
-            let detail: String = error.to_string().chars().take(4096).collect();
+            let detail: String = error
+                .to_string()
+                .chars()
+                .take(MAX_FAILURE_DETAIL_CHARS)
+                .collect();
             let _recorded = writeln!(file, "{detail}");
         }
         if let Ok(reason) = launch_failure_reason(error) {
