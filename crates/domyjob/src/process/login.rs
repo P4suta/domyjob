@@ -17,6 +17,7 @@ use crate::platform::{self, clock, user_files};
 
 const IO_TIMEOUT_MILLIS: u64 = 30_000;
 const MAX_REPLY_BYTES: usize = 16_385;
+const MAX_ERROR_CHARS: usize = 4096;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,7 +150,7 @@ fn receive(
     match started {
         Ok(()) => stream.write_all(b"R"),
         Err(error) => {
-            let detail: String = error.to_string().chars().take(4096).collect();
+            let detail: String = error.to_string().chars().take(MAX_ERROR_CHARS).collect();
             stream.write_all(detail.as_bytes())
         }
     }
