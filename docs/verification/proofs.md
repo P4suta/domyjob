@@ -44,7 +44,10 @@ Miri establishes its checks for those concrete executions under supported memory
 
 The source budget proof checks the production per-byte transition for every byte and all admitted counters, requiring reachable byte admission, empty-record refusal and unterminated-record refusal.
 Its counter domain preserves the existing 100,000-file and 16,777,216-path-byte archive limits, with a 4,096-byte record bound and a 16,877,216-byte tracked stream bound.
-The metadata proof selects all sixteen fixed root/nested paths for the eight production metadata names, quantifies every ASCII casing of those names, and checks both ordinary/metadata controls with unwind sixteen and unwinding assertions.
+The metadata path proof selects all sixteen fixed root/nested paths for the eight production metadata names and checks both ordinary/metadata controls.
+The separate casing proof quantifies the same six independent Boolean case choices for each of the same eight names, with all-uppercase and all-lowercase covers.
+Both proofs retain unwind sixteen and unwinding assertions.
+This decomposition preserves the original combined input domain within the unchanged per-harness timeout.
 The named false metadata control imports the exact production classifier and must fail `NEGATIVE_SOURCE_CONTROL`.
 The read-length proof quantifies all expected and actual u64 lengths through the production admission, length+1 limit, and exact completion functions, with three reachable covers and `NEGATIVE_SOURCE_READ_CONTROL` as its false claim.
 Actual archive and fingerprint readers apply that limit to the native reader and reject changed lengths.
