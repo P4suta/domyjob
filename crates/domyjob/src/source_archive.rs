@@ -1,15 +1,18 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::Dir;
 use domyjob_core::domain::{Invalid, RelativePath};
-use domyjob_core::source_paths::{MAX_FILES, MAX_PATH_BYTES};
+use domyjob_core::source_paths::{MAX_FILES, MAX_PATH_BYTES, ReadLength};
 use domyjob_core::wire::MAX_SNAPSHOT_BYTES;
 use thiserror::Error;
 
 use crate::file_kind;
+
+#[path = "platform/source_file.rs"]
+pub(crate) mod source_file;
 
 #[derive(Debug, Error)]
 pub(crate) enum ArchiveError {
@@ -20,6 +23,10 @@ pub(crate) enum ArchiveError {
     #[error("the source exceeds 64 MiB, {MAX_FILES} files, or its path budget")]
     Capacity,
 }
+
+#[cfg(test)]
+#[path = "source_archive/tests.rs"]
+mod tests;
 
 #[derive(Debug, Error)]
 pub(crate) enum Rejection {
@@ -122,10 +129,12 @@ impl Archive {
             return Err(rejected(Rejection::NonFile));
         }
         let mode = mode(&metadata);
-        let mut content = directory.open(relative).map_err(failed)?.into_std();
+        let mut content = source_file::open(directory, relative).map_err(failed)?;
         if content.metadata().map_err(failed)?.len() != metadata.len() {
             return Err(rejected(Rejection::Changed));
         }
+        let length = ReadLength::new(metadata.len()).ok_or(ArchiveError::Capacity)?;
+        let mut content = (&mut content).take(length.limit());
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(metadata.len());
@@ -135,6 +144,9 @@ impl Archive {
         self.builder
             .append_data(&mut header, name.as_str(), &mut content)
             .map_err(failed)?;
+        if !length.matches(length.limit().saturating_sub(content.limit())) {
+            return Err(rejected(Rejection::Changed));
+        }
         Ok(())
     }
 

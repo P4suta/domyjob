@@ -297,6 +297,7 @@ name = "domyjob"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "cap-primitives",
  "cap-std",
  "clap",
  "data-encoding",

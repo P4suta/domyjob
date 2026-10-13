@@ -44,10 +44,16 @@ Miri establishes its checks for those concrete executions under supported memory
 
 The source budget proof checks the production per-byte transition for every byte and all admitted counters, requiring reachable byte admission, empty-record refusal and unterminated-record refusal.
 Its counter domain preserves the existing 100,000-file and 16,777,216-path-byte archive limits, with a 4,096-byte record bound and a 16,877,216-byte tracked stream bound.
-The metadata proof selects all sixteen fixed root/nested paths for the eight production metadata names and both ordinary/metadata controls, with unwind sixteen and unwinding assertions.
+The metadata proof selects all sixteen fixed root/nested paths for the eight production metadata names, quantifies every ASCII casing of those names, and checks both ordinary/metadata controls with unwind sixteen and unwinding assertions.
 The named false metadata control imports the exact production classifier and must fail `NEGATIVE_SOURCE_CONTROL`.
+The read-length proof quantifies all expected and actual u64 lengths through the production admission, length+1 limit, and exact completion functions, with three reachable covers and `NEGATIVE_SOURCE_READ_CONTROL` as its false claim.
+Actual archive and fingerprint readers apply that limit to the native reader and reject changed lengths.
+Native no-follow, retained-parent, FIFO, and read-fault fixtures establish the adapter linkage; they do not prove operating-system behavior or an atomic source snapshot.
 These proofs do not establish all UTF-8 or Unicode paths, native Git output, filesystem capability semantics or an atomic view of concurrently changing files.
 Native Git fixtures include ignored tracked working bytes, ignored untracked exclusion, tracked deletion, metadata exclusion and subdirectory-relative paths.
+The nested Git fixture forces an ancestor-ignored file into the index, changes its working bytes, and requires the snapshot to exclude the equally ignored untracked peer.
+A second nested fixture compares actual Git with competing relative excludes files and repository-root anchored patterns while retaining changed tracked bytes.
+Canonical root discovery and ignore matching remain native boundaries; these checks do not prove an atomic relationship between Git queries and concurrently changing files.
 The global-ignore fixture creates its real configuration with Git's argument-based writer, and native link/junction fixtures refuse reading outside the retained source root.
 Runtime and build-time archive admission use that same capability-relative boundary without changing portable-path, case-collision or snapshot-byte checks.
 The small parser and metadata interpreter fixtures remain separate from the large native record/count/aggregate boundary tests.

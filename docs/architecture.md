@@ -52,6 +52,13 @@ The frame carries no version, because a client only talks to a node of its own b
 Calls carry deadlines, keep the connection alive with SSH keepalives, and share one connection per machine on Unix.
 A `run` request may carry a 64 MiB tar snapshot of the current directory, including uncommitted files.
 The source scanner rejects links, nonregular files, nonportable names, and case collisions.
+Tracked working-tree bytes are merged with visible untracked paths while ASCII case variants of repository metadata are excluded.
+Git subdirectory snapshots honor ancestor ignore rules for untracked files, while non-Git snapshots retain the selected-directory ignore boundary.
+The selected directory is canonicalized once before the root capability is opened, and bounded Git output discovers its canonical repository root without enlarging the archive boundary.
+Git decodes the configured excludes-file path, including quoted paths and an explicitly empty value, before the ignore walker uses it.
+Relative excludes-file paths and global anchored patterns use the repository root even when the selected source directory is nested.
+Archive and fingerprint reads capture every parent without following links, open the final file relative to that captured parent, and retain those handles through reading.
+The opened regular disk file is read through an admitted length+1 bound, and any growth or truncation relative to its admitted length refuses publication.
 The node checks the declared size and digest before extracting through a confined directory capability.
 Remote text is neutralized before terminal output.
 

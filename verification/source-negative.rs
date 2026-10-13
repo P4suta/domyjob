@@ -5,7 +5,7 @@ mod metadata;
 #[kani::unwind(16)]
 fn rejects_repository_metadata() {
     kani::assert(
-        !metadata::metadata_component(".git"),
+        !metadata::metadata_component(".GiT"),
         "NEGATIVE_SOURCE_CONTROL",
     );
 }
