@@ -327,7 +327,7 @@ fn fingerprint(root: &Path) -> Result<blake3::Hash, String> {
     let mut files = Vec::new();
     for directory in [
         "crates",
-        "xtask/src",
+        "xtask",
         "verification",
         "fuzz/fuzz_targets",
         "fuzz/seeds",
@@ -934,6 +934,26 @@ mod tests {
             }
         }
         root
+    }
+
+    #[test]
+    fn verifier_manifest_changes_refuse_a_stale_source_receipt() {
+        let root = fingerprint_fixture();
+        let manifest = root.path().join("xtask/Cargo.toml");
+        crate::raw::write(&manifest, b"[features]\nchecked = []\n").unwrap();
+        let before = super::fingerprint(root.path()).unwrap();
+        super::unchanged_source(root.path(), before).unwrap();
+        crate::raw::write(&manifest, b"[features]\nchanged = []\n").unwrap();
+        super::unchanged_source(root.path(), before).unwrap_err();
+    }
+
+    #[test]
+    fn adding_an_automatic_verifier_build_script_refuses_a_stale_source_receipt() {
+        let root = fingerprint_fixture();
+        let before = super::fingerprint(root.path()).unwrap();
+        super::unchanged_source(root.path(), before).unwrap();
+        crate::raw::write(&root.path().join("xtask/build.rs"), b"fn main() {}\n").unwrap();
+        super::unchanged_source(root.path(), before).unwrap_err();
     }
 
     #[test]

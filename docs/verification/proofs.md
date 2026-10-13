@@ -53,6 +53,7 @@ Runtime and build-time archive admission use that same capability-relative bound
 The small parser and metadata interpreter fixtures remain separate from the large native record/count/aggregate boundary tests.
 
 The gate fingerprints production source, locked dependencies, proof sources, configuration, the model, and the exact required corpus before and after execution.
+It includes the entire verifier package, including its manifest and any Cargo automatic build inputs.
 Only an unchanged source may produce its success receipt.
 Results from a larger feature set or a different checkout do not certify this baseline.
 Linux and Mac own the complete verifier and interpreter lanes.
