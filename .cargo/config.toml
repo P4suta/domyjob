@@ -1,2 +1,5 @@
 [alias]
 xtask = "run --quiet --locked --package xtask --"
+
+[build]
+jobs = 2
