@@ -299,7 +299,12 @@ fn start_worker_using(
     launch: impl FnOnce(&JobId) -> Result<(), ProcessError>,
 ) -> Result<(), AppError> {
     let _launch = store.launch_lock(job)?;
-    if store.status(job)?.kind() != PhaseKind::Accepted {
+    let state = domyjob_core::job_protocol::State::from(store.status(job)?.kind());
+    let attached =
+        domyjob_core::job_protocol::step(state, domyjob_core::job_protocol::Action::Attach);
+    if attached != Ok(domyjob_core::job_protocol::State::Active)
+        || state != domyjob_core::job_protocol::State::Accepted
+    {
         return Ok(());
     }
     if let Err(error) = launch(job) {

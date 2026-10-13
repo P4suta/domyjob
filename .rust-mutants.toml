@@ -147,7 +147,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "<ControlLength as TryFrom>::try_from"
 rule = "question-to-unwrap"
 original = "?"
-line = 32
+line = 34
 reason = "a u32 always fits a usize on the 32-bit and 64-bit targets domyjob supports"
 outcome = "survived"
 
@@ -156,7 +156,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "payload"
 rule = "question-to-unwrap"
 original = "?"
-line = 258
+line = 261
 reason = "the header is exactly the first four bytes, so it always converts to an array of four"
 outcome = "survived"
 
@@ -165,7 +165,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "payload"
 rule = "question-to-unwrap"
 original = "?"
-line = 260
+line = 266
 reason = "a length of at most 1 MiB plus four cannot overflow a usize"
 outcome = "survived"
 
@@ -174,16 +174,7 @@ path = "crates/domyjob-core/src/wire.rs"
 item = "frame"
 rule = "question-to-unwrap"
 original = "?"
-line = 271
-reason = "the wire's own types always serialize: they hold no maps with non-string keys"
-outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/domyjob-core/src/wire.rs"
-item = "frame"
-rule = "question-to-unwrap"
-original = "?"
-line = 275
+line = 283
 reason = "the length was checked against MAX_CONTROL_BYTES, which fits a u32"
 outcome = "survived"
 
@@ -273,13 +264,13 @@ path = "xtask/src/lib.rs"
 item = "gates_with"
 rule = "question-to-unwrap"
 original = "?"
-line = 359
+line = 416
 reason = "the same unchanged source string was already parsed successfully with syn::parse_file before the pure-core checker parses it again"
 outcome = "survived"
 
 [[mutation.skip]]
 path = "xtask/src/main.rs"
-lines = "23-23"
+lines = "25-25"
 reason = "this success arm has only the return-default mutation, and ExitCode::default is ExitCode::SUCCESS; network-backed dependency checks are not run successfully by the isolated CLI tests"
 
 [[mutation.expect]]
@@ -287,7 +278,7 @@ path = "xtask/src/main.rs"
 item = "workflows"
 rule = "return-default"
 original = "ExitCode::SUCCESS"
-line = 33
+line = 35
 reason = "ExitCode::default is ExitCode::SUCCESS, so replacing the success arm cannot change the CLI exit status"
 outcome = "survived"
 
@@ -296,6 +287,6 @@ path = "xtask/src/main.rs"
 item = "commit_msg"
 rule = "return-default"
 original = "ExitCode::SUCCESS"
-line = 43
+line = 45
 reason = "ExitCode::default is ExitCode::SUCCESS, so replacing the success arm cannot change the CLI exit status"
 outcome = "survived"

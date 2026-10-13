@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+const TASK_ERROR_EXIT_CODE: u8 = 2;
+
 fn gates(root: &Path, mut report: impl FnMut(&str)) -> ExitCode {
     match xtask::gates(root) {
         Ok(0) => {
@@ -13,7 +15,7 @@ fn gates(root: &Path, mut report: impl FnMut(&str)) -> ExitCode {
         }
         Err(error) => {
             report(&format!("gates: {error}"));
-            ExitCode::from(2)
+            ExitCode::from(TASK_ERROR_EXIT_CODE)
         }
     }
 }
@@ -43,6 +45,16 @@ fn commit_msg(root: &Path, message: &Path) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("commit-msg: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn verify(root: &Path, words: &[&str]) -> ExitCode {
+    match xtask::verification::dispatch(root, words) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("verify: {error}");
             ExitCode::FAILURE
         }
     }
@@ -106,6 +118,7 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        ["verify", rest @ ..] => verify(root, rest),
         ["resource-contracts"] => match xtask::resource_proofs::native(root) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -119,9 +132,9 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
         ["dependencies", "vet"] => dependencies(root, xtask::dependencies::Check::Vet),
         _ => {
             eprintln!(
-                "usage: cargo xtask gates | workflows | windows-contracts | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|preview-macos-package TARGET VERSION|verify-windows|bundle|checksums|queue handoff|discover|finalize|publish | ci plan|check|test|hook|gate"
+                "usage: cargo xtask gates | workflows | windows-contracts | verify [models|inventory|fuzz] | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|preview-macos-package TARGET VERSION|verify-windows|bundle|checksums|queue handoff|discover|finalize|publish | ci plan|check|test|hook|gate"
             );
-            ExitCode::from(2)
+            ExitCode::from(TASK_ERROR_EXIT_CODE)
         }
     }
 }

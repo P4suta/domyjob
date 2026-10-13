@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>P4suta/renovate-config"
+  ],
+  "customDatasources": {
+    "temurin-mise": {
+      "defaultRegistryUrlTemplate": "https://mise-java.jdx.dev/jvm/ga/linux/x86_64.json",
+      "format": "json",
+      "transformTemplates": [
+        "($selected := $[vendor = 'temurin' and image_type = 'jdk' and jvm_impl = 'hotspot' and file_type = 'tar.gz' and $count(features) = 0]; $assert($count($selected) > 0, 'TEMURIN_MISE_EMPTY_GA_CATALOG'); $assert($count($selected[$type(version) = 'string' ? $not($contains(version, /^[0-9]+\\.[0-9]+\\.[0-9]+\\+[0-9]+(?:\\.[0-9]+\\.LTS)?$/)) : true]) = 0, 'TEMURIN_MISE_UNSUPPORTED_GA_ALIAS'); {\"releases\": $map($selected, function($release) { {\"version\": $release.version, \"releaseTimestamp\": $release.created_at, \"sourceUrl\": $substringBefore($release.url, '/releases/'), \"changelogUrl\": $substringBefore($release.url, '/releases/download/') & '/releases/tag/' & $split($substringAfter($release.url, '/releases/download/'), '/')[0], \"isStable\": true} }), \"sourceUrl\": \"https://github.com/adoptium\", \"homepage\": \"https://adoptium.net\"})"
+      ]
+    }
+  },
+  "packageRules": [
+    {
+      "description": "Resolve this repository's Temurin JDK from mise's own GA catalog while preserving its exact version aliases.",
+      "matchManagers": [
+        "mise"
+      ],
+      "matchFileNames": [
+        "mise.toml"
+      ],
+      "matchDepNames": [
+        "java"
+      ],
+      "matchDatasources": [
+        "java-version"
+      ],
+      "matchPackageNames": [
+        "java-jdk"
+      ],
+      "overrideDatasource": "custom.temurin-mise",
+      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)\\+(?<build>\\d+)(?:\\.(?<revision>\\d+)\\.LTS)?$"
+    }
+  ]
+}

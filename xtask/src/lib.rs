@@ -55,6 +55,7 @@ pub mod release_orchestration;
 pub mod release_queue;
 mod release_ready;
 pub mod resource_proofs;
+pub mod verification;
 pub mod windows_contracts;
 pub mod workflows;
 
@@ -151,6 +152,34 @@ struct SourcePolicy {
     findings: Vec<String>,
 }
 
+fn verifier_derive(attribute: &syn::Attribute) -> bool {
+    let Ok(arguments) = attribute.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    let entries: Vec<_> = arguments.iter().collect();
+    let [syn::Meta::Path(condition), syn::Meta::List(derive)] = entries.as_slice() else {
+        return false;
+    };
+    if !condition.is_ident("kani") || !derive.path.is_ident("derive") {
+        return false;
+    }
+    let Ok(paths) = derive.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+    ) else {
+        return false;
+    };
+    let derived: Vec<_> = paths.iter().collect();
+    let [path] = derived.as_slice() else {
+        return false;
+    };
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .eq(["kani", "Arbitrary"])
+}
+
 impl<'ast> Visit<'ast> for SourcePolicy {
     fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
         let line = attribute
@@ -165,7 +194,7 @@ impl<'ast> Visit<'ast> for SourcePolicy {
         }
         let platform_branch = attribute.path().is_ident("cfg")
             && matches!(&attribute.meta, syn::Meta::List(list) if !matches!(list.tokens.to_string().as_str(), "test" | "kani"))
-            || attribute.path().is_ident("cfg_attr");
+            || attribute.path().is_ident("cfg_attr") && !verifier_derive(attribute);
         if platform_branch && !self.effect_module {
             self.findings.push(format!(
                 "{line}: platform branches belong in the platform or process adapter"
@@ -541,6 +570,29 @@ mod tests {
                 "2: platform branches belong in the platform or process adapter",
             ]
         );
+    }
+
+    #[test]
+    fn verifier_derives_are_distinct_from_platform_and_lint_branches() {
+        for (source, refused) in [
+            (
+                "#[cfg_attr(kani, derive(kani::Arbitrary))] struct State;",
+                false,
+            ),
+            (
+                "#[cfg_attr(windows, derive(kani::Arbitrary))] struct State;",
+                true,
+            ),
+            ("#[cfg_attr(kani, allow(dead_code))] struct State;", true),
+            (
+                "#[cfg_attr(kani, derive(kani::Arbitrary), allow(dead_code))] struct State;",
+                true,
+            ),
+        ] {
+            let mut policy = SourcePolicy::default();
+            policy.visit_file(&syn::parse_file(source).unwrap());
+            assert_eq!(!policy.findings.is_empty(), refused, "{source}");
+        }
     }
 
     #[test]

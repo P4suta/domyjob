@@ -9,6 +9,9 @@ lefthook = "2.1.15"
 "cargo:cargo-vet" = "0.10.2"
 "aqua:crate-ci/committed" = "1.1.11"
 "npm:jscpd" = "5.4.0"
+node = "26.11.1"
+"npm:@informalsystems/quint" = "0.32.0"
+java = "temurin-25.0.4+101.0.LTS"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 
 [settings]
@@ -75,8 +78,28 @@ description = "Run the complete workspace test suite, each test in its own proce
 run = "cargo nextest run --locked --workspace --all-targets --no-tests=fail"
 
 [tasks."resource-proofs"]
-description = "Prove resource bounds and job transitions and reject a false control"
-run = "cargo xtask resource-proofs"
+description = "Verify every inventoried proof, negative control, and source-bound model replay"
+run = "cargo xtask verify"
+
+[tasks.verify]
+description = "Verify the complete source-bound proof inventory and model traces"
+run = "cargo xtask verify"
+
+[tasks."verify:models"]
+description = "Check protocol induction and replay 100 fixed-seed Quint traces"
+run = "cargo xtask verify models"
+
+[tasks."fuzz:replay"]
+description = "Replay the three preserved wire seeds through the production ingress target"
+run = "cargo xtask verify fuzz"
+
+[tasks.miri]
+description = "Interpret finite production state, protocol, and serialization contracts"
+run = [
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(state::tests)' --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test job_protocol --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(=wire::tests::frames_propagate_serializer_failures_without_panicking)' --no-tests=fail --test-threads=1",
+]
 
 [tasks."resource-contracts"]
 description = "Check small memory-limited scopes on a native Linux user systemd manager"

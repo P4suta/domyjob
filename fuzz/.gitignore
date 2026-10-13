@@ -1,4 +1,9 @@
 target
-corpus
+corpus/*
+!corpus/wire/
+corpus/wire/*
+!corpus/wire/hello
+!corpus/wire/chat-exchange
+!corpus/wire/chat-unknown-field
 artifacts
 coverage

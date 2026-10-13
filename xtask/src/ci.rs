@@ -6,6 +6,9 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use serde_json::{Map, Value};
 
 const INPUT_LIMIT: u64 = 4_194_304;
+const GIT_SHA1_HEX_LENGTH: usize = 40;
+const GIT_SHA256_HEX_LENGTH: usize = 64;
+const SINGLE_PARENT_FIELDS: usize = 2;
 const CHILD_TARGETS: [&str; 2] = ["target/ci-build", "target/ci-build-alt"];
 const XTASK_CLIPPY: [&str; 8] = [
     "clippy",
@@ -487,7 +490,7 @@ fn git(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, CiError> {
 }
 
 fn oid(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
+    matches!(value.len(), GIT_SHA1_HEX_LENGTH | GIT_SHA256_HEX_LENGTH)
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         && value.bytes().any(|byte| byte != b'0')
 }
@@ -523,7 +526,7 @@ fn changed(root: &Path, base: &str, head: &str) -> Result<Vec<String>, CiError> 
         .split(u8::is_ascii_whitespace)
         .filter(|part| !part.is_empty())
         .count()
-        != 2
+        != SINGLE_PARENT_FIELDS
         || !git(
             root,
             &["rev-list", "--min-parents=2", &format!("{base}..{head}")],
@@ -654,8 +657,11 @@ fn static_checks(
 ) -> Result<(), CiError> {
     execute("mise", &["run", "fmt:check"])?;
     execute("cargo", &["xtask", "gates"])?;
-    if std::env::consts::OS == "linux" {
+    if matches!(std::env::consts::OS, "linux" | "macos") {
         execute("cargo", &["xtask", "resource-proofs"])?;
+        execute("mise", &["run", "miri"])?;
+    } else if std::env::consts::OS == "windows" {
+        execute("cargo", &["xtask", "verify", "inventory"])?;
     }
     execute("typos", &[])?;
     execute("cargo", &["xtask", "workflows"])?;
@@ -795,7 +801,9 @@ fn push_plan(root: &Path, input: &[u8], push_remote: Option<&str>) -> Result<Pla
                 "deleted or invalid local objects require the full scope",
             ));
         }
-        let base = if matches!(remote.len(), 40 | 64) && remote.bytes().all(|byte| byte == b'0') {
+        let base = if matches!(remote.len(), GIT_SHA1_HEX_LENGTH | GIT_SHA256_HEX_LENGTH)
+            && remote.bytes().all(|byte| byte == b'0')
+        {
             new_branch_base(root, local, push_remote)?
         } else {
             (*remote).to_owned()

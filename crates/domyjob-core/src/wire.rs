@@ -9,6 +9,8 @@ use crate::state::JobState;
 
 pub const MAX_CONTROL_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
+pub const CONTROL_HEADER_BYTES: usize = size_of::<u32>();
+const SNAPSHOT_DIGEST_HEX_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -24,10 +26,10 @@ impl BuildId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlLength(usize);
 
-impl TryFrom<[u8; 4]> for ControlLength {
+impl TryFrom<[u8; CONTROL_HEADER_BYTES]> for ControlLength {
     type Error = WireError;
 
-    fn try_from(header: [u8; 4]) -> Result<Self, Self::Error> {
+    fn try_from(header: [u8; CONTROL_HEADER_BYTES]) -> Result<Self, Self::Error> {
         let length =
             usize::try_from(u32::from_be_bytes(header)).map_err(|_length| WireError::TooLarge)?;
         if length > MAX_CONTROL_BYTES {
@@ -120,7 +122,7 @@ impl TryFrom<RawSnapshot> for Snapshot {
 
     fn try_from(raw: RawSnapshot) -> Result<Self, Self::Error> {
         if raw.bytes > MAX_SNAPSHOT_BYTES
-            || raw.digest.len() != 64
+            || raw.digest.len() != SNAPSHOT_DIGEST_HEX_CHARS
             || !raw
                 .digest
                 .bytes()
@@ -252,19 +254,25 @@ pub enum WireError {
 }
 
 pub fn payload(frame: &[u8]) -> Result<&[u8], WireError> {
-    let Some(header) = frame.get(..4) else {
+    let Some(header) = frame.get(..CONTROL_HEADER_BYTES) else {
         return Err(WireError::Incomplete);
     };
-    let header = <[u8; 4]>::try_from(header).map_err(|_length| WireError::Incomplete)?;
+    let header =
+        <[u8; CONTROL_HEADER_BYTES]>::try_from(header).map_err(|_length| WireError::Incomplete)?;
     let length = ControlLength::try_from(header)?;
-    let expected = length.bytes().checked_add(4).ok_or(WireError::TooLarge)?;
+    let expected = length
+        .bytes()
+        .checked_add(CONTROL_HEADER_BYTES)
+        .ok_or(WireError::TooLarge)?;
     if frame.len() < expected {
         return Err(WireError::Incomplete);
     }
     if frame.len() > expected {
         return Err(WireError::Trailing);
     }
-    frame.get(4..).ok_or(WireError::Incomplete)
+    frame
+        .get(CONTROL_HEADER_BYTES..)
+        .ok_or(WireError::Incomplete)
 }
 
 pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
@@ -273,7 +281,7 @@ pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
         return Err(WireError::TooLarge);
     }
     let length = u32::try_from(json.len()).map_err(|_length| WireError::TooLarge)?;
-    let mut framed = Vec::with_capacity(json.len().saturating_add(4));
+    let mut framed = Vec::with_capacity(json.len().saturating_add(CONTROL_HEADER_BYTES));
     framed.extend_from_slice(&length.to_be_bytes());
     framed.extend_from_slice(&json);
     Ok(framed)
@@ -289,6 +297,27 @@ mod tests {
 
     fn header(length: usize) -> [u8; 4] {
         u32::try_from(length).unwrap().to_be_bytes()
+    }
+
+    struct RefusingValue;
+
+    impl RefusingValue {
+        const DETAIL: &str = "fixture refuses serialization";
+    }
+
+    impl serde::Serialize for RefusingValue {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(Self::DETAIL))
+        }
+    }
+
+    #[test]
+    fn frames_propagate_serializer_failures_without_panicking() {
+        let error = frame(&RefusingValue).unwrap_err();
+        let WireError::Json(error) = error else {
+            panic!("expected the serializer failure, received {error}");
+        };
+        assert_eq!(alloc::format!("{error}"), RefusingValue::DETAIL);
     }
 
     #[test]

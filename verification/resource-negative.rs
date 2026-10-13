@@ -9,5 +9,5 @@ fn rejects_three_jobs() {
         max: 2,
         swap: 0,
     };
-    assert!(invalid.valid(), "NEGATIVE_RESOURCE_CONTROL");
+    kani::assert(invalid.valid(), "NEGATIVE_RESOURCE_CONTROL");
 }
