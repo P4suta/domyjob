@@ -3,14 +3,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use cap_std::fs::Dir;
 use domyjob_core::domain::{Invalid, RelativePath};
+use domyjob_core::source_paths::{MAX_FILES, MAX_PATH_BYTES};
 use domyjob_core::wire::MAX_SNAPSHOT_BYTES;
 use thiserror::Error;
 
 use crate::file_kind;
-
-const MAX_FILES: usize = 100_000;
-const MAX_PATH_BYTES: usize = 16_777_216;
 
 #[derive(Debug, Error)]
 pub(crate) enum ArchiveError {
@@ -79,7 +78,7 @@ impl Archive {
 
     pub(crate) fn add(
         &mut self,
-        root: &Path,
+        (root, directory): (&Path, &Dir),
         path: &Path,
         mode: impl FnOnce(&fs::Metadata) -> u32,
     ) -> Result<(), ArchiveError> {
@@ -94,8 +93,14 @@ impl Archive {
         let relative = path
             .strip_prefix(root)
             .map_err(|_prefix| rejected(Rejection::Outside))?;
+        let mut ancestor = root.to_path_buf();
         let mut parts = Vec::new();
         for component in relative.components() {
+            ancestor.push(component);
+            let metadata = fs::symlink_metadata(&ancestor).map_err(failed)?;
+            if file_kind::reparse_point(&metadata) {
+                return Err(rejected(Rejection::NonFile));
+            }
             parts.push(
                 component
                     .as_os_str()
@@ -117,7 +122,7 @@ impl Archive {
             return Err(rejected(Rejection::NonFile));
         }
         let mode = mode(&metadata);
-        let mut content = fs::File::open(path).map_err(failed)?;
+        let mut content = directory.open(relative).map_err(failed)?.into_std();
         if content.metadata().map_err(failed)?.len() != metadata.len() {
             return Err(rejected(Rejection::Changed));
         }

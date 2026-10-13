@@ -264,7 +264,7 @@ path = "xtask/src/lib.rs"
 item = "gates_with"
 rule = "question-to-unwrap"
 original = "?"
-line = 416
+line = 399
 reason = "the same unchanged source string was already parsed successfully with syn::parse_file before the pure-core checker parses it again"
 outcome = "survived"
 

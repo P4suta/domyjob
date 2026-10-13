@@ -5,5 +5,10 @@ corpus/wire/*
 !corpus/wire/hello
 !corpus/wire/chat-exchange
 !corpus/wire/chat-unknown-field
+!corpus/source_paths/
+corpus/source_paths/*
+!corpus/source_paths/tracked
+!corpus/source_paths/metadata
+!corpus/source_paths/malformed
 artifacts
 coverage

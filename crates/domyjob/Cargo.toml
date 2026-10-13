@@ -45,6 +45,7 @@ windows-spawn.workspace = true
 windows-sys.workspace = true
 
 [build-dependencies]
+cap-std.workspace = true
 blake3.workspace = true
 domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
 tar.workspace = true

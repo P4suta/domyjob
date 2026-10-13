@@ -8,11 +8,14 @@ mod source_fingerprint;
 use std::io;
 use std::path::{Path, PathBuf};
 
+const SOURCE_FILE_MODE: u32 = 0o644;
+
 fn source_archive(root: &Path, files: Vec<PathBuf>) -> io::Result<Vec<u8>> {
+    let source = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
     let mut archive = source_archive::Archive::new();
     for path in files {
         archive
-            .add(root, &path, |_metadata| 0o644)
+            .add((root, &source), &path, |_metadata| SOURCE_FILE_MODE)
             .map_err(io::Error::other)?;
     }
     archive.finish().map_err(io::Error::other)

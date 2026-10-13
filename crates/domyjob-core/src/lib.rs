@@ -54,5 +54,6 @@ pub mod resource_policy;
 #[cfg(kani)]
 mod resource_proofs;
 pub mod service;
+pub mod source_paths;
 pub mod state;
 pub mod wire;

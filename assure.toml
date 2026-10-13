@@ -2,3 +2,8 @@
 shape = "protocol"
 path = "crates/domyjob-core/src/job_protocol.rs"
 by = "xtask/src/verification.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/source_paths.rs"
+by = "fuzz/fuzz_targets/source_paths.rs"

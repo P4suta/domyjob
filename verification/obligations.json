@@ -5,6 +5,22 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "name": "source_paths::proofs::tracked_path_records_are_bounded",
+      "covers": 3,
+      "contract": "Each byte transition respects record, path, count, and aggregate budgets and reports malformed record endings.",
+      "input_domain": "Every byte and all admitted usize counters: total bytes through 16877216, records through 100000, record bytes through 4096, and aggregate path bytes through 16777216.",
+      "bound": "Scalar per-byte transition with explicit admitted-counter assumptions; no complete UTF-8 or arbitrary-length parser claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs PathBudget::advance and PathBudget::finish called by tracked_paths before portable-path construction"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_is_excluded",
+      "covers": 2,
+      "contract": "Every listed repository-metadata component is excluded at root and nested positions while an ordinary path is admitted.",
+      "input_domain": "All sixteen fixed root/nested paths for the eight metadata names and both metadata/ordinary control values.",
+      "bound": "Unwind 16 with unwinding assertions; finite path fixtures, not all Unicode path strings or filesystem semantics.",
+      "production": "crates/domyjob-core/src/source_paths.rs metadata_path and metadata_component delegate to the production source_paths/metadata.rs classifier and scanner used by tracked_paths and the native ignore walker"
+    },
+    {
       "name": "resource_proofs::execution_records_preserve_command_outcomes",
       "covers": 4,
       "contract": "Recorded command completion preserves the exact exit code or launch failure and rejects unfinished or supervisor-only outcomes.",
@@ -39,6 +55,11 @@
   ],
   "negatives": [
     {
+      "source": "verification/source-negative.rs",
+      "harness": "rejects_repository_metadata",
+      "assertion": "NEGATIVE_SOURCE_CONTROL"
+    },
+    {
       "source": "verification/resource-negative.rs",
       "harness": "rejects_three_jobs",
       "assertion": "NEGATIVE_RESOURCE_CONTROL"
@@ -50,6 +71,12 @@
     }
   ],
   "boundaries": [
+    {
+      "source": "crates/domyjob/src/source.rs",
+      "reason": "The source-bound scalar budget and finite metadata proofs do not establish native Git index output, filesystem identity and concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter merges validated tracked paths with the existing ignore walker and passes one retained root capability to archive admission.",
+      "evidence": "Native source::tests on Mac, Linux and Windows check repository/global ignored tracked modified bytes, untracked ignored exclusion, tracked deletion and metadata exclusion, subdirectory-relative paths, unchanged non-Git behavior, and linked-directory containment. The global-ignore fixture creates its actual configuration with git config --file arguments; the Windows containment fixture uses a real junction. Native source_paths::tests cover actual UTF-8/portable parsing and all record/count/aggregate byte boundaries, and the source_paths corpus replays the production parser and round trip. Both runtime and build-time archives use the capability-relative Archive::add path.",
+      "reconsider": "Git output or capability/filesystem semantics change, a native source, link, budget, collision or archive contract fails, or a verifier can check the actual Git/filesystem adapter boundary."
+    },
     {
       "source": "crates/domyjob/src/app.rs",
       "reason": "The finite protocol step and job-state proofs do not establish filesystem locking, worker creation, SSH reliability, or native process lifetime.",

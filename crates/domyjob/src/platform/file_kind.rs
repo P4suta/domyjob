@@ -1,5 +1,32 @@
 use std::fs;
 
+#[cfg(all(test, unix))]
+pub(crate) fn directory_link(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn directory_link(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    let status = crate::process::command("cmd.exe")
+        .args(["/d", "/c", "mklink", "/j"])
+        .arg(link)
+        .arg(target)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "junction creation failed: {status}"
+        )))
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
@@ -8,8 +35,9 @@ pub(crate) fn reparse_point(metadata: &fs::Metadata) -> bool {
 #[cfg(windows)]
 pub(crate) fn reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 
-    metadata.file_attributes() & 0x400 != 0
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(test)]
