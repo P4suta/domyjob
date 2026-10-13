@@ -29,6 +29,7 @@ One hundred seed-one traces of twenty transitions replay every indexed action th
 Every action must appear, and a false invariant probe must produce a model counterexample rather than a tool failure.
 Trace replay establishes agreement on those finite executions; it does not prove infinite-trace refinement or liveness.
 Node 26.11.1 and Temurin Java 25.0.4+101.0.LTS are pinned prerequisites.
+The [Java catalog provider](java-catalog.md) preserves mise's exact Temurin aliases and the shared minimum-age policy when the default Adoptium lookup is unavailable.
 
 The fuzz phase copies exactly three checked-in wire seeds into fresh replay directories: `hello`, `chat-exchange`, and `chat-unknown-field`.
 Missing or empty required corpus files fail before libFuzzer starts.

@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 const TARGET: &str = "x86_64-pc-windows-msvc";
 const CAPTURE_LIMIT: u64 = 16 * 1024 * 1024;
 const JSON_LIMIT: usize = 1024 * 1024;
+const COMPILER_STDERR_PREFIX_BYTES: usize = 4096;
+const MIN_DESCRIPTOR_DIAGNOSTICS: u64 = 2;
+const DESCRIPTOR_LIFETIME_LINES: &[u64] = &[13, 22];
 const CATEGORIES: &[(&str, &[&str])] = &[
     ("resource_kind", &["E0308"]),
     ("event_access", &["E0599"]),
@@ -53,7 +56,7 @@ fn validate_manifest(manifest: &Value) -> Result<(), String> {
             && fixture
                 .pointer("/expected_min_diagnostics/E0597")
                 .and_then(Value::as_u64)
-                != Some(2)
+                != Some(MIN_DESCRIPTOR_DIAGNOSTICS)
         {
             return Err("both ACL and SID lifetime rejections are required".to_owned());
         }
@@ -124,7 +127,7 @@ fn successful(capture: &Capture, operation: &str) -> Result<(), String> {
             String::from_utf8_lossy(
                 capture
                     .stderr
-                    .get(..capture.stderr.len().min(4096))
+                    .get(..capture.stderr.len().min(COMPILER_STDERR_PREFIX_BYTES))
                     .ok_or("invalid compiler output length")?
             )
         ))
@@ -147,7 +150,7 @@ fn dependencies(metadata: &Value) -> Result<BTreeMap<String, String>, String> {
         .find(|node| node.get("id").and_then(Value::as_str) == Some(package_id))
         .ok_or("missing domyjob dependency node")?;
     let deps = array(node, "deps")?;
-    ["windows_sys", "windows_spawn"]
+    ["windows_sys", "windows_spawn", "cap_std"]
         .into_iter()
         .map(|name| {
             let dep = deps
@@ -162,6 +165,7 @@ fn dependencies(metadata: &Value) -> Result<BTreeMap<String, String>, String> {
 fn artifacts(
     bytes: &[u8],
     dependencies: &BTreeMap<String, String>,
+    directory: &Path,
 ) -> Result<BTreeMap<String, PathBuf>, String> {
     let mut found = BTreeMap::new();
     for line in bytes
@@ -183,6 +187,7 @@ fn artifacts(
                 if path
                     .extension()
                     .is_some_and(|extension| extension == "rmeta")
+                    && path.parent() == Some(directory)
                     && found.insert(name.clone(), path).is_some()
                 {
                     return Err(format!("ambiguous metadata for {name}"));
@@ -259,7 +264,11 @@ fn require_diagnostics(fixture: &Value, codes: &BTreeMap<String, Vec<u64>>) -> R
                 "{category}: missing {code} in its expected primary fixture range"
             ));
         }
-        if category == "descriptor_lifetime" && ![13, 22].iter().all(|line| lines.contains(line)) {
+        if category == "descriptor_lifetime"
+            && !DESCRIPTOR_LIFETIME_LINES
+                .iter()
+                .all(|line| lines.contains(line))
+        {
             return Err(
                 "both ACL and SID lifetime sites must be rejected independently".to_owned(),
             );
@@ -367,7 +376,8 @@ fn prepare(root: &Path, manifest: &Value) -> Result<Contracts, String> {
         usize::try_from(CAPTURE_LIMIT).map_err(|error| error.to_string())?,
     )?;
     let dependencies = dependencies(&graph)?;
-    let evidence = PathBuf::from(text(&graph, "target_directory")?).join("windows-contracts");
+    let target_directory = Path::new(text(&graph, "target_directory")?);
+    let evidence = target_directory.join("windows-contracts");
     crate::raw::create_dir_all(&evidence).map_err(|error| error.to_string())?;
     crate::raw::write(&evidence.join("cargo-metadata.json"), &result.stdout)
         .map_err(|error| error.to_string())?;
@@ -393,7 +403,11 @@ fn prepare(root: &Path, manifest: &Value) -> Result<Contracts, String> {
     crate::raw::write(&evidence.join("cargo-check.stderr.txt"), &checked.stderr)
         .map_err(|error| error.to_string())?;
     successful(&checked, "Cargo Windows check")?;
-    let metadata = artifacts(&checked.stdout, &dependencies)?;
+    let metadata = artifacts(
+        &checked.stdout,
+        &dependencies,
+        &target_directory.join(TARGET).join("debug/deps"),
+    )?;
     let mut source_paths = BTreeMap::new();
     for (placeholder, path) in manifest
         .get("actual_source_placeholders")
@@ -452,8 +466,132 @@ pub fn run(root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dependencies, fixture_codes, require_diagnostics, validate_manifest};
+    use super::{artifacts, dependencies, fixture_codes, require_diagnostics, validate_manifest};
     use serde_json::json;
+
+    fn sdk_artifact_messages(paths: &[std::path::PathBuf]) -> Vec<u8> {
+        paths
+            .iter()
+            .map(|path| {
+                serde_json::to_string(&json!({
+                    "reason":"compiler-artifact", "package_id":"actual-sys",
+                    "target":{"name":"windows_sys"}, "filenames":[path]
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes()
+    }
+
+    fn sdk_dependencies() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([("windows_sys".to_owned(), "actual-sys".to_owned())])
+    }
+
+    fn sdk_namespace() -> std::path::PathBuf {
+        std::path::Path::new("target")
+            .join(super::TARGET)
+            .join("debug/deps")
+    }
+
+    #[test]
+    fn sdk_metadata_selects_the_requested_target_and_ignores_host_artifact_order() {
+        let target = std::path::Path::new("target")
+            .join(super::TARGET)
+            .join("debug/deps/sys-target.rmeta");
+        let host = std::path::Path::new("target/debug/deps/sys-host.rmeta").to_path_buf();
+        let observed = [
+            sdk_artifact_messages(&[target.clone(), host.clone()]),
+            sdk_artifact_messages(&[host, target.clone()]),
+        ]
+        .map(|messages| artifacts(&messages, &sdk_dependencies(), &sdk_namespace()));
+        let expected = std::collections::BTreeMap::from([("windows_sys".to_owned(), target)]);
+        assert_eq!(observed, [Ok(expected.clone()), Ok(expected)]);
+    }
+
+    #[test]
+    fn sdk_metadata_requires_the_requested_target_namespace() {
+        for path in [
+            std::path::Path::new("target/debug/deps/sys-host.rmeta").to_path_buf(),
+            std::path::Path::new("another-target")
+                .join(super::TARGET)
+                .join("debug/deps/sys-foreign.rmeta"),
+            std::path::Path::new("target")
+                .join(super::TARGET)
+                .join("release/deps/sys-release.rmeta"),
+        ] {
+            let error = artifacts(
+                &sdk_artifact_messages(&[path]),
+                &sdk_dependencies(),
+                &sdk_namespace(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Cargo did not emit the actual Windows dependency metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_metadata_refuses_two_target_artifacts_and_repeated_target_messages() {
+        let directory = std::path::Path::new("target")
+            .join(super::TARGET)
+            .join("debug/deps");
+        let first = directory.join("sys-first.rmeta");
+        for second in [directory.join("sys-second.rmeta"), first.clone()] {
+            let error = artifacts(
+                &sdk_artifact_messages(&[first.clone(), second]),
+                &sdk_dependencies(),
+                &sdk_namespace(),
+            )
+            .unwrap_err();
+            assert_eq!(error, "ambiguous metadata for windows_sys");
+        }
+        let error = artifacts(&[], &sdk_dependencies(), &sdk_namespace()).unwrap_err();
+        assert_eq!(
+            error,
+            "Cargo did not emit the actual Windows dependency metadata"
+        );
+    }
+
+    #[test]
+    fn sdk_metadata_keeps_the_resolved_package_and_target_name_binding() {
+        let directory = std::path::Path::new("custom-output")
+            .join(super::TARGET)
+            .join("debug/deps");
+        let original = json!({
+            "reason":"compiler-artifact", "package_id":"actual-sys",
+            "target":{"name":"windows_sys"}, "filenames":[directory.join("sys.rmeta")]
+        });
+        let accepted = artifacts(
+            &serde_json::to_vec(&original).unwrap(),
+            &sdk_dependencies(),
+            &directory,
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.get("windows_sys"),
+            Some(&directory.join("sys.rmeta"))
+        );
+        for (pointer, wrong) in [
+            ("/package_id", "a-different-package"),
+            ("/target/name", "a-different-target"),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!(wrong);
+            let error = artifacts(
+                &serde_json::to_vec(&changed).unwrap(),
+                &sdk_dependencies(),
+                &directory,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "Cargo did not emit the actual Windows dependency metadata"
+            );
+        }
+    }
 
     #[test]
     fn compiler_rejection_requires_a_primary_span_in_the_actual_fixture() {
@@ -472,10 +610,14 @@ mod tests {
 
     #[test]
     fn metadata_uses_the_packages_resolved_for_domyjob() {
-        let metadata = json!({"packages":[{"name":"domyjob","id":"product"}],"resolve":{"nodes":[{"id":"product","deps":[{"name":"windows_sys","pkg":"sys-new"},{"name":"windows_spawn","pkg":"spawn"}]},{"id":"other","deps":[{"name":"windows_sys","pkg":"sys-old"}]}]}});
+        let metadata = json!({"packages":[{"name":"domyjob","id":"product"}],"resolve":{"nodes":[{"id":"product","deps":[{"name":"windows_sys","pkg":"sys-new"},{"name":"windows_spawn","pkg":"spawn"},{"name":"cap_std","pkg":"cap-new"}]},{"id":"other","deps":[{"name":"windows_sys","pkg":"sys-old"},{"name":"cap_std","pkg":"cap-old"}]}]}});
         assert_eq!(
             dependencies(&metadata).unwrap().get("windows_sys").unwrap(),
             "sys-new"
+        );
+        assert_eq!(
+            dependencies(&metadata).unwrap().get("cap_std").unwrap(),
+            "cap-new"
         );
         let _error = dependencies(&json!({})).unwrap_err();
     }
