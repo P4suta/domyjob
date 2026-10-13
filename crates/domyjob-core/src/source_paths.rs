@@ -323,6 +323,16 @@ mod proofs {
         kani::assume(selection < PATHS.len());
         let path = PATHS.get(selection).unwrap();
         assert!(super::metadata::metadata_path(path));
+        let metadata: bool = kani::any();
+        let path = if metadata { "x/.git/y" } else { "x/.gitignore" };
+        assert_eq!(super::metadata::metadata_path(path), metadata);
+        kani::cover!(metadata);
+        kani::cover!(!metadata);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_casing_is_excluded() {
         let uppercase: [bool; 6] = kani::any();
         check_metadata_case(b".git", &uppercase);
         check_metadata_case(b".jj", &uppercase);
@@ -332,11 +342,8 @@ mod proofs {
         check_metadata_case(b"_darcs", &uppercase);
         check_metadata_case(b".bzr", &uppercase);
         check_metadata_case(b"CVS", &uppercase);
-        let metadata: bool = kani::any();
-        let path = if metadata { "x/.git/y" } else { "x/.gitignore" };
-        assert_eq!(super::metadata::metadata_path(path), metadata);
-        kani::cover!(metadata);
-        kani::cover!(!metadata);
+        kani::cover!(uppercase.iter().all(|upper| *upper));
+        kani::cover!(uppercase.iter().all(|upper| !*upper));
     }
 
     fn check_metadata_case<const N: usize>(name: &[u8; N], uppercase: &[bool; 6]) {
