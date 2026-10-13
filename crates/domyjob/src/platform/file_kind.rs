@@ -14,6 +14,10 @@ pub(crate) fn directory_link(
     link: &std::path::Path,
 ) -> std::io::Result<()> {
     let status = crate::process::command("cmd.exe")
+        .current_dir(
+            link.parent()
+                .ok_or_else(|| std::io::Error::other("the junction parent is missing"))?,
+        )
         .args(["/d", "/c", "mklink", "/j"])
         .arg(link)
         .arg(target)

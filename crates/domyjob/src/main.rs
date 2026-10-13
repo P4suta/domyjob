@@ -1,8 +1,8 @@
 use std::process::ExitCode;
-use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 use domyjob_core::domain::{Command as JobCommand, JobId, JobReference, MachineName, SubmissionId};
+use domyjob_core::process_group::ProcessGroup as ReaperGroup;
 use domyjob_core::wire::CleanTarget;
 
 use crate::output::Output;
@@ -49,22 +49,6 @@ mod workspace;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReaperGroup(std::num::NonZeroI32);
-
-impl FromStr for ReaperGroup {
-    type Err = &'static str;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let group: i32 = text.parse().map_err(|_invalid| "invalid process group")?;
-        let group = std::num::NonZeroI32::new(group).ok_or("invalid process group")?;
-        if group.get() < 0 {
-            return Err("invalid process group");
-        }
-        Ok(Self(group))
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,6 +103,8 @@ enum Command {
         #[arg(long, hide = true, requires = "reap")]
         reap_scope: Option<String>,
     },
+    #[command(hide = true)]
+    PublishNode,
     #[command(hide = true)]
     JobExec {
         scope: String,
@@ -229,12 +215,13 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
                 let scope = reap_scope
                     .map(process::resources::Scope::parse)
                     .transpose()?;
-                process::reap(group.0.get(), scope.as_ref());
+                process::reap(group.get(), scope.as_ref());
             } else {
                 transport::node(&output)?;
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::PublishNode => Ok(transport::publish_node()?),
         Command::JobExec { scope, command } => {
             let scope = process::resources::Scope::parse(scope)?;
             let command = JobCommand::try_from(command)?;
@@ -254,12 +241,16 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
 }
 
 fn internal() -> bool {
-    let words: Vec<std::ffi::OsString> = std::env::args_os().skip(1).take(2).collect();
+    const INTERNAL_COMMAND_WORDS: usize = 2;
+    let words: Vec<std::ffi::OsString> = std::env::args_os()
+        .skip(1)
+        .take(INTERNAL_COMMAND_WORDS)
+        .collect();
     let word = |index: usize| words.get(index).and_then(|word| word.to_str());
     matches!(
         (word(0), word(1)),
         (
-            Some("node" | "worker" | "chat-worker" | "job-exec" | "mcp"),
+            Some("node" | "worker" | "chat-worker" | "job-exec" | "publish-node" | "mcp"),
             _
         ) | (Some("chat"), Some("serve"))
     )

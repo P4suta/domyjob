@@ -27,15 +27,35 @@ pub(super) fn metadata_path(path: &str) -> bool {
 }
 
 const fn metadata_bytes(component: &[u8]) -> bool {
-    matches!(
-        component,
-        [b'.', b'g', b'i', b't']
-            | [b'.', b'j', b'j']
-            | [b'.', b'h', b'g']
-            | [b'.', b's', b'v', b'n']
-            | [b'.', b'p', b'i', b'j', b'u', b'l']
-            | [b'_', b'd', b'a', b'r', b'c', b's']
-            | [b'.', b'b', b'z', b'r']
-            | [b'C', b'V', b'S']
-    )
+    match component {
+        [first, second, third] => matches!(
+            [
+                first.to_ascii_lowercase(),
+                second.to_ascii_lowercase(),
+                third.to_ascii_lowercase()
+            ],
+            [b'.', b'j', b'j'] | [b'.', b'h', b'g'] | [b'c', b'v', b's']
+        ),
+        [first, second, third, fourth] => matches!(
+            [
+                first.to_ascii_lowercase(),
+                second.to_ascii_lowercase(),
+                third.to_ascii_lowercase(),
+                fourth.to_ascii_lowercase()
+            ],
+            [b'.', b'g', b'i', b't'] | [b'.', b's', b'v', b'n'] | [b'.', b'b', b'z', b'r']
+        ),
+        [first, second, third, fourth, fifth, sixth] => matches!(
+            [
+                first.to_ascii_lowercase(),
+                second.to_ascii_lowercase(),
+                third.to_ascii_lowercase(),
+                fourth.to_ascii_lowercase(),
+                fifth.to_ascii_lowercase(),
+                sixth.to_ascii_lowercase()
+            ],
+            [b'.', b'p', b'i', b'j', b'u', b'l'] | [b'_', b'd', b'a', b'r', b'c', b's']
+        ),
+        _ => false,
+    }
 }

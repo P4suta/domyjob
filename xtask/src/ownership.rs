@@ -5,6 +5,7 @@ const LOCK: &str = "crates/domyjob/src/lock.rs";
 const MAIN: &str = "crates/domyjob/src/main.rs";
 const KERNEL: &str = "crates/domyjob/src/process/windows/kernel.rs";
 const DESCRIPTOR: &str = "crates/domyjob/src/platform/windows_acl/descriptor.rs";
+const SOURCE_FILE: &str = "crates/domyjob/src/platform/source_file/windows.rs";
 const RELEASE: &str = "xtask/src/release.rs";
 const DISTRIBUTION: &str = "xtask/src/distribution.rs";
 const CI: &str = "xtask/src/ci.rs";
@@ -81,6 +82,7 @@ fn capability_owner(owner: &str) -> bool {
         owner,
         KERNEL
             | DESCRIPTOR
+            | SOURCE_FILE
             | LOCK
             | REPLACEMENT
             | RELEASE
@@ -307,11 +309,11 @@ impl Ownership<'_> {
         if name == "windows_sys"
             && !matches!(
                 self.owner,
-                KERNEL | DESCRIPTOR | "crates/domyjob/tests/e2e/os/windows.rs"
+                KERNEL | DESCRIPTOR | SOURCE_FILE | "crates/domyjob/tests/e2e/os/windows.rs"
             )
         {
             self.findings.push(format!(
-                "{}: Windows SDK imports and calls belong in the kernel or descriptor leaf",
+                "{}: Windows SDK imports and calls belong in an exact kernel, descriptor, or source-file leaf",
                 span.start().line
             ));
         }
@@ -593,7 +595,8 @@ pub fn check(owner: &str, file: &syn::File) -> Vec<String> {
 mod tests {
     use super::{
         CI, DEPENDENCIES, DESCRIPTOR, DISTRIBUTION, KERNEL, LOCK, MACOS_PACKAGE, MAIN, RELEASE,
-        RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, RESOURCES, check,
+        RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, RESOURCES, SOURCE_FILE,
+        check,
     };
 
     fn rejected(owner: &str, source: &str) {
@@ -917,12 +920,17 @@ mod tests {
             "fn f() { windows_sys::Win32::Foundation::CloseHandle(h); }",
             "forward!(windows_sys::Win32::Foundation::CloseHandle(h));",
         ] {
-            for owner in [KERNEL, DESCRIPTOR] {
+            for owner in [KERNEL, DESCRIPTOR, SOURCE_FILE] {
                 assert_eq!(check(owner, &syn::parse_file(source).unwrap()).len(), 0);
             }
             rejected("crates/domyjob/src/process/windows.rs", source);
         }
-        for owner in [KERNEL, DESCRIPTOR, "crates/domyjob/src/process/windows.rs"] {
+        for owner in [
+            KERNEL,
+            DESCRIPTOR,
+            SOURCE_FILE,
+            "crates/domyjob/src/process/windows.rs",
+        ] {
             rejected(owner, "use windows_sys as sdk;");
         }
     }

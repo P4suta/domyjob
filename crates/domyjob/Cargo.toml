@@ -23,6 +23,7 @@ harness = false
 [dependencies]
 blake3 = { workspace = true, features = ["std", "mmap"] }
 cap-std.workspace = true
+cap-primitives.workspace = true
 clap.workspace = true
 data-encoding.workspace = true
 domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
@@ -46,11 +47,18 @@ windows-sys.workspace = true
 
 [build-dependencies]
 cap-std.workspace = true
+cap-primitives.workspace = true
 blake3.workspace = true
 domyjob-core = { version = "0.0.0", path = "../domyjob-core" }
 tar.workspace = true
 thiserror.workspace = true
 winresource = { version = "0.1", default-features = false }
+
+[target.'cfg(unix)'.build-dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+windows-sys.workspace = true
 
 [lints]
 workspace = true

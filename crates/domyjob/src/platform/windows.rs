@@ -54,7 +54,8 @@ impl System for Windows {
     }
 
     fn file_mode(_metadata: &fs::Metadata) -> u32 {
-        0o644
+        const NON_EXECUTABLE_FILE_MODE: u32 = 0o644;
+        NON_EXECUTABLE_FILE_MODE
     }
 
     fn creation_mode(_options: &mut cap_std::fs::OpenOptions, _executable: bool) {}
@@ -69,6 +70,11 @@ impl System for Windows {
 
     fn create_private_dir(path: &Path) -> io::Result<()> {
         windows_acl::create_private_dir(path)
+    }
+
+    #[cfg(test)]
+    fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
+        windows_acl::create_exposed_build_parent(path)
     }
 
     fn owner_only(_options: &mut fs::OpenOptions) {}

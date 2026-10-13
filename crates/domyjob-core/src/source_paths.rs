@@ -27,7 +27,9 @@ pub const GIT_CONTEXT_VARIABLES: [&str; 16] = [
 ];
 
 mod metadata;
+mod read_length;
 pub use metadata::metadata_component;
+pub use read_length::ReadLength;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrackedError {
@@ -208,6 +210,15 @@ mod tests {
             ]),
             Err(TrackedError::Capacity)
         );
+        let mut aggregate = vec![b'a'; super::MAX_RECORD_BYTES];
+        aggregate.push(0);
+        let mut aggregate = aggregate.repeat(MAX_PATH_BYTES / super::MAX_RECORD_BYTES);
+        assert_eq!(
+            tracked_paths(&aggregate).unwrap().paths().len(),
+            MAX_PATH_BYTES / super::MAX_RECORD_BYTES
+        );
+        aggregate.extend_from_slice(b"b\0");
+        assert_eq!(tracked_paths(&aggregate), Err(TrackedError::Capacity));
     }
 
     #[test]
@@ -221,6 +232,14 @@ mod tests {
             ] {
                 assert_eq!(tracked_paths(path.as_bytes()).unwrap().paths(), []);
             }
+            let upper = metadata.to_ascii_uppercase();
+            assert!(metadata_component(&upper));
+            assert_eq!(
+                tracked_paths(alloc::format!("nested/{upper}/private\0").as_bytes())
+                    .unwrap()
+                    .paths(),
+                []
+            );
         }
         assert_eq!(tracked_paths(b".gitignore\0").unwrap().paths().len(), 1);
         assert_eq!(tracked_paths(b"git/normal\0").unwrap().paths().len(), 1);
@@ -304,10 +323,32 @@ mod proofs {
         kani::assume(selection < PATHS.len());
         let path = PATHS.get(selection).unwrap();
         assert!(super::metadata::metadata_path(path));
+        let uppercase: [bool; 6] = kani::any();
+        check_metadata_case(b".git", &uppercase);
+        check_metadata_case(b".jj", &uppercase);
+        check_metadata_case(b".hg", &uppercase);
+        check_metadata_case(b".svn", &uppercase);
+        check_metadata_case(b".pijul", &uppercase);
+        check_metadata_case(b"_darcs", &uppercase);
+        check_metadata_case(b".bzr", &uppercase);
+        check_metadata_case(b"CVS", &uppercase);
         let metadata: bool = kani::any();
         let path = if metadata { "x/.git/y" } else { "x/.gitignore" };
         assert_eq!(super::metadata::metadata_path(path), metadata);
         kani::cover!(metadata);
         kani::cover!(!metadata);
+    }
+
+    fn check_metadata_case<const N: usize>(name: &[u8; N], uppercase: &[bool; 6]) {
+        let mut bytes = *name;
+        for (byte, upper) in bytes.iter_mut().zip(uppercase) {
+            if *upper {
+                byte.make_ascii_uppercase();
+            } else {
+                byte.make_ascii_lowercase();
+            }
+        }
+        let text = core::str::from_utf8(&bytes).unwrap();
+        assert!(super::metadata_component(text));
     }
 }

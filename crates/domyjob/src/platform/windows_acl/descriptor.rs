@@ -28,6 +28,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+const MAX_SID_UTF16_UNITS: usize = 256;
+const MAX_TOKEN_USER_BYTES: u32 = 4096;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Success(());
 
@@ -93,10 +96,10 @@ pub(super) fn sid_text(sid: SidRef<'_>) -> io::Result<Sid> {
     let allocation = LocalAllocation(present(wide)?.cast());
     let text = allocation.0.cast::<u16>();
     let mut length = 0_usize;
-    while length < 256 && unsafe { *text.as_ptr().add(length) } != 0 {
+    while length < MAX_SID_UTF16_UNITS && unsafe { *text.as_ptr().add(length) } != 0 {
         length = length.saturating_add(1);
     }
-    if length == 256 {
+    if length == MAX_SID_UTF16_UNITS {
         return Err(io::Error::other("the SID is too long"));
     }
     let text = String::from_utf16(unsafe { std::slice::from_raw_parts(text.as_ptr(), length) })
@@ -123,7 +126,7 @@ impl TokenUserBuffer {
         if status == 0 && error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
             return Err(error);
         }
-        if needed == 0 || needed > 4096 {
+        if needed == 0 || needed > MAX_TOKEN_USER_BYTES {
             return Err(io::Error::other(
                 "the token user is unavailable or too large",
             ));
@@ -225,6 +228,22 @@ pub(super) struct FileSecurity {
     _descriptor: SecurityDescriptor,
     owner: NonNull<c_void>,
     dacl: Option<NonNull<ACL>>,
+}
+
+#[cfg(test)]
+pub(super) fn create_exposed_build_parent(path: &Path) -> io::Result<Success> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    };
+    const FOREIGN_MODIFY: u32 =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+    let user = current_user_sid()?;
+    let descriptor = SecurityDescriptor::from_sddl(&format!(
+        "O:{}D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)(A;OICI;0x{FOREIGN_MODIFY:x};;;BU)",
+        user.as_str(),
+        user.as_str(),
+    ))?;
+    descriptor.create_dir(path)
 }
 
 impl FileSecurity {

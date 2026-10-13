@@ -67,6 +67,11 @@ fn connect() -> Result<ExitCode, Failure> {
             "connect to host {alias} port 22: Connection refused"
         )));
     }
+    if crate::present(&machine.join("bootstrap-exec"))? {
+        return crate::bootstrap::connect(&root, &machine, &invocation.command, |outcome| {
+            log(&root, &invocation, outcome)
+        });
+    }
     match remote {
         Remote::ShellProbe => {
             log(&root, &invocation, "probe")?;

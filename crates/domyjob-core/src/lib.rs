@@ -48,6 +48,7 @@ pub mod ingress;
 pub mod job_protocol;
 pub mod jsonc;
 pub mod mcp_clients;
+pub mod process_group;
 pub mod resource_budget;
 pub mod resource_policy;
 

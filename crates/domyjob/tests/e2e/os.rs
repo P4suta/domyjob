@@ -7,6 +7,46 @@ mod macos;
 
 use std::io;
 
+pub(crate) type BootstrapInputContract = fn(&std::path::Path) -> Result<(), crate::Failure>;
+
+pub(crate) const fn bootstrap_input_contracts() -> &'static [BootstrapInputContract] {
+    #[cfg(windows)]
+    {
+        &[windows::bootstrap_input_contract]
+    }
+    #[cfg(unix)]
+    {
+        &[]
+    }
+}
+
+pub(crate) fn bootstrap_shell(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut shell = std::process::Command::new("powershell.exe");
+        shell.args(["-NoProfile", "-Command", command]);
+        shell
+    }
+    #[cfg(unix)]
+    {
+        let mut shell = std::process::Command::new("sh");
+        shell.args(["-c", command]);
+        shell
+    }
+}
+
+pub(crate) const fn bootstrap_os() -> &'static str {
+    if cfg!(windows) { "Windows_NT" } else { ":OS" }
+}
+
+pub(crate) fn bootstrap_cache(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        home.join("AppData/Local")
+    } else {
+        home.join(".cache")
+    }
+}
+
 pub(crate) const fn extra_fakes() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         &["launchctl"]

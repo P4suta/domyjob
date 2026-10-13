@@ -24,6 +24,8 @@ macro_rules! ensure {
     };
 }
 
+#[path = "e2e/bootstrap.rs"]
+mod bootstrap;
 #[path = "e2e/os.rs"]
 mod os;
 #[path = "e2e/provider.rs"]
@@ -37,10 +39,13 @@ mod world;
 
 use world::World;
 
-const FAKES: [&str; 5] = ["ssh", "claude", "codex", "opencode", "sleeper"];
+const FAKES: [&str; 6] = ["ssh", "claude", "codex", "opencode", "sleeper", "mise"];
 const AI_CLIENTS: [&str; 3] = ["claude", "codex", "opencode"];
 
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--bootstrap-input-remainder") {
+        return bootstrap::input_remainder();
+    }
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -51,12 +56,16 @@ fn main() -> ExitCode {
     if let Some(code) = os::fake_tool(&executable) {
         return code;
     }
+    if std::env::args().nth(1).as_deref() == Some("publish-node") {
+        return bootstrap::published();
+    }
     match executable.file_stem().and_then(OsStr::to_str) {
         Some("ssh") => ssh::main(),
         Some("claude") => provider::main(provider::Tool::Claude),
         Some("codex") => provider::main(provider::Tool::Codex),
         Some("opencode") => provider::main(provider::Tool::Opencode),
         Some("sleeper") => provider::sleeper(),
+        Some("mise") => bootstrap::installer(),
         Some(_) | None => runner(),
     }
 }

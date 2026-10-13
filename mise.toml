@@ -26,7 +26,7 @@ description = "Format Rust and TOML"
 run = [
   "cargo fmt --all",
   "cargo fmt --manifest-path fuzz/Cargo.toml",
-  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs",
+  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs",
   "taplo fmt",
 ]
 env = { RUST_LOG = "warn" }
@@ -36,7 +36,7 @@ description = "Check Rust and TOML formatting"
 run = [
   "cargo fmt --all -- --check",
   "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
-  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs",
+  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs",
   "taplo fmt --check",
   "taplo lint",
 ]
@@ -90,7 +90,7 @@ description = "Check protocol induction and replay 100 fixed-seed Quint traces"
 run = "cargo xtask verify models"
 
 [tasks."fuzz:replay"]
-description = "Replay the six preserved wire and source seeds through production ingress targets"
+description = "Replay the nine preserved wire, source, and process-group seeds through production ingress"
 run = "cargo xtask verify fuzz"
 
 [tasks.miri]
@@ -101,6 +101,8 @@ run = [
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(=wire::tests::frames_propagate_serializer_failures_without_panicking)' --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(=source_paths::tests::tracked_records_are_exact_portable_paths)' --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(=source_paths::tests::every_repository_metadata_component_is_excluded_at_any_depth)' --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --bin domyjob -E 'test(transport::input::tests)' --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test process_group --no-tests=fail --test-threads=1",
 ]
 
 [tasks."resource-contracts"]
@@ -122,6 +124,7 @@ run = [
   "cargo +nightly-2026-10-01 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
   "cargo +nightly-2026-10-01 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
   "cargo +nightly-2026-10-01 fuzz run source_paths corpus/source_paths -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-10-01 fuzz run process_group corpus/process_group -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
 [tasks.mutants]

@@ -5,6 +5,23 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "name": "process_group::proofs::only_positive_identifiers_are_admitted",
+      "covers": 3,
+      "contract": "Only positive process-group identifiers can grant ownership to the reaper.",
+      "input_domain": "Every i32 process-group identifier.",
+      "bound": "No loops or input assumptions; complete integer domain. Standard-library integer text decoding is checked by native and fuzz ingress round trips.",
+      "production": "crates/domyjob-core/src/process_group.rs ProcessGroup::new called by FromStr and the actual hidden node reaper CLI"
+    },
+    {
+      "source": "verification/outbound-proof.rs",
+      "name": "ordered_segments_stop_at_the_first_failed_write",
+      "covers": 5,
+      "contract": "Source, original frame, and payload preserve order and stop at the first partial-write refusal; flush happens only after every segment and its failure is returned.",
+      "input_domain": "Every byte in three two-byte segments, every admitted partial-acceptance count from zero through six, and both flush outcomes.",
+      "bound": "Six total bytes with unwind eight and unwinding assertions; std write_all runs against an actual one-byte partial writer. Native tests separately cover Interrupted, WriteZero, empty segments, and actual pipes.",
+      "production": "verification/outbound-proof.rs imports crates/domyjob/src/transport/input.rs directly; transport::exchange_input calls the same Outbound::send with actual child stdin."
+    },
+    {
       "name": "source_paths::proofs::tracked_path_records_are_bounded",
       "covers": 3,
       "contract": "Each byte transition respects record, path, count, and aggregate budgets and reports malformed record endings.",
@@ -16,9 +33,17 @@
       "name": "source_paths::proofs::repository_metadata_is_excluded",
       "covers": 2,
       "contract": "Every listed repository-metadata component is excluded at root and nested positions while an ordinary path is admitted.",
-      "input_domain": "All sixteen fixed root/nested paths for the eight metadata names and both metadata/ordinary control values.",
-      "bound": "Unwind 16 with unwinding assertions; finite path fixtures, not all Unicode path strings or filesystem semantics.",
+      "input_domain": "All sixteen fixed root/nested paths for eight metadata names, every ASCII uppercase/lowercase combination of those names, and both metadata/ordinary control values.",
+      "bound": "Unwind 16 with unwinding assertions; finite ASCII metadata casing and path fixtures, not all Unicode path strings or filesystem case-folding semantics.",
       "production": "crates/domyjob-core/src/source_paths.rs metadata_path and metadata_component delegate to the production source_paths/metadata.rs classifier and scanner used by tracked_paths and the native ignore walker"
+    },
+    {
+      "name": "source_paths::read_length::proofs::source_reads_are_bounded_and_exact",
+      "covers": 3,
+      "contract": "Source readers admit at most 64 MiB, inspect at most one extra byte, and accept exactly the admitted length.",
+      "input_domain": "All u64 expected lengths and actual byte counts, including over-budget and changed lengths.",
+      "bound": "No loops or assumptions; scalar admission, limit, and exact-length decision.",
+      "production": "crates/domyjob-core/src/source_paths/read_length.rs ReadLength::{new,limit,matches}; actual source_archive::Archive::add and source_fingerprint::hash_content apply Read::take and check consumed length"
     },
     {
       "name": "resource_proofs::execution_records_preserve_command_outcomes",
@@ -55,6 +80,21 @@
   ],
   "negatives": [
     {
+      "source": null,
+      "harness": "source_paths::read_length::proofs::rejects_a_changed_read_length",
+      "assertion": "NEGATIVE_SOURCE_READ_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "process_group::proofs::rejects_unowned_process_groups",
+      "assertion": "NEGATIVE_PROCESS_GROUP_CONTROL"
+    },
+    {
+      "source": "verification/outbound-proof.rs",
+      "harness": "rejects_success_after_a_partial_segment_failure",
+      "assertion": "NEGATIVE_OUTBOUND_CONTROL"
+    },
+    {
       "source": "verification/source-negative.rs",
       "harness": "rejects_repository_metadata",
       "assertion": "NEGATIVE_SOURCE_CONTROL"
@@ -72,10 +112,22 @@
   ],
   "boundaries": [
     {
+      "source": "crates/domyjob/src/builds.rs",
+      "reason": "The actual admission transition depends on filesystem identity, private candidate ACLs, operating-system selection/usage locks, directory publication, and the publisher-to-node lifetime. The segmented writer proof cannot establish these effects. Selection bridges publication to final usage admission because Windows refuses renaming a directory with open child-file handles.",
+      "evidence": "Native builds::tests on each supported host check a legacy exposed parent's protected candidate, a separate pruner blocked after publication until final usage admission, existing-winner and losing-installer admission, invalid/link refusal, and usage retained through the actual first-node callback. The original two-idle retention policy remains; fixtures make the candidate eligible using two newer idle companions. Replacement fixtures preserve the destination and recreated names and remove only an empty outer stage.",
+      "reconsider": "A native publication, selection, usage, identity, or cleanup contract fails, filesystem or locking semantics change, or the first-node ownership protocol changes."
+    },
+    {
+      "source": "crates/domyjob/src/transport/bootstrap/windows-input.cs",
+      "reason": "Kani verifies the actual bounded Rust segmented writer, not CLR pinning/marshalling, PowerShell stdin inheritance, or overlapped Win32 completion semantics. The prefix reader retains its borrowed pipe handle, pinned bytes, event, and operation until native completion.",
+      "evidence": "The source-bound native Windows bootstrap scenario runs the actual script in Windows PowerShell and PowerShell 7, eight SDK inherited-overlapped-input schedules with exact binary prefix/remainder/EOF, and refusal without publication for truncated input, a write-only handle, and a failed pending observer. All hosts exercise the exact original frame, snapshot digest and bytes, isolated installer input/output, one upload/first-request connection, and primary-preserving cwd/cleanup faults.",
+      "reconsider": "The actual reader, shell launcher, byte-mode pipe assumption, FFI lifetime, source prefix format, or any native handoff contract changes."
+    },
+    {
       "source": "crates/domyjob/src/source.rs",
-      "reason": "The source-bound scalar budget and finite metadata proofs do not establish native Git index output, filesystem identity and concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter merges validated tracked paths with the existing ignore walker and passes one retained root capability to archive admission.",
-      "evidence": "Native source::tests on Mac, Linux and Windows check repository/global ignored tracked modified bytes, untracked ignored exclusion, tracked deletion and metadata exclusion, subdirectory-relative paths, unchanged non-Git behavior, and linked-directory containment. The global-ignore fixture creates its actual configuration with git config --file arguments; the Windows containment fixture uses a real junction. Native source_paths::tests cover actual UTF-8/portable parsing and all record/count/aggregate byte boundaries, and the source_paths corpus replays the production parser and round trip. Both runtime and build-time archives use the capability-relative Archive::add path.",
-      "reconsider": "Git output or capability/filesystem semantics change, a native source, link, budget, collision or archive contract fails, or a verifier can check the actual Git/filesystem adapter boundary."
+      "reason": "The source-bound scalar budget/read-length and finite ASCII metadata proofs do not establish native Git configuration and index output, canonical root discovery, ignore matching, filesystem identity and concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter merges validated tracked paths with the ignore walker, resolves the global excludes path through Git, anchors relative excludes and global patterns at the canonical repository root, and passes one retained selected-root capability to no-follow archive admission.",
+      "evidence": "Native source, source_archive, source_fingerprint and source_file tests cover Git-written global excludes paths with spaces and inherited config-count context, ignored tracked modified bytes, ignored untracked exclusion, deletion, real .GIT metadata, and subdirectory paths. Actual Git oracle fixtures cover ancestor-ignored untracked exclusion plus competing relative excludes files and repository-root anchored patterns without losing current tracked working bytes. Shared runtime/build readers retain every captured parent; Unix uses public cap-primitives open_dir_nofollow and safe rustix NOFOLLOW|NONBLOCK|CLOEXEC, while Windows NtCreateFile uses RootDirectory and OPEN_REPARSE_POINT for every component, rejecting non-disk/reparse handles before reads. Native controls replace inspected parents/final files, rename captured ancestors/root names, refuse a writerless FIFO within a killed/reaped child deadline, preserve read errors, and bound growth/truncation reads to admitted length+1. Native parser tests admit exactly MAX_PATH_BYTES in complete valid records and refuse one extra path byte separately from stream/count/record limits. Filesystem case folding and a single atomic view of concurrently modified files are not claimed.",
+      "reconsider": "Git output, ancestor ignore semantics, or capability/filesystem semantics change, a native source, link, budget, collision or archive contract fails, or a verifier can check the actual Git/filesystem adapter boundary."
     },
     {
       "source": "crates/domyjob/src/app.rs",
