@@ -1,0 +1,4 @@
+[[owner]]
+shape = "protocol"
+path = "crates/domyjob-core/src/job_protocol.rs"
+by = "xtask/src/verification.rs"

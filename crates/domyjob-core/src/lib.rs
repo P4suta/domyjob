@@ -45,6 +45,7 @@ pub mod chat;
 pub mod chat_wire;
 pub mod domain;
 pub mod ingress;
+pub mod job_protocol;
 pub mod jsonc;
 pub mod mcp_clients;
 pub mod resource_budget;

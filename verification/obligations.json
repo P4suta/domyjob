@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "kani_version": "0.68.0",
+  "quint_version": "0.32.0",
+  "apalache_version": "0.56.1",
+  "harnesses": [
+    {
+      "name": "resource_proofs::execution_records_preserve_command_outcomes",
+      "covers": 4,
+      "contract": "Recorded command completion preserves the exact exit code or launch failure and rejects unfinished or supervisor-only outcomes.",
+      "input_domain": "Every i32 exit code and all modeled job outcomes; one valid launch-error payload.",
+      "bound": "Unwind 16 with unwinding assertions; strings are the fixed one-byte payload.",
+      "production": "crates/domyjob-core/src/state.rs JobState::command_completion"
+    },
+    {
+      "name": "resource_proofs::resource_budget_is_bounded",
+      "covers": 2,
+      "contract": "Admission accepts exactly the configured concurrent-job, memory, and swap bounds.",
+      "input_domain": "All u32 concurrent counts and all u64 memory quantities.",
+      "bound": "No loops or input restriction.",
+      "production": "crates/domyjob-core/src/resource_budget.rs Budget::valid"
+    },
+    {
+      "name": "resource_proofs::job_transitions_preserve_queue_and_terminal_invariants",
+      "covers": 3,
+      "contract": "Valid transitions preserve phase, PID, and outcomes; invalid transitions leave the state unchanged.",
+      "input_domain": "All modeled phases/events, all u32 input PIDs, all i32 exit codes; representative nonzero previous PID and one-byte launch reason.",
+      "bound": "Unwind 16 with unwinding assertions; finite phase construction, fixed reason payload.",
+      "production": "crates/domyjob-core/src/state.rs JobState::advance"
+    },
+    {
+      "name": "job_protocol::proofs::persistent_jobs_survive_client_actions",
+      "covers": 4,
+      "contract": "Disconnect preserves durable state, retries are idempotent, conflicts are rejected, and only active jobs can be reaped.",
+      "input_domain": "Every projection of the five recorded phases, all four durable states, and every action, including both request-equivalence values.",
+      "bound": "No loops or assumptions; complete finite enum domain.",
+      "production": "crates/domyjob-core/src/job_protocol.rs step; Store::reserve, Store::status, app::start_worker_using"
+    }
+  ],
+  "negatives": [
+    {
+      "source": "verification/resource-negative.rs",
+      "harness": "rejects_three_jobs",
+      "assertion": "NEGATIVE_RESOURCE_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "job_protocol::proofs::rejects_disconnect_loss",
+      "assertion": "NEGATIVE_JOB_CONTROL"
+    }
+  ],
+  "boundaries": [
+    {
+      "source": "crates/domyjob/src/app.rs",
+      "reason": "The finite protocol step and job-state proofs do not establish filesystem locking, worker creation, SSH reliability, or native process lifetime.",
+      "evidence": "Native workspace tests exercise duplicate and conflicting submission, the existing launch-lock boundary, finished-job retries, launch refusal, and missing-supervisor state through the production app and Store adapters.",
+      "reconsider": "The launch or store locking protocol changes, a native adapter contract fails, or a verifier supports the actual filesystem and process boundary."
+    },
+    {
+      "source": "xtask/src/verification.rs",
+      "reason": "The supported native Kani, Quint/Apalache, Miri, and libFuzzer owner lane runs on Linux and Mac; native Windows verifier capability is not claimed.",
+      "evidence": "Linux or Mac: mise run verify and mise run miri on the exact source digest; Windows: cargo xtask verify inventory, cargo xtask windows-contracts, and mise run test for native SDK, process ownership, and filesystem contracts.",
+      "reconsider": "A pinned native verifier supports Windows, the implementation adds target-specific core decisions, or any native Windows contract fails."
+    },
+    {
+      "source": "crates/domyjob/src/process/windows/kernel.rs",
+      "reason": "Kani does not establish concurrent Win32 kernel ownership or foreign-function behavior.",
+      "evidence": "mise x -- cargo xtask windows-contracts; mise run test on Windows exercises capability, child ownership, failure cleanup, and process-tree termination.",
+      "reconsider": "A verifier supports the actual Win32 boundary, SDK semantics change, or a native ownership contract fails."
+    }
+  ]
+}

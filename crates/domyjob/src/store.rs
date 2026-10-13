@@ -124,6 +124,29 @@ impl JobPaths {
 }
 
 const KEEP_FINISHED: usize = 32;
+const MAX_JOB_RECORDS: usize = 1024;
+const ARCHIVE_COPY_BUFFER_BYTES: usize = 16_384;
+const MAX_LOG_TAIL_BYTES: u64 = 16_384;
+const MAX_ARCHIVE_FILES: usize = 100_000;
+const MAX_ARCHIVE_PATH_BYTES: usize = 16_777_216;
+const ARCHIVE_EXECUTABLE_BITS: u32 = 0o111;
+
+const fn submission_step(
+    state: domyjob_core::job_protocol::State,
+    same_request: bool,
+) -> Result<(), StoreError> {
+    match domyjob_core::job_protocol::step(
+        state,
+        domyjob_core::job_protocol::Action::Submit { same_request },
+    ) {
+        Ok(_) => Ok(()),
+        Err(domyjob_core::job_protocol::Refusal::Conflict) => Err(StoreError::Conflict),
+        Err(
+            domyjob_core::job_protocol::Refusal::Missing
+            | domyjob_core::job_protocol::Refusal::NotActive,
+        ) => Err(StoreError::Corrupt),
+    }
+}
 
 fn in_use(root: &Path) -> Result<bool, StoreError> {
     for entry in std::fs::read_dir(root)? {
@@ -371,7 +394,7 @@ impl Store {
             OrphanKind::Incoming => self.incoming_dir(),
         };
         for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
-            if index >= 1024 {
+            if index >= MAX_JOB_RECORDS {
                 return Err(StoreError::Capacity);
             }
             let entry = entry?;
@@ -412,10 +435,12 @@ impl Store {
         };
         let mut hasher = blake3::Hasher::new();
         let mut remaining = snapshot.bytes();
-        let mut buffer = [0_u8; 16_384];
+        let mut buffer = [0_u8; ARCHIVE_COPY_BUFFER_BYTES];
         while remaining != 0 {
-            let wanted =
-                usize::try_from(remaining.min(16_384)).map_err(|_length| StoreError::Capacity)?;
+            let wanted = usize::try_from(
+                remaining.min(u64::try_from(buffer.len()).map_err(|_length| StoreError::Capacity)?),
+            )
+            .map_err(|_length| StoreError::Capacity)?;
             let chunk = buffer.get_mut(..wanted).ok_or(StoreError::Capacity)?;
             let count = input.read(chunk)?;
             if count == 0 {
@@ -445,7 +470,7 @@ impl Store {
         let mut content_bytes = 0_u64;
         for entry in tar.entries()? {
             let mut entry = entry?;
-            if paths.len() >= 100_000 || !entry.header().entry_type().is_file() {
+            if paths.len() >= MAX_ARCHIVE_FILES || !entry.header().entry_type().is_file() {
                 return Err(StoreError::ArchiveEntry);
             }
             let path = entry.path()?;
@@ -453,7 +478,9 @@ impl Store {
             let validated = RelativePath::try_from(text.to_owned())
                 .map_err(|_invalid| StoreError::ArchiveEntry)?;
             path_bytes = path_bytes.saturating_add(validated.as_str().len());
-            if path_bytes > 16_777_216 || !paths.insert(validated.as_str().to_lowercase()) {
+            if path_bytes > MAX_ARCHIVE_PATH_BYTES
+                || !paths.insert(validated.as_str().to_lowercase())
+            {
                 return Err(StoreError::ArchiveEntry);
             }
             let size = entry.header().size()?;
@@ -462,7 +489,7 @@ impl Store {
                 return Err(StoreError::ArchiveEntry);
             }
             rooted.make_parents(&validated)?;
-            let executable = entry.header().mode()? & 0o111 != 0;
+            let executable = entry.header().mode()? & ARCHIVE_EXECUTABLE_BITS != 0;
             let mut output = rooted.create_file(&validated, executable)?;
             if std::io::copy(&mut entry, &mut output)? != size {
                 return Err(StoreError::ArchiveMismatch);
@@ -545,18 +572,21 @@ impl Store {
         match std::fs::symlink_metadata(self.paths(&job).dir) {
             Ok(_existing) => {
                 self.verify_job(&job)?;
-                if self.read_request(&job)? != *request {
-                    return Err(StoreError::Conflict);
-                }
+                let same_request = self.read_request(&job)? == *request;
+                submission_step(
+                    domyjob_core::job_protocol::State::from(self.read_state(&job)?.kind()),
+                    same_request,
+                )?;
                 return Ok(job);
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(StoreError::Io(error)),
         }
         self.reclaim()?;
-        if self.list()?.len() >= 1024 {
+        if self.list()?.len() >= MAX_JOB_RECORDS {
             return Err(StoreError::Capacity);
         }
+        submission_step(domyjob_core::job_protocol::State::Absent, true)?;
         self.stage(&job, request, archive)?;
         Ok(job)
     }
@@ -565,7 +595,7 @@ impl Store {
         let mut jobs = Vec::new();
         for entry in std::fs::read_dir(self.jobs_dir())? {
             let entry = entry?;
-            if jobs.len() >= 1024 {
+            if jobs.len() >= MAX_JOB_RECORDS {
                 return Err(StoreError::Capacity);
             }
             let name = entry
@@ -614,6 +644,13 @@ impl Store {
                 match OsLock::probe(&self.paths(job).alive_lock())? {
                     Probe::Held => Ok(state),
                     Probe::Absent | Probe::Free => {
+                        if domyjob_core::job_protocol::step(
+                            domyjob_core::job_protocol::State::Active,
+                            domyjob_core::job_protocol::Action::Reap,
+                        ) != Ok(domyjob_core::job_protocol::State::Finished)
+                        {
+                            return Err(StoreError::Corrupt);
+                        }
                         state.advance(&Event::SupervisorGone)?;
                         self.write_state(job, &state)?;
                         Ok(state)
@@ -669,7 +706,7 @@ impl Store {
             ));
         };
         let length = file.metadata()?.len();
-        let take = length.min(16_384);
+        let take = length.min(MAX_LOG_TAIL_BYTES);
         let omitted = length.saturating_sub(take);
         file.seek(SeekFrom::Start(omitted))?;
         let size = usize::try_from(take).map_err(|_size| StoreError::Capacity)?;
