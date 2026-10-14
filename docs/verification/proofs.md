@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers twelve positive Kani harnesses, five named negative controls, and twenty-seven required covers.
+This head registers nineteen positive Kani harnesses, five named negative controls, and forty-one required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -45,9 +45,9 @@ Miri establishes its checks for those concrete executions under supported memory
 The source budget proof checks the production per-byte transition for every byte and all admitted counters, requiring reachable byte admission, empty-record refusal and unterminated-record refusal.
 Its counter domain preserves the existing 100,000-file and 16,777,216-path-byte archive limits, with a 4,096-byte record bound and a 16,877,216-byte tracked stream bound.
 The metadata path proof selects all sixteen fixed root/nested paths for the eight production metadata names and checks both ordinary/metadata controls.
-The separate casing proof quantifies the same six independent Boolean case choices for each of the same eight names, with all-uppercase and all-lowercase covers.
-Both proofs retain unwind sixteen and unwinding assertions.
-This decomposition preserves the original combined input domain within the unchanged per-harness timeout.
+Eight casing proofs each quantify the same six independent Boolean case choices for one of the same eight names, with all-uppercase and all-lowercase covers for every name.
+Their conjunction preserves the original combined input domain within the unchanged per-harness timeout.
+The path and casing proofs retain unwind sixteen and unwinding assertions.
 The named false metadata control imports the exact production classifier and must fail `NEGATIVE_SOURCE_CONTROL`.
 The four standalone metadata-directory proofs import the actual typed component-prefix matcher used by the production collector.
 Its native path adapter passes actual `Path::components()` into that same matcher, and finite Miri controls check complete components and rooted-versus-relative namespaces.

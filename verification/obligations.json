@@ -57,10 +57,66 @@
       "production": "crates/domyjob-core/src/source_paths.rs metadata_path and metadata_component delegate to the production source_paths/metadata.rs classifier and scanner used by tracked_paths and the native ignore walker"
     },
     {
-      "name": "source_paths::proofs::repository_metadata_casing_is_excluded",
+      "name": "source_paths::proofs::repository_metadata_git_casing_is_excluded",
       "covers": 2,
-      "contract": "Every ASCII uppercase/lowercase combination of each of the eight repository metadata names is excluded.",
-      "input_domain": "All six independent Boolean casing choices applied to every one of the eight fixed metadata names.",
+      "contract": "Every ASCII uppercase/lowercase combination of .git is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .git name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_jj_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of .jj is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .jj name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_hg_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of .hg is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .hg name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_svn_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of .svn is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .svn name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_pijul_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of .pijul is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .pijul name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_darcs_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of _darcs is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed _darcs name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_bzr_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of .bzr is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed .bzr name.",
+      "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
+      "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
+    },
+    {
+      "name": "source_paths::proofs::repository_metadata_cvs_casing_is_excluded",
+      "covers": 2,
+      "contract": "Every ASCII uppercase/lowercase combination of CVS is excluded.",
+      "input_domain": "All six independent Boolean casing choices applied to the fixed CVS name.",
       "bound": "Unwind 16 with unwinding assertions; complete stated finite ASCII casing domain, with all-uppercase and all-lowercase covers. No arbitrary Unicode or filesystem case-folding claim.",
       "production": "crates/domyjob-core/src/source_paths.rs check_metadata_case invokes the actual metadata_component classifier after checked UTF-8 construction; tracked_paths and the native ignore walker use that same classifier"
     },
