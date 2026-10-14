@@ -19,6 +19,8 @@ const IO_TIMEOUT_MILLIS: u64 = 30_000;
 const MAX_REPLY_BYTES: usize = 16_385;
 const MAX_ERROR_CHARS: usize = 4096;
 
+mod reply;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Handoff {
@@ -148,10 +150,12 @@ fn receive(
         launch(request).map_err(io::Error::other)
     })();
     match started {
-        Ok(()) => stream.write_all(b"R"),
+        Ok(()) => reply::complete(&mut stream, b"R", |socket| socket.shutdown(Shutdown::Write)),
         Err(error) => {
             let detail: String = error.to_string().chars().take(MAX_ERROR_CHARS).collect();
-            stream.write_all(detail.as_bytes())
+            reply::complete(&mut stream, detail.as_bytes(), |socket| {
+                socket.shutdown(Shutdown::Write)
+            })
         }
     }
 }
@@ -208,14 +212,14 @@ pub(crate) fn start() -> io::Result<()> {
 mod tests {
     use super::{Handoff, bind, exchange, hand_off, receive};
     use crate::process::ProcessError;
-    use domyjob_core::domain::JobId;
+    use domyjob_core::domain::{IDENTIFIER_HEX_BYTES, JobId};
     use std::os::unix::net::UnixStream;
 
     fn request() -> Handoff {
         Handoff {
             program: b"/bin/domyjob".to_vec(),
             state: b"/tmp/state".to_vec(),
-            job: JobId::try_from("1".repeat(32)).unwrap(),
+            job: JobId::try_from("1".repeat(IDENTIFIER_HEX_BYTES)).unwrap(),
             environment: vec![("PATH".to_owned(), b"/usr/bin".to_vec())],
         }
     }
@@ -240,7 +244,7 @@ mod tests {
             receive(server, |received| {
                 assert_eq!(received.program, b"/bin/domyjob");
                 assert_eq!(received.state, b"/tmp/state");
-                assert_eq!(received.job.as_str(), "1".repeat(32));
+                assert_eq!(received.job.as_str(), "1".repeat(IDENTIFIER_HEX_BYTES));
                 assert_eq!(received.environment, request().environment);
                 Ok(())
             })
@@ -248,6 +252,43 @@ mod tests {
         });
         exchange(client, &request()).unwrap();
         receiver.join().unwrap();
+    }
+
+    fn reply_with_held_receiver(
+        launch: impl FnOnce(Handoff) -> Result<(), ProcessError> + Send + 'static,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        const OBSERVATION_TIMEOUT_MILLIS: u64 = 100;
+        let (mut client, server) = UnixStream::pair()?;
+        super::clock::socket_timeout(&client, OBSERVATION_TIMEOUT_MILLIS)?;
+        let held = server.try_clone()?;
+        let receiver = std::thread::spawn(move || receive(server, launch));
+        let bytes = serde_json::to_vec(&request()).map_err(std::io::Error::other)?;
+        std::io::Write::write_all(&mut client, &bytes)?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        receiver
+            .join()
+            .map_err(|_panic| std::io::Error::other("the receiver fixture panicked"))??;
+        let observed = crate::bounded::read(&mut client, super::MAX_REPLY_BYTES);
+        drop(held);
+        observed
+    }
+
+    #[test]
+    fn readiness_reply_finishes_while_another_receiver_handle_remains_open() {
+        assert_eq!(
+            reply_with_held_receiver(|_| Ok(())).unwrap(),
+            Some(b"R".to_vec())
+        );
+    }
+
+    #[test]
+    fn refusal_reply_finishes_while_another_receiver_handle_remains_open() {
+        let reply = reply_with_held_receiver(|_| {
+            Err(ProcessError::NotStarted("worker refused".to_owned()))
+        })
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8(reply).unwrap().contains("worker refused"));
     }
 
     #[test]

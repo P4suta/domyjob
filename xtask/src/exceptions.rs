@@ -9,6 +9,10 @@ const EFFECT_LINTS: &[&str] = &[
 
 const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
     (
+        "crates/domyjob/src/platform/source_file/windows.rs",
+        &["unsafe_code"],
+    ),
+    (
         "crates/domyjob/src/platform/windows_acl/descriptor.rs",
         &["unsafe_code"],
     ),

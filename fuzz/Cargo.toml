@@ -35,3 +35,10 @@ path = "fuzz_targets/chat_ledger.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "source_paths"
+path = "fuzz_targets/source_paths.rs"
+test = false
+doc = false
+bench = false

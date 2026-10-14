@@ -230,24 +230,7 @@ fn read(path: &Path) -> Result<String, GateError> {
 
 pub(crate) fn git_command() -> std::process::Command {
     let mut command = raw::command("git");
-    for name in [
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_INDEX_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_COMMON_DIR",
-        "GIT_NAMESPACE",
-    ] {
+    for name in domyjob_core::source_paths::GIT_CONTEXT_VARIABLES {
         command.env_remove(name);
     }
     command
@@ -907,6 +890,7 @@ mod tests {
             );
         }
         assert!(removed.contains("GIT_NAMESPACE"));
+        assert!(!removed.contains("GIT_CONFIG_GLOBAL"));
         assert!(raw::command("cargo").get_envs().next().is_none());
     }
 }
