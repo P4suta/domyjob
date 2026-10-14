@@ -212,16 +212,14 @@ pub(crate) fn start() -> io::Result<()> {
 mod tests {
     use super::{Handoff, bind, exchange, hand_off, receive};
     use crate::process::ProcessError;
-    use domyjob_core::domain::JobId;
+    use domyjob_core::domain::{IDENTIFIER_HEX_BYTES, JobId};
     use std::os::unix::net::UnixStream;
-
-    const JOB_ID_HEX_CHARS: usize = 32;
 
     fn request() -> Handoff {
         Handoff {
             program: b"/bin/domyjob".to_vec(),
             state: b"/tmp/state".to_vec(),
-            job: JobId::try_from("1".repeat(JOB_ID_HEX_CHARS)).unwrap(),
+            job: JobId::try_from("1".repeat(IDENTIFIER_HEX_BYTES)).unwrap(),
             environment: vec![("PATH".to_owned(), b"/usr/bin".to_vec())],
         }
     }
@@ -246,7 +244,7 @@ mod tests {
             receive(server, |received| {
                 assert_eq!(received.program, b"/bin/domyjob");
                 assert_eq!(received.state, b"/tmp/state");
-                assert_eq!(received.job.as_str(), "1".repeat(JOB_ID_HEX_CHARS));
+                assert_eq!(received.job.as_str(), "1".repeat(IDENTIFIER_HEX_BYTES));
                 assert_eq!(received.environment, request().environment);
                 Ok(())
             })
