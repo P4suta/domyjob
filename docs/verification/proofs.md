@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This baseline registers four positive Kani harnesses, two named negative controls, and thirteen required covers.
+This baseline registers five positive Kani harnesses, four named negative controls, and seventeen required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -15,6 +15,14 @@ The persistent-protocol proof checks every durable state and action, including b
 The resource negative must fail its `NEGATIVE_RESOURCE_CONTROL` assertion, and the disconnect-loss negative must fail its `NEGATIVE_JOB_CONTROL` assertion.
 Complete reports must contain every harness, unique check identities, successful assertions, and the exact individually satisfied cover count.
 Unwinding failures and incomplete result summaries cannot pass.
+
+The login reply harness imports the production generic write-and-shutdown adapter.
+It checks every byte in payloads of length zero through four, every stable one-byte write cutoff within that payload, and both shutdown outcomes with unwind eight.
+Four covers require empty input, nonempty success, an incomplete write, and a shutdown failure.
+The two named negatives reject shutdown after an incomplete write and success after a shutdown failure.
+The proof establishes ordered byte preservation and exact error outcomes under that writer contract.
+It doesn't establish arbitrary writer implementations, native socket behavior, concurrency, or launchd.
+The Mac native controls keep an actual duplicate receiver handle open while requiring both readiness and refusal replies to finish.
 
 The persistent job protocol projects queued, starting, and running phases into an active durable state.
 The production store uses `Submit` while retaining its existing admission locks and complete request equality.
@@ -36,9 +44,10 @@ Missing or empty required corpus files fail before libFuzzer starts.
 The maintained cargo-fuzz 0.13.2 target replays those inputs through production wire ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets finite production state, protocol, and refusing generic-serialization contracts through nightly-2026-10-01.
+`mise run miri` interprets finite production state, protocol, refusing generic-serialization, and login reply contracts through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
+The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
 
 The gate fingerprints production source, locked dependencies, proof sources, configuration, the model, and the exact required corpus before and after execution.

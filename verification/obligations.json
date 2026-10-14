@@ -5,6 +5,15 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": "verification/login-reply.rs",
+      "name": "complete_replies_finish_once_after_every_admitted_byte",
+      "covers": 4,
+      "contract": "Reply completion writes every byte before exactly one shutdown, stops after a failed write, and preserves write or shutdown errors.",
+      "input_domain": "All byte values in payloads of length zero through four, every one-byte progress cutoff within the payload, and both shutdown outcomes.",
+      "bound": "Unwind eight with unwinding assertions; the imported production adapter calls the ordinary Write::write_all implementation against the stated stable one-byte writer.",
+      "production": "crates/domyjob/src/process/login/reply.rs complete; process/login.rs receive readiness and refusal branches"
+    },
+    {
       "name": "resource_proofs::execution_records_preserve_command_outcomes",
       "covers": 4,
       "contract": "Recorded command completion preserves the exact exit code or launch failure and rejects unfinished or supervisor-only outcomes.",
@@ -39,6 +48,16 @@
   ],
   "negatives": [
     {
+      "source": "verification/login-reply.rs",
+      "harness": "rejects_shutdown_after_an_incomplete_reply",
+      "assertion": "NEGATIVE_LOGIN_REPLY_ORDER"
+    },
+    {
+      "source": "verification/login-reply.rs",
+      "harness": "rejects_success_after_reply_shutdown_failure",
+      "assertion": "NEGATIVE_LOGIN_REPLY_SHUTDOWN"
+    },
+    {
       "source": "verification/resource-negative.rs",
       "harness": "rejects_three_jobs",
       "assertion": "NEGATIVE_RESOURCE_CONTROL"
@@ -50,6 +69,12 @@
     }
   ],
   "boundaries": [
+    {
+      "source": "crates/domyjob/src/process/login.rs",
+      "reason": "The bounded Write-port proof does not establish native Unix socket EOF, launchd, descriptor inheritance, concurrency, or every possible Write implementation.",
+      "evidence": "The mandatory Mac workspace test gate exercises actual readiness and refusal through UnixStream while another receiver handle remains open; the cross-platform login_reply target checks partial, interrupted, empty, zero, and failed writes plus shutdown failures, and its finite Miri lane imports the same production adapter.",
+      "reconsider": "Reply framing or socket semantics change, a native integration fails, or a verifier supports the actual concurrent operating-system boundary."
+    },
     {
       "source": "crates/domyjob/src/app.rs",
       "reason": "The finite protocol step and job-state proofs do not establish filesystem locking, worker creation, SSH reliability, or native process lifetime.",

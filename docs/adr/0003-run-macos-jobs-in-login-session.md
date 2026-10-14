@@ -22,6 +22,9 @@ Environment bytes travel only through the socket and are never stored by the han
 SSH credentials and token variables remain outside the allowlist.
 The worker retains the existing job state, workspace, bounded logs, cancellation watcher, reaper, and readiness protocol.
 The node waits for that readiness acknowledgement before reporting acceptance.
+The service finishes its socket write side after the complete readiness or refusal reply.
+This makes reply completion independent of another live receiver handle.
+An incomplete write stops before shutdown, and a failed shutdown preserves its own native error.
 Missing GUI login, absent or stopped agent, invalid request, and failed readiness are explicit refusals with no SSH fallback.
 
 ## Assurance boundary
@@ -34,6 +37,9 @@ Those external semantics require native contracts rather than a detached proof m
 The mandatory `mise run check` runs the production handoff's socket, ownership, stale-socket, allowlist, invalid-input, size-bound, and refusal tests.
 Its SSH end-to-end scenario models launchctl availability while exercising real worker startup, `on`, `run`, status, logs, and cancellation.
 The two refusal regressions were checked against an implementation that accepted both unavailable cases and failed before the fix.
+The actual duplicate-endpoint readiness and refusal controls fail against the original receiver, which relies on dropping one handle for end of stream.
+The [reply proof](../../verification/login-reply.rs) imports the production adapter and checks its bounded ordered writes and shutdown outcomes, with named false-claim controls.
+Its writer contract doesn't model Unix socket semantics or all schedules.
 A credentialed native rehearsal must also install the built version, restart the GUI LaunchAgent, and submit jobs through actual SSH to check `gh auth status`, workspace selection, status, retained logs, and process-tree cancellation.
 Stopping the actual agent supplies the native refusal control.
 These checks establish observed adapter behavior under the native OS contract, not a theorem about all schedules or the keychain.
