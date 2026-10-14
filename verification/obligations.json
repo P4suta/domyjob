@@ -129,6 +129,15 @@
       "production": "crates/domyjob-core/src/source_paths/read_length.rs ReadLength::{new,limit,matches}; actual source_archive::Archive::add and source_fingerprint::hash_content apply Read::take and check consumed length"
     },
     {
+      "source": "verification/login-reply.rs",
+      "name": "complete_replies_finish_once_after_every_admitted_byte",
+      "covers": 4,
+      "contract": "Reply completion writes every byte before exactly one shutdown, stops after a failed write, and preserves write or shutdown errors.",
+      "input_domain": "All byte values in payloads of length zero through four, every one-byte progress cutoff within the payload, and both shutdown outcomes.",
+      "bound": "Unwind eight with unwinding assertions; the imported production adapter calls the ordinary Write::write_all implementation against the stated stable one-byte writer.",
+      "production": "crates/domyjob/src/process/login/reply.rs complete; process/login.rs receive readiness and refusal branches"
+    },
+    {
       "name": "resource_proofs::execution_records_preserve_command_outcomes",
       "covers": 4,
       "contract": "Recorded command completion preserves the exact exit code or launch failure and rejects unfinished or supervisor-only outcomes.",
@@ -178,6 +187,16 @@
       "assertion": "NEGATIVE_SOURCE_CONTROL"
     },
     {
+      "source": "verification/login-reply.rs",
+      "harness": "rejects_shutdown_after_an_incomplete_reply",
+      "assertion": "NEGATIVE_LOGIN_REPLY_ORDER"
+    },
+    {
+      "source": "verification/login-reply.rs",
+      "harness": "rejects_success_after_reply_shutdown_failure",
+      "assertion": "NEGATIVE_LOGIN_REPLY_SHUTDOWN"
+    },
+    {
       "source": "verification/resource-negative.rs",
       "harness": "rejects_three_jobs",
       "assertion": "NEGATIVE_RESOURCE_CONTROL"
@@ -194,6 +213,12 @@
       "reason": "The source-bound scalar budget/read-length, finite ASCII metadata, and bounded actual std::path proofs do not establish native Git configuration and path output, canonical directory identity and case folding, declaration stability, ignore matching, concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter captures canonical Git/common directories through individually bounded queries before top-level discovery, refuses selected metadata/bare roots or unresolved declarations, and excludes both trees after canonicalization from the merged tracked and walker paths. Git's bounded untracked-path query owns Git-ignore precedence; the walker retains .ignore and no-follow entry policy. One retained selected-root capability owns archive admission.",
       "evidence": "Native source, source_archive, source_fingerprint and source_file tests cover Git-written global excludes paths with spaces and inherited config-count context, ignored tracked modified bytes, ignored untracked exclusion, deletion, real .GIT metadata, and subdirectory paths. Actual Git oracle fixtures cover ancestor-ignored exclusion, competing relative excludes files, repository-root anchored patterns, and separate-directory info/exclude precedence with .gitignore negation. Separate, distinct common, forced-tracked metadata and nested-selection controls require only current working bytes; malformed ancestor declarations, selected metadata/bare roots, and unresolved case aliases refuse, while valid symlink/case aliases are bound to actual canonical directories and non-Git HEAD/objects working names remain ordinary input. Finite Miri controls bind Path::components to the actual typed matcher for whole components and rooted/relative namespaces. Shared runtime/build readers retain every captured parent; Unix uses public cap-primitives open_dir_nofollow and safe rustix NOFOLLOW|NONBLOCK|CLOEXEC, while Windows NtCreateFile uses RootDirectory and OPEN_REPARSE_POINT for every component, rejecting non-disk/reparse handles before reads. Native controls replace inspected parents/final files, rename captured ancestors/root names, refuse a writerless FIFO within a killed/reaped child deadline, preserve read errors, and bound growth/truncation reads to admitted length+1. Native parser tests admit exactly MAX_PATH_BYTES in complete valid records and refuse one extra path byte separately from stream/count/record limits. Native case folding, custom bare identification without Git or an explicit declaration, and one atomic view of concurrently modified Git state/files are not claimed.",
       "reconsider": "Git output, ancestor ignore semantics, or capability/filesystem semantics change, a native source, link, budget, collision or archive contract fails, or a verifier can check the actual Git/filesystem adapter boundary."
+    },
+    {
+      "source": "crates/domyjob/src/process/login.rs",
+      "reason": "The bounded Write-port proof does not establish native Unix socket EOF, launchd, descriptor inheritance, concurrency, or every possible Write implementation.",
+      "evidence": "The mandatory Mac workspace test gate exercises actual readiness and refusal through UnixStream while another receiver handle remains open; the cross-platform login_reply target checks partial, interrupted, empty, zero, and failed writes plus shutdown failures, and its finite Miri lane imports the same production adapter.",
+      "reconsider": "Reply framing or socket semantics change, a native integration fails, or a verifier supports the actual concurrent operating-system boundary."
     },
     {
       "source": "crates/domyjob/src/app.rs",

@@ -5,6 +5,8 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const IDENTIFIER_HEX_BYTES: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum Invalid {
     #[error("machine name must be a single SSH destination of at most 128 ASCII bytes")]
@@ -52,7 +54,7 @@ validated_string!(SubmissionId, Invalid, |value| if valid_identifier(value) {
 });
 
 fn valid_identifier(value: &str) -> bool {
-    value.len() == 32
+    value.len() == IDENTIFIER_HEX_BYTES
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
