@@ -13,10 +13,15 @@ use crate::{bounded, platform, process};
 
 const MAX_GIT_PATH_BYTES: usize = 32_768;
 
+mod metadata_directories;
+use metadata_directories::MetadataDirectories;
+
 #[derive(Debug)]
 struct Repository {
     root: PathBuf,
     paths: TrackedPaths,
+    untracked: BTreeSet<PathBuf>,
+    metadata: MetadataDirectories,
 }
 
 #[derive(Debug)]
@@ -80,44 +85,101 @@ fn git_output(root: &Path, arguments: &[&str], limit: usize) -> io::Result<Optio
     }))
 }
 
-fn tracked(root: &Path) -> Result<Option<Repository>, SourceError> {
-    let Some(output) = git_output(root, &["rev-parse", "--show-toplevel"], MAX_GIT_PATH_BYTES)?
+fn git_path(root: &Path, query: &str) -> io::Result<Option<PathBuf>> {
+    let Some(output) = git_output(
+        root,
+        &["rev-parse", "--path-format=absolute", query],
+        MAX_GIT_PATH_BYTES,
+    )?
     else {
         return Ok(None);
     };
     let bytes = output
         .bytes
-        .ok_or_else(|| io::Error::other("the Git root exceeds its path budget"))?;
+        .ok_or_else(|| io::Error::other("the Git directory path exceeds its byte budget"))?;
     if !output.status.success() {
         return Ok(None);
     }
     let bytes = bytes
         .strip_suffix(b"\n")
         .filter(|bytes| !bytes.is_empty() && !bytes.contains(&0))
-        .ok_or_else(|| io::Error::other("the Git root path is malformed"))?;
-    let repository = std::fs::canonicalize(Path::new(
+        .ok_or_else(|| io::Error::other("the Git directory path is malformed"))?;
+    let path = Path::new(
         std::str::from_utf8(bytes)
-            .map_err(|_encoding| io::Error::other("the Git root path is not UTF-8"))?,
-    ))?;
+            .map_err(|_encoding| io::Error::other("the Git directory path is not UTF-8"))?,
+    );
+    if !path.is_absolute() {
+        return Err(io::Error::other("Git returned a relative directory path"));
+    }
+    let path = std::fs::canonicalize(path)?;
+    if !std::fs::metadata(&path)?.is_dir() {
+        return Err(io::Error::other("Git did not name an existing directory"));
+    }
+    Ok(Some(path))
+}
+
+fn declaration_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn declared_repository(root: &Path) -> io::Result<bool> {
+    for ancestor in root.ancestors() {
+        if declaration_exists(&ancestor.join(".git"))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn tracked(root: &Path) -> Result<Option<Repository>, SourceError> {
+    let Some(git) = git_path(root, "--git-dir")? else {
+        if declared_repository(root)? {
+            return Err(io::Error::other("Git could not resolve the declared repository").into());
+        }
+        return Ok(None);
+    };
+    let common = git_path(root, "--git-common-dir")?
+        .ok_or_else(|| io::Error::other("Git could not resolve its common directory"))?;
+    let metadata = MetadataDirectories::new(git, common);
+    if metadata.contains(root) {
+        return Err(io::Error::other("a Git metadata directory cannot be sent as source").into());
+    }
+    let repository = git_path(root, "--show-toplevel")?
+        .ok_or_else(|| io::Error::other("Git could not resolve the repository working tree"))?;
     if !root.starts_with(&repository) {
         return Err(
             io::Error::other("the Git root does not contain the selected directory").into(),
         );
     }
-    let tracked_output = git_output(
-        root,
-        &["ls-files", "--cached", "--deduplicate", "-z", "--", "."],
-        source_paths::MAX_TRACKED_BYTES,
-    )?
-    .ok_or_else(|| io::Error::other("Git became unavailable after repository discovery"))?;
-    let tracked_bytes = tracked_output.bytes.ok_or(TrackedError::Capacity)?;
-    if !tracked_output.status.success() {
-        return Err(io::Error::other("Git could not enumerate the tracked source paths").into());
-    }
+    let paths = git_paths(root, &["--cached", "--deduplicate"])?;
+    let untracked = git_paths(root, &["--others", "--exclude-standard"])?
+        .paths()
+        .iter()
+        .map(|path| root.join(path.as_str()))
+        .collect();
     Ok(Some(Repository {
         root: repository,
-        paths: source_paths::tracked_paths(&tracked_bytes)?,
+        paths,
+        untracked,
+        metadata,
     }))
+}
+
+fn git_paths(root: &Path, options: &[&str]) -> Result<TrackedPaths, SourceError> {
+    let mut arguments = vec!["ls-files"];
+    arguments.extend_from_slice(options);
+    arguments.extend_from_slice(&["-z", "--", "."]);
+    let output = git_output(root, &arguments, source_paths::MAX_TRACKED_BYTES)?
+        .ok_or_else(|| io::Error::other("Git became unavailable after repository discovery"))?;
+    let bytes = output.bytes.ok_or(TrackedError::Capacity)?;
+    if !output.status.success() {
+        return Err(io::Error::other("Git could not enumerate the source paths").into());
+    }
+    Ok(source_paths::tracked_paths(&bytes)?)
 }
 
 fn global_excludes(root: &Path) -> Result<Option<PathBuf>, SourceError> {
@@ -165,24 +227,33 @@ fn global_excludes(root: &Path) -> Result<Option<PathBuf>, SourceError> {
 
 fn walker(root: &Path, repository: Option<&Repository>) -> Result<ignore::Walk, SourceError> {
     let base = repository.map_or(root, |repository| repository.root.as_path());
+    let metadata = repository.map(|repository| repository.metadata.clone());
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .current_dir(base)
         .hidden(false)
         .parents(repository.is_some())
         .ignore(true)
-        .git_ignore(true)
+        .git_ignore(repository.is_none())
         .git_global(false)
-        .git_exclude(true)
+        .git_exclude(repository.is_none())
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             entry
                 .file_name()
                 .to_str()
                 .is_none_or(|name| !source_paths::metadata_component(name))
+                && metadata
+                    .as_ref()
+                    .is_none_or(|metadata| !metadata.contains(entry.path()))
         });
-    if let Some(excludes) = global_excludes(base)? {
+    if let Some(excludes) = repository
+        .is_none()
+        .then(|| global_excludes(base))
+        .transpose()?
+        .flatten()
+    {
         match std::fs::metadata(&excludes) {
             Ok(_) => {
                 if let Some(error) = builder.add_ignore(excludes) {
@@ -225,9 +296,21 @@ pub(crate) fn working_directory(selected_root: &Path) -> Result<(Vec<u8>, Snapsh
         if kind.is_dir() {
             continue;
         }
+        if tracked
+            .as_ref()
+            .is_some_and(|repository| !repository.untracked.contains(item.path()))
+        {
+            continue;
+        }
         paths.insert(item.path().to_path_buf());
     }
     for path in paths {
+        if let Some(repository) = &tracked
+            && (repository.metadata.contains(&path)
+                || repository.metadata.contains(&std::fs::canonicalize(&path)?))
+        {
+            continue;
+        }
         archive.add((root, &source), &path, platform::file_mode)?;
     }
     let bytes = archive.finish()?;
@@ -284,6 +367,17 @@ mod tests {
         assert!(status.success(), "Git fixture failed: {status}");
     }
 
+    fn separate_repository(root: &Path, metadata: &Path) {
+        let initialized = git_command(root)
+            .args(["init", "--quiet", "--template=", "--separate-git-dir"])
+            .arg(metadata)
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        git(root, &["config", "core.fsmonitor", "false"]);
+    }
+
     fn child(test: &str) -> std::process::Command {
         let mut command = crate::process::command(std::env::current_exe().unwrap());
         command.args(["--exact", &format!("source::tests::{test}"), "--nocapture"]);
@@ -331,6 +425,228 @@ mod tests {
                 (".gitignore".to_owned(), b"*.md\nprivate/\n".to_vec()),
                 ("CLAUDE.md".to_owned(), b"current working bytes".to_vec()),
                 ("new.txt".to_owned(), b"untracked visible".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn separate_git_directories_are_never_source_inputs() {
+        let source = tempfile::tempdir().unwrap();
+        let metadata = source.path().join("custom repository data");
+        separate_repository(source.path(), &metadata);
+        testing::write(
+            &source.path().join(".git"),
+            b"gitdir: custom repository data\n",
+        );
+        testing::write(&source.path().join("tracked.txt"), b"indexed");
+        git(source.path(), &["add", "tracked.txt"]);
+        testing::write(&source.path().join("tracked.txt"), b"current tracked");
+        testing::write(&source.path().join("working.txt"), b"ordinary working");
+        testing::write(&metadata.join("private-canary"), b"synthetic metadata");
+        assert_eq!(
+            contents(source.path()),
+            [
+                ("tracked.txt".to_owned(), b"current tracked".to_vec()),
+                ("working.txt".to_owned(), b"ordinary working".to_vec()),
+            ]
+        );
+        assert!(matches!(
+            working_directory(&metadata),
+            Err(super::SourceError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn distinct_common_metadata_is_excluded_even_when_tracked() {
+        let source = tempfile::tempdir().unwrap();
+        let common = source.path().join("shared repository data");
+        separate_repository(source.path(), &common);
+        let metadata = source.path().join("worktree data");
+        testing::write(
+            &metadata.join("HEAD"),
+            testing::read(&common.join("HEAD")).as_bytes(),
+        );
+        testing::write(&metadata.join("commondir"), b"../shared repository data\n");
+        testing::write(&source.path().join(".git"), b"gitdir: worktree data\n");
+        testing::write(&common.join("private-canary"), b"synthetic common metadata");
+        testing::write(
+            &metadata.join("private-canary"),
+            b"synthetic worktree metadata",
+        );
+        testing::write(&source.path().join("working.txt"), b"indexed");
+        git(
+            source.path(),
+            &[
+                "add",
+                "--force",
+                "working.txt",
+                "shared repository data/private-canary",
+            ],
+        );
+        testing::write(&source.path().join("working.txt"), b"current tracked");
+        testing::write(
+            &source.path().join("worktree database/public.txt"),
+            b"ordinary sibling",
+        );
+        let repository = super::tracked(&std::fs::canonicalize(source.path()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            repository
+                .metadata
+                .contains(&std::fs::canonicalize(&common).unwrap())
+        );
+        assert!(
+            repository
+                .metadata
+                .contains(&std::fs::canonicalize(&metadata).unwrap())
+        );
+        assert_eq!(
+            contents(source.path()),
+            [
+                ("working.txt".to_owned(), b"current tracked".to_vec()),
+                (
+                    "worktree database/public.txt".to_owned(),
+                    b"ordinary sibling".to_vec()
+                ),
+            ]
+        );
+        assert!(matches!(
+            working_directory(&common),
+            Err(super::SourceError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn a_nested_selection_excludes_ancestor_repository_metadata_inside_it() {
+        let source = tempfile::tempdir().unwrap();
+        let nested = source.path().join("nested");
+        testing::write(&nested.join("tracked.txt"), b"indexed");
+        separate_repository(source.path(), &nested.join("git storage"));
+        git(source.path(), &["add", "nested/tracked.txt"]);
+        testing::write(&nested.join("tracked.txt"), b"current tracked");
+        testing::write(&nested.join("git storage/private-canary"), b"private");
+        assert_eq!(
+            contents(&nested),
+            [("tracked.txt".to_owned(), b"current tracked".to_vec())]
+        );
+    }
+
+    #[test]
+    fn malformed_git_declarations_and_bare_metadata_roots_are_refused() {
+        let source = tempfile::tempdir().unwrap();
+        testing::write(&source.path().join("nested/public.txt"), b"ordinary");
+        testing::write(&source.path().join(".git"), b"gitdir: missing metadata\n");
+        assert!(matches!(
+            working_directory(&source.path().join("nested")),
+            Err(super::SourceError::Git(_))
+        ));
+        let bare = tempfile::tempdir().unwrap();
+        git(bare.path(), &["init", "--quiet", "--bare", "--template="]);
+        assert!(matches!(
+            working_directory(bare.path()),
+            Err(super::SourceError::Git(_))
+        ));
+        assert!(matches!(
+            working_directory(&bare.path().join("objects")),
+            Err(super::SourceError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn non_git_working_directories_keep_custom_directory_names() {
+        let source = tempfile::tempdir().unwrap();
+        testing::write(&source.path().join("HEAD"), b"ordinary header");
+        testing::write(
+            &source.path().join("objects/public.txt"),
+            b"ordinary object",
+        );
+        testing::write(
+            &source.path().join("custom repository data/public.txt"),
+            b"ordinary",
+        );
+        assert_eq!(
+            contents(source.path()),
+            [
+                ("HEAD".to_owned(), b"ordinary header".to_vec()),
+                (
+                    "custom repository data/public.txt".to_owned(),
+                    b"ordinary".to_vec()
+                ),
+                ("objects/public.txt".to_owned(), b"ordinary object".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn metadata_symlink_aliases_cannot_deliver_their_targets() {
+        let source = tempfile::tempdir().unwrap();
+        let metadata = source.path().join("git storage");
+        separate_repository(source.path(), &metadata);
+        testing::write(&metadata.join("private-canary"), b"private");
+        testing::write(&source.path().join("working.txt"), b"ordinary");
+        crate::file_kind::directory_link(&metadata, &source.path().join("metadata alias")).unwrap();
+        testing::write(&source.path().join(".git"), b"gitdir: metadata alias\n");
+        assert_eq!(
+            contents(source.path()),
+            [("working.txt".to_owned(), b"ordinary".to_vec())]
+        );
+    }
+
+    #[test]
+    fn metadata_pointer_case_aliases_are_bound_to_the_actual_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let metadata = source.path().join("GitDb");
+        separate_repository(source.path(), &metadata);
+        testing::write(&metadata.join("private-canary"), b"private");
+        testing::write(&source.path().join("working.txt"), b"ordinary");
+        testing::write(&source.path().join(".git"), b"gitdir: GITDB\n");
+        match std::fs::canonicalize(source.path().join("GITDB")) {
+            Ok(actual) => {
+                assert_eq!(actual, std::fs::canonicalize(&metadata).unwrap());
+                assert_eq!(
+                    contents(source.path()),
+                    [("working.txt".to_owned(), b"ordinary".to_vec())]
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                assert!(matches!(
+                    working_directory(source.path()),
+                    Err(super::SourceError::Git(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn separate_git_metadata_keeps_native_info_exclude_precedence() {
+        let source = tempfile::tempdir().unwrap();
+        let metadata = source.path().join("git storage");
+        separate_repository(source.path(), &metadata);
+        testing::write(&metadata.join("info/exclude"), b"*.secret\n");
+        testing::write(&source.path().join(".gitignore"), b"!visible.secret\n");
+        testing::write(&source.path().join("private.secret"), b"ignored private");
+        testing::write(&source.path().join("visible.secret"), b"untracked visible");
+        testing::write(&source.path().join("tracked.secret"), b"indexed");
+        git(source.path(), &["add", "--force", "tracked.secret"]);
+        testing::write(&source.path().join("tracked.secret"), b"current tracked");
+        let ignored = git_command(source.path())
+            .args(["check-ignore", "--quiet", "private.secret"])
+            .status()
+            .unwrap();
+        assert!(ignored.success());
+        let visible = git_command(source.path())
+            .args(["check-ignore", "--quiet", "visible.secret"])
+            .status()
+            .unwrap();
+        assert_eq!(visible.code(), Some(1));
+        assert_eq!(
+            contents(source.path()),
+            [
+                (".gitignore".to_owned(), b"!visible.secret\n".to_vec()),
+                ("tracked.secret".to_owned(), b"current tracked".to_vec()),
+                ("visible.secret".to_owned(), b"untracked visible".to_vec()),
             ]
         );
     }
@@ -561,7 +877,7 @@ mod tests {
     #[test]
     fn working_directory_includes_uncommitted_files_but_excludes_repository_metadata() {
         let source = tempfile::tempdir().expect("temporary source");
-        testing::write(&source.path().join(".git/config"), b"private");
+        testing::write(&source.path().join(".hg/config"), b"private");
         testing::write(&source.path().join("new.txt"), b"uncommitted");
         let (bytes, descriptor) = working_directory(source.path()).expect("source archive");
         assert_eq!(

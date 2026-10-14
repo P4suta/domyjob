@@ -5,6 +5,42 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": "verification/source-metadata-directories.rs",
+      "name": "actual_git_metadata_root_is_excluded",
+      "covers": 1,
+      "contract": "Captured Git directory roots are excluded.",
+      "input_domain": "All 26^3 three-byte lowercase ASCII custom Git-directory names. Git-root sequence. The union of the four harnesses preserves the original four sequences.",
+      "bound": "Unwind 32 with unwinding assertions; actual std::path::Component equality and component-prefix matcher over bounded component sequences, not every native path parser or filesystem case-folding theorem.",
+      "production": "crates/domyjob/src/source/metadata_directories.rs contains_components and component_prefix; MetadataDirectories::contains delegates through contains with actual Path::components. source::tracked rejects selected metadata roots, walker prunes captured trees, and working_directory filters both merged streams after canonicalization"
+    },
+    {
+      "source": "verification/source-metadata-directories.rs",
+      "name": "actual_git_metadata_descendants_are_excluded",
+      "covers": 1,
+      "contract": "Captured Git directory descendants are excluded.",
+      "input_domain": "All 26^3 three-byte lowercase ASCII custom Git-directory names. Git-descendant sequence. The union of the four harnesses preserves the original four sequences.",
+      "bound": "Unwind 32 with unwinding assertions; actual std::path::Component equality and component-prefix matcher over bounded component sequences, not every native path parser or filesystem case-folding theorem.",
+      "production": "crates/domyjob/src/source/metadata_directories.rs contains_components and component_prefix; MetadataDirectories::contains delegates through contains with actual Path::components. source::tracked rejects selected metadata roots, walker prunes captured trees, and working_directory filters both merged streams after canonicalization"
+    },
+    {
+      "source": "verification/source-metadata-directories.rs",
+      "name": "actual_common_metadata_descendants_are_excluded",
+      "covers": 1,
+      "contract": "Captured common directory descendants are excluded.",
+      "input_domain": "All 26^3 three-byte lowercase ASCII custom Git-directory names. Common-descendant sequence. The union of the four harnesses preserves the original four sequences.",
+      "bound": "Unwind 32 with unwinding assertions; actual std::path::Component equality and component-prefix matcher over bounded component sequences, not every native path parser or filesystem case-folding theorem.",
+      "production": "crates/domyjob/src/source/metadata_directories.rs contains_components and component_prefix; MetadataDirectories::contains delegates through contains with actual Path::components. source::tracked rejects selected metadata roots, walker prunes captured trees, and working_directory filters both merged streams after canonicalization"
+    },
+    {
+      "source": "verification/source-metadata-directories.rs",
+      "name": "component_prefix_siblings_remain_source_inputs",
+      "covers": 1,
+      "contract": "A component-prefix sibling remains outside captured metadata trees.",
+      "input_domain": "All 26^3 three-byte lowercase ASCII custom Git-directory names. Component-prefix sibling sequence. The union of the four harnesses preserves the original four sequences.",
+      "bound": "Unwind 32 with unwinding assertions; actual std::path::Component equality and component-prefix matcher over bounded component sequences, not every native path parser or filesystem case-folding theorem.",
+      "production": "crates/domyjob/src/source/metadata_directories.rs contains_components and component_prefix; MetadataDirectories::contains delegates through contains with actual Path::components. source::tracked rejects selected metadata roots, walker prunes captured trees, and working_directory filters both merged streams after canonicalization"
+    },
+    {
       "name": "source_paths::proofs::tracked_path_records_are_bounded",
       "covers": 3,
       "contract": "Each byte transition respects record, path, count, and aggregate budgets and reports malformed record endings.",
@@ -71,6 +107,11 @@
   ],
   "negatives": [
     {
+      "source": "verification/source-metadata-directories.rs",
+      "harness": "rejects_custom_git_metadata_delivery",
+      "assertion": "NEGATIVE_GIT_DIRECTORY_CONTROL"
+    },
+    {
       "source": null,
       "harness": "source_paths::read_length::proofs::rejects_a_changed_read_length",
       "assertion": "NEGATIVE_SOURCE_READ_CONTROL"
@@ -94,8 +135,8 @@
   "boundaries": [
     {
       "source": "crates/domyjob/src/source.rs",
-      "reason": "The source-bound scalar budget/read-length and finite ASCII metadata proofs do not establish native Git configuration and index output, canonical root discovery, ignore matching, filesystem identity and concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter merges validated tracked paths with the ignore walker, resolves the global excludes path through Git, anchors relative excludes and global patterns at the canonical repository root, and passes one retained selected-root capability to no-follow archive admission.",
-      "evidence": "Native source, source_archive, source_fingerprint and source_file tests cover Git-written global excludes paths with spaces and inherited config-count context, ignored tracked modified bytes, ignored untracked exclusion, deletion, real .GIT metadata, and subdirectory paths. Actual Git oracle fixtures cover ancestor-ignored untracked exclusion plus competing relative excludes files and repository-root anchored patterns without losing current tracked working bytes. Shared runtime/build readers retain every captured parent; Unix uses public cap-primitives open_dir_nofollow and safe rustix NOFOLLOW|NONBLOCK|CLOEXEC, while Windows NtCreateFile uses RootDirectory and OPEN_REPARSE_POINT for every component, rejecting non-disk/reparse handles before reads. Native controls replace inspected parents/final files, rename captured ancestors/root names, refuse a writerless FIFO within a killed/reaped child deadline, preserve read errors, and bound growth/truncation reads to admitted length+1. Native parser tests admit exactly MAX_PATH_BYTES in complete valid records and refuse one extra path byte separately from stream/count/record limits. Filesystem case folding and a single atomic view of concurrently modified files are not claimed.",
+      "reason": "The source-bound scalar budget/read-length, finite ASCII metadata, and bounded actual std::path proofs do not establish native Git configuration and path output, canonical directory identity and case folding, declaration stability, ignore matching, concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter captures canonical Git/common directories through individually bounded queries before top-level discovery, refuses selected metadata/bare roots or unresolved declarations, and excludes both trees after canonicalization from the merged tracked and walker paths. Git's bounded untracked-path query owns Git-ignore precedence; the walker retains .ignore and no-follow entry policy. One retained selected-root capability owns archive admission.",
+      "evidence": "Native source, source_archive, source_fingerprint and source_file tests cover Git-written global excludes paths with spaces and inherited config-count context, ignored tracked modified bytes, ignored untracked exclusion, deletion, real .GIT metadata, and subdirectory paths. Actual Git oracle fixtures cover ancestor-ignored exclusion, competing relative excludes files, repository-root anchored patterns, and separate-directory info/exclude precedence with .gitignore negation. Separate, distinct common, forced-tracked metadata and nested-selection controls require only current working bytes; malformed ancestor declarations, selected metadata/bare roots, and unresolved case aliases refuse, while valid symlink/case aliases are bound to actual canonical directories and non-Git HEAD/objects working names remain ordinary input. Finite Miri controls bind Path::components to the actual typed matcher for whole components and rooted/relative namespaces. Shared runtime/build readers retain every captured parent; Unix uses public cap-primitives open_dir_nofollow and safe rustix NOFOLLOW|NONBLOCK|CLOEXEC, while Windows NtCreateFile uses RootDirectory and OPEN_REPARSE_POINT for every component, rejecting non-disk/reparse handles before reads. Native controls replace inspected parents/final files, rename captured ancestors/root names, refuse a writerless FIFO within a killed/reaped child deadline, preserve read errors, and bound growth/truncation reads to admitted length+1. Native parser tests admit exactly MAX_PATH_BYTES in complete valid records and refuse one extra path byte separately from stream/count/record limits. Native case folding, custom bare identification without Git or an explicit declaration, and one atomic view of concurrently modified Git state/files are not claimed.",
       "reconsider": "Git output, ancestor ignore semantics, or capability/filesystem semantics change, a native source, link, budget, collision or archive contract fails, or a verifier can check the actual Git/filesystem adapter boundary."
     },
     {
