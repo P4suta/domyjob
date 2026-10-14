@@ -5,6 +5,51 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": "verification/input-controller.rs",
+      "name": "identity_tokens_preserve_every_case_and_process_bit",
+      "covers": 3,
+      "contract": "The private Ready/Begin token round-trips all case and process bits without truncation.",
+      "input_domain": "Every sixteen-byte case identity, every u32 process identity, and every twenty-byte token.",
+      "bound": "Unwind24 with unwinding assertions; exact fixed-size representation.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Identity::{bytes,from_bytes}; the actual Windows Reader parses bounded Ready and atomically publishes Begin"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "preparation_admits_only_live_matching_ready",
+      "covers": 4,
+      "contract": "Preparation releases Begin only for a live matching case below the existing total deadline.",
+      "input_domain": "Every u64 elapsed time and total budget, all Ready variants, all case/process identities, and both observed child states.",
+      "bound": "Unwind24 with unwinding assertions; no input assumptions.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/prepare; actual Reader::begin writes the same twenty-byte identity after actual Add-Type/count controls publish Ready"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "operation_progress_never_resets_either_budget",
+      "covers": 4,
+      "contract": "An admitted progress observation cannot reset the operation start or the whole-case bound, and equality or regressed time refuses completion.",
+      "input_domain": "Every u64 preparation/progress/completion time and case budget with every fixed-size identity; conditional checks follow actual admitted Begin and Progress transitions.",
+      "bound": "Unwind24 with unwinding assertions; three actual transitions and no assumed conclusion.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate; Reader sampling and all pending/zero/completion schedules use the same controller"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "begun_operations_refuse_missing_or_foreign_identity",
+      "covers": 3,
+      "contract": "An admitted operation refuses disappeared, malformed, or foreign Ready and cannot admit a second Begin.",
+      "input_domain": "Every u64 start/next time and total budget, all Ready variants, and all expected/actual identity fields after a checked Begin.",
+      "bound": "Unwind24 with unwinding assertions; two actual transitions and no assumed conclusion.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate used by the real Windows polling loop"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "every_outcome_retains_all_owned_cleanup_results",
+      "covers": 3,
+      "contract": "The actual controller attempts input closure, owned subtree stop, and reap exactly once and retains each cleanup result without replacing the primary observation/refusal.",
+      "input_domain": "Every seven port-failure Boolean choices, all three u64 observation times, every u64 total bound, and every fixed identity in the stated three-observation port.",
+      "bound": "Unwind24 with unwinding assertions; at most three observations. Native kernel cleanup is a separate boundary.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs wait/run; the real Reader implements close_input/stop_tree/reap with retained Windows Job and Child"
+    },
+    {
       "name": "process_group::proofs::only_positive_identifiers_are_admitted",
       "covers": 3,
       "contract": "Only positive process-group identifiers can grant ownership to the reaper.",
@@ -189,6 +234,21 @@
   ],
   "negatives": [
     {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_completion_at_the_input_deadline",
+      "assertion": "NEGATIVE_INPUT_DEADLINE_CONTROL"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_foreign_ready_admission",
+      "assertion": "NEGATIVE_INPUT_IDENTITY_CONTROL"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_discarded_owned_cleanup_errors",
+      "assertion": "NEGATIVE_INPUT_CLEANUP_CONTROL"
+    },
+    {
       "source": "verification/source-metadata-directories.rs",
       "harness": "rejects_custom_git_metadata_delivery",
       "assertion": "NEGATIVE_GIT_DIRECTORY_CONTROL"
@@ -235,6 +295,12 @@
     }
   ],
   "boundaries": [
+    {
+      "source": "crates/domyjob/tests/e2e/os/windows/input_reader.rs",
+      "reason": "The source-bound decision and counted-port proofs do not establish PowerShell compilation time, filesystem publication, monotonic-clock scheduling, windows-spawn creation-time Job attachment, or Win32 accounting/termination. A retained fresh Job is attached during process creation before PowerShell can launch compiler children; the original native reader and binary channels are unchanged.",
+      "evidence": "The dedicated input_controller target controls preparation6s then live Ready/completion7s, exact operation5s and whole-case180s boundaries, foreign/malformed/disappeared readiness, regressed clocks, and primary-plus-cleanup faults through the actual controller. The Windows bootstrap scenario preserves all eight actual input schedules and adds a known held Rust descendant observed inside its creation-time Job, exact operation refusal, retained root reap, and zero active processes before capture. No original hosted failure cause is inferred from successful reruns.",
+      "reconsider": "A phase/channel, Job attachment, accounting, ownership, cleanup, or native deadline contract changes or fails, or a verifier supports the actual Win32/CLR boundary."
+    },
     {
       "source": "crates/domyjob/src/builds.rs",
       "reason": "The actual admission transition depends on filesystem identity, private candidate ACLs, operating-system selection/usage locks, directory publication, and the publisher-to-node lifetime. The segmented writer proof cannot establish these effects. Selection bridges publication to final usage admission because Windows refuses renaming a directory with open child-file handles.",

@@ -7,8 +7,20 @@ use std::io;
 use std::io::Write as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+#[path = "../input_controller.rs"]
+mod input_controller;
+
+#[path = "windows/input_reader.rs"]
+mod input_reader;
+#[path = "windows/owned_job.rs"]
+mod owned_job;
+
+pub(super) fn input_child_role() -> Option<std::process::ExitCode> {
+    (std::env::args().nth(1).as_deref() == Some("--bootstrap-owned-hold"))
+        .then(input_reader::owned_input_descendant)
+}
 
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -24,7 +36,6 @@ use windows_sys::Win32::System::Pipes::{
 use crate::Context as _;
 
 const INPUT_PREFIX: &[u8] = b"\x00\xff\x80\x01\x02\x03";
-const INPUT_DEADLINE: Duration = Duration::from_secs(5);
 const PIPE_BUFFER_BYTES: u32 = 4096;
 const INPUT_SPLIT_BYTES: usize = 3;
 const INPUT_POLL_MILLIS: u64 = 10;
@@ -110,10 +121,15 @@ pub(super) fn bootstrap_input_contract(root: &Path) -> Result<(), crate::Failure
             input_case(root, shell, schedule)?;
         }
     }
-    Ok(())
+    input_reader::descendant_contract(root)?;
+    input_reader::publication_contract(root)
 }
 
-fn input_script(root: &Path, schedule: InputSchedule) -> Result<String, crate::Failure> {
+fn input_script(
+    root: &Path,
+    schedule: InputSchedule,
+    control: &input_reader::Control,
+) -> Result<String, crate::Failure> {
     let implementation = include_str!("../../../src/transport/bootstrap/windows-input.cs").replace(
         "@SOURCE_MAX@",
         &domyjob_core::wire::MAX_SNAPSHOT_BYTES.to_string(),
@@ -121,6 +137,7 @@ fn input_script(root: &Path, schedule: InputSchedule) -> Result<String, crate::F
     let prefix = root.join("bootstrap-input-prefix.bin");
     let marker = root.join("bootstrap-input-pending.txt");
     let executable = std::env::current_exe().context("locating the binary input fixture")?;
+    let handshake = control.script();
     let observation = if schedule == InputSchedule::ObserverError {
         "throw 'injected pending observer failure'"
     } else {
@@ -135,24 +152,35 @@ fn input_script(root: &Path, schedule: InputSchedule) -> Result<String, crate::F
             quote(&marker)
         )
     };
-    Ok(format!("$ErrorActionPreference='Stop'; Add-Type -TypeDefinition @'\n{implementation}\n'@\ntry {{
+    Ok(format!("$ErrorActionPreference='Stop'; [Console]::Error.WriteLine('bootstrap input phase: compiling'); Add-Type -TypeDefinition @'\n{implementation}\n'@\n[Console]::Error.WriteLine('bootstrap input phase: validating');
+try {{
 if ([DomyjobBootstrapInput]::ReadBytes(0).Length -ne 0) {{ throw 'zero read consumed input' }}
 foreach ($invalid in @(-1, {})) {{ try {{ $null=[DomyjobBootstrapInput]::ReadBytes($invalid); throw 'invalid count accepted' }} catch {{ if ($_.Exception.InnerException -isnot [ArgumentOutOfRangeException]) {{ throw }} }} }}
+{handshake}
+[Console]::Error.WriteLine('bootstrap input phase: reading prefix');
 $source=[DomyjobBootstrapInput]::ReadBytes({}, {observer});
+[Console]::Error.WriteLine('bootstrap input phase: prefix complete');
 [IO.File]::WriteAllBytes('{}',$source);
 $s=New-Object Diagnostics.ProcessStartInfo; $s.FileName='{}'; $s.Arguments='--bootstrap-input-remainder'; $s.UseShellExecute=$false;
-$p=[Diagnostics.Process]::Start($s); $p.WaitForExit(); exit $p.ExitCode
+[Console]::Error.WriteLine('bootstrap input phase: starting remainder');
+$p=[Diagnostics.Process]::Start($s);
+[Console]::Error.WriteLine('bootstrap input phase: waiting remainder');
+$p.WaitForExit();
+[Console]::Error.WriteLine('bootstrap input phase: remainder complete');
+exit $p.ExitCode
 }} catch {{ $cause=$_.Exception; while ($null -ne $cause.InnerException) {{ $cause=$cause.InnerException }}; if ($cause -is [ComponentModel.Win32Exception]) {{ [Console]::Error.WriteLine('native error '+$cause.NativeErrorCode) }}; [Console]::Error.WriteLine($_); exit 1 }}",
         domyjob_core::wire::MAX_SNAPSHOT_BYTES.saturating_add(1), INPUT_PREFIX.len(), quote(&prefix), quote(&executable)))
 }
 
 fn input_case(root: &Path, shell: &str, schedule: InputSchedule) -> Result<(), crate::Failure> {
+    let started = Instant::now();
     let case = InputCase {
         root,
         shell,
         schedule,
     };
-    let script = input_script(root, schedule)?;
+    let control = input_reader::Control::new(root).context("owning a fresh input case identity")?;
+    let script = input_script(root, schedule, &control)?;
     let capture = InputCapture {
         output: tempfile::NamedTempFile::new_in(root)
             .context("preparing the binary input output")?,
@@ -177,35 +205,26 @@ fn input_case(root: &Path, shell: &str, schedule: InputSchedule) -> Result<(), c
     if schedule == InputSchedule::Buffered {
         write_input(&mut writer, INPUT_PREFIX)?;
     }
-    let mut child = Command::new(shell)
-        .args(["-NoProfile", "-Command", &script])
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(
-            capture
-                .output
-                .as_file()
-                .try_clone()
-                .context("cloning fixture stdout")?,
-        ))
-        .stderr(Stdio::from(
-            capture
-                .errors
-                .as_file()
-                .try_clone()
-                .context("cloning fixture stderr")?,
-        ))
-        .spawn()
-        .context("starting the actual Framework input reader")?;
-    let supplied = supply_input(&marker, &mut child, writer, schedule);
-    if let Err(failure) = supplied {
-        let _killed = child.kill();
-        let _reaped = child.wait();
-        return Err(input_failure(&case, &failure, &capture));
-    }
-    let status = match wait_reader(&mut child) {
-        Ok(status) => status,
-        Err(failure) => {
-            return Err(input_failure(&case, &failure, &capture));
+    let context = input_reader::Context {
+        control: &control,
+        marker: &marker,
+        schedule,
+        started,
+        case_millis: u64::try_from(crate::world::COMMAND_LIMIT.as_millis())
+            .map_err(|error| crate::Failure::new(error.to_string()))?,
+        descendant: None,
+    };
+    let execution = input_reader::Execution::spawn(shell, &script, input, &capture)
+        .context("admitting the actual Framework reader into its owned Job before execution")?;
+    let (outcome, _) = input_reader::Reader::new(execution, writer, context).run();
+    let status = match outcome.primary {
+        Ok(status) if outcome.cleanup.iter().all(Result::is_ok) => status,
+        primary => {
+            return Err(input_failure(
+                &case,
+                &format!("primary: {primary:?}; cleanup: {:?}", outcome.cleanup),
+                &capture,
+            ));
         }
     };
     check_input_result(&case, status, &capture)
@@ -254,6 +273,7 @@ fn check_input_result(
             "the inherited protocol bytes changed"
         );
     }
+    println!("bootstrap input {shell} {schedule:?}: {diagnostic}");
     Ok(())
 }
 
@@ -264,42 +284,6 @@ fn write_input(writer: &mut std::fs::File, prefix: &[u8]) -> Result<(), crate::F
     writer
         .write_all(crate::bootstrap::INPUT_REMAINDER)
         .context("writing the original binary remainder")
-}
-
-fn supply_input(
-    marker: &Path,
-    child: &mut std::process::Child,
-    mut writer: std::fs::File,
-    schedule: InputSchedule,
-) -> Result<(), crate::Failure> {
-    let (first, second) = INPUT_PREFIX.split_at(INPUT_SPLIT_BYTES);
-    match schedule {
-        InputSchedule::Buffered | InputSchedule::NativeError => {}
-        InputSchedule::ObserverError => {
-            wait_pending(marker, child, 1)?;
-            write_input(&mut writer, INPUT_PREFIX)?;
-        }
-        InputSchedule::Truncated => {
-            wait_pending(marker, child, 1)?;
-            writer
-                .write_all(first)
-                .context("injecting truncated native EOF")?;
-        }
-        InputSchedule::Pending => {
-            wait_pending(marker, child, 1)?;
-            writer
-                .write_all(first)
-                .context("releasing the first pending short read")?;
-            wait_pending(marker, child, 2)?;
-            write_input(&mut writer, second)?;
-        }
-        InputSchedule::ZeroWrite => {
-            wait_pending(marker, child, 1)?;
-            write_zero(&writer).context("releasing a successful zero-byte native read")?;
-            write_input(&mut writer, INPUT_PREFIX)?;
-        }
-    }
-    Ok(())
 }
 
 fn input_failure(
@@ -347,57 +331,8 @@ fn write_zero(writer: &std::fs::File) -> io::Result<()> {
     }
 }
 
-fn wait_pending(
-    marker: &Path,
-    child: &mut std::process::Child,
-    count: usize,
-) -> Result<(), crate::Failure> {
-    let started = Instant::now();
-    loop {
-        if std::fs::read_to_string(marker)
-            .context("reading native pending observations")?
-            .lines()
-            .count()
-            >= count
-        {
-            return Ok(());
-        }
-        if let Some(status) = child
-            .try_wait()
-            .context("checking the owned input reader")?
-        {
-            return Err(crate::Failure::new(format!(
-                "input reader exited before native pending {count}: {status}"
-            )));
-        }
-        ensure!(
-            started.elapsed() < INPUT_DEADLINE,
-            "native pending observation {count} exceeded its finite deadline"
-        );
-        crate::pause(INPUT_POLL_MILLIS);
-    }
-}
-
 fn quote(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
-}
-
-fn wait_reader(child: &mut std::process::Child) -> io::Result<std::process::ExitStatus> {
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
-        }
-        if started.elapsed() >= INPUT_DEADLINE {
-            child.kill()?;
-            child.wait()?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "overlapped stdin reader exceeded its finite deadline",
-            ));
-        }
-        crate::pause(INPUT_POLL_MILLIS);
-    }
 }
 
 fn diagnostic_prefix(mut source: impl io::Read + io::Seek) -> io::Result<String> {

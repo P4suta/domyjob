@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers twenty-two positive Kani harnesses, nine named negative controls, and fifty-three required covers.
+This head registers twenty-seven positive Kani harnesses, twelve named negative controls, and seventy required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -13,6 +13,16 @@ Resource admission quantifies every `u32` concurrency count and `u64` memory val
 The standalone outbound proof imports the actual transport writer and quantifies every byte in three two-byte segments, every partial acceptance count from zero through six, and both flush outcomes, with unwind eight and five covers.
 It checks the exact accepted prefix, first-error refusal, and final-flush result; the false partial-write success control must fail `NEGATIVE_OUTBOUND_CONTROL`.
 Native helper fixtures separately exercise interrupted retries, zero writes, empty segments, and flush failures.
+
+The standalone input-controller proofs import the actual Windows fixture controller.
+They quantify every fixed-size case/process token, every scalar clock/budget value, typed Ready and child observations, and all failure choices in the stated three-observation port.
+Seventeen covers require representation boundaries, actual readiness admission/refusals, fixed operation and case deadlines, clock regression, and retained primary/cleanup outcomes.
+Three exact false controls reject completion at the operation deadline, foreign Ready admission, and discarded owned cleanup errors.
+The actual parent records the operation start before publishing Begin; PowerShell publishes Ready only after actual Add-Type and its zero/invalid-count checks.
+Every pending, zero-byte, and completion observation shares the unchanged five-second operation start, and the existing whole-case command budget remains authoritative.
+These source-bound contracts do not establish PowerShell compilation time or Win32 Job behavior.
+Native controls retain all eight binary input schedules and exercise a held descendant in the exact creation-time Job, followed by owned termination, root reap, and zero-active-process observation.
+The original hosted failure's phase remains unestablished; a successful rerun alone is not a causal fix.
 The actual reaper CLI uses the typed process-group constructor, whose proof quantifies every `i32`, preserves every admitted positive value, and covers positive, zero, and negative inputs.
 Its false ownership control must fail `NEGATIVE_PROCESS_GROUP_CONTROL`.
 Native text fixtures preserve the exact prior integer parsing, error text, and canonical round trips; the mandatory process-group corpus replays positive, nonpositive, and overflow ingress.
@@ -52,7 +62,7 @@ The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add
 The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets nine finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, and login reply lanes through nightly-2026-10-01.
+`mise run miri` interprets ten finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, login reply, and input-controller lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.

@@ -7,6 +7,36 @@ const EFFECT_LINTS: &[&str] = &[
     "clippy::disallowed_macros",
 ];
 
+const ACCOUNTING_OWNER: &str = "crates/domyjob/tests/e2e/os/windows/owned_job.rs";
+
+fn accounting_leaf(owner: &str, function: &syn::ItemFn) -> bool {
+    owner == ACCOUNTING_OWNER
+        && function.sig.ident == "active"
+        && match &function.vis {
+            syn::Visibility::Inherited => true,
+            syn::Visibility::Restricted(scope) => scope.path.is_ident("super"),
+            syn::Visibility::Public(_) => false,
+        }
+}
+
+fn accounting_expect(attribute: &syn::Attribute) -> bool {
+    if !attribute.path().is_ident("expect") {
+        return false;
+    }
+    let Ok(arguments) =
+        attribute.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return false;
+    };
+    let entries: Vec<_> = arguments.iter().collect();
+    let [syn::Meta::Path(lint), syn::Meta::NameValue(reason)] = entries.as_slice() else {
+        return false;
+    };
+    lint.is_ident("unsafe_code")
+        && reason.path.is_ident("reason")
+        && matches!(&reason.value, syn::Expr::Lit(value) if matches!(&value.lit, syn::Lit::Str(text) if !text.value().trim().is_empty()))
+}
+
 const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
     (
         "crates/domyjob/src/platform/source_file/windows.rs",
@@ -208,7 +238,17 @@ pub fn check(path: &str, file: &syn::File) -> Vec<String> {
         }
     }
     for item in &file.items {
-        exceptions.visit_item(item);
+        if let syn::Item::Fn(function) = item
+            && accounting_leaf(path, function)
+        {
+            let mut retained = function.clone();
+            retained
+                .attrs
+                .retain(|attribute| !accounting_expect(attribute));
+            exceptions.visit_item_fn(&retained);
+        } else {
+            exceptions.visit_item(item);
+        }
     }
     exceptions.findings
 }
@@ -216,6 +256,35 @@ pub fn check(path: &str, file: &syn::File) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::check;
+
+    #[test]
+    fn accounting_leaf_has_only_its_exact_reasoned_unsafe_exception() {
+        const OWNER: &str = "crates/domyjob/tests/e2e/os/windows/owned_job.rs";
+        const SOURCE: &str = include_str!("../../crates/domyjob/tests/e2e/os/windows/owned_job.rs");
+        assert_eq!(
+            check(OWNER, &syn::parse_file(SOURCE).unwrap()),
+            Vec::<String>::new()
+        );
+        for source in [
+            SOURCE.replace("fn active", "fn sibling"),
+            format!("mod nested {{ {SOURCE} }}"),
+            "#[expect(unsafe_code, reason = \"native\")] impl Subject { #[expect(unsafe_code, reason = \"native\")] fn active() {} }".to_owned(),
+            "#[expect(unsafe_code, reason = \"\")] pub(super) fn active() {}".to_owned(),
+            "#[expect(unsafe_code)] pub(super) fn active() {}".to_owned(),
+            "#[expect(unsafe_code, dead_code, reason = \"native\")] pub(super) fn active() {}".to_owned(),
+            "#![expect(unsafe_code, reason = \"native\")] pub(super) fn active() {}".to_owned(),
+            "#[cfg_attr(windows, expect(unsafe_code, reason = \"native\"))] pub(super) fn active() {}".to_owned(),
+        ] {
+            assert!(!check(OWNER, &syn::parse_file(&source).unwrap()).is_empty(), "{source}");
+        }
+        assert_ne!(
+            check(
+                "crates/domyjob/tests/e2e/os/windows/other.rs",
+                &syn::parse_file(SOURCE).unwrap()
+            ),
+            Vec::<String>::new()
+        );
+    }
 
     fn findings(source: &str) -> Vec<String> {
         check(

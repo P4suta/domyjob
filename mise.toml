@@ -26,7 +26,7 @@ description = "Format Rust and TOML"
 run = [
   "cargo fmt --all",
   "cargo fmt --manifest-path fuzz/Cargo.toml",
-  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs",
+  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 verification/login-reply.rs",
   "taplo fmt",
 ]
@@ -37,7 +37,7 @@ description = "Check Rust and TOML formatting"
 run = [
   "cargo fmt --all -- --check",
   "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
-  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs",
+  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 --check verification/login-reply.rs",
   "taplo fmt --check",
   "taplo lint",
@@ -107,6 +107,7 @@ run = [
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --bin domyjob -E 'test(transport::input::tests)' --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test process_group --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --bin domyjob -E 'test(source::metadata_directories::tests)' --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --test input_controller --no-tests=fail --test-threads=1",
 ]
 
 [tasks."resource-contracts"]

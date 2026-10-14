@@ -43,6 +43,9 @@ const FAKES: [&str; 6] = ["ssh", "claude", "codex", "opencode", "sleeper", "mise
 const AI_CLIENTS: [&str; 3] = ["claude", "codex", "opencode"];
 
 fn main() -> ExitCode {
+    if let Some(code) = os::input_child_role() {
+        return code;
+    }
     if std::env::args().nth(1).as_deref() == Some("--bootstrap-input-remainder") {
         return bootstrap::input_remainder();
     }

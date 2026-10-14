@@ -7,6 +7,16 @@ mod macos;
 
 use std::io;
 
+#[cfg(windows)]
+pub(crate) fn input_child_role() -> Option<std::process::ExitCode> {
+    windows::input_child_role()
+}
+
+#[cfg(unix)]
+pub(crate) const fn input_child_role() -> Option<std::process::ExitCode> {
+    None
+}
+
 pub(crate) type BootstrapInputContract = fn(&std::path::Path) -> Result<(), crate::Failure>;
 
 pub(crate) const fn bootstrap_input_contracts() -> &'static [BootstrapInputContract] {
