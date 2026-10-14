@@ -11,13 +11,16 @@ Snapshot paths must remain portable, bounded, and confined to the selected worki
 
 ## Decision
 
-Combine the existing ignore walk with the current directory's [NUL-terminated tracked paths](https://git-scm.com/docs/git-ls-files).
+Combine the current directory's [NUL-terminated tracked and untracked paths](https://git-scm.com/docs/git-ls-files) with the existing no-follow walk.
 Read the working-tree files, omit deleted tracked paths, and exclude repository metadata from both sources.
 Keep non-Git directories on the existing ignore walk.
-When Git confirms a repository, load ancestor ignore rules so a selected subdirectory excludes parent-ignored untracked files while retaining ignored tracked working bytes.
-Canonicalize the selected directory once, discover the canonical repository root through bounded Git output, and retain the selected directory as the archive boundary.
-Ask [Git to decode its excludes-file path](https://git-scm.com/docs/git-config) before supplying global ignore rules, including quoted paths and repository configuration precedence.
-Resolve a relative excludes-file path at the repository root and anchor global patterns there, following [Git's exclude pattern rules](https://git-scm.com/docs/gitignore#_pattern_format).
+In Git mode, `ls-files --others --exclude-standard` owns ancestor, `.gitignore`, `info/exclude`, and global-ignore precedence while tracked paths retain their current working bytes.
+The walker still applies `.ignore` rules and entry-shape policy, but cannot reinstate a Git-ignored untracked file.
+Canonicalize the selected directory once and capture the actual Git directory, common directory, and working-tree root through individually bounded [absolute Git queries](https://git-scm.com/docs/git-rev-parse).
+Exclude both captured metadata subtrees, including custom names, from the merged paths and bind case aliases through native canonicalization before archive admission.
+Refuse metadata or bare roots and unresolved declared repositories rather than treating them as ordinary non-Git input.
+Retain the selected directory as the archive capability boundary.
+Non-Git global rules keep the existing [Git-decoded excludes-file path](https://git-scm.com/docs/git-config) and selected-root pattern base.
 Remove inherited repository-local Git context before querying the selected directory, following [the Git context decision](0001-git-process-context.md).
 
 The [pure parser](../../crates/domyjob-core/src/source_paths.rs) bounds path bytes, record length, and file count before constructing validated portable paths.
@@ -33,11 +36,17 @@ Archive size and case-insensitive path collision checks remain authoritative.
 Source-bound Kani harnesses quantify the parser budget transition over every admitted integer counter and byte value and check the production metadata classifier.
 A separate false metadata assertion must fail for the expected assertion.
 An additional source-bound scalar proof and named negative control check actual read admission, length+1 limits, and exact completion.
+Four actual-implementation Kani harnesses check the typed component-prefix matcher for all three-letter lowercase metadata names and the same four exact root, descendant, common, and component-prefix sibling cases.
+One unchanged sequence and cover per harness preserves the complete combined domain and four covers within the unchanged per-harness timeout.
+The native path adapter supplies actual `Path::components()` to that same matcher, with native and Miri controls for rooted and relative namespaces.
+Its named false control must reject delivery of a custom metadata descendant.
 The fuzz corpus checks malformed records, metadata exclusion, and canonical round trips through the production parser.
 Native Git and file fixtures check ignored working bytes, ancestor rules, competing relative excludes files and repository-root anchored patterns against actual Git, quoted global configuration, real metadata case aliases, parent/final link replacements, writerless FIFO refusal, retained-handle renames, and changed read lengths.
+Additional real Git fixtures check separate and distinct common metadata, forced tracked metadata, relative pointers with spaces, metadata-root refusal, malformed ancestor declarations, bare repositories, symlink and case aliases, and `info/exclude` precedence against `.gitignore` negation.
 
-Git index contents, canonical path discovery, ignore matching, filesystem identity, concurrent mutation, and operating-system capability semantics remain external assumptions covered by native contracts rather than the arithmetic proof.
+Git index contents, native path canonicalization and case folding, declaration stability during collection, ignore matching, filesystem identity, concurrent mutation, and operating-system capability semantics remain external assumptions covered by native contracts rather than the bounded path or arithmetic proofs.
 The snapshot does not promise one atomic view of files changing concurrently.
+Without Git or an explicit `.git` declaration, discovery cannot identify an arbitrary custom bare directory, and ordinary `HEAD` or `objects` working names do not become repository heuristics.
 Revisit that boundary if a native containment contract fails or a suitable verifier can check the filesystem adapter.
 
 ## Consequences

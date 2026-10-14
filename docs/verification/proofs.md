@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers nine positive Kani harnesses, six named negative controls, and twenty-nine required covers.
+This head registers fourteen positive Kani harnesses, seven named negative controls, and thirty-five required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -44,7 +44,7 @@ The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add
 The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets seven finite production state, protocol, refusing generic-serialization, source-ingress, process-group, and segmented-writer lanes through nightly-2026-10-01.
+`mise run miri` interprets eight finite production state, protocol, refusing generic-serialization, source-ingress, process-group, and segmented-writer lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
@@ -65,6 +65,13 @@ The separate casing proof quantifies the same six independent Boolean case choic
 Both proofs retain unwind sixteen and unwinding assertions.
 This decomposition preserves the original combined input domain within the unchanged per-harness timeout.
 The named false metadata control imports the exact production classifier and must fail `NEGATIVE_SOURCE_CONTROL`.
+The four standalone metadata-directory proofs import the actual typed component-prefix matcher used by the production collector.
+Its native path adapter passes actual `Path::components()` into that same matcher, and finite Miri controls check complete components and rooted-versus-relative namespaces.
+Each proof quantifies every three-byte lowercase ASCII custom directory name for one of the same four exact root, Git descendant, common descendant, and component-prefix sibling sequences with unwind thirty-two and one cover.
+Their union preserves all 26^3 names across all four original sequences and all four original covers within the unchanged per-harness timeout.
+On Kani's Unix target, the proof-only byte constructor uses safe `OsStrExt::from_bytes` for the same admitted ASCII names; native and Miri controls retain the separate `Path::components()` adapter boundary.
+The deliberately false custom-directory delivery assertion must fail `NEGATIVE_GIT_DIRECTORY_CONTROL`.
+This bounded predicate proof does not establish arbitrary native path parsing or filesystem case-folding semantics.
 The read-length proof quantifies all expected and actual u64 lengths through the production admission, length+1 limit, and exact completion functions, with three reachable covers and `NEGATIVE_SOURCE_READ_CONTROL` as its false claim.
 Actual archive and fingerprint readers apply that limit to the native reader and reject changed lengths.
 Native no-follow, retained-parent, FIFO, and read-fault fixtures establish the adapter linkage; they do not prove operating-system behavior or an atomic source snapshot.
@@ -72,6 +79,12 @@ These proofs do not establish all UTF-8 or Unicode paths, native Git output, fil
 Native Git fixtures include ignored tracked working bytes, ignored untracked exclusion, tracked deletion, metadata exclusion and subdirectory-relative paths.
 The nested Git fixture forces an ancestor-ignored file into the index, changes its working bytes, and requires the snapshot to exclude the equally ignored untracked peer.
 A second nested fixture compares actual Git with competing relative excludes files and repository-root anchored patterns while retaining changed tracked bytes.
+Separate-directory fixtures require private Git and common metadata to remain excluded even when a metadata canary is forced into the index.
+Individually bounded absolute Git-directory queries precede working-tree discovery so selected metadata and bare roots are refused.
+Malformed ancestor declarations refuse collection, while an ordinary non-Git directory with the same custom name remains working input.
+The merged candidate filter uses native canonicalization before the captured-directory predicate to bind case aliases, and the retained no-follow archive reader remains authoritative for file reads.
+In Git mode, the actual bounded untracked-path query owns ancestor, global, `info/exclude`, and `.gitignore` precedence; `.ignore` walking cannot reinstate Git-ignored private input.
+The native `info/exclude` control requires Git-ignored private input to stay absent while `.gitignore` negation and current tracked bytes remain present.
 Canonical root discovery and ignore matching remain native boundaries; these checks do not prove an atomic relationship between Git queries and concurrently changing files.
 The global-ignore fixture creates its real configuration with Git's argument-based writer, and native link/junction fixtures refuse reading outside the retained source root.
 Runtime and build-time archive admission use that same capability-relative boundary without changing portable-path, case-collision or snapshot-byte checks.
