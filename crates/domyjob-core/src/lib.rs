@@ -58,3 +58,4 @@ pub mod service;
 pub mod source_paths;
 pub mod state;
 pub mod wire;
+pub mod worker_handoff;

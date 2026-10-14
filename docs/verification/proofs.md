@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers twenty-seven positive Kani harnesses, twelve named negative controls, and seventy required covers.
+This head registers twenty-eight positive Kani harnesses, fourteen named negative controls, and seventy-five required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -31,6 +31,14 @@ The persistent-protocol proof checks every durable state and action, including b
 The resource negative must fail its `NEGATIVE_RESOURCE_CONTROL` assertion, and the disconnect-loss negative must fail its `NEGATIVE_JOB_CONTROL` assertion.
 Complete reports must contain every harness, unique check identities, successful assertions, and the exact individually satisfied cover count.
 Unwinding failures and incomplete result summaries cannot pass.
+
+The worker handoff harness imports the production ordered request-port function.
+It quantifies all four Boolean refusal choices and every eight-bit owned cause with no input assumptions and unwind eight.
+Five covers require success and the first failure at Read, Decode, Validate, and Launch.
+The exact negatives reject relabelled request-read failure and discarded error payloads.
+The actual Mac adapter supplies bounded reads, JSON ingress, path and environment validation, and native launch; those parser and operating-system semantics are not replaced by the port proof.
+Native controls retain injected error kind, operating-system code, and cause, require zero launches before valid admission, and exercise an actual partial-request timeout with the unchanged thirty-second production bound.
+The observed intermittent timeout's underlying EOF or scheduling cause remains unestablished.
 
 The login reply harness imports the production generic write-and-shutdown adapter.
 It checks every byte in payloads of length zero through four, every stable one-byte write cutoff within that payload, and both shutdown outcomes with unwind eight.
@@ -62,10 +70,11 @@ The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add
 The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets ten finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, login reply, and input-controller lanes through nightly-2026-10-01.
+`mise run miri` interprets eleven finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, worker handoff, login reply, and input-controller lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
+The worker handoff core test checks owned error preservation, exact stage order, admitted request forwarding, and each refusal phase through the production function.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
 
 Bootstrap sends the bounded source archive, unchanged original frame, and snapshot payload over one connection.

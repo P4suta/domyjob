@@ -43,6 +43,7 @@ On macOS, the node hands the matching worker executable, job identity, state roo
 The LaunchAgent starts the worker inside the desktop login session and acknowledges its existing readiness signal.
 The environment crosses the socket in memory, and credentials remain in the keychain or 1Password.
 A missing login session or unavailable agent refuses submission with its cause; Linux and Windows retain direct worker launch.
+The request adapter reports the first failed read, decode, validation, or launch phase with its original cause, and launches only after the preceding stages succeed.
 See [the login-session decision](adr/0003-run-macos-jobs-in-login-session.md) for the boundary and verification scope.
 
 ## Transport and source

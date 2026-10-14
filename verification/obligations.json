@@ -5,6 +5,15 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": "verification/worker-handoff.rs",
+      "name": "handoff_stops_at_the_first_failure_and_retains_its_cause",
+      "covers": 5,
+      "contract": "Read, decode, validation, and launch run in order, stop at the first refusal, and preserve its exact phase and owned error; launch occurs once only after valid request admission.",
+      "input_domain": "Every four Boolean port-failure choices and every u8 cause, with identity byte/request ports and independent scalar call counters; no assumptions.",
+      "bound": "Unwind eight with unwinding assertions; four loop-free production port calls. Actual bounded JSON parsing, validation, Unix socket timeouts and native launch are separate adapter contracts.",
+      "production": "crates/domyjob-core/src/worker_handoff.rs start imported directly by the harness; process/login.rs receive_request supplies actual bounded::read, ingress::json, Handoff::validate and native launch"
+    },
+    {
       "source": "verification/input-controller.rs",
       "name": "identity_tokens_preserve_every_case_and_process_bit",
       "covers": 3,
@@ -234,6 +243,16 @@
   ],
   "negatives": [
     {
+      "source": "verification/worker-handoff.rs",
+      "harness": "rejects_relabelled_request_read_failure",
+      "assertion": "NEGATIVE_HANDOFF_PHASE"
+    },
+    {
+      "source": "verification/worker-handoff.rs",
+      "harness": "rejects_discarded_handoff_error",
+      "assertion": "NEGATIVE_HANDOFF_CAUSE"
+    },
+    {
       "source": "verification/input-controller.rs",
       "harness": "rejects_completion_at_the_input_deadline",
       "assertion": "NEGATIVE_INPUT_DEADLINE_CONTROL"
@@ -321,8 +340,8 @@
     },
     {
       "source": "crates/domyjob/src/process/login.rs",
-      "reason": "The bounded Write-port proof does not establish native Unix socket EOF, launchd, descriptor inheritance, concurrency, or every possible Write implementation.",
-      "evidence": "The mandatory Mac workspace test gate exercises actual readiness and refusal through UnixStream while another receiver handle remains open; the cross-platform login_reply target checks partial, interrupted, empty, zero, and failed writes plus shutdown failures, and its finite Miri lane imports the same production adapter.",
+      "reason": "The source-bound ordered request-port and bounded Write-port proofs do not establish actual JSON decoding, native Unix socket EOF or timeout causes, launchd, descriptor inheritance, concurrency, or every possible port implementation.",
+      "evidence": "The mandatory Mac workspace tests exercise actual bounded ingress decoding and Handoff validation, tagged Read/Decode/Validate/Launch refusals, an actual partial-request timeout with zero launches, injected partial-read WouldBlock retaining native error kind/code/cause, and complete readiness/refusal through UnixStream with a held receiver clone. The core handoff Miri lane interprets the same ordered request function; the cross-platform login_reply target and its Miri lane import the production write/shutdown adapter. Passing reruns do not identify the original intermittent refusal's cause.",
       "reconsider": "Reply framing or socket semantics change, a native integration fails, or a verifier supports the actual concurrent operating-system boundary."
     },
     {

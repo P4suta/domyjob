@@ -8,6 +8,7 @@ use std::path::Path;
 
 use domyjob_core::domain::JobId;
 use domyjob_core::wire::MAX_CONTROL_BYTES;
+use domyjob_core::worker_handoff::{HandoffFailure, HandoffPhase};
 use serde::{Deserialize, Serialize};
 
 use super::{ProcessError, Tool, run_tool};
@@ -107,7 +108,7 @@ fn exchange(mut stream: UnixStream, request: &Handoff) -> Result<(), ProcessErro
         Ok(())
     } else {
         Err(refused(format!(
-            "the login-session agent did not start the worker: {}",
+            "the login-session agent refused the hand-off: {}",
             String::from_utf8_lossy(&reply)
         )))
     }
@@ -140,24 +141,45 @@ fn receive(
     launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
 ) -> io::Result<()> {
     clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS)?;
-    let started = (|| {
-        let bytes = crate::bounded::read(&mut stream, MAX_CONTROL_BYTES)?.ok_or_else(|| {
-            io::Error::other("the login-session hand-off exceeds the 1 MiB limit")
-        })?;
-        let request: Handoff =
-            domyjob_core::ingress::json(&bytes, MAX_CONTROL_BYTES).map_err(io::Error::other)?;
-        request.validate()?;
-        launch(request).map_err(io::Error::other)
-    })();
+    let started = receive_request(&mut stream, launch);
     match started {
         Ok(()) => reply::complete(&mut stream, b"R", |socket| socket.shutdown(Shutdown::Write)),
         Err(error) => {
-            let detail: String = error.to_string().chars().take(MAX_ERROR_CHARS).collect();
+            let detail = refusal_detail(&error);
             reply::complete(&mut stream, detail.as_bytes(), |socket| {
                 socket.shutdown(Shutdown::Write)
             })
         }
     }
+}
+
+fn refusal_detail(error: &HandoffFailure<io::Error>) -> String {
+    let phase = match error.phase {
+        HandoffPhase::Read => "request read",
+        HandoffPhase::Decode => "request decode",
+        HandoffPhase::Validate => "request validation",
+        HandoffPhase::Launch => "worker launch",
+    };
+    format!("{phase}: {}", error.cause)
+        .chars()
+        .take(MAX_ERROR_CHARS)
+        .collect()
+}
+
+fn receive_request(
+    reader: impl io::Read,
+    launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
+) -> Result<(), HandoffFailure<io::Error>> {
+    domyjob_core::worker_handoff::start(
+        || {
+            crate::bounded::read(reader, MAX_CONTROL_BYTES)?.ok_or_else(|| {
+                io::Error::other("the login-session hand-off exceeds the 1 MiB limit")
+            })
+        },
+        |bytes| domyjob_core::ingress::json(&bytes, MAX_CONTROL_BYTES).map_err(io::Error::other),
+        Handoff::validate,
+        |request| launch(request).map_err(io::Error::other),
+    )
 }
 
 fn bind(directory: &Path) -> io::Result<(UnixListener, OsLock)> {
@@ -215,6 +237,45 @@ mod tests {
     use domyjob_core::domain::{IDENTIFIER_HEX_BYTES, JobId};
     use std::os::unix::net::UnixStream;
 
+    #[test]
+    fn request_read_fault_keeps_phase_cause_and_never_launches() {
+        use std::io::Read as _;
+
+        const MACOS_WOULD_BLOCK: i32 = 35;
+
+        struct WouldBlock;
+
+        impl std::io::Read for WouldBlock {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(MACOS_WOULD_BLOCK))
+            }
+        }
+
+        let mut launches = 0_u8;
+        let error = super::receive_request((&b"{\"program\":"[..]).chain(WouldBlock), |_| {
+            launches += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(launches, 0);
+        assert_eq!(error.phase, super::HandoffPhase::Read);
+        assert_eq!(error.cause.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.cause.raw_os_error(), Some(MACOS_WOULD_BLOCK));
+        let original = error.cause.to_string();
+        let detail = super::refusal_detail(&error);
+        assert_eq!(detail, format!("request read: {original}"));
+        let mut output = Vec::new();
+        let mut shutdowns = 0_u8;
+        super::reply::complete(&mut output, detail.as_bytes(), |bytes| {
+            assert_eq!(bytes.as_slice(), detail.as_bytes());
+            shutdowns += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(output, detail.as_bytes());
+        assert_eq!(shutdowns, 1);
+    }
+
     fn request() -> Handoff {
         Handoff {
             program: b"/bin/domyjob".to_vec(),
@@ -222,6 +283,115 @@ mod tests {
             job: JobId::try_from("1".repeat(IDENTIFIER_HEX_BYTES)).unwrap(),
             environment: vec![("PATH".to_owned(), b"/usr/bin".to_vec())],
         }
+    }
+
+    #[test]
+    fn actual_decode_and_validation_refuse_before_launch() {
+        let malformed =
+            super::receive_request(&b"{"[..], |_| panic!("malformed JSON cannot reach launch"))
+                .unwrap_err();
+        assert_eq!(malformed.phase, super::HandoffPhase::Decode);
+        assert!(super::refusal_detail(&malformed).starts_with("request decode: "));
+        for invalid_path in [false, true] {
+            let mut packet = request();
+            let expected = if invalid_path {
+                packet.program = b"relative-worker".to_vec();
+                "absolute"
+            } else {
+                packet
+                    .environment
+                    .push(("GH_TOKEN".to_owned(), b"private".to_vec()));
+                "allowlist"
+            };
+            let bytes = serde_json::to_vec(&packet).unwrap();
+            let error = super::receive_request(bytes.as_slice(), |_| {
+                panic!("invalid request cannot reach launch")
+            })
+            .unwrap_err();
+            assert_eq!(error.phase, super::HandoffPhase::Validate);
+            let detail = super::refusal_detail(&error);
+            assert!(detail.starts_with("request validation: "));
+            assert!(detail.contains(expected));
+        }
+    }
+
+    #[test]
+    fn launch_refusal_retains_its_owned_process_error() {
+        const MACOS_WOULD_BLOCK: i32 = 35;
+        let bytes = serde_json::to_vec(&request()).unwrap();
+        let mut launches = 0_u8;
+        let error = super::receive_request(bytes.as_slice(), |_| {
+            launches += 1;
+            Err(ProcessError::Spawn {
+                what: "the worker",
+                source: std::io::Error::from_raw_os_error(MACOS_WOULD_BLOCK),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(launches, 1);
+        assert_eq!(error.phase, super::HandoffPhase::Launch);
+        if let ProcessError::Spawn { what, source } = error
+            .cause
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<ProcessError>()
+            .unwrap()
+        {
+            assert_eq!(*what, "the worker");
+            assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(source.raw_os_error(), Some(MACOS_WOULD_BLOCK));
+        } else {
+            panic!("the original spawn error must survive");
+        }
+        assert!(super::refusal_detail(&error).starts_with("worker launch: starting the worker: "));
+    }
+
+    #[test]
+    fn legacy_refusal_text_remains_a_client_refusal() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || {
+            crate::bounded::read(&mut server, super::MAX_CONTROL_BYTES)
+                .unwrap()
+                .unwrap();
+            super::reply::complete(&mut server, b"legacy refusal", |stream| {
+                stream.shutdown(std::net::Shutdown::Write)
+            })
+        });
+        let observed = exchange(client, &request());
+        let completed = receiver.join();
+        completed.unwrap().unwrap();
+        assert_eq!(
+            observed.unwrap_err().to_string(),
+            "macOS login-session hand-off refused: the login-session agent refused the hand-off: legacy refusal"
+        );
+    }
+
+    #[test]
+    fn partial_request_timeout_is_named_as_request_read_and_never_launches() {
+        const OBSERVATION_GRACE_MILLIS: u64 = 2_000;
+        const MACOS_WOULD_BLOCK: i32 = 35;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        super::clock::socket_timeout(&client, super::IO_TIMEOUT_MILLIS + OBSERVATION_GRACE_MILLIS)
+            .unwrap();
+        let receiver = std::thread::spawn(move || {
+            let mut launches = 0_u8;
+            let completed = receive(server, |_| {
+                launches += 1;
+                Ok(())
+            });
+            (completed, launches)
+        });
+        let sent = std::io::Write::write_all(&mut client, b"{\"program\":");
+        let observed = crate::bounded::read(&mut client, super::MAX_REPLY_BYTES);
+        drop(client);
+        let joined = receiver.join();
+        sent.unwrap();
+        let (completed, launches) = joined.unwrap();
+        completed.unwrap();
+        assert_eq!(launches, 0);
+        let detail = String::from_utf8(observed.unwrap().unwrap()).unwrap();
+        let cause = std::io::Error::from_raw_os_error(MACOS_WOULD_BLOCK).to_string();
+        assert_eq!(detail, format!("request read: {cause}"));
     }
 
     #[test]
