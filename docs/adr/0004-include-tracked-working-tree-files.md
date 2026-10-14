@@ -36,6 +36,8 @@ Archive size and case-insensitive path collision checks remain authoritative.
 Source-bound Kani harnesses quantify the parser budget transition over every admitted integer counter and byte value and check the production metadata classifier.
 A separate false metadata assertion must fail for the expected assertion.
 An additional source-bound scalar proof and named negative control check actual read admission, length+1 limits, and exact completion.
+Eight casing harnesses each check all six independent case choices for one unchanged metadata name, retaining the production classifier, checked UTF-8 construction, and both casing covers.
+Their conjunction preserves the original eight-name universal claim within the unchanged per-harness time limit.
 Four actual-implementation Kani harnesses check the typed component-prefix matcher for all three-letter lowercase metadata names and the same four exact root, descendant, common, and component-prefix sibling cases.
 One unchanged sequence and cover per harness preserves the complete combined domain and four covers within the unchanged per-harness timeout.
 The native path adapter supplies actual `Path::components()` to that same matcher, with native and Miri controls for rooted and relative namespaces.

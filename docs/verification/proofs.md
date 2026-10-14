@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers fourteen positive Kani harnesses, seven named negative controls, and thirty-five required covers.
+This head registers twenty-two positive Kani harnesses, nine named negative controls, and fifty-three required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -21,6 +21,14 @@ The persistent-protocol proof checks every durable state and action, including b
 The resource negative must fail its `NEGATIVE_RESOURCE_CONTROL` assertion, and the disconnect-loss negative must fail its `NEGATIVE_JOB_CONTROL` assertion.
 Complete reports must contain every harness, unique check identities, successful assertions, and the exact individually satisfied cover count.
 Unwinding failures and incomplete result summaries cannot pass.
+
+The login reply harness imports the production generic write-and-shutdown adapter.
+It checks every byte in payloads of length zero through four, every stable one-byte write cutoff within that payload, and both shutdown outcomes with unwind eight.
+Four covers require empty input, nonempty success, an incomplete write, and a shutdown failure.
+The two named negatives reject shutdown after an incomplete write and success after a shutdown failure.
+The proof establishes ordered byte preservation and exact error outcomes under that writer contract.
+It doesn't establish arbitrary writer implementations, native socket behavior, concurrency, or launchd.
+The Mac native controls keep an actual duplicate receiver handle open while requiring both readiness and refusal replies to finish.
 
 The persistent job protocol projects queued, starting, and running phases into an active durable state.
 The production store uses `Submit` while retaining its existing admission locks and complete request equality.
@@ -44,9 +52,10 @@ The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add
 The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets eight finite production state, protocol, refusing generic-serialization, source-ingress, process-group, and segmented-writer lanes through nightly-2026-10-01.
+`mise run miri` interprets nine finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, and login reply lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
+The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
 
 Bootstrap sends the bounded source archive, unchanged original frame, and snapshot payload over one connection.
@@ -61,9 +70,9 @@ The Rust segmented proof does not establish those native effects.
 The source budget proof checks the production per-byte transition for every byte and all admitted counters, requiring reachable byte admission, empty-record refusal and unterminated-record refusal.
 Its counter domain preserves the existing 100,000-file and 16,777,216-path-byte archive limits, with a 4,096-byte record bound and a 16,877,216-byte tracked stream bound.
 The metadata path proof selects all sixteen fixed root/nested paths for the eight production metadata names and checks both ordinary/metadata controls.
-The separate casing proof quantifies the same six independent Boolean case choices for each of the same eight names, with all-uppercase and all-lowercase covers.
-Both proofs retain unwind sixteen and unwinding assertions.
-This decomposition preserves the original combined input domain within the unchanged per-harness timeout.
+Eight casing proofs each quantify the same six independent Boolean case choices for one of the same eight names, with all-uppercase and all-lowercase covers for every name.
+Their conjunction preserves the original combined input domain within the unchanged per-harness timeout.
+The path and casing proofs retain unwind sixteen and unwinding assertions.
 The named false metadata control imports the exact production classifier and must fail `NEGATIVE_SOURCE_CONTROL`.
 The four standalone metadata-directory proofs import the actual typed component-prefix matcher used by the production collector.
 Its native path adapter passes actual `Path::components()` into that same matcher, and finite Miri controls check complete components and rooted-versus-relative namespaces.

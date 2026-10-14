@@ -332,21 +332,65 @@ mod proofs {
 
     #[kani::proof]
     #[kani::unwind(16)]
-    fn repository_metadata_casing_is_excluded() {
-        let uppercase: [bool; 6] = kani::any();
-        check_metadata_case(b".git", &uppercase);
-        check_metadata_case(b".jj", &uppercase);
-        check_metadata_case(b".hg", &uppercase);
-        check_metadata_case(b".svn", &uppercase);
-        check_metadata_case(b".pijul", &uppercase);
-        check_metadata_case(b"_darcs", &uppercase);
-        check_metadata_case(b".bzr", &uppercase);
-        check_metadata_case(b"CVS", &uppercase);
+    fn repository_metadata_git_casing_is_excluded() {
+        metadata_casing(b".git");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_jj_casing_is_excluded() {
+        metadata_casing(b".jj");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_hg_casing_is_excluded() {
+        metadata_casing(b".hg");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_svn_casing_is_excluded() {
+        metadata_casing(b".svn");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_pijul_casing_is_excluded() {
+        metadata_casing(b".pijul");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_darcs_casing_is_excluded() {
+        metadata_casing(b"_darcs");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_bzr_casing_is_excluded() {
+        metadata_casing(b".bzr");
+    }
+
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn repository_metadata_cvs_casing_is_excluded() {
+        metadata_casing(b"CVS");
+    }
+
+    const METADATA_CASE_CHOICES: usize = 6;
+
+    fn metadata_casing<const N: usize>(name: &[u8; N]) {
+        let uppercase: [bool; METADATA_CASE_CHOICES] = kani::any();
+        check_metadata_case(name, &uppercase);
         kani::cover!(uppercase.iter().all(|upper| *upper));
         kani::cover!(uppercase.iter().all(|upper| !*upper));
     }
 
-    fn check_metadata_case<const N: usize>(name: &[u8; N], uppercase: &[bool; 6]) {
+    fn check_metadata_case<const N: usize>(
+        name: &[u8; N],
+        uppercase: &[bool; METADATA_CASE_CHOICES],
+    ) {
         let mut bytes = *name;
         for (byte, upper) in bytes.iter_mut().zip(uppercase) {
             if *upper {
