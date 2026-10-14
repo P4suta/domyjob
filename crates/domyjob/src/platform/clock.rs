@@ -2,6 +2,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 use domyjob_core::chat::event::Stamp;
 
+const MILLIS_PER_SECOND: u64 = 1_000;
+
 mod raw {
     #![expect(
         clippy::disallowed_methods,
@@ -80,7 +82,7 @@ impl Deadline {
 
     #[must_use]
     pub(crate) fn after_seconds(seconds: u64) -> Self {
-        Self::after_millis(seconds.saturating_mul(1000))
+        Self::after_millis(seconds.saturating_mul(MILLIS_PER_SECOND))
     }
 
     #[must_use]

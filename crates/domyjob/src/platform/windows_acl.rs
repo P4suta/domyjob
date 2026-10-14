@@ -73,6 +73,11 @@ pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
     )
 }
 
+#[cfg(test)]
+pub(super) fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
+    descriptor::create_exposed_build_parent(path).map(|_created| ())
+}
+
 fn create_private_dir_using(
     path: &Path,
     current_user: impl FnOnce() -> io::Result<Sid>,

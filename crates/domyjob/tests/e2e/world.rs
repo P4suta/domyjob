@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 
 use crate::{Context as _, FAKES, Failure};
 
-const COMMAND_LIMIT: Duration = Duration::from_secs(180);
+pub(crate) const COMMAND_LIMIT: Duration = Duration::from_secs(180);
 const POLL_MILLISECONDS: u64 = 50;
 pub(crate) const POLLS: u32 = 2400;
 

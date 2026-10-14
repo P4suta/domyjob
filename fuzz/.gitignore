@@ -10,5 +10,10 @@ corpus/source_paths/*
 !corpus/source_paths/tracked
 !corpus/source_paths/metadata
 !corpus/source_paths/malformed
+!corpus/process_group/
+corpus/process_group/*
+!corpus/process_group/positive
+!corpus/process_group/nonpositive
+!corpus/process_group/overflow
 artifacts
 coverage

@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers twenty positive Kani harnesses, seven named negative controls, and forty-five required covers.
+This head registers twenty-eight positive Kani harnesses, fourteen named negative controls, and seventy-five required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
@@ -10,11 +10,35 @@ An optional standalone source selects that maintained source explicitly; omissio
 Kani 0.68.0 checks the production execution-result, resource-budget, job-state, persistent-protocol and source-admission decisions.
 Execution outcomes quantify every `i32` exit code with a fixed valid launch-error payload and four reachable outcomes.
 Resource admission quantifies every `u32` concurrency count and `u64` memory value with two covers.
+The standalone outbound proof imports the actual transport writer and quantifies every byte in three two-byte segments, every partial acceptance count from zero through six, and both flush outcomes, with unwind eight and five covers.
+It checks the exact accepted prefix, first-error refusal, and final-flush result; the false partial-write success control must fail `NEGATIVE_OUTBOUND_CONTROL`.
+Native helper fixtures separately exercise interrupted retries, zero writes, empty segments, and flush failures.
+
+The standalone input-controller proofs import the actual Windows fixture controller.
+They quantify every fixed-size case/process token, every scalar clock/budget value, typed Ready and child observations, and all failure choices in the stated three-observation port.
+Seventeen covers require representation boundaries, actual readiness admission/refusals, fixed operation and case deadlines, clock regression, and retained primary/cleanup outcomes.
+Three exact false controls reject completion at the operation deadline, foreign Ready admission, and discarded owned cleanup errors.
+The actual parent records the operation start before publishing Begin; PowerShell publishes Ready only after actual Add-Type and its zero/invalid-count checks.
+Every pending, zero-byte, and completion observation shares the unchanged five-second operation start, and the existing whole-case command budget remains authoritative.
+These source-bound contracts do not establish PowerShell compilation time or Win32 Job behavior.
+Native controls retain all eight binary input schedules and exercise a held descendant in the exact creation-time Job, followed by owned termination, root reap, and zero-active-process observation.
+The original hosted failure's phase remains unestablished; a successful rerun alone is not a causal fix.
+The actual reaper CLI uses the typed process-group constructor, whose proof quantifies every `i32`, preserves every admitted positive value, and covers positive, zero, and negative inputs.
+Its false ownership control must fail `NEGATIVE_PROCESS_GROUP_CONTROL`.
+Native text fixtures preserve the exact prior integer parsing, error text, and canonical round trips; the mandatory process-group corpus replays positive, nonpositive, and overflow ingress.
 The job-state proof checks the finite phase and event variants, arbitrary PID and exit-code inputs, a representative prior nonzero PID, and a one-byte launch reason with unwind sixteen and three covers.
 The persistent-protocol proof checks every durable state and action, including both request-equivalence values, without loops or input assumptions and with four covers.
 The resource negative must fail its `NEGATIVE_RESOURCE_CONTROL` assertion, and the disconnect-loss negative must fail its `NEGATIVE_JOB_CONTROL` assertion.
 Complete reports must contain every harness, unique check identities, successful assertions, and the exact individually satisfied cover count.
 Unwinding failures and incomplete result summaries cannot pass.
+
+The worker handoff harness imports the production ordered request-port function.
+It quantifies all four Boolean refusal choices and every eight-bit owned cause with no input assumptions and unwind eight.
+Five covers require success and the first failure at Read, Decode, Validate, and Launch.
+The exact negatives reject relabelled request-read failure and discarded error payloads.
+The actual Mac adapter supplies bounded reads, JSON ingress, path and environment validation, and native launch; those parser and operating-system semantics are not replaced by the port proof.
+Native controls retain injected error kind, operating-system code, and cause, require zero launches before valid admission, and exercise an actual partial-request timeout with the unchanged thirty-second production bound.
+The observed intermittent timeout's underlying EOF or scheduling cause remains unestablished.
 
 The login reply harness imports the production generic write-and-shutdown adapter.
 It checks every byte in payloads of length zero through four, every stable one-byte write cutoff within that payload, and both shutdown outcomes with unwind eight.
@@ -42,14 +66,25 @@ The [Java catalog provider](java-catalog.md) preserves mise's exact Temurin alia
 The fuzz phase copies exactly three checked-in wire seeds into a fresh replay directory: `hello`, `chat-exchange`, and `chat-unknown-field`.
 It also copies the checked-in source seeds `tracked`, `metadata` and `malformed` into a separate fresh replay directory.
 Missing or empty required corpus files fail before libFuzzer starts.
-The maintained cargo-fuzz 0.13.2 targets replay those six inputs through production wire and source ingress with zero mutation runs and seed one.
+The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add a third isolated replay directory.
+The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets seven finite production state, protocol, refusing generic-serialization, source-ingress and login reply lanes through nightly-2026-10-01.
+`mise run miri` interprets eleven finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, worker handoff, login reply, and input-controller lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
+The worker handoff core test checks owned error preservation, exact stage order, admitted request forwarding, and each refusal phase through the production function.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
+
+Bootstrap sends the bounded source archive, unchanged original frame, and snapshot payload over one connection.
+The exact source prefix is consumed before a private installer runs with isolated stdin and diagnostic stderr; the first node inherits the untouched remainder and EOF.
+Publication holds the installed-build selection lock until final usage admission, and the publisher retains that usage lock through the first node.
+The existing two-idle-build retention policy remains unchanged.
+Native fixtures make an unprotected candidate eligible using two newer idle companions and compare its deletion with protected publication and first use.
+The same scripts exercise truncated input and primary-preserving first-node, cwd-recovery, and cleanup faults.
+Windows tests run actual inherited overlapped pipe schedules in Windows PowerShell and PowerShell 7, while CLR marshalling, native completion, shell inheritance, filesystem identity, ACLs, and kernel locks remain external semantic boundaries.
+The Rust segmented proof does not establish those native effects.
 
 The source budget proof checks the production per-byte transition for every byte and all admitted counters, requiring reachable byte admission, empty-record refusal and unterminated-record refusal.
 Its counter domain preserves the existing 100,000-file and 16,777,216-path-byte archive limits, with a 4,096-byte record bound and a 16,877,216-byte tracked stream bound.

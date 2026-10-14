@@ -76,8 +76,15 @@ trait System {
     fn ownership(file: &fs::File) -> io::Result<Ownership>;
     fn open_private_dir(path: &Path) -> io::Result<fs::File>;
     fn create_private_dir(path: &Path) -> io::Result<()>;
+    #[cfg(test)]
+    fn create_exposed_build_parent(path: &Path) -> io::Result<()>;
     fn owner_only(options: &mut fs::OpenOptions);
     fn no_follow(options: &mut fs::OpenOptions);
+}
+
+#[cfg(test)]
+pub(crate) fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
+    Native::create_exposed_build_parent(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +108,15 @@ pub(crate) fn home() -> io::Result<PathBuf> {
 pub(crate) fn ssh_control_path(
     directory: &Path,
 ) -> Result<Option<PathBuf>, crate::state_io::StateError> {
-    if cfg!(windows) || directory.as_os_str().len().saturating_add(41) > 100 {
+    const CONTROL_NAME_WITH_SEPARATOR_BYTES: usize = 41;
+    const MAX_CONTROL_PATH_BYTES: usize = 100;
+    if cfg!(windows)
+        || directory
+            .as_os_str()
+            .len()
+            .saturating_add(CONTROL_NAME_WITH_SEPARATOR_BYTES)
+            > MAX_CONTROL_PATH_BYTES
+    {
         return Ok(None);
     }
     crate::state_io::private_dir(directory)?;
@@ -142,13 +157,14 @@ pub(crate) fn user_id() -> Option<u32> {
 }
 
 pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
+    const MAX_MACHINE_LABEL_CHARS: usize = 64;
     let name = Native::host_name();
     let label = name.split('.').next().unwrap_or_default().trim().to_owned();
     Ok(MachineCard {
         label: Line::try_from(if label.is_empty() {
             "machine".to_owned()
         } else {
-            label.chars().take(64).collect()
+            label.chars().take(MAX_MACHINE_LABEL_CHARS).collect()
         })?,
         os: Native::OS,
     })

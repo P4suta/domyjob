@@ -5,6 +5,77 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": "verification/worker-handoff.rs",
+      "name": "handoff_stops_at_the_first_failure_and_retains_its_cause",
+      "covers": 5,
+      "contract": "Read, decode, validation, and launch run in order, stop at the first refusal, and preserve its exact phase and owned error; launch occurs once only after valid request admission.",
+      "input_domain": "Every four Boolean port-failure choices and every u8 cause, with identity byte/request ports and independent scalar call counters; no assumptions.",
+      "bound": "Unwind eight with unwinding assertions; four loop-free production port calls. Actual bounded JSON parsing, validation, Unix socket timeouts and native launch are separate adapter contracts.",
+      "production": "crates/domyjob-core/src/worker_handoff.rs start imported directly by the harness; process/login.rs receive_request supplies actual bounded::read, ingress::json, Handoff::validate and native launch"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "identity_tokens_preserve_every_case_and_process_bit",
+      "covers": 3,
+      "contract": "The private Ready/Begin token round-trips all case and process bits without truncation.",
+      "input_domain": "Every sixteen-byte case identity, every u32 process identity, and every twenty-byte token.",
+      "bound": "Unwind24 with unwinding assertions; exact fixed-size representation.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Identity::{bytes,from_bytes}; the actual Windows Reader parses bounded Ready and atomically publishes Begin"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "preparation_admits_only_live_matching_ready",
+      "covers": 4,
+      "contract": "Preparation releases Begin only for a live matching case below the existing total deadline.",
+      "input_domain": "Every u64 elapsed time and total budget, all Ready variants, all case/process identities, and both observed child states.",
+      "bound": "Unwind24 with unwinding assertions; no input assumptions.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/prepare; actual Reader::begin writes the same twenty-byte identity after actual Add-Type/count controls publish Ready"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "operation_progress_never_resets_either_budget",
+      "covers": 4,
+      "contract": "An admitted progress observation cannot reset the operation start or the whole-case bound, and equality or regressed time refuses completion.",
+      "input_domain": "Every u64 preparation/progress/completion time and case budget with every fixed-size identity; conditional checks follow actual admitted Begin and Progress transitions.",
+      "bound": "Unwind24 with unwinding assertions; three actual transitions and no assumed conclusion.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate; Reader sampling and all pending/zero/completion schedules use the same controller"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "begun_operations_refuse_missing_or_foreign_identity",
+      "covers": 3,
+      "contract": "An admitted operation refuses disappeared, malformed, or foreign Ready and cannot admit a second Begin.",
+      "input_domain": "Every u64 start/next time and total budget, all Ready variants, and all expected/actual identity fields after a checked Begin.",
+      "bound": "Unwind24 with unwinding assertions; two actual transitions and no assumed conclusion.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate used by the real Windows polling loop"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "name": "every_outcome_retains_all_owned_cleanup_results",
+      "covers": 3,
+      "contract": "The actual controller attempts input closure, owned subtree stop, and reap exactly once and retains each cleanup result without replacing the primary observation/refusal.",
+      "input_domain": "Every seven port-failure Boolean choices, all three u64 observation times, every u64 total bound, and every fixed identity in the stated three-observation port.",
+      "bound": "Unwind24 with unwinding assertions; at most three observations. Native kernel cleanup is a separate boundary.",
+      "production": "crates/domyjob/tests/e2e/input_controller.rs wait/run; the real Reader implements close_input/stop_tree/reap with retained Windows Job and Child"
+    },
+    {
+      "name": "process_group::proofs::only_positive_identifiers_are_admitted",
+      "covers": 3,
+      "contract": "Only positive process-group identifiers can grant ownership to the reaper.",
+      "input_domain": "Every i32 process-group identifier.",
+      "bound": "No loops or input assumptions; complete integer domain. Standard-library integer text decoding is checked by native and fuzz ingress round trips.",
+      "production": "crates/domyjob-core/src/process_group.rs ProcessGroup::new called by FromStr and the actual hidden node reaper CLI"
+    },
+    {
+      "source": "verification/outbound-proof.rs",
+      "name": "ordered_segments_stop_at_the_first_failed_write",
+      "covers": 5,
+      "contract": "Source, original frame, and payload preserve order and stop at the first partial-write refusal; flush happens only after every segment and its failure is returned.",
+      "input_domain": "Every byte in three two-byte segments, every admitted partial-acceptance count from zero through six, and both flush outcomes.",
+      "bound": "Six total bytes with unwind eight and unwinding assertions; std write_all runs against an actual one-byte partial writer. Native tests separately cover Interrupted, WriteZero, empty segments, and actual pipes.",
+      "production": "verification/outbound-proof.rs imports crates/domyjob/src/transport/input.rs directly; transport::exchange_input calls the same Outbound::send with actual child stdin."
+    },
+    {
       "source": "verification/source-metadata-directories.rs",
       "name": "actual_git_metadata_root_is_excluded",
       "covers": 1,
@@ -172,6 +243,31 @@
   ],
   "negatives": [
     {
+      "source": "verification/worker-handoff.rs",
+      "harness": "rejects_relabelled_request_read_failure",
+      "assertion": "NEGATIVE_HANDOFF_PHASE"
+    },
+    {
+      "source": "verification/worker-handoff.rs",
+      "harness": "rejects_discarded_handoff_error",
+      "assertion": "NEGATIVE_HANDOFF_CAUSE"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_completion_at_the_input_deadline",
+      "assertion": "NEGATIVE_INPUT_DEADLINE_CONTROL"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_foreign_ready_admission",
+      "assertion": "NEGATIVE_INPUT_IDENTITY_CONTROL"
+    },
+    {
+      "source": "verification/input-controller.rs",
+      "harness": "rejects_discarded_owned_cleanup_errors",
+      "assertion": "NEGATIVE_INPUT_CLEANUP_CONTROL"
+    },
+    {
       "source": "verification/source-metadata-directories.rs",
       "harness": "rejects_custom_git_metadata_delivery",
       "assertion": "NEGATIVE_GIT_DIRECTORY_CONTROL"
@@ -180,6 +276,16 @@
       "source": null,
       "harness": "source_paths::read_length::proofs::rejects_a_changed_read_length",
       "assertion": "NEGATIVE_SOURCE_READ_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "process_group::proofs::rejects_unowned_process_groups",
+      "assertion": "NEGATIVE_PROCESS_GROUP_CONTROL"
+    },
+    {
+      "source": "verification/outbound-proof.rs",
+      "harness": "rejects_success_after_a_partial_segment_failure",
+      "assertion": "NEGATIVE_OUTBOUND_CONTROL"
     },
     {
       "source": "verification/source-negative.rs",
@@ -209,6 +315,24 @@
   ],
   "boundaries": [
     {
+      "source": "crates/domyjob/tests/e2e/os/windows/input_reader.rs",
+      "reason": "The source-bound decision and counted-port proofs do not establish PowerShell compilation time, filesystem publication, monotonic-clock scheduling, windows-spawn creation-time Job attachment, or Win32 accounting/termination. A retained fresh Job is attached during process creation before PowerShell can launch compiler children; the original native reader and binary channels are unchanged.",
+      "evidence": "The dedicated input_controller target controls preparation6s then live Ready/completion7s, exact operation5s and whole-case180s boundaries, foreign/malformed/disappeared readiness, regressed clocks, and primary-plus-cleanup faults through the actual controller. The Windows bootstrap scenario preserves all eight actual input schedules and adds a known held Rust descendant observed inside its creation-time Job, exact operation refusal, retained root reap, and zero active processes before capture. No original hosted failure cause is inferred from successful reruns.",
+      "reconsider": "A phase/channel, Job attachment, accounting, ownership, cleanup, or native deadline contract changes or fails, or a verifier supports the actual Win32/CLR boundary."
+    },
+    {
+      "source": "crates/domyjob/src/builds.rs",
+      "reason": "The actual admission transition depends on filesystem identity, private candidate ACLs, operating-system selection/usage locks, directory publication, and the publisher-to-node lifetime. The segmented writer proof cannot establish these effects. Selection bridges publication to final usage admission because Windows refuses renaming a directory with open child-file handles.",
+      "evidence": "Native builds::tests on each supported host check a legacy exposed parent's protected candidate, a separate pruner blocked after publication until final usage admission, existing-winner and losing-installer admission, invalid/link refusal, and usage retained through the actual first-node callback. The original two-idle retention policy remains; fixtures make the candidate eligible using two newer idle companions. Replacement fixtures preserve the destination and recreated names and remove only an empty outer stage.",
+      "reconsider": "A native publication, selection, usage, identity, or cleanup contract fails, filesystem or locking semantics change, or the first-node ownership protocol changes."
+    },
+    {
+      "source": "crates/domyjob/src/transport/bootstrap/windows-input.cs",
+      "reason": "Kani verifies the actual bounded Rust segmented writer, not CLR pinning/marshalling, PowerShell stdin inheritance, or overlapped Win32 completion semantics. The prefix reader retains its borrowed pipe handle, pinned bytes, event, and operation until native completion.",
+      "evidence": "The source-bound native Windows bootstrap scenario runs the actual script in Windows PowerShell and PowerShell 7, eight SDK inherited-overlapped-input schedules with exact binary prefix/remainder/EOF, and refusal without publication for truncated input, a write-only handle, and a failed pending observer. All hosts exercise the exact original frame, snapshot digest and bytes, isolated installer input/output, one upload/first-request connection, and primary-preserving cwd/cleanup faults.",
+      "reconsider": "The actual reader, shell launcher, byte-mode pipe assumption, FFI lifetime, source prefix format, or any native handoff contract changes."
+    },
+    {
       "source": "crates/domyjob/src/source.rs",
       "reason": "The source-bound scalar budget/read-length, finite ASCII metadata, and bounded actual std::path proofs do not establish native Git configuration and path output, canonical directory identity and case folding, declaration stability, ignore matching, concurrent mutation, capability-relative file opening, Windows reparse semantics, or tar publication. The actual source adapter captures canonical Git/common directories through individually bounded queries before top-level discovery, refuses selected metadata/bare roots or unresolved declarations, and excludes both trees after canonicalization from the merged tracked and walker paths. Git's bounded untracked-path query owns Git-ignore precedence; the walker retains .ignore and no-follow entry policy. One retained selected-root capability owns archive admission.",
       "evidence": "Native source, source_archive, source_fingerprint and source_file tests cover Git-written global excludes paths with spaces and inherited config-count context, ignored tracked modified bytes, ignored untracked exclusion, deletion, real .GIT metadata, and subdirectory paths. Actual Git oracle fixtures cover ancestor-ignored exclusion, competing relative excludes files, repository-root anchored patterns, and separate-directory info/exclude precedence with .gitignore negation. Separate, distinct common, forced-tracked metadata and nested-selection controls require only current working bytes; malformed ancestor declarations, selected metadata/bare roots, and unresolved case aliases refuse, while valid symlink/case aliases are bound to actual canonical directories and non-Git HEAD/objects working names remain ordinary input. Finite Miri controls bind Path::components to the actual typed matcher for whole components and rooted/relative namespaces. Shared runtime/build readers retain every captured parent; Unix uses public cap-primitives open_dir_nofollow and safe rustix NOFOLLOW|NONBLOCK|CLOEXEC, while Windows NtCreateFile uses RootDirectory and OPEN_REPARSE_POINT for every component, rejecting non-disk/reparse handles before reads. Native controls replace inspected parents/final files, rename captured ancestors/root names, refuse a writerless FIFO within a killed/reaped child deadline, preserve read errors, and bound growth/truncation reads to admitted length+1. Native parser tests admit exactly MAX_PATH_BYTES in complete valid records and refuse one extra path byte separately from stream/count/record limits. Native case folding, custom bare identification without Git or an explicit declaration, and one atomic view of concurrently modified Git state/files are not claimed.",
@@ -216,8 +340,8 @@
     },
     {
       "source": "crates/domyjob/src/process/login.rs",
-      "reason": "The bounded Write-port proof does not establish native Unix socket EOF, launchd, descriptor inheritance, concurrency, or every possible Write implementation.",
-      "evidence": "The mandatory Mac workspace test gate exercises actual readiness and refusal through UnixStream while another receiver handle remains open; the cross-platform login_reply target checks partial, interrupted, empty, zero, and failed writes plus shutdown failures, and its finite Miri lane imports the same production adapter.",
+      "reason": "The source-bound ordered request-port and bounded Write-port proofs do not establish actual JSON decoding, native Unix socket EOF or timeout causes, launchd, descriptor inheritance, concurrency, or every possible port implementation.",
+      "evidence": "The mandatory Mac workspace tests exercise actual bounded ingress decoding and Handoff validation, tagged Read/Decode/Validate/Launch refusals, an actual partial-request timeout with zero launches, injected partial-read WouldBlock retaining native error kind/code/cause, and complete readiness/refusal through UnixStream with a held receiver clone. The core handoff Miri lane interprets the same ordered request function; the cross-platform login_reply target and its Miri lane import the production write/shutdown adapter. Passing reruns do not identify the original intermittent refusal's cause.",
       "reconsider": "Reply framing or socket semantics change, a native integration fails, or a verifier supports the actual concurrent operating-system boundary."
     },
     {

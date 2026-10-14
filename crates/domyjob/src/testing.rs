@@ -29,12 +29,23 @@ mod raw {
         std::fs::read_to_string(path)
     }
 
+    pub(super) fn stdout() -> io::Stdout {
+        io::stdout()
+    }
+
     pub(super) fn set_permissions(
         path: &Path,
         permissions: std::fs::Permissions,
     ) -> io::Result<()> {
         std::fs::set_permissions(path, permissions)
     }
+}
+
+pub(crate) fn signal(bytes: &[u8]) {
+    use std::io::Write as _;
+    let mut output = raw::stdout();
+    output.write_all(bytes).expect("signal the fixture event");
+    output.flush().expect("flush the fixture event");
 }
 
 pub(crate) fn mkdir(path: &Path) {

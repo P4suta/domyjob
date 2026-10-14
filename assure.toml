@@ -7,3 +7,8 @@ by = "xtask/src/verification.rs"
 shape = "parser"
 path = "crates/domyjob-core/src/source_paths.rs"
 by = "fuzz/fuzz_targets/source_paths.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/process_group.rs"
+by = "fuzz/fuzz_targets/process_group.rs"

@@ -15,6 +15,60 @@ const MACOS_PACKAGE: &str = "xtask/src/macos_package.rs";
 const RELEASE_READY: &str = "xtask/src/release_ready.rs";
 const DEPENDENCIES: &str = "xtask/src/dependencies.rs";
 const RESOURCES: &str = "crates/domyjob/src/process/resources.rs";
+const INPUT_ACCOUNTING: &str = "crates/domyjob/tests/e2e/os/windows/owned_job.rs";
+const ACCOUNTING_NAMESPACE: &[&str] = &["windows_sys", "Win32", "System", "JobObjects"];
+const ACCOUNTING_SYMBOLS: &[&str] = &[
+    "JOBOBJECT_BASIC_ACCOUNTING_INFORMATION",
+    "JobObjectBasicAccountingInformation",
+    "QueryInformationJobObject",
+];
+
+fn accounting_import(tree: &syn::UseTree, namespace: &[&str]) -> bool {
+    match (namespace.split_first(), tree) {
+        (Some((expected, remaining)), syn::UseTree::Path(part)) => {
+            identifier_name(&part.ident) == *expected && accounting_import(&part.tree, remaining)
+        }
+        (None, syn::UseTree::Name(name)) => {
+            ACCOUNTING_SYMBOLS.contains(&identifier_name(&name.ident).as_str())
+        }
+        (None, syn::UseTree::Group(group)) => {
+            !group.items.is_empty()
+                && group
+                    .items
+                    .iter()
+                    .all(|part| accounting_import(part, namespace))
+        }
+        _ => false,
+    }
+}
+
+fn accounting_path(path: &syn::Path) -> bool {
+    let names: Vec<_> = path
+        .segments
+        .iter()
+        .map(|part| identifier_name(&part.ident))
+        .collect();
+    ACCOUNTING_NAMESPACE.len().checked_add(1) == Some(names.len())
+        && names
+            .iter()
+            .zip(ACCOUNTING_NAMESPACE)
+            .all(|(actual, expected)| actual == expected)
+        && names
+            .last()
+            .is_some_and(|name| ACCOUNTING_SYMBOLS.contains(&name.as_str()))
+}
+
+fn imports_accounting_sdk(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(part) => {
+            identifier_name(&part.ident) == "windows_sys" || imports_accounting_sdk(&part.tree)
+        }
+        syn::UseTree::Name(part) => identifier_name(&part.ident) == "windows_sys",
+        syn::UseTree::Rename(part) => identifier_name(&part.ident) == "windows_sys",
+        syn::UseTree::Group(group) => group.items.iter().any(imports_accounting_sdk),
+        syn::UseTree::Glob(_) => false,
+    }
+}
 
 const CAPABILITIES: &[&str] = &[
     "Event",
@@ -309,7 +363,11 @@ impl Ownership<'_> {
         if name == "windows_sys"
             && !matches!(
                 self.owner,
-                KERNEL | DESCRIPTOR | SOURCE_FILE | "crates/domyjob/tests/e2e/os/windows.rs"
+                KERNEL
+                    | DESCRIPTOR
+                    | SOURCE_FILE
+                    | INPUT_ACCOUNTING
+                    | "crates/domyjob/tests/e2e/os/windows.rs"
             )
         {
             self.findings.push(format!(
@@ -327,6 +385,9 @@ impl Ownership<'_> {
             match token {
                 proc_macro2::TokenTree::Ident(ident) => {
                     let name = identifier_name(&ident);
+                    if self.owner == INPUT_ACCOUNTING && name == "windows_sys" {
+                        self.findings.push(format!("{}: accounting SDK roles use explicit imports or paths, not macro tokens", ident.span().start().line));
+                    }
                     if raw_path && name == "command" {
                         self.ci_command(ident.span());
                     }
@@ -363,6 +424,27 @@ impl Ownership<'_> {
 }
 
 impl<'ast> Visit<'ast> for Ownership<'_> {
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if self.owner == INPUT_ACCOUNTING
+            && imports_accounting_sdk(&item.tree)
+            && !accounting_import(&item.tree, ACCOUNTING_NAMESPACE)
+        {
+            self.findings.push(format!(
+                "{}: accounting SDK imports spell their complete namespace and exact roles",
+                item.use_token.span.start().line
+            ));
+        }
+        syn::visit::visit_item_use(self, item);
+    }
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        if self.owner == INPUT_ACCOUNTING && identifier_name(&item.ident) == "windows_sys" {
+            self.findings.push(format!(
+                "{}: the accounting leaf does not import or alias the SDK crate",
+                item.ident.span().start().line
+            ));
+        }
+        syn::visit::visit_item_extern_crate(self, item);
+    }
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         let previous = self.ci_command_owner;
         self.ci_command_owner = self.owner == CI
@@ -490,6 +572,19 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
+        if self.owner == INPUT_ACCOUNTING
+            && let Some(first) = path.segments.first()
+            && path
+                .segments
+                .iter()
+                .any(|part| identifier_name(&part.ident) == "windows_sys")
+            && !accounting_path(path)
+        {
+            self.findings.push(format!(
+                "{}: the accounting leaf imports only its three exact JobObjects SDK roles",
+                first.ident.span().start().line
+            ));
+        }
         if let Some(last) = path.segments.last()
             && let Some(parent) = path.segments.iter().rev().nth(1)
         {
@@ -509,6 +604,20 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
     }
 
     fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
+        let accounting_root = match tree {
+            syn::UseTree::Path(part) => identifier_name(&part.ident) == "windows_sys",
+            syn::UseTree::Name(part) => identifier_name(&part.ident) == "windows_sys",
+            syn::UseTree::Rename(part) => identifier_name(&part.ident) == "windows_sys",
+            syn::UseTree::Glob(_) | syn::UseTree::Group(_) => false,
+        };
+        if self.owner == INPUT_ACCOUNTING
+            && accounting_root
+            && !accounting_import(tree, ACCOUNTING_NAMESPACE)
+        {
+            self.findings.push(
+                "the accounting leaf imports only its three exact JobObjects SDK roles".to_owned(),
+            );
+        }
         if self.owner == CI
             && let syn::UseTree::Name(name) = tree
             && identifier_name(&name.ident) == "command"
@@ -598,6 +707,34 @@ mod tests {
         RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, RESOURCES, SOURCE_FILE,
         check,
     };
+
+    #[test]
+    fn accounting_sdk_imports_have_only_their_exact_owner_and_roles() {
+        const OWNER: &str = "crates/domyjob/tests/e2e/os/windows/owned_job.rs";
+        const SOURCE: &str = include_str!("../../crates/domyjob/tests/e2e/os/windows/owned_job.rs");
+        assert_eq!(
+            check(OWNER, &syn::parse_file(SOURCE).unwrap()),
+            Vec::<String>::new()
+        );
+        for source in [
+            "use windows_sys::Win32::System::JobObjects::TerminateJobObject;",
+            "use windows_sys::Win32::System::JobObjects::*;",
+            "use windows_sys::Win32::System::JobObjects::QueryInformationJobObject as query;",
+            "use windows_sys::Win32::System::JobObjects as jobs;",
+            "fn f() { windows_sys::Win32::System::JobObjects::TerminateJobObject(); }",
+            "use windows_sys::Win32::Foundation::CloseHandle;",
+            "extern crate windows_sys as sdk; fn f() { sdk::Win32::System::JobObjects::TerminateJobObject(); }",
+            "extern crate windows_sys;",
+            "fn f() { crate::windows_sys::Win32::System::JobObjects::TerminateJobObject(); }",
+            "fn f() { self::windows_sys::Win32::System::JobObjects::QueryInformationJobObject(); }",
+            "use self::windows_sys::Win32::System::JobObjects::QueryInformationJobObject;",
+            "use crate::windows_sys::Win32::System::JobObjects::QueryInformationJobObject;",
+            "fn f() { forward!(windows_sys::Win32::System::JobObjects::QueryInformationJobObject()); }",
+        ] {
+            rejected(OWNER, source);
+        }
+        rejected("crates/domyjob/tests/e2e/os/windows/other.rs", SOURCE);
+    }
 
     fn rejected(owner: &str, source: &str) {
         assert!(

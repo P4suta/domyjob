@@ -8,7 +8,12 @@ use crate::world::{
 };
 use crate::{Failure, Scenario};
 
-pub(crate) const ALL: [Scenario; 13] = [
+pub(crate) const ALL: [Scenario; 14] = [
+    Scenario {
+        name: "bootstrap_preserves_first_request_and_cleans_its_owned_work",
+        machines: &["alpha", "beta"],
+        run: crate::bootstrap::scenario,
+    },
     Scenario {
         name: "fake_ssh_stands_in_for_openssh",
         machines: &["alpha", "beta"],

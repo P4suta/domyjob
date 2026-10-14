@@ -17,9 +17,10 @@ const TRACE_STEPS: usize = 20;
 const TRACE_SEED: &str = "1";
 const SCHEMA_VERSION: u32 = 1;
 const FUZZ_TOOL: &str = "cargo:cargo-fuzz@0.13.2";
-const FUZZ_TARGETS: [(&str, &[&str]); 2] = [
+const FUZZ_TARGETS: [(&str, &[&str]); 3] = [
     ("wire", &["hello", "chat-exchange", "chat-unknown-field"]),
     ("source_paths", &["tracked", "metadata", "malformed"]),
+    ("process_group", &["positive", "nonpositive", "overflow"]),
 ];
 const AUTOMATIC_PORT: u16 = 0;
 const VERIFIER_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;

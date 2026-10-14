@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -29,8 +29,14 @@ use crate::source::{self, SourceError};
 use crate::state_io::{self, StateError};
 use crate::store::{Store, StoreError};
 
+mod input;
+
 const EMBEDDED_SOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/source.tar"));
 const MISSING_NODE: i32 = 97;
+const SSH_UNREACHABLE_STATUS: i32 = 255;
+const MAX_SHELL_PROBE_BYTES: usize = 64;
+const BOOTSTRAP_BUILD_JOBS: u8 = 2;
+const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -150,6 +156,49 @@ impl SshChild {
     }
 }
 
+pub(crate) fn publish_node() -> Result<ExitCode, TransportError> {
+    publish_node_using(
+        &std::env::current_exe()?,
+        platform::stable_program(&identity::tag())?,
+        launch_published_node,
+    )
+}
+
+fn publish_node_using(
+    source: &Path,
+    program: std::path::PathBuf,
+    first_node: impl FnOnce(&Path) -> Result<ExitCode, TransportError>,
+) -> Result<ExitCode, TransportError> {
+    let admission = crate::builds::admit(source, program)?;
+    let result = first_node(&admission.program);
+    drop(admission);
+    result
+}
+
+fn launch_published_node(program: &Path) -> Result<ExitCode, TransportError> {
+    let child = process::command(program)
+        .arg("node")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("starting published node {}: {error}", program.display()),
+            )
+        })?;
+    let mut child = SshChild {
+        child,
+        finished: false,
+    };
+    let status = child.wait()?;
+    Ok(match status.code().map(u8::try_from) {
+        Some(Ok(code)) => ExitCode::from(code),
+        Some(Err(_)) | None => ExitCode::FAILURE,
+    })
+}
+
 struct Watchdog(Option<mpsc::SyncSender<()>>);
 
 impl Watchdog {
@@ -177,12 +226,12 @@ impl Drop for Watchdog {
 }
 
 fn read_frame(input: &mut impl Read) -> Result<Vec<u8>, TransportError> {
-    let mut header = [0_u8; 4];
+    let mut header = [0_u8; wire::CONTROL_HEADER_BYTES];
     input.read_exact(&mut header)?;
     let length = wire::ControlLength::try_from(header)?;
     let mut body = vec![0_u8; length.bytes()];
     input.read_exact(&mut body)?;
-    let mut frame = Vec::with_capacity(length.bytes().saturating_add(4));
+    let mut frame = Vec::with_capacity(length.bytes().saturating_add(wire::CONTROL_HEADER_BYTES));
     frame.extend_from_slice(&header);
     frame.extend_from_slice(&body);
     Ok(frame)
@@ -203,7 +252,7 @@ fn node_command(shell: Shell, build: &str) -> String {
             "sh -c 'p=\"$HOME/.cargo/domyjob/versions/{build}/bin/domyjob\"; [ -x \"$p\" ] || {{ echo \"domyjob: node {build} missing\" >&2; exit {MISSING_NODE}; }}; exec \"$p\" node'"
         ),
         Shell::Windows => format!(
-            "$p = Join-Path $env:USERPROFILE '.cargo\\domyjob\\versions\\{build}\\bin\\domyjob.exe'; if (-not (Test-Path -LiteralPath $p)) {{ [Console]::Error.WriteLine('domyjob: node {build} missing'); exit {MISSING_NODE} }}; & $p node; exit $LASTEXITCODE"
+            "$root = if (-not [string]::IsNullOrEmpty($env:HOME)) {{ $env:HOME }} else {{ $env:USERPROFILE }}; $p = Join-Path $root '.cargo\\domyjob\\versions\\{build}\\bin\\domyjob.exe'; if (-not (Test-Path -LiteralPath $p)) {{ [Console]::Error.WriteLine('domyjob: node {build} missing'); exit {MISSING_NODE} }}; & $p node; exit $LASTEXITCODE"
         ),
     }
 }
@@ -222,7 +271,7 @@ const PLAIN: Policy = Policy {
 fn failure(status: ExitStatus, policy: Policy, error: TransportError) -> TransportError {
     match status.code() {
         Some(MISSING_NODE) => TransportError::Missing,
-        Some(255) => TransportError::Unreachable,
+        Some(SSH_UNREACHABLE_STATUS) => TransportError::Unreachable,
         None if policy.deadline.is_some_and(clock::Deadline::expired) => TransportError::Deadline,
         Some(_) | None => error,
     }
@@ -243,9 +292,26 @@ fn raw_call(
 }
 
 fn exchange(
-    mut child: SshChild,
+    child: SshChild,
     request: &Request,
     payload: &[u8],
+    policy: Policy,
+) -> Result<Reply, TransportError> {
+    let frame = wire::frame(request)?;
+    exchange_input(
+        child,
+        input::Outbound {
+            source: &[],
+            frame: &frame,
+            payload,
+        },
+        policy,
+    )
+}
+
+fn exchange_input(
+    mut child: SshChild,
+    outgoing: input::Outbound<'_>,
     policy: Policy,
 ) -> Result<Reply, TransportError> {
     let watchdog = Watchdog::start(&child.child, policy.deadline);
@@ -254,10 +320,7 @@ fn exchange(
         .stdin
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
-    let sent = stdin
-        .write_all(&wire::frame(request)?)
-        .and_then(|()| stdin.write_all(payload))
-        .and_then(|()| stdin.flush());
+    let sent = outgoing.send(&mut stdin);
     if let Err(error) = sent {
         drop(stdin);
         drop(child.child.stdout.take());
@@ -353,13 +416,13 @@ fn detect_shell(machine: &MachineName) -> Result<Shell, TransportError> {
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
-    let bytes = crate::bounded::prefix(&mut output, 65)?;
+    let bytes = crate::bounded::prefix(&mut output, MAX_SHELL_PROBE_BYTES.saturating_add(1))?;
     drop(output);
     let status = child.wait()?;
-    if status.code() == Some(255) {
+    if status.code() == Some(SSH_UNREACHABLE_STATUS) {
         return Err(TransportError::Unreachable);
     }
-    if !status.success() || bytes.len() > 64 {
+    if !status.success() || bytes.len() > MAX_SHELL_PROBE_BYTES {
         return Err(TransportError::RemoteShell);
     }
     match std::str::from_utf8(&bytes)
@@ -387,48 +450,46 @@ fn shell(machine: &MachineName) -> Result<Shell, TransportError> {
     Ok(shell)
 }
 
-fn install_command(shell: Shell, build: &str) -> String {
+fn install_command(shell: Shell, ticket: &SubmissionId) -> String {
+    let script = match shell {
+        Shell::Unix => include_str!("transport/bootstrap/unix.sh"),
+        Shell::Windows => include_str!("transport/bootstrap/windows.ps1"),
+    }
+    .replace(
+        "@INPUT_READER@",
+        include_str!("transport/bootstrap/windows-input.cs"),
+    )
+    .replace("@SOURCE_MAX@", &wire::MAX_SNAPSHOT_BYTES.to_string())
+    .replace("@TICKET@", ticket.as_str())
+    .replace("@CACHE_TAG@", CACHE_TAG)
+    .replace("@BUILD_JOBS@", &BOOTSTRAP_BUILD_JOBS.to_string())
+    .replace("@SOURCE_BYTES@", &EMBEDDED_SOURCE.len().to_string());
     match shell {
-        Shell::Unix => String::from(
-            r#"bash -lc 'set -eu; umask 077; base="${XDG_CACHE_HOME:-$HOME/.cache}/domyjob/bootstrap"; install="$HOME/.cargo/domyjob/versions/@BUILD@"; mkdir -p "$base"; work="$(mktemp -d "$base/source.XXXXXXXX")"; tar -xmf - -C "$work"; cd "$work"; export CARGO_TARGET_DIR="$base/target" MISE_TRUSTED_CONFIG_PATHS="$work"; trap '"'"'cd "$work" && mise x -- cargo clean --quiet -p domyjob -p domyjob-core || true; cd "$HOME"; rm -rf -- "$work"'"'"' EXIT; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root "$install" --force'"#,
-        )
-        .replace("@BUILD@", build),
+        Shell::Unix => format!("bash -c '{}'", script.replace('\'', "'\"'\"'")),
         Shell::Windows => {
-            let script = r#"$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue"; $base=Join-Path $env:LOCALAPPDATA "domyjob\bootstrap"; $install=Join-Path $env:USERPROFILE ".cargo\domyjob\versions\@BUILD@"; $null=New-Item -ItemType Directory -Force -Path $base; $work=Join-Path $base ([guid]::NewGuid().ToString("N")); $null=New-Item -ItemType Directory -Path $work; tar.exe -xmf - -C $work; if ($LASTEXITCODE -ne 0) { throw "source extraction failed" }; Set-Location $work; $env:CARGO_TARGET_DIR=Join-Path $base "target"; $env:MISE_TRUSTED_CONFIG_PATHS=$work; mise x -- cargo install --debug --locked --path crates/domyjob --bin domyjob --root $install --force; $result=$LASTEXITCODE; mise x -- cargo clean --quiet -p domyjob -p domyjob-core; Set-Location $env:USERPROFILE; if ($result -eq 0) { Remove-Item -LiteralPath $work -Recurse -Force }; exit $result"#.replace("@BUILD@", build);
             let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             format!(
-                "powershell.exe -NoProfile -EncodedCommand {}",
+                "& ([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))))",
                 data_encoding::BASE64.encode(&utf16)
             )
         }
     }
 }
 
-fn bootstrap(machine: &MachineName, shell: Shell) -> Result<(), TransportError> {
+fn bootstrap(
+    (machine, shell): (&MachineName, Shell),
+    outgoing: input::Outbound<'_>,
+    policy: Policy,
+) -> Result<Reply, TransportError> {
     if u64::try_from(EMBEDDED_SOURCE.len()).map_err(|_size| WireError::Snapshot)?
         > wire::MAX_SNAPSHOT_BYTES
     {
         return Err(WireError::Snapshot.into());
     }
     eprintln!("{}: installing this build's node", machine.as_str());
-    let mut child = SshChild::start(
-        machine,
-        &install_command(shell, &identity::tag()),
-        Stdio::from(std::io::stderr()),
-    )?;
-    let mut input = child
-        .child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("SSH standard input was not piped"))?;
-    input.write_all(EMBEDDED_SOURCE)?;
-    drop(input);
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(TransportError::Deployment(status))
-    }
+    let ticket = new_submission()?;
+    let child = SshChild::start(machine, &install_command(shell, &ticket), Stdio::piped())?;
+    exchange_input(child, outgoing, policy)
 }
 
 fn call_with(
@@ -446,8 +507,16 @@ fn call_with(
     let _installing = OsLock::exclusive(&State::here()?.install_lock(machine))?;
     match call() {
         Err(TransportError::Missing) => {
-            bootstrap(machine, shell)?;
-            call()
+            let frame = wire::frame(request)?;
+            bootstrap(
+                (machine, shell),
+                input::Outbound {
+                    source: EMBEDDED_SOURCE,
+                    frame: &frame,
+                    payload,
+                },
+                policy,
+            )
         }
         other => other,
     }
@@ -902,23 +971,112 @@ mod tests {
     }
 
     #[test]
-    fn remote_installs_leave_only_reusable_artifacts_behind() {
-        let unix = install_command(Shell::Unix, "0123456789abcdef");
+    fn first_request_installation_retains_original_input_until_owned_publication() {
+        let ticket = super::new_submission().unwrap();
+        let unix = install_command(Shell::Unix, &ticket);
+        assert!(
+            unix.contains("publish-node"),
+            "the installer must pass the original request through owned publication"
+        );
+        assert!(unix.contains("dd ibs=1"));
+        assert!(unix.contains("< /dev/null >&2"));
+    }
+
+    #[test]
+    fn remote_installs_stage_the_candidate_until_the_owned_first_request() {
+        let ticket = super::new_submission().unwrap();
+        let unix = install_command(Shell::Unix, &ticket);
         assert!(unix.contains("tar -xmf"), "extraction stamps fresh times");
-        assert!(unix.contains("trap '\"'\"'cd \"$work\" && mise x -- cargo clean --quiet -p domyjob -p domyjob-core || true"));
-        let encoded = install_command(Shell::Windows, "0123456789abcdef");
+        assert!(unix.contains("CARGO_TARGET_DIR=\"$work/target\""));
+        assert!(unix.contains("--root \"$work/install\""));
+        assert!(unix.contains("if ! rm -rf -- \"$work\""));
+        assert!(unix.contains(super::CACHE_TAG));
+        let encoded = install_command(Shell::Windows, &ticket);
         let base64 = encoded
-            .strip_prefix("powershell.exe -NoProfile -EncodedCommand ")
+            .strip_prefix("& ([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('")
+            .unwrap()
+            .strip_suffix("'))))")
             .unwrap();
         let utf16 = data_encoding::BASE64.decode(base64.as_bytes()).unwrap();
         let (units, rest) = utf16.as_chunks::<2>();
         assert_eq!(rest.len(), 0);
         let units: Vec<u16> = units.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         let script = String::from_utf16(&units).unwrap();
-        assert!(
-            script.contains("tar.exe -xmf"),
-            "extraction stamps fresh times"
+        assert!(script.contains("$start.FileName=\"tar.exe\""));
+        assert!(script.contains("$start.Arguments='-xmf \"'+$archive+'\" -C \"'+$work+'\"'"));
+        assert!(script.contains("CARGO_TARGET_DIR=Join-Path $work \"target\""));
+        assert!(script.contains("[DomyjobBootstrapInput]::ReadBytes"));
+        assert!(script.contains(".StandardInput.Close()"));
+        assert!(script.contains("publish-node"));
+        assert!(script.contains("Remove-Item -LiteralPath $work -Recurse -Force"));
+        assert!(script.contains(super::CACHE_TAG));
+    }
+
+    #[test]
+    fn a_reused_publication_stays_owned_through_its_first_node_and_preserves_its_exit_code() {
+        const FIRST_NODE_EXIT: u8 = 7;
+        let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let program = root.path().join("versions/0123456789abcdef/bin/domyjob");
+        let winner = crate::builds::admit(&source, program.clone()).unwrap();
+        let lock = publication_usage_lock(&program);
+        let result = super::publish_node_using(&source, program.clone(), |selected| {
+            drop(winner);
+            assert_first_node_uses(selected, &program, &lock);
+            Ok(std::process::ExitCode::from(FIRST_NODE_EXIT))
+        })
+        .unwrap();
+        assert_eq!(result, std::process::ExitCode::from(FIRST_NODE_EXIT));
+        assert_eq!(
+            crate::lock::OsLock::probe(&lock).unwrap(),
+            crate::lock::Probe::Free
         );
-        assert!(script.contains("mise x -- cargo clean --quiet -p domyjob -p domyjob-core"));
+    }
+
+    #[test]
+    fn a_failed_first_node_action_preserves_the_error_and_releases_its_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let program = root.path().join("versions/0123456789abcdef/bin/domyjob");
+        let lock = publication_usage_lock(&program);
+        let error = super::publish_node_using(&source, program.clone(), |selected| {
+            assert_first_node_uses(selected, &program, &lock);
+            Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected first node refusal",
+            )))
+        })
+        .unwrap_err();
+        let TransportError::Io(error) = error else {
+            panic!("the first-node I/O error must be preserved");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("injected first node refusal"));
+        assert_eq!(
+            crate::lock::OsLock::probe(&lock).unwrap(),
+            crate::lock::Probe::Free
+        );
+        assert!(std::fs::metadata(program).unwrap().is_file());
+    }
+
+    fn publication_usage_lock(program: &std::path::Path) -> std::path::PathBuf {
+        program
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("in-use.lock")
+    }
+
+    fn assert_first_node_uses(
+        selected: &std::path::Path,
+        expected: &std::path::Path,
+        lock: &std::path::Path,
+    ) {
+        assert_eq!(selected, expected);
+        assert_eq!(
+            crate::lock::OsLock::probe(lock).unwrap(),
+            crate::lock::Probe::Held
+        );
     }
 }

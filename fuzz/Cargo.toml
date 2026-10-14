@@ -42,3 +42,10 @@ path = "fuzz_targets/source_paths.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "process_group"
+path = "fuzz_targets/process_group.rs"
+test = false
+doc = false
+bench = false

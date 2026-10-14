@@ -9,6 +9,14 @@ use domyjob_core::chat::card::Os;
 
 use super::{Ownership, System, raw};
 
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const PUBLIC_EXECUTABLE_MODE: u32 = 0o755;
+const PUBLIC_FILE_MODE: u32 = 0o644;
+const EXECUTE_BITS: u32 = 0o111;
+const PERMISSION_BITS: u32 = 0o777;
+const NON_OWNER_PERMISSION_BITS: u32 = 6;
+
 #[derive(Debug)]
 pub(super) struct Unix;
 
@@ -55,25 +63,29 @@ impl System for Unix {
     }
 
     fn executable(metadata: &fs::Metadata) -> bool {
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        metadata.is_file() && metadata.permissions().mode() & EXECUTE_BITS != 0
     }
 
     fn make_executable(path: &Path) -> io::Result<()> {
-        raw::set_permissions(path, fs::Permissions::from_mode(0o755))
+        raw::set_permissions(path, fs::Permissions::from_mode(PUBLIC_EXECUTABLE_MODE))
     }
 
     fn file_mode(metadata: &fs::Metadata) -> u32 {
-        if metadata.permissions().mode() & 0o111 == 0 {
-            0o644
+        if metadata.permissions().mode() & EXECUTE_BITS == 0 {
+            PUBLIC_FILE_MODE
         } else {
-            0o755
+            PUBLIC_EXECUTABLE_MODE
         }
     }
 
     fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool) {
         use cap_std::fs::OpenOptionsExt as _;
 
-        options.mode(if executable { 0o755 } else { 0o644 });
+        options.mode(if executable {
+            PUBLIC_EXECUTABLE_MODE
+        } else {
+            PUBLIC_FILE_MODE
+        });
     }
 
     fn ownership(file: &fs::File) -> io::Result<Ownership> {
@@ -81,8 +93,8 @@ impl System for Unix {
         if metadata.uid() != rustix::process::geteuid().as_raw() {
             return Ok(Ownership::Foreign);
         }
-        let mode = metadata.mode() & 0o777;
-        if mode.trailing_zeros() >= 6 {
+        let mode = metadata.mode() & PERMISSION_BITS;
+        if mode.trailing_zeros() >= NON_OWNER_PERMISSION_BITS {
             Ok(Ownership::Private)
         } else {
             Ok(Ownership::Exposed(Mode(mode)))
@@ -99,12 +111,21 @@ impl System for Unix {
     fn create_private_dir(path: &Path) -> io::Result<()> {
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(PRIVATE_DIRECTORY_MODE)
             .create(path)
     }
 
     fn owner_only(options: &mut fs::OpenOptions) {
-        options.mode(0o600);
+        options.mode(PRIVATE_FILE_MODE);
+    }
+
+    #[cfg(test)]
+    fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
+        const PUBLIC_BUILD_PARENT_MODE: u32 = 0o755;
+        fs::DirBuilder::new()
+            .mode(PUBLIC_BUILD_PARENT_MODE)
+            .create(path)?;
+        raw::set_permissions(path, fs::Permissions::from_mode(PUBLIC_BUILD_PARENT_MODE))
     }
 
     fn no_follow(options: &mut fs::OpenOptions) {
