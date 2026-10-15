@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/P4suta/domyjob/compare/v0.0.0...v0.0.1) - 2026-10-15
+
+### Added
+
+- *(chat)* add receipts, scoped handoffs, and a live dashboard ([#55](https://github.com/P4suta/domyjob/pull/55))
+- *(verification)* enforce source-bound assurance gates ([#49](https://github.com/P4suta/domyjob/pull/49))
+
+### Fixed
+
+- *(bootstrap)* protect publication through first use ([#54](https://github.com/P4suta/domyjob/pull/54))
+- *(source)* preserve safe snapshots and complete login replies ([#50](https://github.com/P4suta/domyjob/pull/50))
+- *(macos)* run jobs inside the login session ([#45](https://github.com/P4suta/domyjob/pull/45))
+- *(resources)* enforce bounded Linux job admission ([#37](https://github.com/P4suta/domyjob/pull/37))
+
 ## [0.0.0](https://github.com/P4suta/domyjob/releases/tag/v0.0.0) - 2026-10-02
 
 ### Added
