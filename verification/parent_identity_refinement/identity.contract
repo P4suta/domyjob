@@ -9,7 +9,8 @@ pub(super) fn matches(parent: Option<&EventId>, request: &EventId) -> bool {
 
 #[cfg(kani)]
 mod proofs {
-    use alloc::string::String;
+    use alloc::borrow::ToOwned;
+    use core::ascii::Char;
     use core::num::NonZeroU64;
 
     use super::super::Parent;
@@ -20,6 +21,7 @@ mod proofs {
     const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     const HEX_RADIX: u8 = 16;
     const DECIMAL_DIGITS: u8 = 10;
+    const ASCII_MASK: u8 = 0x7f;
     const PRESENT: u8 = 0;
     const OPAQUE: u8 = 1;
     const MISSING: u8 = 2;
@@ -47,6 +49,8 @@ mod proofs {
         let encoded = hex_digit(byte);
         assert_eq!(encoded, HEX_DIGITS[usize::from(byte) % HEX_DIGITS.len()]);
         assert!(encoded.is_ascii_digit() || matches!(encoded, b'a'..=b'f'));
+        assert!(encoded & ASCII_MASK == encoded);
+        assert!(u8::from(Char::from_u8(encoded & ASCII_MASK).unwrap()) == encoded);
         let wanted: u8 = kani::any();
         if wanted.is_ascii_digit() {
             let inverse = wanted.checked_sub(b'0').unwrap();
@@ -71,8 +75,8 @@ mod proofs {
     fn identity() -> Result<GeneratedIdentity, Invalid> {
         let choices: [u8; ORIGIN_BYTES] = kani::any();
         let bytes = choices.map(hex_digit);
-        let text = String::from_utf8(bytes.to_vec())
-            .map_err(|_error| Invalid("origin generator encoding"))?;
+        let chars = bytes.map(|byte| Char::from_u8(byte & ASCII_MASK).unwrap());
+        let text = chars.as_str().to_owned();
         let origin = Origin::try_from(text)?;
         let sequence = NonZeroU64::new(kani::any()).unwrap_or(NonZeroU64::MIN);
         Ok(GeneratedIdentity {
@@ -85,10 +89,7 @@ mod proofs {
     #[kani::unwind(34)]
     fn canonical_parent_identity_generator_preserves_every_origin_byte() {
         let generated = identity().unwrap();
-        assert_eq!(
-            generated.identity.origin().as_str().as_bytes(),
-            generated.bytes
-        );
+        assert!(generated.identity.origin().as_str().as_bytes() == generated.bytes);
         kani::cover!(generated.identity.seq() == NonZeroU64::MIN);
     }
 
@@ -97,8 +98,8 @@ mod proofs {
     fn present_parent_identity_matches_exact_origin_and_sequence() {
         let parent = identity().unwrap();
         let request = identity().unwrap();
-        assert_eq!(parent.identity.origin().as_str().as_bytes(), parent.bytes);
-        assert_eq!(request.identity.origin().as_str().as_bytes(), request.bytes);
+        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);
+        assert!(request.identity.origin().as_str().as_bytes() == request.bytes);
         let origin_equal = parent.identity.origin().as_str().as_bytes()
             == request.identity.origin().as_str().as_bytes();
         let sequence_equal = parent.identity.seq() == request.identity.seq();
@@ -115,8 +116,8 @@ mod proofs {
     fn absent_parent_identity_accepts_every_request() {
         let parent = identity().unwrap();
         let request = identity().unwrap();
-        assert_eq!(parent.identity.origin().as_str().as_bytes(), parent.bytes);
-        assert_eq!(request.identity.origin().as_str().as_bytes(), request.bytes);
+        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);
+        assert!(request.identity.origin().as_str().as_bytes() == request.bytes);
         let opaque_admitted = Parent::Opaque.matches(&request.identity);
         let missing_admitted = Parent::Missing.matches(&request.identity);
         assert!(opaque_admitted);
@@ -130,8 +131,8 @@ mod proofs {
     fn projected_parent_identity_preserves_every_complete_identity_class() {
         let parent = identity().unwrap();
         let request = identity().unwrap();
-        assert_eq!(parent.identity.origin().as_str().as_bytes(), parent.bytes);
-        assert_eq!(request.identity.origin().as_str().as_bytes(), request.bytes);
+        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);
+        assert!(request.identity.origin().as_str().as_bytes() == request.bytes);
         let variant = kani::any::<u8>() % VARIANTS;
         let origin_equal = parent.identity.origin().as_str().as_bytes()
             == request.identity.origin().as_str().as_bytes();
@@ -157,10 +158,7 @@ mod proofs {
     #[kani::unwind(34)]
     fn rejects_a_present_parent_with_a_different_sequence() {
         let generated = identity().unwrap();
-        assert_eq!(
-            generated.identity.origin().as_str().as_bytes(),
-            generated.bytes
-        );
+        assert!(generated.identity.origin().as_str().as_bytes() == generated.bytes);
         let machine = generated.identity.origin().clone();
         let parent = EventId::new(
             machine.clone(),

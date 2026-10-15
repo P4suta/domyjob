@@ -1,5 +1,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
+#![cfg_attr(kani, feature(ascii_char))]
 
 extern crate alloc;
 

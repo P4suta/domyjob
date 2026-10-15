@@ -1449,12 +1449,16 @@ mod tests {
                 "let generated = identity().unwrap(); kani::assume(false);",
             ),
             (
-                "fn present_parent_identity_matches_exact_origin_and_sequence() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert_eq!(parent.identity.origin().as_str().as_bytes(), parent.bytes);",
+                "fn present_parent_identity_matches_exact_origin_and_sequence() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
                 "fn present_parent_identity_matches_exact_origin_and_sequence() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();",
             ),
             (
-                "fn absent_parent_identity_accepts_every_request() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert_eq!(parent.identity.origin().as_str().as_bytes(), parent.bytes);",
+                "fn absent_parent_identity_accepts_every_request() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
                 "fn absent_parent_identity_accepts_every_request() {\n        let request = identity().unwrap();",
+            ),
+            (
+                "assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
+                "assert!(parent.identity.origin().as_str().as_bytes().len() == parent.bytes.len());",
             ),
             (
                 "matches(Some(&parent.identity), &request.identity)",

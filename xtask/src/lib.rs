@@ -160,32 +160,38 @@ struct SourcePolicy {
     findings: Vec<String>,
 }
 
-fn verifier_derive(attribute: &syn::Attribute) -> bool {
+fn verifier_attribute(attribute: &syn::Attribute) -> bool {
     let Ok(arguments) = attribute.parse_args_with(
         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
     ) else {
         return false;
     };
     let entries: Vec<_> = arguments.iter().collect();
-    let [syn::Meta::Path(condition), syn::Meta::List(derive)] = entries.as_slice() else {
+    let [syn::Meta::Path(condition), syn::Meta::List(directive)] = entries.as_slice() else {
         return false;
     };
-    if !condition.is_ident("kani") || !derive.path.is_ident("derive") {
+    if !condition.is_ident("kani") {
         return false;
     }
-    let Ok(paths) = derive.parse_args_with(
+    let Ok(paths) = directive.parse_args_with(
         syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
     ) else {
         return false;
     };
-    let derived: Vec<_> = paths.iter().collect();
-    let [path] = derived.as_slice() else {
+    let requested: Vec<_> = paths.iter().collect();
+    let [path] = requested.as_slice() else {
         return false;
     };
-    path.segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .eq(["kani", "Arbitrary"])
+    if directive.path.is_ident("feature") {
+        matches!(attribute.style, syn::AttrStyle::Inner(_)) && path.is_ident("ascii_char")
+    } else {
+        directive.path.is_ident("derive")
+            && path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .eq(["kani", "Arbitrary"])
+    }
 }
 
 impl<'ast> Visit<'ast> for SourcePolicy {
@@ -202,7 +208,7 @@ impl<'ast> Visit<'ast> for SourcePolicy {
         }
         let platform_branch = attribute.path().is_ident("cfg")
             && matches!(&attribute.meta, syn::Meta::List(list) if !matches!(list.tokens.to_string().as_str(), "test" | "kani"))
-            || attribute.path().is_ident("cfg_attr") && !verifier_derive(attribute);
+            || attribute.path().is_ident("cfg_attr") && !verifier_attribute(attribute);
         if platform_branch && !self.effect_module {
             self.findings.push(format!(
                 "{line}: platform branches belong in the platform or process adapter"
@@ -599,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_derives_are_distinct_from_platform_and_lint_branches() {
+    fn verifier_attributes_are_distinct_from_platform_and_lint_branches() {
         for (source, refused) in [
             (
                 "#[cfg_attr(kani, derive(kani::Arbitrary))] struct State;",
@@ -614,6 +620,22 @@ mod tests {
                 "#[cfg_attr(kani, derive(kani::Arbitrary), allow(dead_code))] struct State;",
                 true,
             ),
+            ("#![cfg_attr(kani, feature(ascii_char))]", false),
+            ("#![cfg_attr(windows, feature(ascii_char))]", true),
+            (
+                "#![cfg_attr(all(kani, windows), feature(ascii_char))]",
+                true,
+            ),
+            ("#![cfg_attr(kani, feature(core_intrinsics))]", true),
+            (
+                "#![cfg_attr(kani, feature(ascii_char, core_intrinsics))]",
+                true,
+            ),
+            (
+                "#![cfg_attr(kani, feature(ascii_char), allow(dead_code))]",
+                true,
+            ),
+            ("#[cfg_attr(kani, feature(ascii_char))] struct State;", true),
         ] {
             let mut policy = SourcePolicy::default();
             policy.visit_file(&syn::parse_file(source).unwrap());
