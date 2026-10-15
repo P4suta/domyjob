@@ -1,7 +1,7 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers forty-six positive Kani harnesses, twenty-five named negative controls, and 130 required covers.
+The inventory defines the required positive Kani harnesses, named negative controls, and cover counts.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
