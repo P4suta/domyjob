@@ -909,6 +909,24 @@ mod tests {
         (value, expected)
     }
 
+    fn assert_metadata_substitutions_refused(
+        value: &serde_json::Value,
+        context: (&super::DefaultReportExpectation<'_>, &Report, super::Phase),
+        substitutions: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
+    ) {
+        let (expected, report, phase) = context;
+        for (pointer, replacement) in substitutions {
+            let mut substituted = value.clone();
+            *substituted.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                expected
+                    .validate(&serde_json::to_vec(&substituted).unwrap(), report, phase)
+                    .is_err(),
+                "{pointer}"
+            );
+        }
+    }
+
     #[test]
     fn native_default_report_requires_an_actual_tool_binding() {
         let (mut value, _) = default_metadata_fixture();
@@ -941,114 +959,96 @@ mod tests {
         expected
             .validate(&valid, &report, super::Phase::NamedNegative)
             .unwrap_err();
-        for (pointer, replacement) in [
-            (
-                "/metadata/target",
-                serde_json::json!("aarch64-apple-darwin"),
-            ),
-            ("/metadata/kani_version", serde_json::json!("0.67.0")),
-            ("/tools/kani", serde_json::json!("0.67.0")),
-            ("/tools/rustc", serde_json::json!("foreign compiler")),
-            ("/tools/cbmc", serde_json::json!("foreign CBMC")),
-            ("/tools/goto_cc", serde_json::json!("foreign goto-cc")),
-            (
-                "/tools/goto_instrument",
-                serde_json::json!("foreign goto-instrument"),
-            ),
-            ("/tools/solvers/0/name", serde_json::json!("z3")),
-            ("/tools/solvers/0/version", serde_json::json!("unknown")),
-            ("/cbmc/0/configuration/solver", serde_json::json!("z3")),
-            (
-                "/cbmc/0/configuration/object_bits",
-                serde_json::json!(u32::MAX),
-            ),
-            (
-                "/cbmc/0/cbmc_metadata/os_info",
-                serde_json::json!("x86_64 macos unix"),
-            ),
-            ("/cbmc/0/cbmc_metadata/version", serde_json::json!("6.10.0")),
-            ("/cbmc/0/harness_id", serde_json::json!("foreign")),
-            (
-                "/harness_metadata/0/pretty_name",
-                serde_json::json!("foreign"),
-            ),
-            ("/harness_metadata/0/mangled_name", serde_json::json!("")),
-            ("/error_details/0/has_errors", serde_json::json!(true)),
-        ] {
-            let mut substituted = value.clone();
-            *substituted.pointer_mut(pointer).unwrap() = replacement;
-            assert!(
-                expected
-                    .validate(
-                        &serde_json::to_vec(&substituted).unwrap(),
-                        &report,
-                        super::Phase::Positive
-                    )
-                    .is_err(),
-                "{pointer}"
-            );
-        }
+        assert_metadata_substitutions_refused(
+            &value,
+            (&expected, &report, super::Phase::Positive),
+            [
+                (
+                    "/metadata/target",
+                    serde_json::json!("aarch64-apple-darwin"),
+                ),
+                ("/metadata/kani_version", serde_json::json!("0.67.0")),
+                ("/tools/kani", serde_json::json!("0.67.0")),
+                ("/tools/rustc", serde_json::json!("foreign compiler")),
+                ("/tools/cbmc", serde_json::json!("foreign CBMC")),
+                ("/tools/goto_cc", serde_json::json!("foreign goto-cc")),
+                (
+                    "/tools/goto_instrument",
+                    serde_json::json!("foreign goto-instrument"),
+                ),
+                ("/tools/solvers/0/name", serde_json::json!("z3")),
+                ("/tools/solvers/0/version", serde_json::json!("unknown")),
+                ("/cbmc/0/configuration/solver", serde_json::json!("z3")),
+                (
+                    "/cbmc/0/configuration/object_bits",
+                    serde_json::json!(u32::MAX),
+                ),
+                (
+                    "/cbmc/0/cbmc_metadata/os_info",
+                    serde_json::json!("x86_64 macos unix"),
+                ),
+                ("/cbmc/0/cbmc_metadata/version", serde_json::json!("6.10.0")),
+                ("/cbmc/0/harness_id", serde_json::json!("foreign")),
+                (
+                    "/harness_metadata/0/pretty_name",
+                    serde_json::json!("foreign"),
+                ),
+                ("/harness_metadata/0/mangled_name", serde_json::json!("")),
+                ("/error_details/0/has_errors", serde_json::json!(true)),
+            ],
+        );
     }
 
     #[test]
     fn native_default_property_counts_match_every_reported_status() {
         let (value, expected) = default_metadata_fixture();
         let (report, _) = positive();
-        for (pointer, replacement) in [
-            (
-                "/property_details/0/property_details/total_properties",
-                serde_json::json!(u64::MAX),
-            ),
-            (
-                "/property_details/0/property_details/passed",
-                serde_json::json!(0),
-            ),
-            (
-                "/property_details/0/property_details/failed",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/unreachable",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/undetermined",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/solver_error",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/satisfied",
-                serde_json::json!(0),
-            ),
-            (
-                "/property_details/0/property_details/unsatisfiable",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/covered",
-                serde_json::json!(1),
-            ),
-            (
-                "/property_details/0/property_details/uncovered",
-                serde_json::json!(1),
-            ),
-        ] {
-            let mut substituted = value.clone();
-            *substituted.pointer_mut(pointer).unwrap() = replacement;
-            assert!(
-                expected
-                    .validate(
-                        &serde_json::to_vec(&substituted).unwrap(),
-                        &report,
-                        super::Phase::Positive
-                    )
-                    .is_err(),
-                "{pointer}"
-            );
-        }
+        assert_metadata_substitutions_refused(
+            &value,
+            (&expected, &report, super::Phase::Positive),
+            [
+                (
+                    "/property_details/0/property_details/total_properties",
+                    serde_json::json!(u64::MAX),
+                ),
+                (
+                    "/property_details/0/property_details/passed",
+                    serde_json::json!(0),
+                ),
+                (
+                    "/property_details/0/property_details/failed",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/unreachable",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/undetermined",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/solver_error",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/satisfied",
+                    serde_json::json!(0),
+                ),
+                (
+                    "/property_details/0/property_details/unsatisfiable",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/covered",
+                    serde_json::json!(1),
+                ),
+                (
+                    "/property_details/0/property_details/uncovered",
+                    serde_json::json!(1),
+                ),
+            ],
+        );
     }
 
     #[test]
@@ -1127,38 +1127,29 @@ mod tests {
                 super::Phase::NamedNegative,
             )
             .unwrap();
-        for (pointer, replacement) in [
-            ("/error_details/0/has_errors", serde_json::json!(false)),
-            (
-                "/error_details/0/error_type",
-                serde_json::json!("solver_error"),
-            ),
-            (
-                "/error_details/0/exit_status",
-                serde_json::json!("tool_failed"),
-            ),
-            (
-                "/error_details/0/failed_properties_type",
-                serde_json::json!("Other"),
-            ),
-            (
-                "/error_details/0/failed_properties_type",
-                serde_json::json!(""),
-            ),
-        ] {
-            let mut invalid = value.clone();
-            *invalid.pointer_mut(pointer).unwrap() = replacement;
-            assert!(
-                expected
-                    .validate(
-                        &serde_json::to_vec(&invalid).unwrap(),
-                        &report,
-                        super::Phase::NamedNegative
-                    )
-                    .is_err(),
-                "{pointer}"
-            );
-        }
+        assert_metadata_substitutions_refused(
+            &value,
+            (&expected, &report, super::Phase::NamedNegative),
+            [
+                ("/error_details/0/has_errors", serde_json::json!(false)),
+                (
+                    "/error_details/0/error_type",
+                    serde_json::json!("solver_error"),
+                ),
+                (
+                    "/error_details/0/exit_status",
+                    serde_json::json!("tool_failed"),
+                ),
+                (
+                    "/error_details/0/failed_properties_type",
+                    serde_json::json!("Other"),
+                ),
+                (
+                    "/error_details/0/failed_properties_type",
+                    serde_json::json!(""),
+                ),
+            ],
+        );
     }
 
     fn component_positive(harness: &Harness) -> Report {
@@ -1341,13 +1332,17 @@ mod tests {
         ]
     }
 
+    fn negative_field_refusal(pointer: &str, fault: &serde_json::Value) -> String {
+        let (mut value, negative) = negative_fixture();
+        value.pointer_mut(pointer).unwrap().clone_from(fault);
+        let report = domyjob_core::ingress::value(value).unwrap();
+        check_negative(&report, &negative).unwrap_err()
+    }
+
     #[test]
     fn each_incomplete_counterexample_field_is_refused_with_a_diagnostic() {
         for (pointer, fault) in summary_faults().into_iter().chain(assertion_faults()) {
-            let (mut value, negative) = negative_fixture();
-            value.pointer_mut(pointer).unwrap().clone_from(&fault);
-            let report = domyjob_core::ingress::value(value).unwrap();
-            let error = check_negative(&report, &negative).unwrap_err();
+            let error = negative_field_refusal(pointer, &fault);
             assert_ne!(error.trim(), "", "missing refusal diagnostic for {pointer}");
         }
     }
@@ -1364,10 +1359,7 @@ mod tests {
                 .first()
                 .unwrap();
             for fault in [serde_json::json!([]), serde_json::json!([first, first])] {
-                let (mut value, negative) = negative_fixture();
-                value.pointer_mut(pointer).unwrap().clone_from(&fault);
-                let report = domyjob_core::ingress::value(value).unwrap();
-                let error = check_negative(&report, &negative).unwrap_err();
+                let error = negative_field_refusal(pointer, &fault);
                 assert_ne!(error.trim(), "", "missing record diagnostic for {pointer}");
             }
         }

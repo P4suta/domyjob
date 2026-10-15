@@ -1827,6 +1827,18 @@ mod tests {
         }
     }
 
+    fn assert_loader_search_paths_removed(command: &Command) {
+        for loader in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
+            assert_eq!(
+                command
+                    .get_envs()
+                    .find(|(name, _)| *name == loader)
+                    .map(|(_, value)| value),
+                Some(None)
+            );
+        }
+    }
+
     #[test]
     fn native_default_isolation_is_command_local_and_preserves_other_controls() {
         let mut command = crate::raw::command("closed native producer");
@@ -1837,15 +1849,7 @@ mod tests {
             .env("RUSTC_WRAPPER", "unbound wrapper")
             .env("PATH", "selected executable search");
         isolate_native_default(&mut command);
-        for loader in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
-            assert_eq!(
-                command
-                    .get_envs()
-                    .find(|(name, _)| *name == loader)
-                    .map(|(_, value)| value),
-                Some(None)
-            );
-        }
+        assert_loader_search_paths_removed(&command);
         for (name, expected_value) in [
             ("LD_PRELOAD", "unbound preload"),
             ("RUSTC_WRAPPER", "unbound wrapper"),
@@ -1865,15 +1869,7 @@ mod tests {
     fn native_default_observers_exclude_parent_loader_search_paths() {
         for observer in [DefaultObserver::Context, DefaultObserver::Versions] {
             let command = default_observer_command(Path::new("owned root"), observer).unwrap();
-            for loader in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
-                assert_eq!(
-                    command
-                        .get_envs()
-                        .find(|(name, _)| *name == loader)
-                        .map(|(_, value)| value),
-                    Some(None)
-                );
-            }
+            assert_loader_search_paths_removed(&command);
         }
     }
 

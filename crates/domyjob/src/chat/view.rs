@@ -445,17 +445,10 @@ fn message_line(message: &MessageView) -> String {
 
 impl Outcome {
     pub(crate) const fn pending_read(&self) -> Option<&super::ops::PendingRead> {
-        match self {
-            Self::Events { pending, .. } => pending.as_ref(),
-            Self::Agent { .. }
-            | Self::Removed { .. }
-            | Self::Directory(_)
-            | Self::Rooms(_)
-            | Self::Posted(_)
-            | Self::HandoffCreated(_)
-            | Self::HandoffMetadata { .. }
-            | Self::HandoffBody(_)
-            | Self::Asked(_) => None,
+        if let Self::Events { pending, .. } = self {
+            pending.as_ref()
+        } else {
+            None
         }
     }
 

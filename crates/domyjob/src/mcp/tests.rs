@@ -26,6 +26,16 @@ struct FaultWriter {
     bytes: Vec<u8>,
 }
 
+impl FaultWriter {
+    fn new(fault: OutputFault, cancelled: &Arc<AtomicBool>) -> Self {
+        Self {
+            fault,
+            cancelled: Arc::clone(cancelled),
+            bytes: Vec::new(),
+        }
+    }
+}
+
 struct FlushGate {
     entered: std::sync::mpsc::SyncSender<()>,
     proceed: std::sync::mpsc::Receiver<()>,
@@ -40,6 +50,30 @@ impl Write for FlushGate {
         self.entered.send(()).map_err(io::Error::other)?;
         self.proceed.recv().map_err(io::Error::other)
     }
+}
+
+fn cancel_during_flush(request: &str, prepare: impl FnOnce(FlushGate) -> Server<FlushGate>) {
+    let (entered, flushing) = std::sync::mpsc::sync_channel(0);
+    let (proceed, release) = std::sync::mpsc::sync_channel(0);
+    let server = prepare(FlushGate {
+        entered,
+        proceed: release,
+    });
+    let registered = std::thread::scope(|scope| {
+        let completion = scope.spawn(|| serve_io(request.as_bytes(), &server));
+        flushing.recv().unwrap();
+        let registered = server.calls.lock().unwrap().contains_key("1");
+        super::notification(
+            &server,
+            "notifications/cancelled",
+            &serde_json::json!({"requestId":1}),
+        );
+        proceed.send(()).unwrap();
+        completion.join().unwrap().unwrap();
+        registered
+    });
+    assert!(registered);
+    assert_eq!(server.calls.lock().unwrap().len(), 0);
 }
 
 impl Write for FaultWriter {
@@ -76,13 +110,7 @@ fn prepared_read<W: Write + Send>(
     cancelled: &Arc<AtomicBool>,
     inbox: bool,
 ) -> (Server<W>, super::CallReply) {
-    let server = Server {
-        output: Mutex::new(output),
-        phase: Mutex::new(Phase::Ready),
-        session: Mutex::new(fixture.session.clone_for(Arc::clone(cancelled))),
-        client: Mutex::new(None),
-        calls: Mutex::new(BTreeMap::new()),
-    };
+    let server = ready_server(fixture.session.clone_for(Arc::clone(cancelled)), output);
     let (tool, args) = if inbox {
         ("chat_inbox", serde_json::json!({"limit":INBOX_READ_LIMIT}))
     } else {
@@ -97,6 +125,22 @@ fn prepared_read<W: Write + Send>(
     (server, reply)
 }
 
+fn for_each_read_reply(
+    check: impl Fn(
+        &crate::chat::ops::reads::tests::Fixture,
+        &Arc<AtomicBool>,
+        Server<Vec<u8>>,
+        super::CallReply,
+    ),
+) {
+    for inbox in [false, true] {
+        let fixture = crate::chat::ops::reads::tests::fixture();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (server, reply) = prepared_read(&fixture, Vec::new(), &cancelled, inbox);
+        check(&fixture, &cancelled, server, reply);
+    }
+}
+
 #[test]
 fn read_and_inbox_payload_newline_and_flush_failures_never_mark_read() {
     use crate::chat::ops::reads::tests::{fixture, stage};
@@ -109,11 +153,7 @@ fn read_and_inbox_payload_newline_and_flush_failures_never_mark_read() {
         ] {
             let fixture = fixture();
             let cancelled = Arc::new(AtomicBool::new(false));
-            let writer = FaultWriter {
-                fault,
-                cancelled: Arc::clone(&cancelled),
-                bytes: Vec::new(),
-            };
+            let writer = FaultWriter::new(fault, &cancelled);
             let (server, reply) = prepared_read(&fixture, writer, &cancelled, inbox);
             assert_eq!(stage(&fixture), Delivery::Pending);
             let error = server.deliver_call(reply, &cancelled).unwrap_err();
@@ -131,11 +171,7 @@ fn cancellation_before_or_during_read_output_never_marks_read() {
         for before in [false, true] {
             let fixture = fixture();
             let cancelled = Arc::new(AtomicBool::new(false));
-            let writer = FaultWriter {
-                fault: OutputFault::CancelOnFlush,
-                cancelled: Arc::clone(&cancelled),
-                bytes: Vec::new(),
-            };
+            let writer = FaultWriter::new(OutputFault::CancelOnFlush, &cancelled);
             let (server, reply) = prepared_read(&fixture, writer, &cancelled, inbox);
             if before {
                 cancelled.store(true, Ordering::Release);
@@ -153,17 +189,6 @@ fn read_cancellation_stays_registered_until_response_flush_completes() {
     use domyjob_core::chat::notification::Delivery;
     let fixture = fixture();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (entered, flushing) = std::sync::mpsc::sync_channel(0);
-    let (proceed, release) = std::sync::mpsc::sync_channel(0);
-    let (server, _prepared) = prepared_read(
-        &fixture,
-        FlushGate {
-            entered,
-            proceed: release,
-        },
-        &cancelled,
-        false,
-    );
     let request = format!(
         "{}\n",
         call(
@@ -172,50 +197,32 @@ fn read_cancellation_stays_registered_until_response_flush_completes() {
             &serde_json::json!({"message":fixture.message.id()}).to_string()
         )
     );
-    let registered = std::thread::scope(|scope| {
-        let completion = scope.spawn(|| serve_io(request.as_bytes(), &server));
-        flushing.recv().unwrap();
-        let registered = server.calls.lock().unwrap().contains_key("1");
-        super::notification(
-            &server,
-            "notifications/cancelled",
-            &serde_json::json!({"requestId":1}),
-        );
-        proceed.send(()).unwrap();
-        completion.join().unwrap().unwrap();
-        registered
+    cancel_during_flush(&request, |output| {
+        prepared_read(&fixture, output, &cancelled, false).0
     });
-    assert!(registered);
     assert_eq!(stage(&fixture), Delivery::Pending);
-    assert_eq!(server.calls.lock().unwrap().len(), 0);
 }
 
 #[test]
 fn substituted_oversized_read_responses_never_mark_read() {
-    use crate::chat::ops::reads::tests::{fixture, stage};
+    use crate::chat::ops::reads::tests::stage;
     use domyjob_core::chat::notification::Delivery;
-    for inbox in [false, true] {
-        let fixture = fixture();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (server, mut reply) = prepared_read(&fixture, Vec::new(), &cancelled, inbox);
+    for_each_read_reply(|fixture, cancelled, server, mut reply| {
         reply.value = serde_json::json!({"id":1,"result":"x".repeat(MAX_CONTROL_BYTES)});
-        server.deliver_call(reply, &cancelled).unwrap();
-        assert_eq!(stage(&fixture), Delivery::Pending);
+        server.deliver_call(reply, cancelled).unwrap();
+        assert_eq!(stage(fixture), Delivery::Pending);
         assert_eq!(
             field(&replies(server), &1.into(), "/error/code"),
             super::INTERNAL_ERROR
         );
-    }
+    });
 }
 
 #[test]
 fn successful_read_delivery_marks_only_the_bound_reader_and_reports_remaining_unread() {
-    use crate::chat::ops::reads::tests::{fixture, stage};
+    use crate::chat::ops::reads::tests::stage;
     use domyjob_core::chat::notification::Delivery;
-    for inbox in [false, true] {
-        let fixture = fixture();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (server, reply) = prepared_read(&fixture, Vec::new(), &cancelled, inbox);
+    for_each_read_reply(|fixture, cancelled, server, reply| {
         assert_eq!(
             reply.value.pointer("/result/structuredContent/unread"),
             Some(&0.into())
@@ -226,8 +233,8 @@ fn successful_read_delivery_marks_only_the_bound_reader_and_reports_remaining_un
             .unwrap()
             .bind(fixture.sender.name().as_str())
             .unwrap();
-        server.deliver_call(reply, &cancelled).unwrap();
-        assert_eq!(stage(&fixture), Delivery::Read);
+        server.deliver_call(reply, cancelled).unwrap();
+        assert_eq!(stage(fixture), Delivery::Read);
         assert_eq!(
             fixture
                 .session
@@ -240,7 +247,7 @@ fn successful_read_delivery_marks_only_the_bound_reader_and_reports_remaining_un
                 .unwrap(),
             Delivery::Pending
         );
-    }
+    });
 }
 
 fn server(root: &tempfile::TempDir) -> Server<Vec<u8>> {
@@ -399,19 +406,24 @@ fn malformed_and_oversized_input_is_bounded() {
     let tools = catalog();
     assert_eq!(tools.len(), EXPECTED_TOOL_COUNT);
     for name in ["chat_read", "chat_acknowledge"] {
-        let tool = tools
-            .iter()
-            .find(|tool| tool.get("name") == Some(&name.into()))
-            .unwrap();
-        assert_eq!(
-            tool.pointer("/annotations/readOnlyHint"),
-            Some(&false.into())
-        );
-        assert_eq!(
-            tool.pointer("/inputSchema/additionalProperties"),
-            Some(&false.into())
-        );
+        assert_tool_contract(name, false);
     }
+}
+
+fn assert_tool_contract(name: &str, read_only: bool) -> Value {
+    let tool = catalog()
+        .into_iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .unwrap();
+    assert_eq!(
+        tool.pointer("/annotations/readOnlyHint"),
+        Some(&read_only.into())
+    );
+    assert_eq!(
+        tool.pointer("/inputSchema/additionalProperties"),
+        Some(&false.into())
+    );
+    tool
 }
 
 fn prepared_handoff<W: Write + Send>(
@@ -419,12 +431,20 @@ fn prepared_handoff<W: Write + Send>(
     output: W,
     cancelled: &Arc<AtomicBool>,
 ) -> (Server<W>, super::CallReply) {
-    let server = ready_server(fixture.continuing.clone_for(Arc::clone(cancelled)), output);
+    let server = handoff_server(fixture, output, cancelled);
     let request = parse(handoff_request(&fixture.descriptor).as_bytes()).unwrap();
     let reply = server.call(&1.into(), request.params, cancelled).unwrap();
     assert_eq!(reply.value.pointer("/result/isError"), Some(&false.into()));
     assert!(!handoff_was_observed(fixture));
     (server, reply)
+}
+
+fn handoff_server<W>(
+    fixture: &crate::chat::ops::handoff::tests::Fixture,
+    output: W,
+    cancelled: &Arc<AtomicBool>,
+) -> Server<W> {
+    ready_server(fixture.continuing.clone_for(Arc::clone(cancelled)), output)
 }
 
 fn ready_server<W>(session: Session, output: W) -> Server<W> {
@@ -447,17 +467,7 @@ fn handoff_request(descriptor: &domyjob_core::chat::handoff::Descriptor) -> Stri
 }
 
 fn handoff_was_observed(fixture: &crate::chat::ops::handoff::tests::Fixture) -> bool {
-    fixture
-        .continuing
-        .store
-        .read(|read| {
-            crate::chat::store::handoff::observed(
-                read,
-                fixture.continuing.me().unwrap(),
-                fixture.descriptor.id(),
-            )
-        })
-        .unwrap()
+    fixture.observed()
 }
 
 #[test]
@@ -467,19 +477,7 @@ fn scoped_handoffs_have_dedicated_typed_tools_and_honest_effects() {
         ("chat_handoff_list", true),
         ("chat_handoff_read", false),
     ] {
-        let tools = catalog();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.get("name") == Some(&name.into()))
-            .unwrap();
-        assert_eq!(
-            tool.pointer("/annotations/readOnlyHint"),
-            Some(&read_only.into())
-        );
-        assert_eq!(
-            tool.pointer("/inputSchema/additionalProperties"),
-            Some(&false.into())
-        );
+        let tool = assert_tool_contract(name, read_only);
         assert!(
             tool.pointer("/inputSchema/properties")
                 .unwrap()
@@ -492,10 +490,7 @@ fn scoped_handoffs_have_dedicated_typed_tools_and_honest_effects() {
 #[test]
 fn a_delivered_handoff_records_only_the_bound_continuing_reader() {
     let fixture = crate::chat::ops::handoff::tests::fixture();
-    let session = fixture
-        .continuing
-        .clone_for(Arc::new(AtomicBool::new(false)));
-    let server = ready_server(session, Vec::new());
+    let server = handoff_server(&fixture, Vec::new(), &Arc::new(AtomicBool::new(false)));
     let request = format!("{}\n", handoff_request(&fixture.descriptor));
     serve_io(request.as_bytes(), &server).unwrap();
     let responses = replies(server);
@@ -516,11 +511,7 @@ fn failed_handoff_payload_newline_and_flush_preserve_the_io_cause_without_observ
     ] {
         let fixture = crate::chat::ops::handoff::tests::fixture();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let output = FaultWriter {
-            fault,
-            cancelled: Arc::clone(&cancelled),
-            bytes: Vec::new(),
-        };
+        let output = FaultWriter::new(fault, &cancelled);
         let (server, reply) = prepared_handoff(&fixture, output, &cancelled);
         let error = server.deliver_call(reply, &cancelled).unwrap_err();
         let (kind, message) = if fault == OutputFault::Flush {
@@ -540,11 +531,7 @@ fn cancelled_handoff_delivery_never_records_an_observation() {
     for during_flush in [false, true] {
         let fixture = crate::chat::ops::handoff::tests::fixture();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let output = FaultWriter {
-            fault: OutputFault::CancelOnFlush,
-            cancelled: Arc::clone(&cancelled),
-            bytes: Vec::new(),
-        };
+        let output = FaultWriter::new(OutputFault::CancelOnFlush, &cancelled);
         let (server, reply) = prepared_handoff(&fixture, output, &cancelled);
         if !during_flush {
             cancelled.store(true, Ordering::Release);
@@ -561,35 +548,11 @@ fn cancelled_handoff_delivery_never_records_an_observation() {
 #[test]
 fn cancellation_remains_registered_until_the_actual_response_flush_completes() {
     let fixture = crate::chat::ops::handoff::tests::fixture();
-    let (entered, flushing) = std::sync::mpsc::sync_channel(0);
-    let (proceed, release) = std::sync::mpsc::sync_channel(0);
-    let session = fixture
-        .continuing
-        .clone_for(Arc::new(AtomicBool::new(false)));
-    let server = ready_server(
-        session,
-        FlushGate {
-            entered,
-            proceed: release,
-        },
-    );
     let request = format!("{}\n", handoff_request(&fixture.descriptor));
-    let registered = std::thread::scope(|scope| {
-        let completion = scope.spawn(|| serve_io(request.as_bytes(), &server));
-        flushing.recv().unwrap();
-        let registered = server.calls.lock().unwrap().contains_key("1");
-        super::notification(
-            &server,
-            "notifications/cancelled",
-            &serde_json::json!({"requestId":1}),
-        );
-        proceed.send(()).unwrap();
-        completion.join().unwrap().unwrap();
-        registered
+    cancel_during_flush(&request, |output| {
+        handoff_server(&fixture, output, &Arc::new(AtomicBool::new(false)))
     });
-    assert!(registered);
     assert!(!handoff_was_observed(&fixture));
-    assert_eq!(server.calls.lock().unwrap().len(), 0);
 }
 
 #[test]

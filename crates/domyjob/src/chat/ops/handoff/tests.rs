@@ -6,18 +6,29 @@ use serde_json::json;
 
 use super::*;
 use crate::chat::args::MessageArgs;
-use crate::chat::store::fixtures::{register, store};
+use crate::chat::store::fixtures::{assert_removed_after_drop, register, store};
 use crate::chat::store::{Store, handoff};
 
 const BODY: &str = "continuation for issue 47";
 const PRIVATE_BODY: &str = "unrelated private message";
 
 pub(crate) struct Fixture {
-    _root: tempfile::TempDir,
     pub(crate) sender: Session,
     pub(crate) continuing: Session,
     pub(crate) descriptor: Descriptor,
     private: EventId,
+    root: tempfile::TempDir,
+}
+
+impl Fixture {
+    pub(crate) fn observed(&self) -> bool {
+        self.continuing
+            .store
+            .read(|read| {
+                handoff::observed(read, self.continuing.me().unwrap(), self.descriptor.id())
+            })
+            .unwrap()
+    }
 }
 
 fn exchange(first: &Store, second: &Store) {
@@ -65,12 +76,19 @@ pub(crate) fn fixture() -> Fixture {
     };
     exchange(&sender_session.store, &reader_session.store);
     Fixture {
-        _root: root,
         sender: sender_session,
         continuing: reader_session,
         descriptor,
         private: private.id().clone(),
+        root,
     }
+}
+
+#[test]
+fn fixture_closes_sessions_before_removing_their_directory() {
+    let fixture = fixture();
+    let path = fixture.root.path().to_owned();
+    assert_removed_after_drop(fixture, &path);
 }
 
 pub(crate) fn read_args(descriptor: &Descriptor) -> HandoffReadArgs {

@@ -1,16 +1,70 @@
 use std::cell::Cell;
 
 use domyjob_core::chat::card::Mode;
-use domyjob_core::chat::event::{Members, Stamp};
-use domyjob_core::chat::handoff::{Metadata, ReadRefusal, Target};
+use domyjob_core::chat::event::Stamp;
+use domyjob_core::chat::handoff::ReadRefusal;
 use domyjob_core::chat::id::Origin;
 use domyjob_core::chat::policy::Priority;
 
 use super::*;
-use crate::chat::store::fixtures::{register, store};
+use crate::chat::store::fixtures::{assert_removed_after_drop, handoff_metadata, register, store};
 use crate::chat::store::tables::EVENTS;
 
 const CHAT_FORMAT_HEX_CHARS: usize = 16;
+
+struct Fixture {
+    store: super::super::Store,
+    sender: AgentId,
+    previous: AgentId,
+    continuing: AgentId,
+    descriptor: Descriptor,
+    root: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root, "local");
+        let sender = register(&store, "sender", Mode::Interactive);
+        let previous = register(&store, "previous", Mode::Interactive);
+        let continuing = register(&store, "continuing", Mode::Interactive);
+        let descriptor = publish(&store, &sender, &previous, &continuing);
+        Self {
+            store,
+            sender,
+            previous,
+            continuing,
+            descriptor,
+            root,
+        }
+    }
+
+    fn body(&self) -> ReadBody {
+        self.store
+            .read(|transaction| {
+                read(
+                    transaction,
+                    &self.continuing,
+                    &self.descriptor,
+                    ReadLimit::MAX,
+                )
+            })
+            .unwrap()
+    }
+
+    fn observed(&self, reader: &AgentId) -> bool {
+        self.store
+            .read(|transaction| observed(transaction, reader, self.descriptor.id()))
+            .unwrap()
+    }
+}
+
+#[test]
+fn fixture_closes_the_store_before_removing_its_directory() {
+    let fixture = Fixture::new();
+    let path = fixture.root.path().to_owned();
+    assert_removed_after_drop(fixture, &path);
+}
 
 fn publish(
     store: &super::super::Store,
@@ -18,18 +72,7 @@ fn publish(
     previous: &AgentId,
     continuing: &AgentId,
 ) -> Descriptor {
-    let metadata = Metadata::new(
-        sender.clone(),
-        Target::Agent {
-            agent: previous.clone(),
-        },
-        (
-            Project::try_from("owner/project".to_owned()).unwrap(),
-            Scope::try_from("issue-47".to_owned()).unwrap(),
-        ),
-        Members::try_from(vec![previous.clone(), continuing.clone()]).unwrap(),
-    )
-    .unwrap();
+    let metadata = handoff_metadata(sender, previous, continuing);
     let text = Text::try_from("only the scoped handoff".to_owned()).unwrap();
     let event = store
         .write(|tx| {
@@ -48,13 +91,10 @@ fn publish(
 
 #[test]
 fn metadata_discovery_never_decodes_the_body_record() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let descriptor = publish(&store, &sender, &previous, &continuing);
-    store
+    let fixture = Fixture::new();
+    let descriptor = &fixture.descriptor;
+    fixture
+        .store
         .write(|tx| {
             tx.transaction()
                 .open_table(EVENTS)?
@@ -62,11 +102,12 @@ fn metadata_discovery_never_decodes_the_body_record() {
             Ok(())
         })
         .unwrap();
-    let discovered = store
+    let discovered = fixture
+        .store
         .read(|read| {
             discover(
                 read,
-                &continuing,
+                &fixture.continuing,
                 (
                     descriptor.metadata().project(),
                     descriptor.metadata().scope(),
@@ -77,21 +118,28 @@ fn metadata_discovery_never_decodes_the_body_record() {
         .unwrap();
     assert_eq!(discovered, vec![descriptor.clone()]);
     assert!(matches!(
-        store.read(|transaction| read(transaction, &continuing, &descriptor, ReadLimit::MAX)),
+        fixture.store.read(|transaction| read(
+            transaction,
+            &fixture.continuing,
+            descriptor,
+            ReadLimit::MAX
+        )),
         Err(StoreError::Record(_))
     ));
 }
 
 #[test]
 fn copied_metadata_headers_are_refused_before_discovery_or_body_fetch() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let first = publish(&store, &sender, &previous, &continuing);
-    let second = publish(&store, &sender, &previous, &continuing);
-    store
+    let fixture = Fixture::new();
+    let first = &fixture.descriptor;
+    let second = publish(
+        &fixture.store,
+        &fixture.sender,
+        &fixture.previous,
+        &fixture.continuing,
+    );
+    fixture
+        .store
         .write(|tx| {
             tx.transaction()
                 .open_table(HANDOFF_HEADERS)?
@@ -103,45 +151,45 @@ fn copied_metadata_headers_are_refused_before_discovery_or_body_fetch() {
         })
         .unwrap();
     assert!(matches!(
-        store.read(|read| discover(
+        fixture.store.read(|read| discover(
             read,
-            &continuing,
+            &fixture.continuing,
             (first.metadata().project(), first.metadata().scope()),
             MAX_HANDOFFS,
         )),
         Err(StoreError::Corrupt("handoff header identity"))
     ));
     assert!(matches!(
-        store.read(|transaction| read(transaction, &continuing, &first, ReadLimit::MAX)),
+        fixture.store.read(|transaction| read(
+            transaction,
+            &fixture.continuing,
+            first,
+            ReadLimit::MAX
+        )),
         Err(StoreError::Corrupt("handoff header identity"))
     ));
 }
 
 #[test]
 fn a_denied_reader_cannot_reach_the_body_port() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let descriptor = publish(&store, &sender, &previous, &continuing);
-    let stranger = AgentId::new(continuing.name().clone(), Origin::from_entropy([9; 16]));
-    let calls = Cell::new(0);
-    let result = load_using(
-        &descriptor,
-        &stranger,
-        (&descriptor, ReadLimit::MAX),
-        |_id| {
-            calls.set(calls.get() + 1);
-            Ok(None)
-        },
+    let fixture = Fixture::new();
+    let descriptor = &fixture.descriptor;
+    let stranger = AgentId::new(
+        fixture.continuing.name().clone(),
+        Origin::from_entropy([9; 16]),
     );
+    let calls = Cell::new(0);
+    let result = load_using(descriptor, &stranger, (descriptor, ReadLimit::MAX), |_id| {
+        calls.set(calls.get() + 1);
+        Ok(None)
+    });
     assert!(matches!(
         result,
         Err(StoreError::Handoff(ReadRefusal::Reader))
     ));
     assert_eq!(calls.get(), 0);
-    let discovered = store
+    let discovered = fixture
+        .store
         .read(|read| {
             discover(
                 read,
@@ -160,51 +208,25 @@ fn a_denied_reader_cannot_reach_the_body_port() {
 
 #[test]
 fn an_admitted_read_records_only_the_actual_reader_and_is_idempotent() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let descriptor = publish(&store, &sender, &previous, &continuing);
-    let body = store
-        .read(|transaction| read(transaction, &continuing, &descriptor, ReadLimit::MAX))
-        .unwrap();
-    assert_eq!(body.reader, continuing);
+    let fixture = Fixture::new();
+    let body = fixture.body();
+    assert_eq!(body.reader, fixture.continuing);
     assert_eq!(body.text.as_str(), "only the scoped handoff");
-    assert!(
-        !store
-            .read(|read| observed(read, &continuing, descriptor.id()))
-            .unwrap()
-    );
-    store.write(|tx| body.pending().commit(tx)).unwrap();
-    let count = store.local_seen().unwrap();
-    store.write(|tx| body.pending().commit(tx)).unwrap();
-    assert_eq!(store.local_seen().unwrap(), count);
-    assert!(
-        store
-            .read(|read| observed(read, &continuing, descriptor.id()))
-            .unwrap()
-    );
-    assert!(
-        !store
-            .read(|read| observed(read, &previous, descriptor.id()))
-            .unwrap()
-    );
+    assert!(!fixture.observed(&fixture.continuing));
+    fixture.store.write(|tx| body.pending().commit(tx)).unwrap();
+    let count = fixture.store.local_seen().unwrap();
+    fixture.store.write(|tx| body.pending().commit(tx)).unwrap();
+    assert_eq!(fixture.store.local_seen().unwrap(), count);
+    assert!(fixture.observed(&fixture.continuing));
+    assert!(!fixture.observed(&fixture.previous));
 }
 
 #[test]
 fn an_aborted_observation_transaction_is_retryable_without_a_false_reader() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let descriptor = publish(&store, &sender, &previous, &continuing);
-    let body = store
-        .read(|transaction| read(transaction, &continuing, &descriptor, ReadLimit::MAX))
-        .unwrap();
-    let before = store.local_seen().unwrap();
-    let result: Result<(), StoreError> = store.write(|tx| {
+    let fixture = Fixture::new();
+    let body = fixture.body();
+    let before = fixture.store.local_seen().unwrap();
+    let result: Result<(), StoreError> = fixture.store.write(|tx| {
         body.pending().commit(tx)?;
         Err(StoreError::Corrupt("injected observation abort"))
     });
@@ -212,18 +234,10 @@ fn an_aborted_observation_transaction_is_retryable_without_a_false_reader() {
         result,
         Err(StoreError::Corrupt("injected observation abort"))
     ));
-    assert_eq!(store.local_seen().unwrap(), before);
-    assert!(
-        !store
-            .read(|transaction| observed(transaction, &continuing, descriptor.id()))
-            .unwrap()
-    );
-    store.write(|tx| body.pending().commit(tx)).unwrap();
-    assert!(
-        store
-            .read(|transaction| observed(transaction, &continuing, descriptor.id()))
-            .unwrap()
-    );
+    assert_eq!(fixture.store.local_seen().unwrap(), before);
+    assert!(!fixture.observed(&fixture.continuing));
+    fixture.store.write(|tx| body.pending().commit(tx)).unwrap();
+    assert!(fixture.observed(&fixture.continuing));
 }
 
 #[test]
@@ -282,20 +296,15 @@ fn all_previous_formats_preserve_identity_and_history_when_adding_handoff_indexe
 
 #[test]
 fn resetting_the_store_refuses_a_prepared_old_identity_observation() {
-    let root = tempfile::tempdir().unwrap();
-    let store = store(&root, "local");
-    let sender = register(&store, "sender", Mode::Interactive);
-    let previous = register(&store, "previous", Mode::Interactive);
-    let continuing = register(&store, "continuing", Mode::Interactive);
-    let descriptor = publish(&store, &sender, &previous, &continuing);
-    let body = store
-        .read(|transaction| read(transaction, &continuing, &descriptor, ReadLimit::MAX))
-        .unwrap();
-    let replacement =
-        super::super::Store::reset(&crate::layout::State::at(&root.path().join("local"))).unwrap();
-    assert_ne!(store.origin(), replacement.origin());
+    let fixture = Fixture::new();
+    let body = fixture.body();
+    let replacement = super::super::Store::reset(&crate::layout::State::at(
+        &fixture.root.path().join("local"),
+    ))
+    .unwrap();
+    assert_ne!(fixture.store.origin(), replacement.origin());
     assert!(matches!(
-        store.write(|tx| body.pending().commit(tx)),
+        fixture.store.write(|tx| body.pending().commit(tx)),
         Err(StoreError::IdentityChanged)
     ));
     assert_eq!(replacement.local_seen().unwrap(), 0);

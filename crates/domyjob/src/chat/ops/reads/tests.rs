@@ -6,14 +6,14 @@ use domyjob_core::chat::policy::{Priority, audience};
 
 use crate::chat::args::{InboxArgs, MessageArgs};
 use crate::chat::ops::{self, Session};
-use crate::chat::store::fixtures::{register, store};
+use crate::chat::store::fixtures::{assert_removed_after_drop, register, store};
 
 pub(crate) struct Fixture {
-    _root: tempfile::TempDir,
     pub(crate) session: Session,
     pub(crate) sender: AgentId,
     pub(crate) recipient: AgentId,
     pub(crate) message: Event,
+    root: tempfile::TempDir,
 }
 
 pub(crate) fn fixture() -> Fixture {
@@ -40,12 +40,19 @@ pub(crate) fn fixture() -> Fixture {
     let mut session = Session::with_store(local);
     session.bind(recipient.name().as_str()).unwrap();
     Fixture {
-        _root: root,
         session,
         sender,
         recipient,
         message,
+        root,
     }
+}
+
+#[test]
+fn fixture_closes_the_session_before_removing_its_directory() {
+    let fixture = fixture();
+    let path = fixture.root.path().to_owned();
+    assert_removed_after_drop(fixture, &path);
 }
 
 pub(crate) fn stage(fixture: &Fixture) -> Delivery {

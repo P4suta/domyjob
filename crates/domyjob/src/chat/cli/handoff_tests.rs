@@ -2,7 +2,6 @@ use crate::chat::ops::{
     self,
     handoff::tests::{fixture, read_args},
 };
-use crate::chat::store::handoff;
 
 use super::{CliError, deliver_outcome};
 
@@ -43,27 +42,7 @@ fn failed_handoff_output_does_not_publish_an_actual_reader_observation() {
     assert!(
         matches!(result, Err(CliError::Io(error)) if error.kind()==std::io::ErrorKind::BrokenPipe)
     );
-    assert!(
-        !fixture
-            .continuing
-            .store
-            .read(|read| handoff::observed(
-                read,
-                fixture.continuing.me().unwrap(),
-                fixture.descriptor.id()
-            ))
-            .unwrap()
-    );
+    assert!(!fixture.observed());
     deliver_outcome(&fixture.continuing, &outcome, |_value, _text| Ok(())).unwrap();
-    assert!(
-        fixture
-            .continuing
-            .store
-            .read(|read| handoff::observed(
-                read,
-                fixture.continuing.me().unwrap(),
-                fixture.descriptor.id()
-            ))
-            .unwrap()
-    );
+    assert!(fixture.observed());
 }

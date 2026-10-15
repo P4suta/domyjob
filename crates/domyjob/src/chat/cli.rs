@@ -718,49 +718,18 @@ mod tests {
     #[test]
     fn failed_hook_output_leaves_the_message_pending() {
         use crate::chat::args::{HookArgs, HookPhase};
-        use crate::chat::ops::Session;
-        use crate::chat::store::fixtures::{register, store};
-        use domyjob_core::chat::card::Mode;
-        use domyjob_core::chat::event::{Body, Intent, Stamp};
-        use domyjob_core::chat::id::Text;
+        use crate::chat::ops::reads::tests::{fixture, stage};
         use domyjob_core::chat::notification::Delivery;
-        use domyjob_core::chat::policy::{Priority, audience};
-        let root = tempfile::tempdir().unwrap();
-        let store = store(&root, "local");
-        let sender = register(&store, "sender", Mode::Interactive);
-        let recipient = register(&store, "recipient", Mode::Interactive);
-        let message = store
-            .write(|tx| {
-                tx.author(
-                    Priority::Ordinary,
-                    Body::Message {
-                        conversation: Conversation::direct(&sender, &recipient)?,
-                        from: sender.name().clone(),
-                        text: Text::try_from("hello".to_owned())?,
-                        audience: audience([&sender, &recipient])?,
-                        intent: Intent::Send {},
-                        at: Stamp::from_unix_millis(0),
-                        notice: None,
-                    },
-                )
-            })
-            .unwrap();
-        let mut session = Session::with_store(store.clone());
-        session.bind(recipient.name().as_str()).unwrap();
+        let fixture = fixture();
         let args = HookArgs {
             phase: HookPhase::Pre,
             status: None,
             client: None,
             if_bound: false,
         };
-        let error = super::hook_using(&session, &args, broken_pipe).unwrap_err();
+        let error = super::hook_using(&fixture.session, &args, broken_pipe).unwrap_err();
         assert_io_error(error, std::io::ErrorKind::BrokenPipe);
-        assert_eq!(
-            store
-                .read(|read| crate::chat::store::delivery(read, &recipient, message.id()))
-                .unwrap(),
-            Delivery::Pending
-        );
+        assert_eq!(stage(&fixture), Delivery::Pending);
     }
 
     fn finding(area: &'static str, ok: bool, detail: &str, fix: Option<&str>) -> Finding {
@@ -931,13 +900,7 @@ mod tests {
         let mut names = Vec::new();
         let inputs = session_inputs(None, true, |name| {
             names.push(name.to_owned());
-            match name {
-                "DOMYJOB_CHAT_AGENT" => Ok(None),
-                "DOMYJOB_CHAT_TURN" => {
-                    environment_value(Err(crate::platform::non_unicode_environment_value()))
-                }
-                _ => panic!("unexpected environment input"),
-            }
+            invalid_turn_environment(name)
         })
         .unwrap();
         assert_eq!(inputs, (None, None));
@@ -946,18 +909,21 @@ mod tests {
 
     #[test]
     fn unbound_commands_without_optional_hooks_still_refuse_non_unicode_turns() {
-        let error = session_inputs(None, false, |name| match name {
-            "DOMYJOB_CHAT_AGENT" => Ok(None),
-            "DOMYJOB_CHAT_TURN" => {
-                environment_value(Err(crate::platform::non_unicode_environment_value()))
-            }
-            _ => panic!("unexpected environment input"),
-        })
-        .unwrap_err();
+        let error = session_inputs(None, false, invalid_turn_environment).unwrap_err();
         assert!(matches!(
             error,
             CliError::Usage("chat environment variables must be UTF-8")
         ));
+    }
+
+    fn invalid_turn_environment(name: &str) -> Result<Option<String>, CliError> {
+        match name {
+            "DOMYJOB_CHAT_AGENT" => Ok(None),
+            "DOMYJOB_CHAT_TURN" => {
+                environment_value(Err(crate::platform::non_unicode_environment_value()))
+            }
+            _ => Err(CliError::Usage("unexpected environment input")),
+        }
     }
 
     #[test]
