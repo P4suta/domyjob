@@ -20,8 +20,12 @@ pub(crate) fn previous_chat() -> String {
     identity(PREVIOUS_CHAT)
 }
 
+pub(crate) fn legacy_chat() -> String {
+    identity(LEGACY_CHAT)
+}
+
 pub(crate) fn compatible_chat(format: &str) -> bool {
-    format == chat() || format == previous_chat() || format == identity(LEGACY_CHAT)
+    format == chat() || format == previous_chat() || format == legacy_chat()
 }
 
 pub(crate) fn runner() -> String {

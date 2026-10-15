@@ -3,9 +3,12 @@ use domyjob_core::chat::event::{Body, Stamp};
 use domyjob_core::chat::id::{AgentId, AgentName, Conversation, EventId, Origin};
 use domyjob_core::chat::notification::{Activity, Delivery};
 use domyjob_core::dashboard::MAX_ROWS;
-use redb::{ReadableDatabase as _, ReadableTable as _};
+use redb::{ReadOnlyTable, ReadTransaction, ReadableDatabase as _, ReadableTable as _};
 
-use super::tables::{LINKS, MACHINES, META, PEERS, PROFILES, ROOMS, decode, get_text};
+use super::tables::{
+    ACTIVITY, DELIVERY, LINKS, MACHINES, META, PEERS, PROFILES, ROOMS, TextTable, decode,
+    delivery_key, get_json, get_text,
+};
 use super::{Link, Reader as _, StoreError, views};
 use crate::{layout, lock::OsLock, state_io};
 
@@ -60,6 +63,25 @@ pub(crate) struct Snapshot {
     pub(crate) local_agents: Vec<AgentId>,
 }
 
+struct Notifications {
+    activity: Option<ReadOnlyTable<&'static str, &'static str>>,
+    delivery: Option<ReadOnlyTable<&'static str, &'static str>>,
+}
+
+fn notification_table(
+    read: &ReadTransaction,
+    format: &str,
+    table: TextTable,
+) -> Result<Option<ReadOnlyTable<&'static str, &'static str>>, StoreError> {
+    match read.open_table(table) {
+        Ok(table) => Ok(Some(table)),
+        Err(redb::TableError::TableDoesNotExist(_)) if format == crate::formats::legacy_chat() => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn observe(state: &layout::State, request: &Request) -> Result<Snapshot, StoreError> {
     let paths = state.chat();
     let Some(lock_file) = state_io::open_existing_lock(&paths.lock())? else {
@@ -80,7 +102,7 @@ pub(crate) fn observe(state: &layout::State, request: &Request) -> Result<Snapsh
     }
     let origin =
         Origin::try_from(get_text(&meta, "origin")?.ok_or(StoreError::Corrupt("chat origin"))?)?;
-    let result = snapshot(&read, &origin, request);
+    let result = snapshot(&read, &origin, request, &format);
     drop(meta);
     drop(read);
     drop(database);
@@ -98,10 +120,15 @@ fn absent(request: &Request) -> Result<Snapshot, StoreError> {
 }
 
 fn snapshot(
-    read: &impl super::Reader,
+    read: &ReadTransaction,
     origin: &Origin,
     request: &Request,
+    format: &str,
 ) -> Result<Snapshot, StoreError> {
+    let notifications = Notifications {
+        activity: notification_table(read, format, ACTIVITY)?,
+        delivery: notification_table(read, format, DELIVERY)?,
+    };
     let mut snapshot = Snapshot::default();
     for entry in read.table(PROFILES)?.iter()?.take(MAX_ROWS) {
         let (id, card) = entry?;
@@ -110,7 +137,10 @@ fn snapshot(
             snapshot.local_agents.push(id.clone());
         }
         snapshot.agents.push(Agent {
-            activity: views::activity(read, &id)?,
+            activity: notifications
+                .activity
+                .as_ref()
+                .map_or(Ok(None), |table| get_json(table, &id.to_string()))?,
             id,
             card: decode(card.value())?,
         });
@@ -125,7 +155,7 @@ fn snapshot(
                     "the viewing identity cannot access this conversation",
                 ));
             }
-            messages(read, conversation, &actor, &mut snapshot)?;
+            messages(read, (conversation, &actor), &mut snapshot, &notifications)?;
         }
     }
     snapshot.observed = crate::platform::clock::observed_millis();
@@ -244,9 +274,9 @@ fn conversations(
 
 fn messages(
     read: &impl super::Reader,
-    conversation: &Conversation,
-    actor: &AgentId,
+    (conversation, actor): (&Conversation, &AgentId),
     snapshot: &mut Snapshot,
+    notifications: &Notifications,
 ) -> Result<(), StoreError> {
     let (first, last) = super::tables::thread_bounds(conversation);
     for entry in read
@@ -279,9 +309,13 @@ fn messages(
                 .map_or_else(Vec::new, |notice| notice.recipients.agents().to_vec())
                 .into_iter()
                 .map(|recipient| {
+                    let table = notifications
+                        .delivery
+                        .as_ref()
+                        .ok_or(StoreError::Corrupt("notification receipt table is absent"))?;
                     Ok((
                         recipient.clone(),
-                        views::delivery(read, &recipient, event.id())?,
+                        get_json(table, &delivery_key(&recipient, event.id()))?.unwrap_or_default(),
                     ))
                 })
                 .collect::<Result<Vec<_>, StoreError>>()?;

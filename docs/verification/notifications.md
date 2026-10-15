@@ -39,6 +39,14 @@ A sync error can leave the old state or the complete new transaction, so the fix
 An escalation interrupted by counter exhaustion leaves no fallback or link; reopening after repair creates one fallback and repeated escalation preserves its exact ID.
 These checks use the production store and command adapters without launching an AI client.
 
+Passive dashboard observation reads the recognized pre-notification format without creating its missing activity or delivery tables.
+Missing activity remains unknown, and legacy messages keep their history without invented receipt records.
+Notification-capable formats require both tables, and every format preserves table type and record decoding failures.
+The observer fixtures remove tables from populated native redb databases, inject invalid table types and records, and compare database bytes before and after successful and refused observations.
+The observer refuses notification-bearing messages with an absent delivery table.
+These fixtures check the read-only redb adapter boundary.
+The scalar decision proofs don't establish redb or filesystem semantics.
+
 The proof trusts Rust's checked string boundaries and the standard library's UTF-8 contracts when producing a summary prefix.
 The client must run the configured synchronous hook, honor its context and stop output, and inherit the bound identity.
 A successful write proves that the adapter returned context, not that the client consumed or understood it.
