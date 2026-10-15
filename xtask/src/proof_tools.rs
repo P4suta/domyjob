@@ -423,7 +423,8 @@ fn observed_link(_path: &Path) -> Result<SelectionLink, String> {
 }
 
 fn selection_link(path: &Path) -> Result<SelectedProgram, String> {
-    let mut remaining = path.to_path_buf();
+    let selected = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let mut remaining = selected.clone();
     let mut links = Vec::new();
     loop {
         let mut current = PathBuf::new();
@@ -466,8 +467,8 @@ fn selection_link(path: &Path) -> Result<SelectedProgram, String> {
         }
     }
     Ok(SelectedProgram {
-        selected: path.to_path_buf(),
-        canonical: path.canonicalize().map_err(|error| error.to_string())?,
+        canonical: selected.canonicalize().map_err(|error| error.to_string())?,
+        selected,
         links,
     })
 }
@@ -525,7 +526,7 @@ const fn executable_metadata(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
-fn default_selection() -> Result<DefaultSelection, String> {
+fn default_selection(root: &Path, evidence: &Path) -> Result<DefaultSelection, String> {
     let target = default_target()?;
     for name in [
         "LD_PRELOAD",
@@ -593,11 +594,12 @@ fn default_selection() -> Result<DefaultSelection, String> {
         )
     })
     .collect();
+    let (cargo_proxy, standalone_proxy) = default_selected_proxies(root, evidence)?;
     Ok(DefaultSelection {
         target: target.triple().to_owned(),
         mise: selected_program("mise")?,
-        cargo_proxy: selected_program("cargo-kani")?,
-        standalone_proxy: selected_program("kani")?,
+        cargo_proxy,
+        standalone_proxy,
         outer_cargo: selected_program("cargo")?,
         observer: std::env::current_exe().map_err(|error| error.to_string())?,
         bundle,
@@ -608,7 +610,9 @@ fn default_selection() -> Result<DefaultSelection, String> {
 }
 
 pub(crate) fn emit_default_selection() -> Result<(), String> {
-    let context = default_selection()?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let evidence = default_version_evidence(&root)?;
+    let context = default_selection(&root, &evidence)?;
     let bytes = serde_json::to_vec(&context).map_err(|error| error.to_string())?;
     emit_default_bytes(&bytes)
 }
@@ -733,6 +737,44 @@ fn default_lookup(
     } else {
         Ok(PathBuf::from(path))
     }
+}
+
+fn default_provider_proxies(
+    provider: &Path,
+    proxy: &Path,
+) -> Result<(SelectedProgram, SelectedProgram), String> {
+    let provider = physical_directory(provider)?;
+    let cargo = selection_link(&provider.join("bin/cargo-kani"))?;
+    let standalone = selection_link(&provider.join("bin/kani"))?;
+    if proxy.canonicalize().map_err(|error| error.to_string())? != cargo.canonical {
+        return Err("native-default child PATH disagrees with its exact mise provider".to_owned());
+    }
+    Ok((cargo, standalone))
+}
+
+fn default_selected_proxies(
+    root: &Path,
+    evidence: &Path,
+) -> Result<(SelectedProgram, SelectedProgram), String> {
+    let observation = new_evidence(evidence, EvidenceKind::SolverObservation)?;
+    let provider = default_lookup(
+        root,
+        &observation,
+        "provider",
+        &["where", "cargo:kani-verifier@0.68.0"],
+    )?;
+    let proxy = default_lookup(
+        root,
+        &observation,
+        "proxy",
+        &[
+            "which",
+            "cargo-kani",
+            "--tool",
+            "cargo:kani-verifier@0.68.0",
+        ],
+    )?;
+    default_provider_proxies(&provider, &proxy)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1480,7 +1522,7 @@ fn default_versions(
 
 pub(crate) fn emit_default_versions(root: &Path) -> Result<(), String> {
     let evidence = default_version_evidence(root)?;
-    let before = default_selection();
+    let before = default_selection(root, &evidence);
     let primary = match before.as_ref() {
         Ok(context) => NativeDefaultBinding::observe_using(
             || default_files(context),
@@ -1488,7 +1530,7 @@ pub(crate) fn emit_default_versions(root: &Path) -> Result<(), String> {
         ),
         Err(error) => Err(error.clone()),
     };
-    let after = default_selection();
+    let after = default_selection(root, &evidence);
     let observed = match (before, primary, after) {
         (Ok(before), Ok((_, versions)), Ok(after)) if before == after => {
             DefaultVersionObservation {
@@ -1517,7 +1559,28 @@ pub(crate) struct NativeDefaultBinding {
     versions: DefaultVersions,
 }
 
+fn default_proof_command(context: &DefaultSelection, root: &Path, source: Option<&str>) -> Command {
+    let mut command = crate::raw::command(&context.mise.selected);
+    command
+        .current_dir(root)
+        .args(["x", "cargo:kani-verifier@0.68.0", "--"]);
+    if let Some(source) = source {
+        command
+            .arg(&context.standalone_proxy.selected)
+            .arg(root.join(source));
+    } else {
+        command
+            .arg(&context.cargo_proxy.selected)
+            .args(["kani", "-p", "domyjob-core"]);
+    }
+    command
+}
+
 impl NativeDefaultBinding {
+    pub(crate) fn command(&self, root: &Path, source: Option<&str>) -> Command {
+        default_proof_command(&self.selection, root, source)
+    }
+
     pub(crate) fn capture(root: &Path, evidence: &Path) -> Result<Self, String> {
         Self::capture_using(
             || default_context(root, evidence),
@@ -1621,6 +1684,176 @@ mod raw {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_default_selected_programs_make_relative_paths_absolute() {
+        let selected = selection_link(Path::new("Cargo.toml")).unwrap();
+        assert!(selected.selected.is_absolute());
+        assert_eq!(
+            selected.selected.canonicalize().unwrap(),
+            selected.canonical
+        );
+    }
+
+    #[cfg(unix)]
+    fn executable_fixture(path: &Path, script: &[u8]) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const PRIVATE_EXECUTABLE: u32 = 0o700;
+        let mut file = crate::raw::create_new_file(path).unwrap();
+        file.write_all(script).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_EXECUTABLE))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn command_fixture(root: &Path) -> DefaultSelection {
+        let provider = root.join("pinned provider");
+        crate::raw::create_dir_all(&provider.join("bin")).unwrap();
+        executable_fixture(
+            &provider.join("bin/cargo-kani"),
+            b"#!/bin/sh\nprintf '%s\\n' 'pinned cargo' \"$@\"\n",
+        );
+        executable_fixture(
+            &provider.join("bin/kani"),
+            b"#!/bin/sh\nprintf '%s\\n' 'pinned standalone' \"$@\"\n",
+        );
+        let mise = root.join("mise");
+        executable_fixture(
+            &mise,
+            b"#!/bin/sh\n[ \"$1\" = x ] && [ \"$2\" = cargo:kani-verifier@0.68.0 ] && [ \"$3\" = -- ] || exit 1\nshift 3\nexec \"$@\"\n",
+        );
+        let (cargo_proxy, standalone_proxy) =
+            default_provider_proxies(&provider, &provider.join("bin/cargo-kani")).unwrap();
+        DefaultSelection {
+            mise: selection_link(&mise).unwrap(),
+            cargo_proxy,
+            standalone_proxy,
+            ..default_selection_fixture()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_default_provider_selection_refuses_a_foreign_proxy() {
+        let root = tempfile::tempdir().unwrap();
+        let context = command_fixture(root.path());
+        let provider = root.path().join("pinned provider");
+        let error = default_provider_proxies(&provider, &context.mise.selected).unwrap_err();
+        assert_eq!(
+            error,
+            "native-default child PATH disagrees with its exact mise provider"
+        );
+        default_provider_proxies(&root.path().join("missing"), &context.cargo_proxy.selected)
+            .unwrap_err();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_default_proof_commands_bind_the_exact_absolute_mise_and_proxy() {
+        let root = tempfile::tempdir().unwrap();
+        let context = command_fixture(root.path());
+        for source in [None, Some("verification/proof.rs")] {
+            let command = default_proof_command(&context, root.path(), source);
+            assert_eq!(command.get_program(), context.mise.selected);
+            assert!(Path::new(command.get_program()).is_absolute());
+            let mut expected = ["x", "cargo:kani-verifier@0.68.0", "--"]
+                .map(std::ffi::OsString::from)
+                .to_vec();
+            if let Some(source) = source {
+                expected.extend([
+                    context.standalone_proxy.selected.clone().into_os_string(),
+                    root.path().join(source).into_os_string(),
+                ]);
+            } else {
+                expected.push(context.cargo_proxy.selected.clone().into_os_string());
+                expected.extend(["kani", "-p", "domyjob-core"].map(std::ffi::OsString::from));
+            }
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_pinned_output(
+        context: &DefaultSelection,
+        root: &Path,
+        path: &std::ffi::OsStr,
+        (name, source, expected): (&str, Option<&str>, &str),
+    ) {
+        let output = capture(
+            default_proof_command(context, root, source).env("PATH", path),
+            CapturePlan {
+                evidence: root,
+                name,
+                limit_millis: LOCAL_LIMIT_MILLIS,
+                stdout_bytes: VERSION_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bounded_bytes(&output, VERSION_BYTES).unwrap(),
+            expected.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_default_commands_ignore_path_shadows_and_refuse_broken_absolute_pins() {
+        const BROKEN_PIN_EXIT: i32 = 7;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let mut context = command_fixture(&root);
+        let shadow = root.join("shadow");
+        crate::raw::create_dir_all(&shadow).unwrap();
+        for name in ["mise", "cargo-kani", "kani"] {
+            executable_fixture(
+                &shadow.join(name),
+                b"#!/bin/sh\nprintf 'WRONG\\n'\nexit 1\n",
+            );
+        }
+        let path =
+            std::env::join_paths([shadow.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .unwrap();
+        for (name, source, expected) in [
+            (
+                "core",
+                None,
+                "pinned cargo\nkani\n-p\ndomyjob-core\n".to_owned(),
+            ),
+            (
+                "standalone",
+                Some("verification/proof.rs"),
+                format!(
+                    "pinned standalone\n{}\n",
+                    root.join("verification/proof.rs").display()
+                ),
+            ),
+        ] {
+            assert_pinned_output(&context, &root, &path, (name, source, &expected));
+        }
+        let broken = shadow.join("broken-cargo-kani");
+        executable_fixture(
+            &broken,
+            format!("#!/bin/sh\nexit {BROKEN_PIN_EXIT}\n").as_bytes(),
+        );
+        context.cargo_proxy.selected = broken;
+        let failure = capture_observed(
+            default_proof_command(&context, &root, None).env("PATH", path),
+            CapturePlan {
+                evidence: &root,
+                name: "broken-pin",
+                limit_millis: LOCAL_LIMIT_MILLIS,
+                stdout_bytes: VERSION_BYTES,
+            },
+        )
+        .unwrap_err();
+        let CaptureError::Child(observed) = failure else {
+            panic!("the broken pin must fail through the executed child");
+        };
+        assert_eq!(observed.wait.unwrap().code(), Some(BROKEN_PIN_EXIT));
+        assert_eq!(bounded_bytes(&observed.stdout, VERSION_BYTES).unwrap(), b"");
+    }
 
     #[cfg(not(unix))]
     #[test]

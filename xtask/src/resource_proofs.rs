@@ -566,22 +566,13 @@ fn check_negative(report: &Report, negative: &Negative) -> Result<(), String> {
 }
 
 fn command(
-    root: &Path,
+    mut command: std::process::Command,
     target: &Path,
     report: &Path,
     (source, phase): (Option<&str>, Phase),
 ) -> std::process::Command {
-    let mut command = crate::raw::command("mise");
-    command
-        .current_dir(root)
-        .args(["x", "cargo:kani-verifier@0.68.0", "--"]);
-    if let Some(source) = source {
-        command
-            .arg("kani")
-            .arg(root.join(source))
-            .env("RUSTFLAGS", STANDALONE_RUSTFLAGS);
-    } else {
-        command.args(["cargo", "kani", "-p", "domyjob-core"]);
+    if source.is_some() {
+        command.env("RUSTFLAGS", STANDALONE_RUSTFLAGS);
     }
     command
         .args([
@@ -704,7 +695,7 @@ fn execute(
     let (directory, binding) = observation;
     let report_path = directory.join("results.json");
     let mut proof = command(
-        root,
+        binding.command(root, run.source),
         &directory.join("target"),
         &report_path,
         (run.source, run.phase),
@@ -784,7 +775,12 @@ mod tests {
     fn actual_proof_command_limits_jobs_and_applies_fail_fast_only_to_positives() {
         let root = std::path::Path::new("root");
         for phase in [super::Phase::Positive, super::Phase::NamedNegative] {
-            let command = super::command(root, root, root, (None, phase));
+            let command = super::command(
+                crate::raw::command("admitted proof"),
+                root,
+                root,
+                (None, phase),
+            );
             let arguments = command
                 .get_args()
                 .map(|value| value.to_string_lossy())
@@ -813,7 +809,12 @@ mod tests {
     fn standalone_commands_select_the_workspace_edition_and_isolate_loader_paths() {
         let root = std::path::Path::new("root");
         for source in [None, Some("verification/native-default-tool-binding.rs")] {
-            let command = super::command(root, root, root, (source, super::Phase::Positive));
+            let command = super::command(
+                crate::raw::command("admitted proof"),
+                root,
+                root,
+                (source, super::Phase::Positive),
+            );
             let variables = command
                 .get_envs()
                 .collect::<std::collections::BTreeMap<_, _>>();
