@@ -401,7 +401,10 @@ fn detail_view(frame: &mut Grid, area: Rect, model: &Model, now: Option<u64>) {
                 Line::from(""),
             ];
             if model.request.conversation.as_ref() == Some(id) {
-                lines.extend(message_detail(&model.snapshot.messages));
+                lines.extend(message_detail(
+                    &model.snapshot.messages,
+                    model.snapshot.history_scan,
+                ));
             } else {
                 lines.extend([
                     Line::from("Press Enter to inspect this conversation."),
@@ -532,8 +535,15 @@ const fn delivery_label(delivery: Delivery) -> &'static str {
     }
 }
 
-fn message_detail(messages: &[observer::Message]) -> Vec<Line> {
+fn message_detail(messages: &[observer::Message], scan: observer::HistoryScan) -> Vec<Line> {
     let mut lines = Vec::new();
+    if scan == observer::HistoryScan::Limited {
+        lines.push(Line::styled(
+            "History scan limit reached; older messages may be omitted.",
+            emphasis(AMBER),
+        ));
+        lines.push(Line::from(""));
+    }
     for message in messages {
         lines.push(Line::styled(
             format!(
@@ -566,8 +576,11 @@ fn message_detail(messages: &[observer::Message]) -> Vec<Line> {
         ));
         lines.push(Line::from(""));
     }
-    if lines.is_empty() {
-        lines.push(Line::from("No messages to display."));
+    if messages.is_empty() {
+        lines.push(Line::from(match scan {
+            observer::HistoryScan::WithinBudget => "No messages to display.",
+            observer::HistoryScan::Limited => "No messages in the scanned range.",
+        }));
     }
     lines
 }

@@ -2,7 +2,7 @@ use domyjob_core::chat::id::{AgentId, Conversation, Origin};
 use domyjob_core::dashboard::{self, IdentityMatch, Movement, Refresh, Section};
 
 pub(crate) use crate::chat::store::observer::Request;
-use crate::chat::store::observer::Snapshot;
+use crate::chat::store::observer::{HistoryScan, Snapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowId {
@@ -98,6 +98,7 @@ impl Model {
             self.request.conversation = None;
             self.snapshot.chats.clear();
             self.snapshot.messages.clear();
+            self.snapshot.history_scan = HistoryScan::default();
             self.selected = None;
             self.intended = None;
             self.picker = None;

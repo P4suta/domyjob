@@ -122,6 +122,212 @@ fn passive_observation_preserves_actual_database_bytes_and_recipient_receipts() 
     );
 }
 
+const ROOM_RECIPIENTS: usize = 32;
+
+fn receipt_room(
+    root: &tempfile::TempDir,
+    receipt_counts: &[usize],
+) -> (
+    super::super::Store,
+    Request,
+    Vec<domyjob_core::chat::event::Event>,
+) {
+    use domyjob_core::chat::event::Members;
+    use domyjob_core::chat::id::{RoomId, RoomName};
+
+    assert!(receipt_counts.iter().all(|count| *count <= ROOM_RECIPIENTS));
+    let store = store(root, "local");
+    let sender = register(&store, "sender", Mode::Interactive);
+    let recipients = (0..ROOM_RECIPIENTS)
+        .map(|index| register(&store, &format!("reader-{index}"), Mode::Interactive))
+        .collect::<Vec<_>>();
+    let room_id = RoomId::new(
+        store.origin().clone(),
+        RoomName::try_from("receipts".to_owned()).unwrap(),
+    );
+    let conversation = Conversation::Room(room_id.clone());
+    let sent = store
+        .write(|tx| {
+            let mut members = recipients.clone();
+            members.push(sender.clone());
+            tx.author(
+                Priority::Ordinary,
+                Body::Room {
+                    name: room_id.name().clone(),
+                    topic: None,
+                    members: Members::try_from(members.clone())?,
+                },
+            )?;
+            let mut messages = Vec::new();
+            for (index, count) in receipt_counts.iter().enumerate() {
+                let sent = tx.author(
+                    Priority::Ordinary,
+                    Body::Message {
+                        conversation: conversation.clone(),
+                        from: sender.name().clone(),
+                        text: Text::try_from(format!("Room message {index}"))?,
+                        audience: audience(&members)?,
+                        intent: Intent::Send {},
+                        at: Stamp::from_unix_millis(1),
+                        notice: Some(Notice {
+                            recipients: Members::try_from(recipients.clone())?,
+                            urgent: false,
+                            subject: None,
+                            question: None,
+                        }),
+                    },
+                )?;
+                for recipient in recipients.iter().take(*count) {
+                    tx.receipt(recipient, &sent, Delivery::Acknowledged)?;
+                }
+                messages.push(sent);
+            }
+            Ok(messages)
+        })
+        .unwrap();
+    (
+        store,
+        Request {
+            actor: Some(sender),
+            conversation: Some(conversation),
+            ..Request::default()
+        },
+        sent,
+    )
+}
+
+#[test]
+fn receipt_backlog_does_not_hide_room_messages_or_mutate_the_database() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, request, sent) = receipt_room(&root, &[ROOM_RECIPIENTS]);
+    let before = database_bytes(&store.paths().database());
+    let observed = observe(&State::at(&root.path().join("local")), &request).unwrap();
+    assert_eq!(observed.messages.len(), 1);
+    assert_eq!(observed.history_scan, super::HistoryScan::WithinBudget);
+    let found = observed.messages.first().unwrap();
+    assert_eq!(found.id, *sent.first().unwrap().id());
+    assert_eq!(found.text, "Room message 0");
+    assert_eq!(found.recipients.len(), ROOM_RECIPIENTS);
+    assert!(
+        found
+            .recipients
+            .iter()
+            .all(|(_, delivery)| *delivery == Delivery::Acknowledged)
+    );
+    assert_eq!(database_bytes(&store.paths().database()), before);
+}
+
+#[test]
+fn message_and_scan_budgets_keep_the_newest_messages_in_display_order() {
+    use super::{HistoryScan, MAX_MESSAGES, MAX_THREAD_ROWS};
+
+    let mut exact_rows = vec![ROOM_RECIPIENTS; MAX_MESSAGES];
+    *exact_rows.first_mut().unwrap() = 0;
+    assert_eq!(
+        exact_rows
+            .iter()
+            .map(|receipts| receipts + 1)
+            .sum::<usize>(),
+        MAX_THREAD_ROWS
+    );
+    for (receipts, count, scan) in [
+        (
+            vec![0; MAX_MESSAGES + 1],
+            MAX_MESSAGES,
+            HistoryScan::WithinBudget,
+        ),
+        (exact_rows, MAX_MESSAGES, HistoryScan::WithinBudget),
+        (
+            vec![ROOM_RECIPIENTS; MAX_MESSAGES],
+            MAX_MESSAGES - 1,
+            HistoryScan::Limited,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (store, request, sent) = receipt_room(&root, &receipts);
+        let before = database_bytes(&store.paths().database());
+        let observed = observe(&State::at(&root.path().join("local")), &request).unwrap();
+        assert_eq!(observed.history_scan, scan);
+        let expected = sent
+            .iter()
+            .rev()
+            .take(count)
+            .rev()
+            .map(domyjob_core::chat::event::Event::id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observed
+                .messages
+                .iter()
+                .map(|message| &message.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(database_bytes(&store.paths().database()), before);
+    }
+}
+
+fn thread_event_at(
+    store: &super::super::Store,
+    request: &Request,
+    position: usize,
+) -> domyjob_core::chat::id::EventId {
+    use super::super::tables::{Reader as _, THREADS, thread_bounds};
+    use redb::ReadableTable as _;
+
+    store
+        .read(|read| {
+            let (first, last) = thread_bounds(request.conversation.as_ref().unwrap());
+            let table = read.table(THREADS)?;
+            let (_, id) = table
+                .range(first.as_str()..last.as_str())?
+                .rev()
+                .nth(position)
+                .transpose()?
+                .unwrap();
+            Ok(domyjob_core::chat::id::EventId::try_from(
+                id.value().to_owned(),
+            )?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn scanned_message_and_receipt_records_are_validated_without_reading_past_the_budget() {
+    use super::{HistoryScan, MAX_MESSAGES, MAX_THREAD_ROWS};
+
+    for (position, limited) in [
+        (0, false),
+        (ROOM_RECIPIENTS, false),
+        (MAX_THREAD_ROWS, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let receipts = if limited {
+            vec![ROOM_RECIPIENTS; MAX_MESSAGES]
+        } else {
+            vec![ROOM_RECIPIENTS]
+        };
+        let (store, request, _) = receipt_room(&root, &receipts);
+        let id = thread_event_at(&store, &request, position);
+        store
+            .write(|tx| {
+                tx.transaction()
+                    .open_table(super::super::tables::EVENTS)?
+                    .insert(super::super::tables::event_key(&id).as_str(), "{")?;
+                Ok(())
+            })
+            .unwrap();
+        let before = database_bytes(&store.paths().database());
+        let observed = observe(&State::at(&root.path().join("local")), &request);
+        if limited {
+            assert_eq!(observed.unwrap().history_scan, HistoryScan::Limited);
+        } else {
+            assert!(matches!(observed, Err(super::StoreError::Record(_))));
+        }
+        assert_eq!(database_bytes(&store.paths().database()), before);
+    }
+}
+
 #[test]
 fn direct_chat_labels_identify_the_viewers_counterpart_and_preserve_canonical_identity() {
     let root = tempfile::tempdir().unwrap();

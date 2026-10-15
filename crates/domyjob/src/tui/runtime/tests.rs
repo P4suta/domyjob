@@ -20,6 +20,59 @@ fn chats_prompt_for_an_explicit_local_viewing_identity() {
 }
 
 #[test]
+fn selecting_another_conversation_resets_limited_history_before_refresh() {
+    use crate::chat::store::observer::{Chat, HistoryScan};
+    use crate::tui::model::{Request, RowId};
+    use domyjob_core::chat::id::{AgentId, AgentName, Conversation, Origin, RoomId, RoomName};
+
+    let actor = AgentId::new(
+        AgentName::try_from("viewer".to_owned()).unwrap(),
+        Origin::from_entropy([1; 16]),
+    );
+    let conversation = |name: &str| {
+        Conversation::Room(RoomId::new(
+            Origin::from_entropy([1; 16]),
+            RoomName::try_from(name.to_owned()).unwrap(),
+        ))
+    };
+    let next = conversation("next");
+    let mut model = Model {
+        selected: Some(RowId::Chat(next.clone())),
+        request: Request {
+            actor: Some(actor.clone()),
+            conversation: Some(conversation("previous")),
+            ..Request::default()
+        },
+        snapshot: Snapshot {
+            actor: Some(actor),
+            chats: vec![Chat {
+                id: next.clone(),
+                label: "Next conversation".to_owned(),
+            }],
+            history_scan: HistoryScan::Limited,
+            ..Snapshot::default()
+        },
+        ..Model::default()
+    };
+    assert!(key_event(
+        &mut model,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    assert_eq!(model.request.conversation, Some(next));
+    assert!(model.snapshot.messages.is_empty());
+    assert_eq!(model.snapshot.history_scan, HistoryScan::WithinBudget);
+    let generation = model.refresh.request().unwrap();
+    assert_eq!(model.refresh.pending(), Some(generation));
+    model.accept(
+        generation,
+        &model.request.clone(),
+        Err("observer busy".to_owned()),
+    );
+    assert_eq!(model.error.as_deref(), Some("observer busy"));
+    assert_eq!(model.snapshot.history_scan, HistoryScan::WithinBudget);
+}
+
+#[test]
 fn nonterminal_startup_refuses_before_a_worker_or_terminal_mode_is_entered() {
     let output = crate::raw::output().into_stream();
     assert!(matches!(

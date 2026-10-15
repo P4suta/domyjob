@@ -6,6 +6,7 @@ use domyjob_core::terminal_input::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers
 use super::model::{Model, RowId};
 use super::worker::Worker;
 use super::{TuiError, frame::Grid, output, render};
+use crate::chat::store::observer::HistoryScan;
 use crate::platform::{clock, terminal};
 
 const POLL_MILLIS: u64 = 50;
@@ -137,6 +138,7 @@ fn key_event(model: &mut Model, key: KeyEvent) -> bool {
         if let Some(RowId::Chat(conversation)) = &model.selected {
             model.request.conversation = Some(conversation.clone());
             model.snapshot.messages.clear();
+            model.snapshot.history_scan = HistoryScan::default();
         }
     } else {
         controls(model, key.code);

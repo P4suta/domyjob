@@ -13,6 +13,14 @@ use super::{Link, Reader as _, StoreError, views};
 use crate::{layout, lock::OsLock, state_io};
 
 pub(crate) const MAX_MESSAGES: usize = 32;
+const MAX_THREAD_ROWS: usize = 1024;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryScan {
+    #[default]
+    WithinBudget,
+    Limited,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Request {
@@ -60,6 +68,7 @@ pub(crate) struct Snapshot {
     pub(crate) agents: Vec<Agent>,
     pub(crate) chats: Vec<Chat>,
     pub(crate) messages: Vec<Message>,
+    pub(crate) history_scan: HistoryScan,
     pub(crate) local_agents: Vec<AgentId>,
 }
 
@@ -279,12 +288,9 @@ fn messages(
     notifications: &Notifications,
 ) -> Result<(), StoreError> {
     let (first, last) = super::tables::thread_bounds(conversation);
-    for entry in read
-        .table(super::tables::THREADS)?
-        .range(first.as_str()..last.as_str())?
-        .rev()
-        .take(MAX_MESSAGES)
-    {
+    let thread_index = read.table(super::tables::THREADS)?;
+    let mut rows = thread_index.range(first.as_str()..last.as_str())?.rev();
+    for entry in rows.by_ref().take(MAX_THREAD_ROWS) {
         let (_, id) = entry?;
         let id = EventId::try_from(id.value().to_owned())?;
         let Some(event) = views::event(read, &id)? else {
@@ -326,7 +332,13 @@ fn messages(
                 at: *at,
                 recipients,
             });
+            if snapshot.messages.len() == MAX_MESSAGES {
+                break;
+            }
         }
+    }
+    if snapshot.messages.len() < MAX_MESSAGES && rows.next().transpose()?.is_some() {
+        snapshot.history_scan = HistoryScan::Limited;
     }
     snapshot.messages.reverse();
     Ok(())

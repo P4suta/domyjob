@@ -91,6 +91,15 @@ fn populated() -> Model {
     }
 }
 
+fn conversation_model() -> Model {
+    let mut model = populated();
+    let conversation = model.snapshot.chats.first().unwrap().id.clone();
+    model.section = Section::Chats;
+    model.selected = Some(RowId::Chat(conversation.clone()));
+    model.request.conversation = Some(conversation);
+    model
+}
+
 fn screen(model: &Model, size: (u16, u16), now: u64) -> Buffer {
     screen_at(model, size, Some(now))
 }
@@ -311,11 +320,8 @@ fn utf8_and_untrusted_controls_are_rendered_as_literal_safe_text() {
 
 #[test]
 fn conversation_details_show_each_recipients_own_delivery_progress() {
-    let mut model = populated();
-    let conversation = model.snapshot.chats.first().unwrap().id.clone();
-    model.section = Section::Chats;
-    model.selected = Some(RowId::Chat(conversation.clone()));
-    model.request.conversation = Some(conversation);
+    let mut model = conversation_model();
+    model.snapshot.history_scan = observer::HistoryScan::Limited;
     model.snapshot.messages.push(observer::Message {
         id: EventId::new(Origin::from_entropy([1; 16]), NonZeroU64::new(1).unwrap()),
         from: "alice".to_owned(),
@@ -344,6 +350,7 @@ fn conversation_details_show_each_recipients_own_delivery_progress() {
     });
     let shown = text(&screen(&model, (128, 36), OBSERVED));
     for expected in [
+        "History scan limit reached",
         "Checked invariants",
         "Pending",
         "Delivered",
@@ -355,6 +362,29 @@ fn conversation_details_show_each_recipients_own_delivery_progress() {
     }
     for (recipient, _) in &model.snapshot.messages.first().unwrap().recipients {
         assert!(shown.contains(&recipient.to_string()));
+    }
+}
+
+#[test]
+fn an_incomplete_history_scan_is_distinct_from_an_empty_conversation() {
+    let mut model = conversation_model();
+    for (scan, expected) in [
+        (
+            observer::HistoryScan::WithinBudget,
+            "No messages to display.",
+        ),
+        (
+            observer::HistoryScan::Limited,
+            "No messages in the scanned range.",
+        ),
+    ] {
+        model.snapshot.history_scan = scan;
+        let shown = text(&screen(&model, (128, 36), OBSERVED));
+        assert!(shown.contains(expected), "missing {expected}:\n{shown}");
+        assert_eq!(
+            shown.contains("History scan limit reached"),
+            scan == observer::HistoryScan::Limited
+        );
     }
 }
 

@@ -83,3 +83,52 @@ fn a_late_completion_cannot_replace_a_newer_viewing_identity() {
     assert!(model.refresh.pending().is_none());
     assert!(model.refresh.request().is_some());
 }
+
+#[test]
+fn changing_the_viewing_actor_clears_limited_history_before_pending_and_failed_refreshes() {
+    use crate::chat::store::observer::HistoryScan;
+
+    let previous = agent([1; 16]).id;
+    let next = AgentId::new(
+        AgentName::try_from("next".to_owned()).unwrap(),
+        previous.origin().clone(),
+    );
+    let old = Request {
+        actor: Some(previous),
+        ..Request::default()
+    };
+    let mut model = Model {
+        request: old.clone(),
+        snapshot: Snapshot {
+            actor: old.actor.clone(),
+            local_agents: vec![next.clone()],
+            history_scan: HistoryScan::Limited,
+            ..Snapshot::default()
+        },
+        ..Model::default()
+    };
+    let old_generation = model.refresh.request().unwrap();
+    model.choose_actor(0);
+    assert_eq!(model.request.actor.as_ref(), Some(&next));
+    assert_eq!(model.snapshot.history_scan, HistoryScan::WithinBudget);
+    assert!(model.snapshot.messages.is_empty());
+    assert!(model.snapshot.chats.is_empty());
+    assert_eq!(model.refresh.pending(), Some(old_generation));
+    model.accept(
+        old_generation,
+        &old,
+        Ok(Snapshot {
+            history_scan: HistoryScan::Limited,
+            ..Snapshot::default()
+        }),
+    );
+    assert_eq!(model.snapshot.history_scan, HistoryScan::WithinBudget);
+    let generation = model.refresh.request().unwrap();
+    model.accept(
+        generation,
+        &model.request.clone(),
+        Err("new actor unavailable".to_owned()),
+    );
+    assert_eq!(model.error.as_deref(), Some("new actor unavailable"));
+    assert_eq!(model.snapshot.history_scan, HistoryScan::WithinBudget);
+}
