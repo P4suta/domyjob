@@ -176,6 +176,22 @@ fn clean_in(tx: &Tx<'_>, conversation: &Conversation) -> Result<usize, StoreErro
         }
     }
     for (event, _) in &events {
+        if let domyjob_core::chat::event::Body::Message {
+            notice: Some(notice),
+            ..
+        } = event.body()
+            && notice.urgent
+        {
+            for recipient in notice.recipients.agents() {
+                if views::delivery(write, recipient, event.id())?
+                    != domyjob_core::chat::notification::Delivery::Acknowledged
+                {
+                    return Err(StoreError::Invalid(domyjob_core::chat::id::Invalid(
+                        "urgent messages must be acknowledged before cleaning",
+                    )));
+                }
+            }
+        }
         let open = write
             .open_table(OPEN)?
             .get(event_key(event.id()).as_str())?

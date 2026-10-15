@@ -28,6 +28,7 @@ fn message(
         audience: audience(members.iter().copied()).unwrap(),
         intent,
         at: Stamp::from_unix_millis(0),
+        notice: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn reply(request: &Event, from: &AgentId) -> Body {
             request: request.id().clone(),
         },
         at: Stamp::from_unix_millis(0),
+        notice: None,
     }
 }
 
@@ -440,6 +442,7 @@ fn follow_ups_must_preserve_the_question_thread_and_advance_its_clock() {
                     request: question.id().clone(),
                 },
                 at: Stamp::from_unix_millis(0),
+                notice: None,
             },
             Body::Resolved {
                 request: question.id().clone(),

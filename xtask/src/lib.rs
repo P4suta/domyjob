@@ -10,6 +10,7 @@ pub mod exceptions;
 pub mod fixes;
 pub mod macos_package;
 pub mod ownership;
+pub mod parent_refinement;
 
 mod raw {
     #![expect(
@@ -21,7 +22,7 @@ mod raw {
     use std::path::Path;
     use std::process::Command;
 
-    pub(super) fn command(program: &str) -> Command {
+    pub(super) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         Command::new(program)
     }
 
@@ -38,6 +39,10 @@ mod raw {
         std::fs::create_dir_all(path)
     }
 
+    pub(super) fn create_new_file(path: &Path) -> io::Result<std::fs::File> {
+        std::fs::File::create_new(path)
+    }
+
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
     }
@@ -49,6 +54,7 @@ mod raw {
         )
     }
 }
+mod proof_tools;
 pub mod pure_core;
 pub mod release;
 pub mod release_orchestration;
@@ -61,6 +67,8 @@ pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
+    #[error("parent implementation refinement: {0}")]
+    Refinement(String),
     #[error("reading {path}: {source}")]
     Read {
         path: PathBuf,
@@ -152,32 +160,38 @@ struct SourcePolicy {
     findings: Vec<String>,
 }
 
-fn verifier_derive(attribute: &syn::Attribute) -> bool {
+fn verifier_attribute(attribute: &syn::Attribute) -> bool {
     let Ok(arguments) = attribute.parse_args_with(
         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
     ) else {
         return false;
     };
     let entries: Vec<_> = arguments.iter().collect();
-    let [syn::Meta::Path(condition), syn::Meta::List(derive)] = entries.as_slice() else {
+    let [syn::Meta::Path(condition), syn::Meta::List(directive)] = entries.as_slice() else {
         return false;
     };
-    if !condition.is_ident("kani") || !derive.path.is_ident("derive") {
+    if !condition.is_ident("kani") {
         return false;
     }
-    let Ok(paths) = derive.parse_args_with(
+    let Ok(paths) = directive.parse_args_with(
         syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
     ) else {
         return false;
     };
-    let derived: Vec<_> = paths.iter().collect();
-    let [path] = derived.as_slice() else {
+    let requested: Vec<_> = paths.iter().collect();
+    let [path] = requested.as_slice() else {
         return false;
     };
-    path.segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .eq(["kani", "Arbitrary"])
+    if directive.path.is_ident("feature") {
+        matches!(attribute.style, syn::AttrStyle::Inner(_)) && path.is_ident("ascii_char")
+    } else {
+        directive.path.is_ident("derive")
+            && path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .eq(["kani", "Arbitrary"])
+    }
 }
 
 impl<'ast> Visit<'ast> for SourcePolicy {
@@ -194,7 +208,7 @@ impl<'ast> Visit<'ast> for SourcePolicy {
         }
         let platform_branch = attribute.path().is_ident("cfg")
             && matches!(&attribute.meta, syn::Meta::List(list) if !matches!(list.tokens.to_string().as_str(), "test" | "kani"))
-            || attribute.path().is_ident("cfg_attr") && !verifier_derive(attribute);
+            || attribute.path().is_ident("cfg_attr") && !verifier_attribute(attribute);
         if platform_branch && !self.effect_module {
             self.findings.push(format!(
                 "{line}: platform branches belong in the platform or process adapter"
@@ -212,7 +226,9 @@ fn effect_module(path: &str) -> bool {
             | "crates/domyjob/tests/e2e/os.rs"
             | "xtask/src/ci.rs"
             | "xtask/src/macos_package.rs"
+            | "xtask/src/proof_tools.rs"
             | "xtask/src/release.rs"
+            | "xtask/src/resource_proofs/process.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
         || path.starts_with("crates/domyjob/tests/e2e/os/")
@@ -363,7 +379,12 @@ fn comment_findings_with(
 }
 
 pub fn gates(root: &Path) -> Result<usize, GateError> {
-    gates_with(root, &directory_entries, &raw::read_to_string)
+    let findings = gates_with(root, &directory_entries, &raw::read_to_string)?;
+    if findings != 0 {
+        return Ok(findings);
+    }
+    verification::check_parent_refinement(root).map_err(GateError::Refinement)?;
+    Ok(findings)
 }
 
 fn gates_with(
@@ -508,7 +529,9 @@ mod tests {
             "crates/domyjob/src/platform/windows_acl.rs",
             "xtask/src/ci.rs",
             "xtask/src/macos_package.rs",
+            "xtask/src/proof_tools.rs",
             "xtask/src/release.rs",
+            "xtask/src/resource_proofs/process.rs",
             "crates/domyjob/src/process/windows.rs",
             "crates/domyjob/tests/e2e/os/windows.rs",
         ] {
@@ -518,6 +541,11 @@ mod tests {
             "crates/domyjob/src/store.rs",
             "crates/domyjob/src/platform_extra.rs",
             "crates/domyjob/tests/e2e/other.rs",
+            "xtask/src/resource_proofs.rs",
+            "xtask/src/resource_proofs/process_extra.rs",
+            "xtask/src/resource_proofs/process/other.rs",
+            "xtask/src/proof_tools/native_default.rs",
+            "xtask/src/proof_tools_extra.rs",
         ] {
             assert!(!effect_module(path), "{path}");
         }
@@ -556,7 +584,28 @@ mod tests {
     }
 
     #[test]
-    fn verifier_derives_are_distinct_from_platform_and_lint_branches() {
+    fn verifier_process_adapter_accepts_no_adjacent_platform_scope() {
+        let source = syn::parse_file("#[cfg(unix)] fn native_status() {}").unwrap();
+        for (path, admitted) in [
+            ("xtask/src/resource_proofs/process.rs", true),
+            ("xtask/src/resource_proofs.rs", false),
+            ("xtask/src/resource_proofs/process_extra.rs", false),
+            ("xtask/src/resource_proofs/process/other.rs", false),
+            ("xtask/src/proof_tools.rs", true),
+            ("xtask/src/proof_tools/native_default.rs", false),
+            ("xtask/src/proof_tools_extra.rs", false),
+        ] {
+            let mut policy = SourcePolicy {
+                effect_module: effect_module(path),
+                ..SourcePolicy::default()
+            };
+            policy.visit_file(&source);
+            assert_eq!(policy.findings.is_empty(), admitted, "{path}");
+        }
+    }
+
+    #[test]
+    fn verifier_attributes_are_distinct_from_platform_and_lint_branches() {
         for (source, refused) in [
             (
                 "#[cfg_attr(kani, derive(kani::Arbitrary))] struct State;",
@@ -571,6 +620,22 @@ mod tests {
                 "#[cfg_attr(kani, derive(kani::Arbitrary), allow(dead_code))] struct State;",
                 true,
             ),
+            ("#![cfg_attr(kani, feature(ascii_char))]", false),
+            ("#![cfg_attr(windows, feature(ascii_char))]", true),
+            (
+                "#![cfg_attr(all(kani, windows), feature(ascii_char))]",
+                true,
+            ),
+            ("#![cfg_attr(kani, feature(core_intrinsics))]", true),
+            (
+                "#![cfg_attr(kani, feature(ascii_char, core_intrinsics))]",
+                true,
+            ),
+            (
+                "#![cfg_attr(kani, feature(ascii_char), allow(dead_code))]",
+                true,
+            ),
+            ("#[cfg_attr(kani, feature(ascii_char))] struct State;", true),
         ] {
             let mut policy = SourcePolicy::default();
             policy.visit_file(&syn::parse_file(source).unwrap());
@@ -662,6 +727,24 @@ mod tests {
         )
         .unwrap();
         raw::write(&root.path().join("README.md"), b"# prose\n").unwrap();
+        assert!(matches!(
+            gates(root.path()),
+            Err(GateError::Refinement(reason))
+                if reason.contains("crates/domyjob-core/src/chat/ledger.rs")
+        ));
+        for (file, source) in crate::parent_refinement::FILES.iter().zip([
+            include_str!("../../crates/domyjob-core/src/chat/ledger.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/ledger/parent_identity.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/id.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/event.rs"),
+            include_str!("../../crates/domyjob/src/chat/store/views.rs"),
+            include_str!("../../crates/domyjob-core/src/lib.rs"),
+            include_str!("../../crates/domyjob-core/src/chat.rs"),
+        ]) {
+            let path = root.path().join(file);
+            raw::create_dir_all(path.parent().unwrap()).unwrap();
+            raw::write(&path, source.as_bytes()).unwrap();
+        }
         assert_eq!(gates(root.path()).unwrap(), 0);
         raw::write(&root.path().join("settings.TOML"), b"# setting\n").unwrap();
         raw::write(

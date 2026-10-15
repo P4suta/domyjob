@@ -14,7 +14,11 @@ use crate::platform::clock::{self, Deadline, Waited};
 
 const EXCHANGE_SECONDS: u64 = 60;
 const MAX_BACKOFF_MILLIS: u64 = 60_000;
-const PEER_REFRESH_MILLIS: u64 = 60_000;
+const QUESTION_REFRESH_MILLIS: u64 = 1000;
+const SIGNAL_CAPACITY: usize = 4;
+const HEARTBEAT_GRACE_SECONDS: u64 = 15;
+const INITIAL_BACKOFF_MILLIS: u64 = 1000;
+const BACKOFF_FACTOR: u64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServeError {
@@ -52,11 +56,12 @@ pub(crate) fn serve() -> Result<(), ServeError> {
     )
     .map_err(StoreError::from)?;
     ops::publish_machine(&store)?;
-    let mut pulse = Pulse::new(&store, PEER_REFRESH_MILLIS)?;
+    let mut pulse = Pulse::new(&store, QUESTION_REFRESH_MILLIS)?;
     let mut workers: BTreeMap<String, Worker> = BTreeMap::new();
     loop {
+        store.escalate(clock::stamp())?;
         reconcile(&store, &mut workers)?;
-        if pulse.next(Deadline::after_millis(PEER_REFRESH_MILLIS))? {
+        if pulse.next(Deadline::after_millis(QUESTION_REFRESH_MILLIS))? {
             for worker in workers.values() {
                 let _delivered = worker.sender.try_send(Signal::Local);
             }
@@ -81,7 +86,7 @@ fn reconcile(store: &Store, workers: &mut BTreeMap<String, Worker>) -> Result<()
         if workers.contains_key(&alias) {
             continue;
         }
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let (sender, receiver) = mpsc::sync_channel(SIGNAL_CAPACITY);
         let thread = std::thread::spawn({
             let store = store.clone();
             let sender = sender.clone();
@@ -110,7 +115,8 @@ fn start_wait(store: &Store, alias: &str, peer: &Origin, sender: &SyncSender<Sig
     std::thread::spawn(move || {
         let result = request.map_err(SyncError::from).and_then(|seen| {
             let mut channel = Ssh::new(&alias)?;
-            let deadline = Deadline::after_seconds(HEARTBEAT_SECONDS.saturating_add(15));
+            let deadline =
+                Deadline::after_seconds(HEARTBEAT_SECONDS.saturating_add(HEARTBEAT_GRACE_SECONDS));
             channel.call(
                 ChatRequest::Wait {
                     from: store_origin,
@@ -139,17 +145,19 @@ fn follow(
         alias,
         origin: peer,
     } = *peer;
-    let mut backoff = 1000_u64;
+    let mut backoff = INITIAL_BACKOFF_MILLIS;
     let mut waiting = false;
     let mut exchange = true;
     loop {
         if exchange {
             let deadline = Deadline::after_seconds(EXCHANGE_SECONDS);
             match sync::sync(store, Some(alias), deadline) {
-                Ok(report) if report.complete() => backoff = 1000,
+                Ok(report) if report.complete() => backoff = INITIAL_BACKOFF_MILLIS,
                 Ok(_) | Err(_) => {
                     clock::pause_millis(backoff);
-                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF_MILLIS);
+                    backoff = backoff
+                        .saturating_mul(BACKOFF_FACTOR)
+                        .min(MAX_BACKOFF_MILLIS);
                 }
             }
         }
@@ -167,7 +175,9 @@ fn follow(
                     Ok(_) => true,
                     Err(_) => {
                         clock::pause_millis(backoff);
-                        backoff = backoff.saturating_mul(2).min(MAX_BACKOFF_MILLIS);
+                        backoff = backoff
+                            .saturating_mul(BACKOFF_FACTOR)
+                            .min(MAX_BACKOFF_MILLIS);
                         true
                     }
                 }

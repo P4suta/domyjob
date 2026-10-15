@@ -16,6 +16,7 @@ fn direct(from: &AgentId, to: &AgentId, intent: Intent) -> Body {
         audience: audience([from, to]).unwrap(),
         intent,
         at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+        notice: None,
     }
 }
 
@@ -36,8 +37,57 @@ fn write(store: &Store, body: Body) -> Event {
         .unwrap()
 }
 
+fn local_pair(root: &tempfile::TempDir) -> (Store, AgentId, AgentId) {
+    let local = store(root, "local");
+    let alice = register(&local, "alice", Mode::Interactive);
+    let bob = register(&local, "bob", Mode::Interactive);
+    (local, alice, bob)
+}
+
+fn substituted_event_store(root: &tempfile::TempDir) -> (Store, Event) {
+    let (local, alice, bob) = local_pair(root);
+    let requested = write(&local, direct(&alice, &bob, Intent::Send {}));
+    let replacement = write(&local, direct(&alice, &bob, Intent::Send {}));
+    assert_ne!(requested.id(), replacement.id());
+    let encoded = serde_json::to_string(&replacement).unwrap();
+    local
+        .write(|tx| {
+            tx.transaction().open_table(super::tables::EVENTS)?.insert(
+                super::tables::event_key(requested.id()).as_str(),
+                encoded.as_str(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    (local, requested)
+}
+
+#[test]
+fn stored_events_reject_a_valid_payload_under_a_different_event_key() {
+    let root = tempfile::tempdir().unwrap();
+    let (local, requested) = substituted_event_store(&root);
+    let observed = local.read(|read| super::views::stored(read, requested.id()));
+    assert!(
+        matches!(observed, Err(StoreError::Corrupt("event identity"))),
+        "a different event's valid payload was returned: {observed:?}"
+    );
+}
+
+#[test]
+fn transaction_parent_rejects_a_valid_payload_under_a_different_event_key() {
+    use domyjob_core::chat::ledger::Ledger;
+    let root = tempfile::tempdir().unwrap();
+    let (local, requested) = substituted_event_store(&root);
+    let observed = local.write(|tx| tx.parent(requested.id()));
+    assert!(
+        matches!(&observed, Err(StoreError::Corrupt("event identity"))),
+        "the parent port returned a different event: {observed:?}"
+    );
+}
+
 fn exchange(client: &Store, node: &Store) {
-    for _ in 0..16 {
+    const MAX_EXCHANGE_ROUNDS: usize = 16;
+    for _ in 0..MAX_EXCHANGE_ROUNDS {
         let offer = client.offer(node.origin()).unwrap().unwrap();
         let answer = node.respond(&offer).unwrap().unwrap();
         let progress = client.accept(&offer, answer).unwrap().unwrap();
@@ -46,6 +96,184 @@ fn exchange(client: &Store, node: &Store) {
         }
     }
     panic!("the exchange did not settle");
+}
+
+#[test]
+fn recipients_sync_delivery_read_and_ack_without_advancing_each_other() {
+    use domyjob_core::chat::notification::Delivery;
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = (store(&root, "a"), store(&root, "b"));
+    let alice = register(&a, "alice", Mode::Interactive);
+    let bob = register(&b, "bob", Mode::Interactive);
+    let message = write(&a, direct(&alice, &bob, Intent::Send {}));
+    exchange(&a, &b);
+    for stage in [Delivery::Delivered, Delivery::Read, Delivery::Acknowledged] {
+        b.write(|tx| tx.receipt(&bob, &message, stage)).unwrap();
+        exchange(&b, &a);
+        assert_eq!(
+            a.read(|read| super::delivery(read, &bob, message.id()))
+                .unwrap(),
+            stage
+        );
+        assert_eq!(
+            a.read(|read| super::delivery(read, &alice, message.id()))
+                .unwrap(),
+            Delivery::Pending
+        );
+    }
+    let seen = b.local_seen().unwrap();
+    b.write(|tx| tx.receipt(&bob, &message, Delivery::Delivered))
+        .unwrap();
+    assert_eq!(b.local_seen().unwrap(), seen);
+}
+
+#[test]
+fn an_unanswered_question_escalates_once_at_its_deadline() {
+    use domyjob_core::chat::event::Stamp;
+    use domyjob_core::chat::id::Line;
+    use domyjob_core::chat::notification::{Notice, Question};
+    let root = tempfile::tempdir().unwrap();
+    let (local, alice, bob) = local_pair(&root);
+    let fallback = register(&local, "fallback", Mode::Interactive);
+    let mut question = ask(&alice, &bob);
+    if let Body::Message { notice, .. } = &mut question {
+        *notice = Some(Notice {
+            recipients: Members::try_from(vec![bob]).unwrap(),
+            urgent: false,
+            subject: None,
+            question: Some(
+                Question::new(
+                    Line::try_from("Approve or explain".to_owned()).unwrap(),
+                    1,
+                    fallback.clone(),
+                )
+                .unwrap(),
+            ),
+        });
+    }
+    let question = write(&local, question);
+    assert_eq!(local.escalate(Stamp::from_unix_millis(999)).unwrap(), 0);
+    assert_eq!(local.escalate(Stamp::from_unix_millis(1000)).unwrap(), 1);
+    assert_eq!(local.escalate(Stamp::from_unix_millis(2000)).unwrap(), 0);
+    let forwarded = local
+        .read(|read| super::escalation(read, question.id()))
+        .unwrap()
+        .unwrap();
+    let forwarded = local
+        .read(|read| super::event(read, &forwarded))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(forwarded.body(), Body::Message {
+        intent: Intent::Ask { responder, .. }, notice: Some(notice), ..
+    } if *responder == fallback && notice.urgent));
+    assert_eq!(
+        local.read(|read| super::urgent(read, &fallback)).unwrap(),
+        [forwarded.id().clone()]
+    );
+}
+
+#[test]
+fn a_reply_acknowledges_an_urgent_message_and_releases_stop() {
+    use domyjob_core::chat::notification::{Delivery, Notice};
+    let root = tempfile::tempdir().unwrap();
+    let (local, alice, bob) = local_pair(&root);
+    let mut message = direct(&alice, &bob, Intent::Send {});
+    if let Body::Message { notice, .. } = &mut message {
+        *notice = Some(Notice {
+            recipients: Members::try_from(vec![bob.clone()]).unwrap(),
+            urgent: true,
+            subject: None,
+            question: None,
+        });
+    }
+    let message = write(&local, message);
+    write(
+        &local,
+        direct(
+            &bob,
+            &alice,
+            Intent::Reply {
+                request: message.id().clone(),
+            },
+        ),
+    );
+    assert_eq!(
+        local
+            .read(|read| super::delivery(read, &bob, message.id()))
+            .unwrap(),
+        Delivery::Acknowledged
+    );
+    assert_eq!(
+        local.read(|read| super::urgent(read, &bob)).unwrap(),
+        Vec::new()
+    );
+}
+
+#[test]
+fn room_receipts_advance_only_the_named_recipient() {
+    use domyjob_core::chat::notification::{Delivery, Notice};
+    let root = tempfile::tempdir().unwrap();
+    let local = store(&root, "local");
+    let sender = register(&local, "sender", Mode::Interactive);
+    let first = register(&local, "first", Mode::Interactive);
+    let second = register(&local, "second", Mode::Interactive);
+    let name = RoomName::try_from("attention".to_owned()).unwrap();
+    write(
+        &local,
+        Body::Room {
+            name: name.clone(),
+            topic: None,
+            members: Members::try_from(vec![sender.clone(), first.clone(), second.clone()])
+                .unwrap(),
+        },
+    );
+    let message = write(
+        &local,
+        Body::Message {
+            conversation: Conversation::Room(domyjob_core::chat::id::RoomId::new(
+                local.origin().clone(),
+                name,
+            )),
+            from: sender.name().clone(),
+            text: Text::try_from("review".to_owned()).unwrap(),
+            audience: audience([&sender, &first, &second]).unwrap(),
+            intent: Intent::Send {},
+            at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+            notice: Some(Notice {
+                recipients: Members::try_from(vec![first.clone(), second.clone()]).unwrap(),
+                urgent: true,
+                subject: None,
+                question: None,
+            }),
+        },
+    );
+    local
+        .write(|tx| tx.receipt(&first, &message, Delivery::Acknowledged))
+        .unwrap();
+    assert_eq!(
+        local
+            .read(|read| super::delivery(read, &first, message.id()))
+            .unwrap(),
+        Delivery::Acknowledged
+    );
+    assert_eq!(
+        local
+            .read(|read| super::delivery(read, &second, message.id()))
+            .unwrap(),
+        Delivery::Pending
+    );
+    assert_eq!(
+        local.read(|read| super::urgent(read, &first)).unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        local.read(|read| super::urgent(read, &second)).unwrap(),
+        [message.id().clone()]
+    );
+    let error = local
+        .clean(message.body().conversation().unwrap())
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Invalid(_)));
 }
 
 fn ids(store: &Store) -> Vec<String> {
@@ -98,6 +326,34 @@ fn a_node_refuses_an_offer_meant_for_another_identity() {
     let (a, b, c) = (store(&root, "a"), store(&root, "b"), store(&root, "c"));
     let offer = a.offer(c.origin()).unwrap().unwrap();
     assert_eq!(b.respond(&offer).unwrap(), Err(Rejection::WrongPeer));
+}
+
+#[test]
+fn managed_claim_finish_and_recovery_publish_actual_activity_boundaries() {
+    use domyjob_core::chat::notification::ActivityState;
+    let root = tempfile::tempdir().unwrap();
+    let local = store(&root, "local");
+    let asker = register(&local, "asker", Mode::Interactive);
+    let worker = register(&local, "worker", Mode::Managed);
+    write(&local, ask(&asker, &worker));
+    let activity = || {
+        local
+            .read(|read| super::activity(read, &worker))
+            .unwrap()
+            .unwrap()
+    };
+    let turn = local.claim(&worker).unwrap().unwrap();
+    assert_eq!(activity().state, ActivityState::Working);
+    local.finish(&turn, Completion::Failed).unwrap();
+    assert_eq!(activity().state, ActivityState::Waiting);
+    write(&local, ask(&asker, &worker));
+    local.claim(&worker).unwrap().unwrap();
+    assert_eq!(activity().state, ActivityState::Working);
+    assert_eq!(local.recover(&worker).unwrap(), 1);
+    assert_eq!(activity().state, ActivityState::Waiting);
+    let seen = local.local_seen().unwrap();
+    assert_eq!(local.recover(&worker).unwrap(), 0);
+    assert_eq!(local.local_seen().unwrap(), seen);
 }
 
 #[test]
@@ -194,6 +450,7 @@ fn inboxes_follow_direct_conversations_and_room_membership() {
             audience: Audience::try_from(vec![a.origin().clone()]).unwrap(),
             intent: Intent::Send {},
             at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+            notice: None,
         },
     );
     let inbox = |agent: &AgentId| {
@@ -295,4 +552,43 @@ fn a_store_in_another_or_unrecorded_format_is_refused() {
             Err(StoreError::Format(found)) if found == expected
         ));
     }
+}
+
+#[test]
+fn additive_notifications_upgrade_the_previous_format_without_losing_history() {
+    let root = tempfile::tempdir().unwrap();
+    let original = store(&root, "previous");
+    let alice = register(&original, "alice", Mode::Interactive);
+    let bob = register(&original, "bob", Mode::Interactive);
+    let message = write(&original, direct(&alice, &bob, Intent::Send {}));
+    {
+        let database = super::open_database(original.paths()).unwrap();
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(super::tables::META)
+            .unwrap()
+            .insert("format", crate::formats::previous_chat().as_str())
+            .unwrap();
+        for table in [
+            super::tables::DELIVERY,
+            super::tables::ACTIVITY,
+            super::tables::ESCALATIONS,
+            super::tables::URGENT,
+        ] {
+            write.delete_table(table).unwrap();
+        }
+        write.commit().unwrap();
+    }
+    let upgraded = store(&root, "previous");
+    assert_eq!(upgraded.origin(), original.origin());
+    assert_eq!(
+        upgraded
+            .read(|read| super::event(read, message.id()))
+            .unwrap(),
+        Some(message)
+    );
+    assert_eq!(
+        upgraded.read(|read| super::urgent(read, &bob)).unwrap(),
+        Vec::new()
+    );
 }

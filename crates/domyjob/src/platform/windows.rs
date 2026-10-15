@@ -19,6 +19,12 @@ impl std::fmt::Display for Acl {
 }
 
 impl System for Windows {
+    #[cfg(test)]
+    fn non_unicode_string() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+        std::ffi::OsString::from_wide(&[0xd800])
+    }
+
     const OS: Os = Os::Windows;
     const JOB_ENVIRONMENT: &'static [&'static str] = &[
         "PATHEXT",

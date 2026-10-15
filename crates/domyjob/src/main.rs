@@ -41,6 +41,7 @@ mod store;
 #[cfg(test)]
 mod testing;
 mod transport;
+mod tui;
 mod watch_event;
 mod workspace;
 
@@ -48,11 +49,16 @@ mod workspace;
 #[command(name = "domyjob", about = "Run persistent jobs over SSH")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Open the read-only human dashboard")]
+    Tui {
+        #[arg(long = "as", value_name = "LOCAL_AGENT")]
+        actor: Option<String>,
+    },
     #[command(about = "Conversations between AI agents on this and other machines")]
     Chat(chat::cli::ChatArgs),
     #[command(about = "Serve the chat tools to an AI client over the MCP stdio transport")]
@@ -84,18 +90,12 @@ enum Command {
         #[arg(long)]
         job: Option<String>,
     },
-    Status {
-        job: String,
-    },
-    Wait {
-        job: String,
-    },
+    Status(ResultReadArgs),
+    Wait(ResultReadArgs),
     Kill {
         job: String,
     },
-    Logs {
-        job: String,
-    },
+    Logs(ResultReadArgs),
     #[command(hide = true)]
     Node {
         #[arg(long, hide = true)]
@@ -117,6 +117,19 @@ enum Command {
         #[arg(long, hide = true)]
         ready_event: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+struct ResultReadArgs {
+    job: String,
+    #[arg(
+        long = "keep",
+        hide = true,
+        num_args = 0,
+        default_value = "preserve",
+        default_missing_value = "preserve"
+    )]
+    retention: transport::ResultRetention,
 }
 
 #[derive(Debug, Args)]
@@ -163,12 +176,18 @@ enum MainError {
     #[error(transparent)]
     App(#[from] app::AppError),
     #[error(transparent)]
+    Dashboard(#[from] tui::TuiError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
     let output = raw::output();
     match command {
+        Command::Tui { actor } => {
+            tui::run(actor.as_deref(), output)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Chat(args) => Ok(chat::cli::run(args, &output)?),
         Command::Mcp { actor, turn } => {
             mcp::serve(output, actor.as_deref(), turn.as_deref())?;
@@ -200,14 +219,18 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
             transport::clean(&MachineName::try_from(machine)?, target, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Status { job } => {
-            transport::status(&JobReference::try_from(job)?, &output)?;
+        Command::Status(ResultReadArgs { job, retention }) => {
+            transport::status(&JobReference::try_from(job)?, retention, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait { job } => Ok(transport::wait(&JobReference::try_from(job)?, &output)?),
+        Command::Wait(ResultReadArgs { job, retention }) => Ok(transport::wait(
+            &JobReference::try_from(job)?,
+            retention,
+            &output,
+        )?),
         Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?, &output)?),
-        Command::Logs { job } => {
-            transport::logs(&JobReference::try_from(job)?, &output)?;
+        Command::Logs(ResultReadArgs { job, retention }) => {
+            transport::logs(&JobReference::try_from(job)?, retention, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Node { reap, reap_scope } => {
@@ -258,6 +281,12 @@ fn internal() -> bool {
 
 fn main() -> ExitCode {
     let internal = internal();
+    let command = Cli::parse().command.unwrap_or(Command::Tui { actor: None });
+    let dashboard = matches!(command, Command::Tui { .. });
+    if dashboard && !platform::terminal::interactive(&raw::output().into_stream()) {
+        eprintln!("domyjob: {}", tui::TuiError::NotTerminal);
+        return ExitCode::FAILURE;
+    }
     let _build = match builds::hold_current() {
         Ok(held) => held,
         Err(error) => {
@@ -265,7 +294,7 @@ fn main() -> ExitCode {
             None
         }
     };
-    if !internal {
+    if !internal && !dashboard {
         match transport::refresh_local() {
             Ok(Some(code)) => return code,
             Ok(None) => {}
@@ -275,7 +304,7 @@ fn main() -> ExitCode {
             }
         }
     }
-    match run(Cli::parse().command) {
+    match run(command) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("domyjob: {error}");
@@ -291,12 +320,68 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
+    fn job_reads_accept_keep_as_the_preserving_compatibility_form() {
+        let job = "beta:00000000000000000000000000000001";
+        for command in ["status", "wait", "logs"] {
+            for arguments in [
+                vec!["domyjob", command, "--keep", job],
+                vec!["domyjob", command, job, "--keep"],
+                vec!["domyjob", command, job],
+            ] {
+                let parsed = Cli::try_parse_from(&arguments);
+                assert!(parsed.is_ok(), "{arguments:?}: {parsed:?}");
+                assert!(matches!(
+                    parsed.unwrap().command,
+                    Some(Command::Status(args) | Command::Wait(args) | Command::Logs(args))
+                        if args.job == job
+                            && args.retention == super::transport::ResultRetention::Preserve
+                ));
+            }
+            let help = Cli::try_parse_from(["domyjob", command, "--help"])
+                .unwrap_err()
+                .to_string();
+            assert!(!help.contains("--keep"), "{help}");
+        }
+    }
+
+    #[test]
+    fn keep_is_only_a_zero_argument_result_read_option() {
+        let job = "beta:00000000000000000000000000000001";
+        for arguments in [
+            vec!["domyjob", "status", "--keep=false", job],
+            vec!["domyjob", "wait", "--keep=preserve", job],
+            vec!["domyjob", "logs", "--keep", "false", job],
+            vec!["domyjob", "logs", "--unknown", job],
+            vec!["domyjob", "kill", "--keep", job],
+            vec!["domyjob", "tui", "--keep"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn human_dashboard_is_the_default_and_has_an_explicit_command() {
+        let default = Cli::try_parse_from(["domyjob"]).unwrap();
+        assert!(default.command.is_none());
+        let explicit = Cli::try_parse_from(["domyjob", "tui"]).unwrap();
+        assert!(matches!(
+            explicit.command,
+            Some(Command::Tui { actor: None })
+        ));
+        let selected = Cli::try_parse_from(["domyjob", "tui", "--as", "alice"]).unwrap();
+        assert!(matches!(
+            selected.command,
+            Some(Command::Tui { actor: Some(actor) }) if actor == "alice"
+        ));
+    }
+
+    #[test]
     fn reaper_command_accepts_only_positive_groups() {
         let parsed = Cli::try_parse_from(["domyjob", "node", "--reap", "17"]);
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Command::Node { reap: Some(_), .. }
+                command: Some(Command::Node { reap: Some(_), .. })
             })
         ));
         for value in ["0", "-1", "2147483648", "invalid"] {

@@ -307,11 +307,15 @@ fn runner() -> ExitCode {
 fn attempt(scenario: &Scenario, binaries: &Path, keep: bool) -> Result<(), Failure> {
     let world = World::create(scenario.machines, binaries)?;
     let outcome = (scenario.run)(&world);
+    let mut diagnostics = outcome.is_err().then(|| world.failure_diagnostics());
     let cleaned = world
         .cleanup()
         .map_err(|failure| Failure::new(format!("cleanup: {failure}")));
+    if cleaned.is_err() && diagnostics.is_none() {
+        diagnostics = Some(world.failure_diagnostics());
+    }
     let removed = world.finish(keep);
-    let problems: Vec<String> = [outcome, cleaned, removed]
+    let mut problems: Vec<String> = [outcome, cleaned, removed]
         .into_iter()
         .filter_map(Result::err)
         .map(|failure| failure.0)
@@ -319,6 +323,15 @@ fn attempt(scenario: &Scenario, binaries: &Path, keep: bool) -> Result<(), Failu
     if problems.is_empty() {
         Ok(())
     } else {
+        match diagnostics {
+            Some(Ok(logs)) if !logs.is_empty() => {
+                problems.push(format!("owned failure diagnostics:\n{logs}"));
+            }
+            Some(Err(error)) => {
+                problems.push(format!("capturing owned failure diagnostics: {error}"));
+            }
+            Some(Ok(_)) | None => {}
+        }
         Err(Failure::new(problems.join("\n")))
     }
 }

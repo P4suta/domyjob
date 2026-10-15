@@ -1,0 +1,52 @@
+use std::collections::BTreeMap;
+
+use domyjob_core::chat::card::{Card, MachineCard};
+use domyjob_core::chat::event::{Body, Digest, Event};
+use domyjob_core::chat::id::{AgentId, AgentName, Conversation, EventId, Origin, RoomId};
+use domyjob_core::chat::ledger::{Cursor, Resolution, Room};
+use domyjob_core::chat::notification::{
+    Activity, ActivityState, Delivery, MAX_STATUS_BYTES, STALLED_MILLIS, activity_state,
+};
+use domyjob_core::chat::policy::Usage;
+use redb::ReadableTable;
+use serde::{Deserialize, Serialize};
+
+use super::StoreError;
+use super::tables::{
+    ACTIVITY, COUNTERS, CURSORS, DELIVERY, EVENTS, JOINED, LOCAL_AGENTS, MACHINES, OPEN, PROFILES,
+    READS, RESOLUTIONS, ROOMS, Reader, STARTED, THREADS, TOMBSTONES, decode, delivery_key,
+    event_key, get_json, get_number, get_text, order_key, room_key, thread_bounds, thread_key,
+};
+pub(crate) fn stored(reader: &impl Reader, id: &EventId) -> Result<Option<Stored>, StoreError> {
+    let key = event_key(id);
+    if let Some(encoded) = reader.table(EVENTS)?.get(key.as_str())? {
+        let encoded = encoded.value().to_owned();
+        let event: Event = decode(&encoded)?;
+        if event.id() != id {
+            return Err(StoreError::Corrupt("event identity"));
+        }
+        return Ok(Some(Stored::Event {
+            event: Box::new(event),
+            encoded,
+        }));
+    }
+    let tombstones = reader.table(TOMBSTONES)?;
+    let Some(cleaned) = tombstones.get(key.as_str())? else {
+        return Ok(None);
+    };
+    let (clock, digest) = cleaned.value();
+    let digest =
+        <[u8; 32]>::try_from(digest).map_err(|_length| StoreError::Corrupt("tombstone"))?;
+    Ok(Some(Stored::Cleaned {
+        clock,
+        digest: Digest::from_bytes(digest),
+    }))
+}
+
+const MACRO_SITES: &[&str] = &[
+    r##"format!("{agent}\u{1f}")"##,
+    r##"matches!(event . body () , Body :: Message { notice , .. } if event . author () . as_ref () != Some (agent) && notice . as_ref () . is_none_or (| notice | notice . recipients . contains (agent)))"##,
+    r##"matches!(event . body () , Body :: Resolved { .. })"##,
+    r##"matches!(event . body () , Body :: Message { .. })"##,
+    r##"matches!(event . body () , Body :: Message { .. })"##,
+];

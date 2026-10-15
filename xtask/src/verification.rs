@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::resource_proofs::{Harness, Negative};
 
+mod handoffs;
+
 const MANIFEST: &str = "verification/obligations.json";
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const QUINT_VERSION: &str = "0.32.0";
@@ -17,10 +19,23 @@ const TRACE_STEPS: usize = 20;
 const TRACE_SEED: &str = "1";
 const SCHEMA_VERSION: u32 = 1;
 const FUZZ_TOOL: &str = "cargo:cargo-fuzz@0.13.2";
-const FUZZ_TARGETS: [(&str, &[&str]); 3] = [
+const FUZZ_TARGETS: [(&str, &[&str]); 7] = [
     ("wire", &["hello", "chat-exchange", "chat-unknown-field"]),
     ("source_paths", &["tracked", "metadata", "malformed"]),
     ("process_group", &["positive", "nonpositive", "overflow"]),
+    ("chat_ledger", &["notifications"]),
+    ("hook_clients", &["foreign", "malformed"]),
+    ("terminal_input", &["unicode", "csi", "malformed", "mouse"]),
+    (
+        "handoff_metadata",
+        &[
+            "granted",
+            "team",
+            "malformed",
+            "agent-target",
+            "team-target",
+        ],
+    ),
 ];
 const AUTOMATIC_PORT: u16 = 0;
 const VERIFIER_HOST: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
@@ -29,6 +44,109 @@ const NODE_TOOL: &str = "node@26.11.1";
 const MAX_VERSION_BYTES: usize = 256;
 const MODEL_FIELD_PARTS: usize = 2;
 const MODEL_VARIABLE_COUNT: usize = 4;
+const PARENT_POSITIVE: &str = "chat::ledger::parent_identity::proofs::projected_parent_identity_preserves_every_complete_identity_class";
+const PARENT_NEGATIVE: &str =
+    "chat::ledger::parent_identity::proofs::rejects_a_present_parent_with_a_different_sequence";
+const EXIT_SOURCE: &str = "verification/proof-exit-policy.rs";
+const EXIT_POSITIVE: &str = "only_the_required_normal_code_admits_each_proof_phase";
+const EXIT_NEGATIVE: &str = "rejects_an_unrelated_exit_as_a_named_counterexample";
+const EXIT_COVERS: u64 = 4;
+const PARENT_COVERS: u64 = 6;
+const GENERATOR_COVERS: u64 = 1;
+const PRESENT_COVERS: u64 = 4;
+const ABSENT_COVERS: u64 = 2;
+const GENERATOR_POSITIVE: &str = "chat::ledger::parent_identity::proofs::canonical_parent_identity_generator_preserves_every_origin_byte";
+const PRESENT_POSITIVE: &str = "chat::ledger::parent_identity::proofs::present_parent_identity_matches_exact_origin_and_sequence";
+const ABSENT_POSITIVE: &str =
+    "chat::ledger::parent_identity::proofs::absent_parent_identity_accepts_every_request";
+const ENCODER_POSITIVE: &str = "chat::ledger::parent_identity::proofs::canonical_parent_hex_encoder_preserves_the_exact_full_domain";
+const ENCODER_NEGATIVE: &str =
+    "chat::ledger::parent_identity::proofs::rejects_a_changed_parent_hex_encoder_value";
+const ENCODER_COVERS: u64 = 2;
+const NATIVE_DEFAULT_SOURCE: &str = "verification/native-default-tool-binding.rs";
+const NATIVE_DEFAULT_POSITIVES: [(&str, u64); 5] = [
+    (
+        "native_default::native_default_loader_search_path_filter",
+        2,
+    ),
+    (
+        "native_default::native_default_target_and_object_admission",
+        2,
+    ),
+    (
+        "native_default::native_default_required_roles_and_limits",
+        4,
+    ),
+    ("native_default::native_default_full_identity_recheck", 2),
+    ("native_default::native_default_builtin_configuration", 2),
+];
+const NATIVE_DEFAULT_NEGATIVES: [(&str, &str); 5] = [
+    (
+        "native_default::rejects_unfiltered_native_default_toolchain_loader",
+        "NEGATIVE_DEFAULT_LOADER_TAIL",
+    ),
+    (
+        "native_default::rejects_foreign_native_default_architecture",
+        "NEGATIVE_DEFAULT_ARCHITECTURE",
+    ),
+    (
+        "native_default::rejects_missing_native_default_required_role",
+        "NEGATIVE_DEFAULT_REQUIRED_ROLE",
+    ),
+    (
+        "native_default::rejects_changed_native_default_identity",
+        "NEGATIVE_DEFAULT_IDENTITY_CHANGE",
+    ),
+    (
+        "native_default::rejects_foreign_native_default_configuration",
+        "NEGATIVE_DEFAULT_CONFIGURATION",
+    ),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentComponent {
+    Generator,
+    Present,
+    Absent,
+}
+
+impl ParentComponent {
+    fn parse(words: &[&str]) -> Result<Self, String> {
+        match words {
+            ["generator"] => Ok(Self::Generator),
+            ["present"] => Ok(Self::Present),
+            ["absent"] => Ok(Self::Absent),
+            _ => Err(
+                "usage: cargo xtask verify parent-identity-component generator|present|absent"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Generator => "generator",
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
+
+    const fn obligation(self) -> (&'static str, u64) {
+        match self {
+            Self::Generator => (GENERATOR_POSITIVE, GENERATOR_COVERS),
+            Self::Present => (PRESENT_POSITIVE, PRESENT_COVERS),
+            Self::Absent => (ABSENT_POSITIVE, ABSENT_COVERS),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProofFamily {
+    ExitPolicy,
+    ParentEncoder,
+    ParentIdentity,
+    ParentComponent(ParentComponent),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -735,16 +853,243 @@ fn quint(root: &Path) -> Result<(), String> {
 
 pub fn run(root: &Path) -> Result<(), String> {
     let before = fingerprint(root)?;
-    let inventory = inventory(root)?;
-    quint(root)?;
-    crate::resource_proofs::run_inventory(root, &inventory.harnesses, &inventory.negatives)?;
-    replay_fuzz(root)?;
-    unchanged_source(root, before)?;
+    let inventory = bound_attempt(
+        || {
+            check_parent_refinement(root)?;
+            let inventory = inventory(root)?;
+            quint(root)?;
+            crate::resource_proofs::run_inventory(
+                root,
+                &inventory.harnesses,
+                &inventory.negatives,
+            )?;
+            replay_fuzz(root)?;
+            Ok(inventory)
+        },
+        || unchanged_source(root, before),
+    )?;
     eprintln!(
         "verification: source={before}; {} positive harnesses; {} negative controls; {TRACE_COUNT} ITF traces; {} preserved corpora",
         inventory.harnesses.len(),
         inventory.negatives.len(),
         FUZZ_TARGETS.len()
+    );
+    Ok(())
+}
+
+fn bound_attempt<T>(
+    attempt: impl FnOnce() -> Result<T, String>,
+    after: impl FnOnce() -> Result<(), String>,
+) -> Result<T, String> {
+    let result = attempt();
+    let binding = after();
+    match (result, binding) {
+        (Ok(inventory), Ok(())) => Ok(inventory),
+        (Err(primary), Ok(())) | (Ok(_), Err(primary)) => Err(primary),
+        (Err(primary), Err(binding_failure)) => {
+            Err(format!("{primary}; source binding: {binding_failure}"))
+        }
+    }
+}
+
+fn select_proof_pair(
+    inventory: &Inventory,
+    family: ProofFamily,
+) -> Result<(&Harness, &Negative), String> {
+    let (positive_name, negative_name, source, covers, assertion) = match family {
+        ProofFamily::ExitPolicy => (
+            EXIT_POSITIVE,
+            EXIT_NEGATIVE,
+            Some(EXIT_SOURCE),
+            EXIT_COVERS,
+            "NEGATIVE_PROOF_EXIT_CODE",
+        ),
+        ProofFamily::ParentEncoder => (
+            ENCODER_POSITIVE,
+            ENCODER_NEGATIVE,
+            None,
+            ENCODER_COVERS,
+            "NEGATIVE_PARENT_HEX_ENCODER",
+        ),
+        ProofFamily::ParentIdentity => (
+            PARENT_POSITIVE,
+            PARENT_NEGATIVE,
+            None,
+            PARENT_COVERS,
+            "NEGATIVE_PARENT_IDENTITY",
+        ),
+        ProofFamily::ParentComponent(component) => {
+            let (name, covers) = component.obligation();
+            (
+                name,
+                PARENT_NEGATIVE,
+                None,
+                covers,
+                "NEGATIVE_PARENT_IDENTITY",
+            )
+        }
+    };
+    let positives = inventory
+        .harnesses
+        .iter()
+        .filter(|harness| harness.name == positive_name)
+        .collect::<Vec<_>>();
+    let negatives = inventory
+        .negatives
+        .iter()
+        .filter(|negative| negative.harness == negative_name)
+        .collect::<Vec<_>>();
+    let ([positive], [negative]) = (positives.as_slice(), negatives.as_slice()) else {
+        return Err("selected proof pair is missing or duplicated".to_owned());
+    };
+    if positive.source.as_deref() != source
+        || negative.source.as_deref() != source
+        || positive.covers != covers
+        || negative.assertion != assertion
+    {
+        return Err(
+            "selected proof pair has a foreign source, cover count, or assertion".to_owned(),
+        );
+    }
+    Ok((positive, negative))
+}
+
+fn parent_identity(root: &Path) -> Result<(), String> {
+    crate::resource_proofs::process::require_native_linux()?;
+    let before = fingerprint(root)?;
+    bound_attempt(
+        || {
+            check_parent_refinement(root)?;
+            let inventory = inventory(root)?;
+            let (exit_positive, exit_negative) =
+                select_proof_pair(&inventory, ProofFamily::ExitPolicy)?;
+            let (parent_positive, parent_negative) =
+                select_proof_pair(&inventory, ProofFamily::ParentIdentity)?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(exit_positive),
+                std::slice::from_ref(exit_negative),
+            )?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(parent_positive),
+                std::slice::from_ref(parent_negative),
+            )
+        },
+        || unchanged_source(root, before),
+    )?;
+    eprintln!(
+        "verification: source={before}; native-default tool binding; exit policy 1 positive/1 negative/4 covers; Parent 1 positive/1 negative/6 covers"
+    );
+    Ok(())
+}
+
+fn parent_identity_encoder(root: &Path) -> Result<(), String> {
+    crate::resource_proofs::process::require_native_linux()?;
+    let before = fingerprint(root)?;
+    bound_attempt(
+        || {
+            check_parent_refinement(root)?;
+            let inventory = inventory(root)?;
+            let (exit_positive, exit_negative) =
+                select_proof_pair(&inventory, ProofFamily::ExitPolicy)?;
+            let (positive, negative) = select_proof_pair(&inventory, ProofFamily::ParentEncoder)?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(exit_positive),
+                std::slice::from_ref(exit_negative),
+            )?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(positive),
+                std::slice::from_ref(negative),
+            )
+        },
+        || unchanged_source(root, before),
+    )?;
+    eprintln!(
+        "verification: source={before}; native-default tool binding; exit policy 1 positive/1 negative/{EXIT_COVERS} covers; Parent encoder 1 positive/1 negative/{ENCODER_COVERS} covers; generator and aggregate proofs remain required"
+    );
+    Ok(())
+}
+
+fn parent_identity_component(root: &Path, component: ParentComponent) -> Result<(), String> {
+    crate::resource_proofs::process::require_native_linux()?;
+    let before = fingerprint(root)?;
+    bound_attempt(
+        || {
+            check_parent_refinement(root)?;
+            let inventory = inventory(root)?;
+            let (exit_positive, exit_negative) =
+                select_proof_pair(&inventory, ProofFamily::ExitPolicy)?;
+            let (component_positive, parent_negative) =
+                select_proof_pair(&inventory, ProofFamily::ParentComponent(component))?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(exit_positive),
+                std::slice::from_ref(exit_negative),
+            )?;
+            crate::resource_proofs::run_inventory(
+                root,
+                std::slice::from_ref(component_positive),
+                std::slice::from_ref(parent_negative),
+            )
+        },
+        || unchanged_source(root, before),
+    )?;
+    let (_, covers) = component.obligation();
+    eprintln!(
+        "verification: source={before}; native-default tool binding; selected Parent {} component; exit policy 1 positive/1 negative/{EXIT_COVERS} covers; component 1 positive/1 negative/{covers} covers; aggregate proof remains required",
+        component.name()
+    );
+    Ok(())
+}
+
+fn select_native_default(inventory: &Inventory) -> Result<(Vec<Harness>, Vec<Negative>), String> {
+    let harnesses = inventory
+        .harnesses
+        .iter()
+        .filter(|item| item.source.as_deref() == Some(NATIVE_DEFAULT_SOURCE))
+        .cloned()
+        .collect::<Vec<_>>();
+    let negatives = inventory
+        .negatives
+        .iter()
+        .filter(|item| item.source.as_deref() == Some(NATIVE_DEFAULT_SOURCE))
+        .cloned()
+        .collect::<Vec<_>>();
+    let names = harnesses
+        .iter()
+        .map(|item| (item.name.as_str(), item.covers))
+        .collect::<BTreeMap<_, _>>();
+    let assertions = negatives
+        .iter()
+        .map(|item| (item.harness.as_str(), item.assertion.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    if harnesses.len() != NATIVE_DEFAULT_POSITIVES.len()
+        || negatives.len() != NATIVE_DEFAULT_NEGATIVES.len()
+        || names != BTreeMap::from(NATIVE_DEFAULT_POSITIVES)
+        || assertions != BTreeMap::from(NATIVE_DEFAULT_NEGATIVES)
+    {
+        return Err("native-default qualification inventory changed its exact contract".to_owned());
+    }
+    Ok((harnesses, negatives))
+}
+
+fn native_default(root: &Path) -> Result<(), String> {
+    crate::resource_proofs::process::require_native_linux()?;
+    let before = fingerprint(root)?;
+    bound_attempt(
+        || {
+            check_parent_refinement(root)?;
+            let inventory = inventory(root)?;
+            let (harnesses, negatives) = select_native_default(&inventory)?;
+            crate::resource_proofs::run_inventory(root, &harnesses, &negatives)
+        },
+        || unchanged_source(root, before),
+    )?;
+    eprintln!(
+        "verification: source={before}; native-default qualification; 5 positives; 5 named negatives; 12 covers; source and physical tools bound before and after"
     );
     Ok(())
 }
@@ -763,16 +1108,36 @@ pub fn replay_models(root: &Path) -> Result<(), String> {
 
 pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
     match words {
+        ["__native-default-context"] => crate::proof_tools::emit_default_selection(),
+        ["__native-default-versions"] => crate::proof_tools::emit_default_versions(root),
         [] => run(root),
         ["models"] => replay_models(root),
         ["inventory"] => check_inventory(root),
+        ["handoffs"] => handoffs::run(root),
+        ["native-default"] => native_default(root),
+        ["parent-identity-encoder"] => parent_identity_encoder(root),
+        ["parent-identity"] => parent_identity(root),
+        ["parent-identity-component", component @ ..] => {
+            parent_identity_component(root, ParentComponent::parse(component)?)
+        }
         ["fuzz"] => replay_fuzz(root),
-        _ => Err("usage: cargo xtask verify [models|inventory|fuzz]".to_owned()),
+        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|handoffs|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
     }
 }
 
 pub fn check_inventory(root: &Path) -> Result<(), String> {
+    check_parent_refinement(root)?;
     inventory(root).map(|_inventory| ())
+}
+
+pub fn check_parent_refinement(root: &Path) -> Result<(), String> {
+    let sources = crate::parent_refinement::FILES
+        .iter()
+        .map(|file| {
+            String::from_utf8(read_bytes(&root.join(file))?).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::parent_refinement::check(&sources).map_err(|error| error.to_string())
 }
 
 pub fn replay_fuzz(root: &Path) -> Result<(), String> {
@@ -840,6 +1205,445 @@ fn replay_target(root: &Path, target: &str, seeds: &[&str]) -> Result<(), String
 mod tests {
     use super::{Command, Trace, replay};
     use std::collections::BTreeSet;
+
+    fn actual_inventory_value() -> serde_json::Value {
+        domyjob_core::ingress::foreign_json(include_str!("../../verification/obligations.json"))
+            .unwrap()
+    }
+
+    fn native_default_inventory_fixture() -> super::Inventory {
+        let mut inventory: super::Inventory =
+            domyjob_core::ingress::value(actual_inventory_value()).unwrap();
+        inventory
+            .harnesses
+            .retain(|item| item.source.as_deref() == Some(super::NATIVE_DEFAULT_SOURCE));
+        inventory
+            .negatives
+            .retain(|item| item.source.as_deref() == Some(super::NATIVE_DEFAULT_SOURCE));
+        inventory
+    }
+
+    #[test]
+    fn native_default_selector_requires_its_exact_registered_contracts() {
+        #[derive(Clone, Copy, Debug)]
+        enum Change {
+            PositiveSource,
+            PositiveName,
+            PositiveCovers,
+            DuplicatePositive,
+            NegativeSource,
+            NegativeAssertion,
+            DuplicateNegative,
+            MissingNegatives,
+        }
+
+        let (harnesses, negatives) =
+            super::select_native_default(&native_default_inventory_fixture()).unwrap();
+        assert_eq!(harnesses.len(), super::NATIVE_DEFAULT_POSITIVES.len());
+        assert_eq!(negatives.len(), super::NATIVE_DEFAULT_NEGATIVES.len());
+        for change in [
+            Change::PositiveSource,
+            Change::PositiveName,
+            Change::PositiveCovers,
+            Change::DuplicatePositive,
+            Change::NegativeSource,
+            Change::NegativeAssertion,
+            Change::DuplicateNegative,
+            Change::MissingNegatives,
+        ] {
+            let mut inventory = native_default_inventory_fixture();
+            match change {
+                Change::PositiveSource => {
+                    inventory.harnesses.first_mut().unwrap().source = None;
+                }
+                Change::PositiveName => {
+                    inventory
+                        .harnesses
+                        .first_mut()
+                        .unwrap()
+                        .name
+                        .push_str("_foreign");
+                }
+                Change::PositiveCovers => {
+                    inventory.harnesses.first_mut().unwrap().covers = 0;
+                }
+                Change::DuplicatePositive => {
+                    inventory
+                        .harnesses
+                        .push(inventory.harnesses.first().unwrap().clone());
+                }
+                Change::NegativeSource => {
+                    inventory.negatives.first_mut().unwrap().source = None;
+                }
+                Change::NegativeAssertion => {
+                    inventory
+                        .negatives
+                        .first_mut()
+                        .unwrap()
+                        .assertion
+                        .push_str("_foreign");
+                }
+                Change::DuplicateNegative => {
+                    inventory
+                        .negatives
+                        .push(inventory.negatives.first().unwrap().clone());
+                }
+                Change::MissingNegatives => inventory.negatives.clear(),
+            }
+            assert!(
+                super::select_native_default(&inventory).is_err(),
+                "{change:?}"
+            );
+        }
+    }
+
+    fn actual_pair_indices(family: super::ProofFamily) -> (usize, usize) {
+        let inventory: super::Inventory =
+            domyjob_core::ingress::value(actual_inventory_value()).unwrap();
+        let (positive, negative) = super::select_proof_pair(&inventory, family).unwrap();
+        let positive_index = inventory
+            .harnesses
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, positive))
+            .unwrap();
+        let negative_index = inventory
+            .negatives
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, negative))
+            .unwrap();
+        (positive_index, negative_index)
+    }
+
+    fn actual_families() -> [super::ProofFamily; 6] {
+        [
+            super::ProofFamily::ExitPolicy,
+            super::ProofFamily::ParentEncoder,
+            super::ProofFamily::ParentIdentity,
+            super::ProofFamily::ParentComponent(super::ParentComponent::Generator),
+            super::ProofFamily::ParentComponent(super::ParentComponent::Present),
+            super::ProofFamily::ParentComponent(super::ParentComponent::Absent),
+        ]
+    }
+
+    #[test]
+    fn encoder_selector_has_its_own_exact_pair_and_refuses_extra_arguments() {
+        let inventory: super::Inventory =
+            domyjob_core::ingress::value(actual_inventory_value()).unwrap();
+        let (positive, negative) =
+            super::select_proof_pair(&inventory, super::ProofFamily::ParentEncoder).unwrap();
+        assert_eq!(positive.name, super::ENCODER_POSITIVE);
+        assert_eq!(positive.covers, super::ENCODER_COVERS);
+        assert_eq!(negative.harness, super::ENCODER_NEGATIVE);
+        assert_eq!(negative.assertion, "NEGATIVE_PARENT_HEX_ENCODER");
+        assert_ne!(negative.harness, super::PARENT_NEGATIVE);
+        let root = tempfile::tempdir().unwrap();
+        for words in [
+            vec!["parent-identity-encoder", "extra"],
+            vec![
+                "parent-identity-encoder",
+                "--harness",
+                super::ENCODER_POSITIVE,
+            ],
+            vec!["parent-identity-encoder", "--backend", "z3"],
+        ] {
+            assert!(
+                super::dispatch(root.path(), &words)
+                    .unwrap_err()
+                    .starts_with("usage:")
+            );
+        }
+    }
+
+    #[test]
+    fn component_arguments_select_only_the_three_typed_cases() {
+        for (word, expected) in [
+            ("generator", super::ParentComponent::Generator),
+            ("present", super::ParentComponent::Present),
+            ("absent", super::ParentComponent::Absent),
+        ] {
+            assert_eq!(super::ParentComponent::parse(&[word]).unwrap(), expected);
+            assert_eq!(expected.name(), word);
+        }
+        for words in [
+            vec![],
+            vec![""],
+            vec!["Generator"],
+            vec!["aggregate"],
+            vec![super::PARENT_POSITIVE],
+            vec!["verification/proof-exit-policy.rs"],
+            vec!["generator", "present"],
+            vec!["present", "--solver=z3"],
+            vec!["absent", "--harness-timeout=120s"],
+        ] {
+            assert!(
+                super::ParentComponent::parse(&words)
+                    .unwrap_err()
+                    .starts_with("usage:")
+            );
+        }
+    }
+
+    #[test]
+    fn selected_components_keep_the_original_parent_negative_and_cover_contracts() {
+        let inventory: super::Inventory =
+            domyjob_core::ingress::value(actual_inventory_value()).unwrap();
+        for (component, name, covers) in [
+            (
+                super::ParentComponent::Generator,
+                super::GENERATOR_POSITIVE,
+                super::GENERATOR_COVERS,
+            ),
+            (
+                super::ParentComponent::Present,
+                super::PRESENT_POSITIVE,
+                super::PRESENT_COVERS,
+            ),
+            (
+                super::ParentComponent::Absent,
+                super::ABSENT_POSITIVE,
+                super::ABSENT_COVERS,
+            ),
+        ] {
+            let (positive, negative) = super::select_proof_pair(
+                &inventory,
+                super::ProofFamily::ParentComponent(component),
+            )
+            .unwrap();
+            assert_eq!(positive.name, name);
+            assert_eq!(positive.covers, covers);
+            assert_ne!(positive.name, super::PARENT_POSITIVE);
+            assert_eq!(negative.harness, super::PARENT_NEGATIVE);
+            assert_eq!(negative.assertion, "NEGATIVE_PARENT_IDENTITY");
+        }
+    }
+
+    #[test]
+    fn component_refinement_rejects_parsed_domain_assertion_and_cover_changes() {
+        let original = [
+            include_str!("../../crates/domyjob-core/src/chat/ledger.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/ledger/parent_identity.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/id.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/event.rs"),
+            include_str!("../../crates/domyjob/src/chat/store/views.rs"),
+            include_str!("../../crates/domyjob-core/src/lib.rs"),
+            include_str!("../../crates/domyjob-core/src/chat.rs"),
+        ]
+        .map(str::to_owned);
+        crate::parent_refinement::check(&original).unwrap();
+        let identity_index = crate::parent_refinement::FILES
+            .iter()
+            .position(|file| *file == "crates/domyjob-core/src/chat/ledger/parent_identity.rs")
+            .unwrap();
+        let identity = original.get(identity_index).unwrap();
+        for (before, after) in [
+            (
+                "const ORIGIN_BYTES: usize = 32;",
+                "const ORIGIN_BYTES: usize = 16;",
+            ),
+            (
+                "NonZeroU64::new(kani::any())",
+                "NonZeroU64::new(u64::from(kani::any::<u32>()))",
+            ),
+            (
+                "let generated = identity().unwrap();",
+                "let generated = identity().unwrap(); kani::assume(false);",
+            ),
+            (
+                "fn present_parent_identity_matches_exact_origin_and_sequence() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
+                "fn present_parent_identity_matches_exact_origin_and_sequence() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();",
+            ),
+            (
+                "fn absent_parent_identity_accepts_every_request() {\n        let parent = identity().unwrap();\n        let request = identity().unwrap();\n        assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
+                "fn absent_parent_identity_accepts_every_request() {\n        let request = identity().unwrap();",
+            ),
+            (
+                "assert!(parent.identity.origin().as_str().as_bytes() == parent.bytes);",
+                "assert!(parent.identity.origin().as_str().as_bytes().len() == parent.bytes.len());",
+            ),
+            (
+                "matches(Some(&parent.identity), &request.identity)",
+                "matches(None, &request.identity)",
+            ),
+            (
+                "kani::cover!(origin_equal && !sequence_equal && !admitted);",
+                "",
+            ),
+            ("assert!(missing_admitted);", "let _ = missing_admitted;"),
+            ("NEGATIVE_PARENT_IDENTITY", "UNRELATED_PARENT_ASSERTION"),
+        ] {
+            let changed = identity.replacen(before, after, 1);
+            assert_ne!(&changed, identity);
+            syn::parse_file(&changed).unwrap();
+            let mut sources = original.clone();
+            *sources.get_mut(identity_index).unwrap() = changed;
+            assert!(matches!(
+                crate::parent_refinement::check(&sources),
+                Err(crate::parent_refinement::RefinementError::Refused { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn closed_calibration_selects_registered_exit_and_parent_objects() {
+        let inventory: super::Inventory =
+            domyjob_core::ingress::value(actual_inventory_value()).unwrap();
+        let (exit, exit_negative) =
+            super::select_proof_pair(&inventory, super::ProofFamily::ExitPolicy).unwrap();
+        assert_eq!(exit.name, super::EXIT_POSITIVE);
+        assert_eq!(exit_negative.harness, super::EXIT_NEGATIVE);
+        let (parent, parent_negative) =
+            super::select_proof_pair(&inventory, super::ProofFamily::ParentIdentity).unwrap();
+        assert_eq!(parent.name, super::PARENT_POSITIVE);
+        assert_eq!(parent_negative.harness, super::PARENT_NEGATIVE);
+        for family in actual_families() {
+            let (positive_index, negative_index) = actual_pair_indices(family);
+            let (positive, negative) = super::select_proof_pair(&inventory, family).unwrap();
+            assert!(std::ptr::eq(
+                positive,
+                inventory.harnesses.get(positive_index).unwrap()
+            ));
+            assert!(std::ptr::eq(
+                negative,
+                inventory.negatives.get(negative_index).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn closed_calibration_refuses_missing_duplicate_and_foreign_pairs() {
+        for family in actual_families() {
+            let (positive, negative) = actual_pair_indices(family);
+            let original = actual_inventory_value();
+            let mut mutations = Vec::new();
+            for (array, index) in [("harnesses", positive), ("negatives", negative)] {
+                let mut missing = original.clone();
+                missing
+                    .get_mut(array)
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(index);
+                mutations.push(missing);
+                let mut duplicate = original.clone();
+                let entries = duplicate.get_mut(array).unwrap().as_array_mut().unwrap();
+                entries.push(entries.get(index).unwrap().clone());
+                mutations.push(duplicate);
+            }
+            for (path, value) in [
+                (
+                    format!("/harnesses/{positive}/name"),
+                    serde_json::json!("UNREGISTERED_COMPONENT"),
+                ),
+                (
+                    format!("/negatives/{negative}/harness"),
+                    serde_json::json!("UNREGISTERED_NEGATIVE"),
+                ),
+                (
+                    format!("/harnesses/{positive}/source"),
+                    serde_json::json!("verification/resource-negative.rs"),
+                ),
+                (
+                    format!("/negatives/{negative}/source"),
+                    serde_json::json!("verification/resource-negative.rs"),
+                ),
+                (
+                    format!("/harnesses/{positive}/covers"),
+                    serde_json::json!(0),
+                ),
+                (
+                    format!("/harnesses/{positive}/covers"),
+                    serde_json::json!(u64::MAX),
+                ),
+                (
+                    format!("/negatives/{negative}/assertion"),
+                    serde_json::json!("UNRELATED_ASSERTION"),
+                ),
+            ] {
+                let mut changed = original.clone();
+                *changed.pointer_mut(&path).unwrap() = value;
+                mutations.push(changed);
+            }
+            for changed in mutations {
+                let inventory = domyjob_core::ingress::value(changed).unwrap();
+                super::select_proof_pair(&inventory, family).unwrap_err();
+            }
+        }
+    }
+
+    #[test]
+    fn empty_work_cannot_select_any_calibration_pair() {
+        let mut value = actual_inventory_value();
+        *value.get_mut("harnesses").unwrap() = serde_json::json!([]);
+        *value.get_mut("negatives").unwrap() = serde_json::json!([]);
+        let inventory = domyjob_core::ingress::value(value).unwrap();
+        for family in actual_families() {
+            super::select_proof_pair(&inventory, family).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn calibration_does_not_accept_extra_arguments_or_backend_selection() {
+        let root = std::path::Path::new("unused");
+        for words in [
+            vec!["parent-identity", "extra"],
+            vec!["parent-identity", "--solver=z3"],
+            vec!["parent-identity", "--harness-timeout=120s"],
+            vec!["parent-identity-component"],
+            vec!["parent-identity-component", ""],
+            vec!["parent-identity-component", "aggregate"],
+            vec!["parent-identity-component", super::PARENT_POSITIVE],
+            vec!["parent-identity-component", "generator", "present"],
+            vec!["parent-identity-component", "present", "--solver=z3"],
+            vec![
+                "parent-identity-component",
+                "absent",
+                "--harness-timeout=120s",
+            ],
+        ] {
+            assert!(
+                super::dispatch(root, &words)
+                    .unwrap_err()
+                    .starts_with("usage:")
+            );
+        }
+    }
+
+    #[test]
+    fn actual_bound_attempt_runs_after_every_primary_outcome_and_retains_both_errors() {
+        for primary_ok in [false, true] {
+            for after_ok in [false, true] {
+                let calls = std::cell::RefCell::new(Vec::new());
+                let outcome = super::bound_attempt(
+                    || {
+                        calls.borrow_mut().push("primary");
+                        if primary_ok {
+                            Ok("completed")
+                        } else {
+                            Err("primary refusal".to_owned())
+                        }
+                    },
+                    || {
+                        calls.borrow_mut().push("after");
+                        if after_ok {
+                            Ok(())
+                        } else {
+                            Err("changed source".to_owned())
+                        }
+                    },
+                );
+                assert_eq!(*calls.borrow(), ["primary", "after"]);
+                let expected = match (primary_ok, after_ok) {
+                    (true, true) => Ok("completed"),
+                    (false, true) => Err("primary refusal".to_owned()),
+                    (true, false) => Err("changed source".to_owned()),
+                    (false, false) => {
+                        Err("primary refusal; source binding: changed source".to_owned())
+                    }
+                };
+                assert_eq!(outcome, expected);
+            }
+        }
+    }
 
     #[test]
     fn oversized_version_output_is_drained_before_waiting_for_completion() {

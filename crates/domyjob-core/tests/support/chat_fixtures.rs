@@ -56,5 +56,6 @@ pub(crate) fn ask(from: &AgentId, to: &AgentId) -> Body {
             chain: Chain::default(),
         },
         at: Stamp::from_unix_millis(1),
+        notice: None,
     }
 }

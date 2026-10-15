@@ -10,6 +10,7 @@ pub(crate) use crate::file_kind::reparse_point;
 pub(crate) mod clock;
 pub(crate) mod replacement;
 pub(crate) mod service;
+pub(crate) mod terminal;
 pub(crate) mod user_files;
 
 #[cfg(unix)]
@@ -78,6 +79,8 @@ trait System {
     fn create_private_dir(path: &Path) -> io::Result<()>;
     #[cfg(test)]
     fn create_exposed_build_parent(path: &Path) -> io::Result<()>;
+    #[cfg(test)]
+    fn non_unicode_string() -> OsString;
     fn owner_only(options: &mut fs::OpenOptions);
     fn no_follow(options: &mut fs::OpenOptions);
 }
@@ -85,6 +88,11 @@ trait System {
 #[cfg(test)]
 pub(crate) fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
     Native::create_exposed_build_parent(path)
+}
+
+#[cfg(test)]
+pub(crate) fn non_unicode_environment_value() -> std::env::VarError {
+    std::env::VarError::NotUnicode(Native::non_unicode_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

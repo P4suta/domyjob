@@ -1,6 +1,7 @@
 pub(crate) mod address;
 pub(crate) mod args;
 pub(crate) mod cli;
+pub(crate) mod hook;
 pub(crate) mod ops;
 pub(crate) mod provider;
 pub(crate) mod pulse;

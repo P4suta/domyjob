@@ -99,6 +99,8 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.2"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 tar = { version = "0.4", default-features = false }
 cap-std = "4"
@@ -109,7 +111,15 @@ clap = { version = "4.6", features = ["derive", "wrap_help"] }
 getrandom = "0.4"
 ignore = "0.4"
 proc-macro2 = { version = "1.0", default-features = false, features = ["span-locations"] }
-rustix = { version = "1.1", features = ["event", "fs", "pipe", "process", "system"] }
+rustix = { version = "1.1", features = [
+  "event",
+  "fs",
+  "pipe",
+  "process",
+  "system",
+  "termios",
+  "pty",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -140,11 +150,20 @@ windows-sys = { version = "0.61", features = [
   "Win32_System_JobObjects",
   "Win32_System_IO",
   "Win32_System_Threading",
+  "Win32_System_Console",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_System_Pipes",
   "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [profile.test]
 debug = 0
+
+[profile.dev.package.xtask]
+opt-level = 1
+
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.remote]
 inherits = "dev"

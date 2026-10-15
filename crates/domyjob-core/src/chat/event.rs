@@ -6,17 +6,24 @@ use core::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use super::card::{Card, MachineCard};
+use super::handoff::{Metadata as HandoffMetadata, Observation as HandoffObservation};
 use super::id::{
     AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
 };
+use super::notification::{Activity, Delivery, MILLIS_PER_SECOND, Notice};
 
 pub const MAX_EVENT_BYTES: usize = 400 * 1024;
 pub const MAX_CHAIN: usize = 8;
+pub const MAX_MEMBERS: usize = 64;
+const DUPLICATE_WINDOW: usize = 2;
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3600;
+const SECONDS_PER_DAY: u64 = 86_400;
 
 macro_rules! agent_list {
     ($(#[$doc:meta])* $name:ident, $min:literal, $max:expr, $what:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(try_from = "Vec<AgentId>", into = "Vec<AgentId>")]
         pub struct $name(Vec<AgentId>);
 
@@ -29,7 +36,7 @@ macro_rules! agent_list {
                 }
                 let mut sorted: Vec<&AgentId> = agents.iter().collect();
                 sorted.sort();
-                if sorted.windows(2).any(|pair| matches!(pair, [first, second] if first == second)) {
+                if sorted.windows(DUPLICATE_WINDOW).any(|pair| matches!(pair, [first, second] if first == second)) {
                     return Err(Invalid($what));
                 }
                 Ok(Self(agents))
@@ -61,8 +68,14 @@ macro_rules! agent_list {
     };
 }
 
-agent_list!(Chain, 0, MAX_CHAIN, "delegation chain");
-agent_list!(Members, 1, 64, "room members");
+agent_list!(
+    #[derive(Default)]
+    Chain,
+    0,
+    MAX_CHAIN,
+    "delegation chain"
+);
+agent_list!(Members, 1, MAX_MEMBERS, "room members");
 
 impl Chain {
     pub fn extended(&self, waiting: AgentId) -> Result<Self, Invalid> {
@@ -113,13 +126,18 @@ pub struct Stamp(u64);
 
 impl Stamp {
     #[must_use]
+    pub const fn millis(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
     pub const fn from_unix_millis(millis: u64) -> Self {
         Self(millis)
     }
 
     #[must_use]
     pub const fn age(self, now: Self) -> Age {
-        Age(now.0.saturating_sub(self.0) / 1000)
+        Age(now.0.saturating_sub(self.0) / MILLIS_PER_SECOND)
     }
 }
 
@@ -130,10 +148,14 @@ impl core::fmt::Display for Age {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let seconds = self.0;
         match seconds {
-            0..60 => write!(formatter, "{seconds}s ago"),
-            60..3600 => write!(formatter, "{}m ago", seconds / 60),
-            3600..86_400 => write!(formatter, "{}h ago", seconds / 3600),
-            _ => write!(formatter, "{}d ago", seconds / 86_400),
+            0..SECONDS_PER_MINUTE => write!(formatter, "{seconds}s ago"),
+            SECONDS_PER_MINUTE..SECONDS_PER_HOUR => {
+                write!(formatter, "{}m ago", seconds / SECONDS_PER_MINUTE)
+            }
+            SECONDS_PER_HOUR..SECONDS_PER_DAY => {
+                write!(formatter, "{}h ago", seconds / SECONDS_PER_HOUR)
+            }
+            _ => write!(formatter, "{}d ago", seconds / SECONDS_PER_DAY),
         }
     }
 }
@@ -167,6 +189,28 @@ pub enum Body {
         audience: Audience,
         intent: Intent,
         at: Stamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<Notice>,
+    },
+    Handoff {
+        metadata: HandoffMetadata,
+        text: Text,
+        at: Stamp,
+    },
+    HandoffRead {
+        observation: HandoffObservation,
+        audience: Audience,
+    },
+    Receipt {
+        request: EventId,
+        conversation: Conversation,
+        audience: Audience,
+        agent: AgentName,
+        delivery: Delivery,
+    },
+    Activity {
+        agent: AgentName,
+        activity: Activity,
     },
     TurnStarted {
         request: EventId,
@@ -202,19 +246,41 @@ impl Body {
                 conversation,
                 audience,
                 ..
+            }
+            | Self::Receipt {
+                conversation,
+                audience,
+                ..
             } => Some((conversation, audience)),
             Self::Profile { .. }
             | Self::Left { .. }
             | Self::Machine { .. }
             | Self::Room { .. }
             | Self::RoomClosed { .. }
+            | Self::Activity { .. }
+            | Self::Handoff { .. }
+            | Self::HandoffRead { .. }
             | Self::Omitted {} => None,
         }
     }
 
     #[must_use]
     pub fn audience(&self) -> Option<&Audience> {
-        self.thread().map(|(_, audience)| audience)
+        match self {
+            Self::Handoff { metadata, .. } => Some(metadata.audience()),
+            Self::HandoffRead { audience, .. } => Some(audience),
+            Self::Profile { .. }
+            | Self::Left { .. }
+            | Self::Machine { .. }
+            | Self::Room { .. }
+            | Self::RoomClosed { .. }
+            | Self::Message { .. }
+            | Self::Receipt { .. }
+            | Self::Activity { .. }
+            | Self::TurnStarted { .. }
+            | Self::Resolved { .. }
+            | Self::Omitted {} => self.thread().map(|(_, audience)| audience),
+        }
     }
 
     #[must_use]
@@ -224,12 +290,16 @@ impl Body {
 
     #[must_use]
     pub const fn request(&self) -> Option<&EventId> {
+        if let Self::HandoffRead { observation, .. } = self {
+            return Some(observation.handoff());
+        }
         if let Self::Message {
             intent: Intent::Reply { request },
             ..
         }
         | Self::TurnStarted { request, .. }
-        | Self::Resolved { request, .. } = self
+        | Self::Resolved { request, .. }
+        | Self::Receipt { request, .. } = self
         {
             Some(request)
         } else {
@@ -244,7 +314,11 @@ impl Body {
             | Self::Profile { agent, .. }
             | Self::Left { agent }
             | Self::TurnStarted { agent, .. }
-            | Self::Resolved { agent, .. } => Some(agent),
+            | Self::Resolved { agent, .. }
+            | Self::Receipt { agent, .. }
+            | Self::Activity { agent, .. } => Some(agent),
+            Self::Handoff { metadata, .. } => Some(metadata.sender().name()),
+            Self::HandoffRead { observation, .. } => Some(observation.reader().name()),
             Self::Machine { .. }
             | Self::Room { .. }
             | Self::RoomClosed { .. }
@@ -308,20 +382,59 @@ fn valid_ask(
 fn valid_thread(conversation: &Conversation, audience: &Audience, author: &AgentId) -> bool {
     match conversation {
         Conversation::Direct(pair) => {
-            let mut machines: Vec<&Origin> =
-                pair.agents().iter().map(|agent| agent.origin()).collect();
-            machines.sort();
-            machines.dedup();
-            pair.includes(author) && audience.members().iter().eq(machines)
+            let [first, second] = pair.agents();
+            let (first, second) = (first.origin(), second.origin());
+            pair.includes(author)
+                && match first.cmp(second) {
+                    core::cmp::Ordering::Equal => {
+                        matches!(audience.members(), [only] if only == first)
+                    }
+                    core::cmp::Ordering::Less => {
+                        matches!(audience.members(), [lower, upper] if lower == first && upper == second)
+                    }
+                    core::cmp::Ordering::Greater => {
+                        matches!(audience.members(), [lower, upper] if lower == second && upper == first)
+                    }
+                }
         }
         Conversation::Room(_) => true,
     }
+}
+
+fn valid_notice(
+    sender: &AgentId,
+    (conversation, audience): (&Conversation, &Audience),
+    intent: &Intent,
+    notice: &Notice,
+) -> bool {
+    !(notice.recipients.contains(sender)
+        || notice.recipients.agents().iter().any(|agent| {
+            !audience.includes(agent.origin())
+                || matches!(conversation, Conversation::Direct(pair) if !pair.includes(agent))
+        }) || notice.question.as_ref().is_some_and(|question| {
+        question.fallback() == sender
+            || !matches!(intent, Intent::Ask { chain, .. } if !chain.contains(question.fallback()))
+    })
+        || matches!(intent, Intent::Ask { responder, .. } if !notice.recipients.contains(responder)))
 }
 
 impl Event {
     pub fn new(id: EventId, clock: u64, body: Body) -> Result<Self, Invalid> {
         if clock == 0 || clock == u64::MAX {
             return Err(Invalid("event clock"));
+        }
+        if let Body::Handoff { metadata, .. } = &body
+            && metadata.sender().origin() != id.origin()
+        {
+            return Err(Invalid("handoff sender origin"));
+        }
+        if let Body::HandoffRead {
+            observation,
+            audience,
+        } = &body
+            && (observation.reader().origin() != id.origin() || !audience.includes(id.origin()))
+        {
+            return Err(Invalid("handoff observation author or audience"));
         }
         if let Some((conversation, audience)) = body.thread() {
             let author = body
@@ -345,6 +458,31 @@ impl Event {
             if !valid_ask(&sender, conversation, audience, (responder, chain)) {
                 return Err(Invalid("ask responder, conversation, or delegation chain"));
             }
+        }
+        if let Body::Message {
+            conversation,
+            from,
+            audience,
+            notice: Some(notice),
+            intent,
+            ..
+        } = &body
+        {
+            let sender = AgentId::new(from.clone(), id.origin().clone());
+            if !valid_notice(&sender, (conversation, audience), intent, notice) {
+                return Err(Invalid("message notification recipients"));
+            }
+        }
+        if matches!(
+            body,
+            Body::Receipt {
+                delivery: Delivery::Pending,
+                ..
+            }
+        ) {
+            return Err(Invalid(
+                "a receipt must record delivery, reading, or acknowledgment",
+            ));
         }
         Ok(Self { id, clock, body })
     }
@@ -593,6 +731,7 @@ mod tests {
             audience: audience.clone(),
             intent: Intent::Ask { responder, chain },
             at: Stamp::from_unix_millis(1),
+            notice: None,
         };
         let bob = agent("bob", 'b');
         let cycle = Chain::try_from(vec![bob.clone()]).unwrap();
@@ -606,6 +745,7 @@ mod tests {
             audience: audience.clone(),
             intent: Intent::Send {},
             at: Stamp::from_unix_millis(1),
+            notice: None,
         };
         Event::new(id('a', 1), 1, outsider).unwrap_err();
         Chain::try_from(vec![agent("x", 'a'), agent("x", 'a')]).unwrap_err();
@@ -615,6 +755,55 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn direct_threads_require_exact_origins_and_full_agent_identity() {
+        for (first_origin, second_origin) in [('a', 'b'), ('b', 'a'), ('a', 'a')] {
+            let first = agent("alice", first_origin);
+            let second = agent("bob", second_origin);
+            let conversation = Conversation::direct(&first, &second).unwrap();
+            assert_eq!(conversation, Conversation::direct(&second, &first).unwrap());
+            let exact = crate::chat::policy::audience([&first, &second]).unwrap();
+            let outsiders = [
+                agent("mallory", first_origin),
+                agent("mallory", second_origin),
+            ];
+            for author in [&first, &second] {
+                assert!(super::valid_thread(&conversation, &exact, author));
+            }
+            for author in &outsiders {
+                assert!(!super::valid_thread(&conversation, &exact, author));
+            }
+            let extra =
+                crate::chat::policy::audience([&first, &second, &agent("carol", 'c')]).unwrap();
+            let wrong = crate::chat::policy::audience([&agent("carol", 'c')]).unwrap();
+            for audience in [&extra, &wrong] {
+                assert!(!super::valid_thread(&conversation, audience, &first));
+            }
+            if first_origin != second_origin {
+                let missing = crate::chat::policy::audience([&first]).unwrap();
+                assert!(!super::valid_thread(&conversation, &missing, &first));
+                let substituted =
+                    crate::chat::policy::audience([&first, &agent("carol", 'c')]).unwrap();
+                assert!(!super::valid_thread(&conversation, &substituted, &first));
+            }
+        }
+    }
+
+    #[test]
+    fn room_thread_validation_leaves_author_and_audience_admission_to_the_caller() {
+        let owner = agent("alice", 'a');
+        let conversation = Conversation::Room(crate::chat::id::RoomId::new(
+            owner.origin().clone(),
+            crate::chat::id::RoomName::try_from(alloc::string::String::from("work")).unwrap(),
+        ));
+        let audience = crate::chat::policy::audience([&owner]).unwrap();
+        assert!(super::valid_thread(
+            &conversation,
+            &audience,
+            &agent("outsider", 'c')
+        ));
     }
 
     #[test]
@@ -647,5 +836,91 @@ mod tests {
             first.digest(),
             super::Digest::of(first.encoded().as_bytes())
         );
+    }
+
+    fn maximal_notification_event() -> Event {
+        use crate::chat::id::{
+            AgentId, AgentName, Audience, EventId, Line, MAX_AUDIENCE, MAX_TEXT, Origin, RoomId,
+            RoomName, Text,
+        };
+        use crate::chat::notification::{
+            MAX_EXPECTED_BYTES, MAX_FALLBACK_SECONDS, MAX_SUBJECT_BYTES, Notice, Question,
+        };
+        use core::num::NonZeroU64;
+
+        const MAX_HANDLE_BYTES: usize = 64;
+        const ORIGIN_ENTROPY_BYTES: usize = 16;
+        let origins: Vec<_> = (0..MAX_AUDIENCE)
+            .map(|index| Origin::from_entropy([u8::try_from(index).unwrap(); ORIGIN_ENTROPY_BYTES]))
+            .collect();
+        let local = origins.first().unwrap().clone();
+        let recipients: Vec<_> = origins
+            .iter()
+            .enumerate()
+            .map(|(index, origin)| {
+                AgentId::new(
+                    AgentName::try_from(alloc::format!("{index:0MAX_HANDLE_BYTES$}")).unwrap(),
+                    origin.clone(),
+                )
+            })
+            .collect();
+        let responder = recipients.first().unwrap().clone();
+        let chain = Chain::try_from(
+            (0..super::MAX_CHAIN)
+                .map(|index| {
+                    AgentId::new(
+                        AgentName::try_from(alloc::format!(
+                            "c{index:0width$}",
+                            width = MAX_HANDLE_BYTES - 1
+                        ))
+                        .unwrap(),
+                        local.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let fallback = AgentId::new(
+            AgentName::try_from("f".repeat(MAX_HANDLE_BYTES)).unwrap(),
+            local.clone(),
+        );
+        Event::new(
+            EventId::new(local.clone(), NonZeroU64::new(u64::MAX).unwrap()),
+            u64::MAX - 1,
+            Body::Message {
+                conversation: Conversation::Room(RoomId::new(
+                    local,
+                    RoomName::try_from("r".repeat(MAX_HANDLE_BYTES)).unwrap(),
+                )),
+                from: AgentName::try_from("s".repeat(MAX_HANDLE_BYTES)).unwrap(),
+                text: Text::try_from("\u{0001}".repeat(MAX_TEXT)).unwrap(),
+                audience: Audience::try_from(origins).unwrap(),
+                intent: Intent::Ask { responder, chain },
+                at: Stamp::from_unix_millis(u64::MAX),
+                notice: Some(Notice {
+                    recipients: super::Members::try_from(recipients).unwrap(),
+                    urgent: false,
+                    subject: Some(Line::try_from("\"".repeat(MAX_SUBJECT_BYTES)).unwrap()),
+                    question: Some(
+                        Question::new(
+                            Line::try_from("\"".repeat(MAX_EXPECTED_BYTES)).unwrap(),
+                            MAX_FALLBACK_SECONDS,
+                            fallback,
+                        )
+                        .unwrap(),
+                    ),
+                }),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn maximal_notification_fields_still_seal_within_the_event_limit() {
+        const MAXIMAL_NOTIFICATION_BYTES: usize = 404_147;
+        let sealed = Sealed::new(maximal_notification_event()).unwrap();
+        assert_eq!(sealed.encoded().len(), MAXIMAL_NOTIFICATION_BYTES);
+        assert!(sealed.encoded().len() < super::MAX_EVENT_BYTES);
+        assert_eq!(decode(sealed.encoded()).unwrap(), *sealed.event());
     }
 }

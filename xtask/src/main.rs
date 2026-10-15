@@ -132,7 +132,7 @@ fn dispatch(root: &Path, words: &[&str]) -> ExitCode {
         ["dependencies", "vet"] => dependencies(root, xtask::dependencies::Check::Vet),
         _ => {
             eprintln!(
-                "usage: cargo xtask gates | workflows | windows-contracts | verify [models|inventory|fuzz] | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|preview-macos-package TARGET VERSION|verify-windows|bundle|checksums|queue handoff|discover|finalize|publish | ci plan|check|test|hook|gate"
+                "usage: cargo xtask gates | workflows | windows-contracts | verify [models|inventory|fuzz|parent-identity] | commit-msg FILE | dependencies deny|audit|vet | release version|build|sign-macos|preview-macos-package TARGET VERSION|verify-windows|bundle|checksums|queue handoff|discover|finalize|publish | ci plan|check|test|hook|gate"
             );
             ExitCode::from(TASK_ERROR_EXIT_CODE)
         }
@@ -166,6 +166,24 @@ mod tests {
         }
     }
 
+    fn actual_parent_sources(root: &std::path::Path) {
+        let sources = [
+            include_bytes!("../../crates/domyjob-core/src/chat/ledger.rs").as_slice(),
+            include_bytes!("../../crates/domyjob-core/src/chat/ledger/parent_identity.rs")
+                .as_slice(),
+            include_bytes!("../../crates/domyjob-core/src/chat/id.rs").as_slice(),
+            include_bytes!("../../crates/domyjob-core/src/chat/event.rs").as_slice(),
+            include_bytes!("../../crates/domyjob/src/chat/store/views.rs").as_slice(),
+            include_bytes!("../../crates/domyjob-core/src/lib.rs").as_slice(),
+            include_bytes!("../../crates/domyjob-core/src/chat.rs").as_slice(),
+        ];
+        for (file, bytes) in xtask::parent_refinement::FILES.iter().zip(sources) {
+            let path = root.join(file);
+            raw::create_dir_all(path.parent().unwrap()).unwrap();
+            raw::write(&path, bytes).unwrap();
+        }
+    }
+
     #[test]
     fn commands_preserve_success_failure_and_usage_exit_codes() {
         let root = tempfile::tempdir().unwrap();
@@ -181,6 +199,7 @@ mod tests {
         for directory in ["crates", "xtask"] {
             raw::create_dir_all(&root.path().join(directory)).unwrap();
         }
+        actual_parent_sources(root.path());
         assert_eq!(dispatch(root.path(), &["gates"]), ExitCode::SUCCESS);
         let mut diagnostics = Vec::new();
         assert_eq!(

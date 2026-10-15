@@ -1,10 +1,38 @@
 use domyjob_core::chat::card::{Access, Card, Mode, Skills, Tool};
-use domyjob_core::chat::event::Body;
+use domyjob_core::chat::event::{Body, Members};
+use domyjob_core::chat::handoff::{Metadata, Project, Scope, Target};
 use domyjob_core::chat::id::{AgentId, AgentName, Line};
 use domyjob_core::chat::policy::Priority;
 
 use super::Store;
 use super::views::LocalAgent;
+
+pub(crate) fn assert_removed_after_drop(fixture: impl Sized, path: &std::path::Path) {
+    drop(fixture);
+    assert_eq!(
+        std::fs::symlink_metadata(path).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+pub(crate) fn handoff_metadata(
+    sender: &AgentId,
+    previous: &AgentId,
+    continuing: &AgentId,
+) -> Metadata {
+    Metadata::new(
+        sender.clone(),
+        Target::Agent {
+            agent: previous.clone(),
+        },
+        (
+            Project::try_from("owner/project".to_owned()).unwrap(),
+            Scope::try_from("issue-47".to_owned()).unwrap(),
+        ),
+        Members::try_from(vec![previous.clone(), continuing.clone()]).unwrap(),
+    )
+    .unwrap()
+}
 
 pub(crate) fn store(root: &tempfile::TempDir, name: &str) -> Store {
     Store::open_in(&crate::layout::State::at(&root.path().join(name))).unwrap()

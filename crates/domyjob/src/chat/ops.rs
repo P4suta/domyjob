@@ -8,12 +8,14 @@ use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, EventId, Invalid, Line, Paragraph, RoomName, Text,
 };
 use domyjob_core::chat::ledger::{Ending as Resolved, Room};
+use domyjob_core::chat::notification::{Activity, ActivityState, Delivery, Notice, Question};
 use domyjob_core::chat::policy::{self, Priority, Refusal};
 
 use super::address::{self, Book};
 use super::args::{
-    AskArgs, DirectoryArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs,
-    ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
+    AskArgs, DirectoryArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs,
+    NotificationArgs, ProfileArgs, ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs,
+    UpdateArgs,
 };
 use super::pulse::{Pulse, PulseError};
 use super::store::{self, LocalAgent, Reader, Store, StoreError};
@@ -21,6 +23,11 @@ use super::sync::{self, Report, SyncError};
 use super::view::{self, AskState, Outcome, Presence};
 use crate::lock::{OsLock, Probe};
 use crate::platform::clock::{self, Deadline};
+
+pub(crate) mod reads;
+pub(crate) use reads::{PendingRead, complete_read};
+pub(crate) mod handoff;
+pub(crate) use handoff::{create_handoff, handoffs, observe_handoff, read_handoff};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpsError {
@@ -64,6 +71,8 @@ pub(crate) struct Session {
 
 const SYNC_SECONDS: u64 = 15;
 pub(crate) const MAX_WAIT_SECONDS: u64 = 600;
+const MAX_PROJECT_BYTES: usize = 128;
+const QUESTION_POLL_MILLIS: u64 = 1000;
 const MAX_LIMIT: usize = 500;
 
 impl Session {
@@ -117,7 +126,7 @@ impl Session {
         self.actor.clone_from(&other.actor);
     }
 
-    fn me(&self) -> Result<&AgentId, OpsError> {
+    pub(crate) fn me(&self) -> Result<&AgentId, OpsError> {
         self.actor.as_ref().ok_or(OpsError::Anonymous)
     }
 
@@ -227,7 +236,7 @@ fn apply_profile(card: &mut Card, profile: &ProfileArgs) -> Result<(), Invalid> 
     Ok(())
 }
 
-fn project_of(cwd: &str) -> Option<Line<128>> {
+fn project_of(cwd: &str) -> Option<Line<MAX_PROJECT_BYTES>> {
     let name = Path::new(cwd).file_name()?.to_str()?;
     match Line::try_from(name.to_owned()) {
         Ok(project) => Some(project),
@@ -285,7 +294,7 @@ pub(crate) fn join(
         .to_string_lossy()
         .into_owned();
     let access = args.access.map_or(Access::Write, Access::from);
-    let card = session.store.write(|tx| {
+    session.store.write(|tx| {
         let existing = store::profile(tx.transaction(), &agent)?;
         if existing
             .as_ref()
@@ -302,28 +311,30 @@ pub(crate) fn join(
         card.tool = tool;
         card.access = access;
         apply_profile(&mut card, &args.profile)?;
-        tx.configure(
+        configure_profile(
+            tx,
             &name,
-            Some(&LocalAgent {
+            &card,
+            &LocalAgent {
                 cwd: cwd.clone(),
                 session: None,
-            }),
-        )?;
-        tx.author(
-            Priority::Ordinary,
-            Body::Profile {
-                agent: name.clone(),
-                card: Box::new(card.clone()),
             },
         )?;
-        Ok(card)
+        tx.author(
+            Priority::Ending,
+            Body::Activity {
+                agent: name.clone(),
+                activity: Activity {
+                    state: ActivityState::Waiting,
+                    at: clock::stamp(),
+                    status: card.status.clone(),
+                },
+            },
+        )?;
+        Ok(())
     })?;
-    session.actor = Some(agent.clone());
-    Ok(Outcome::Agent {
-        agent,
-        card,
-        presence: Presence::default(),
-    })
+    session.actor = Some(agent);
+    whoami(session)
 }
 
 pub(crate) fn start(session: &Session, args: &StartArgs) -> Result<Outcome, OpsError> {
@@ -347,18 +358,13 @@ pub(crate) fn start(session: &Session, args: &StartArgs) -> Result<Outcome, OpsE
                 "an agent with this name already exists here",
             ))));
         }
-        tx.configure(
+        configure_profile(
+            tx,
             &name,
-            Some(&LocalAgent {
+            &card,
+            &LocalAgent {
                 cwd: cwd.clone(),
                 session: args.resume.clone(),
-            }),
-        )?;
-        tx.author(
-            Priority::Ordinary,
-            Body::Profile {
-                agent: name.clone(),
-                card: Box::new(card.clone()),
             },
         )?;
         Ok(())
@@ -368,6 +374,23 @@ pub(crate) fn start(session: &Session, args: &StartArgs) -> Result<Outcome, OpsE
         card,
         presence: Presence::default(),
     })
+}
+
+fn configure_profile(
+    tx: &mut store::Tx<'_>,
+    name: &AgentName,
+    card: &Card,
+    config: &LocalAgent,
+) -> Result<(), StoreError> {
+    tx.configure(name, Some(config))?;
+    tx.author(
+        Priority::Ordinary,
+        Body::Profile {
+            agent: name.clone(),
+            card: Box::new(card.clone()),
+        },
+    )?;
+    Ok(())
 }
 
 pub(crate) fn update(session: &Session, args: &UpdateArgs) -> Result<Outcome, OpsError> {
@@ -423,7 +446,7 @@ pub(crate) fn remove(session: &Session, args: &NameArgs) -> Result<Outcome, OpsE
 
 pub(crate) fn profile(session: &Session, args: &ProfileArgs) -> Result<Outcome, OpsError> {
     let agent = session.me()?.clone();
-    let card = session.store.write(|tx| {
+    session.store.write(|tx| {
         let mut card = store::profile(tx.transaction(), &agent)?
             .ok_or_else(|| StoreError::Unknown(agent.to_string()))?;
         apply_profile(&mut card, args)?;
@@ -434,13 +457,22 @@ pub(crate) fn profile(session: &Session, args: &ProfileArgs) -> Result<Outcome, 
                 card: Box::new(card.clone()),
             },
         )?;
-        Ok(card)
+        if args.status.is_some() {
+            tx.author(
+                Priority::Ending,
+                Body::Activity {
+                    agent: agent.name().clone(),
+                    activity: Activity {
+                        state: ActivityState::Working,
+                        at: clock::stamp(),
+                        status: card.status.clone(),
+                    },
+                },
+            )?;
+        }
+        Ok(())
     })?;
-    Ok(Outcome::Agent {
-        agent,
-        card,
-        presence: Presence::default(),
-    })
+    whoami(session)
 }
 
 pub(crate) fn whoami(session: &Session) -> Result<Outcome, OpsError> {
@@ -621,7 +653,7 @@ fn message(
     conversation: &Conversation,
     me: &AgentId,
     audience: domyjob_core::chat::id::Audience,
-    (text, intent): (Text, Intent),
+    (text, intent, notice): (Text, Intent, Option<Notice>),
 ) -> Body {
     Body::Message {
         conversation: conversation.clone(),
@@ -630,21 +662,119 @@ fn message(
         audience,
         intent,
         at: clock::stamp(),
+        notice,
     }
 }
 
 pub(crate) fn send(session: &Session, args: &SendArgs) -> Result<Outcome, OpsError> {
     let me = session.me()?.clone();
-    let conversation = session.book()?.conversation(&me, &args.target)?;
+    let book = session.book()?;
+    let conversation = book.conversation(&me, &args.target)?;
     let body = text(&args.text)?;
     let event = session.store.write(|tx| {
-        let (audience, _) = route(tx.transaction(), &conversation, &me)?;
+        let (audience, room) = route(tx.transaction(), &conversation, &me)?;
+        let notice = notification(
+            &book,
+            NotificationRoute {
+                conversation: &conversation,
+                room: room.as_ref(),
+                me: &me,
+                responder: None,
+            },
+            &args.notification,
+        )?;
         tx.author(
             Priority::Ordinary,
-            message(&conversation, &me, audience, (body, Intent::Send {})),
+            message(
+                &conversation,
+                &me,
+                audience,
+                (body, Intent::Send {}, notice),
+            ),
         )
     })?;
     Ok(Outcome::Posted(event))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NotificationRoute<'a> {
+    conversation: &'a Conversation,
+    room: Option<&'a Room>,
+    me: &'a AgentId,
+    responder: Option<&'a AgentId>,
+}
+
+fn notification(
+    book: &Book,
+    route: NotificationRoute<'_>,
+    args: &NotificationArgs,
+) -> Result<Option<Notice>, StoreError> {
+    let NotificationRoute {
+        conversation,
+        room,
+        me,
+        responder,
+    } = route;
+    let mut recipients = if args.mentions.is_empty() {
+        match (conversation, responder) {
+            (_, Some(responder)) => vec![responder.clone()],
+            (Conversation::Direct(pair), None) => pair.other(me).cloned().into_iter().collect(),
+            (Conversation::Room(_), None) => room.map_or_else(Vec::new, |room| {
+                room.members
+                    .agents()
+                    .iter()
+                    .filter(|agent| *agent != me)
+                    .cloned()
+                    .collect()
+            }),
+        }
+    } else {
+        args.mentions
+            .iter()
+            .map(|name| book.agent(name))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for recipient in &recipients {
+        if recipient == me
+            || matches!(conversation, Conversation::Direct(pair) if !pair.includes(recipient))
+        {
+            return Err(StoreError::Invalid(Invalid(
+                "mentions must name another recipient of this conversation",
+            )));
+        }
+        if let Some(room) = room {
+            policy::check_member(room, recipient)?;
+        }
+    }
+    recipients.sort();
+    recipients.dedup();
+    let question = match (&args.expected, &args.fallback) {
+        (Some(expected), Some(fallback)) if responder.is_some() => Some(Question::new(
+            Line::try_from(expected.clone())?,
+            args.after,
+            book.agent(fallback)?,
+        )?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(StoreError::Invalid(Invalid(
+                "expected answers and fallback escalation require chat ask",
+            )));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(StoreError::Invalid(Invalid(
+                "expected and fallback must be supplied together",
+            )));
+        }
+    };
+    if recipients.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Notice {
+        recipients: Members::try_from(recipients)?,
+        urgent: args.urgent,
+        subject: args.subject.clone().map(Line::try_from).transpose()?,
+        question,
+    }))
 }
 
 fn delegation(session: &Session, me: &AgentId) -> Result<Chain, OpsError> {
@@ -694,21 +824,30 @@ pub(crate) fn ask(session: &Session, args: &AskArgs) -> Result<Outcome, OpsError
         if let Some(room) = &room {
             policy::check_member(room, &responder)?;
         }
-        tx.author(
-            Priority::Ordinary,
-            message(
-                &conversation,
-                &me,
-                audience,
-                (
-                    body,
-                    Intent::Ask {
-                        responder: responder.clone(),
-                        chain,
-                    },
-                ),
+        let notice = notification(
+            &book,
+            NotificationRoute {
+                conversation: &conversation,
+                room: room.as_ref(),
+                me: &me,
+                responder: Some(&responder),
+            },
+            &args.notification,
+        )?;
+        let message = message(
+            &conversation,
+            &me,
+            audience,
+            (
+                body,
+                Intent::Ask {
+                    responder: responder.clone(),
+                    chain,
+                },
+                notice,
             ),
-        )
+        );
+        tx.author(Priority::Ordinary, message)
     })?;
     super::runner::dispatch(&session.store)?;
     let state = await_ending(session, request.id(), args.timeout)?;
@@ -743,7 +882,7 @@ fn ask_state(session: &Session, request: &EventId) -> Result<AskState, OpsError>
             .agents
             .values()
             .any(|(_, presence)| presence.working_on.as_ref() == Some(request));
-        Ok(view::ask_state(
+        let mut state = view::ask_state(
             &book,
             &view::AskFacts {
                 request: &event,
@@ -751,14 +890,17 @@ fn ask_state(session: &Session, request: &EventId) -> Result<AskState, OpsError>
                 answer: answer.as_ref(),
                 working,
             },
-        ))
+        );
+        state.escalated_to = store::escalation(read, request)?;
+        Ok(state)
     })?)
 }
 
 fn await_ending(session: &Session, request: &EventId, timeout: u64) -> Result<AskState, OpsError> {
     let deadline = Deadline::after_seconds(timeout);
-    let mut pulse = Pulse::new(&session.store, 1000)?;
+    let mut pulse = Pulse::new(&session.store, QUESTION_POLL_MILLIS)?;
     loop {
+        session.store.escalate(clock::stamp())?;
         let state = ask_state(session, request)?;
         if state.ended() || deadline.expired() || session.cancelled.load(Ordering::Acquire) {
             return Ok(state);
@@ -808,6 +950,7 @@ pub(crate) fn reply(session: &Session, args: &ReplyArgs) -> Result<Outcome, OpsE
                     Intent::Reply {
                         request: request.clone(),
                     },
+                    None,
                 ),
             ),
         )
@@ -851,19 +994,19 @@ pub(crate) fn withdraw(session: &Session, args: &MessageArgs) -> Result<Outcome,
 pub(crate) fn inbox(session: &Session, args: &InboxArgs) -> Result<Outcome, OpsError> {
     let me = session.me()?.clone();
     let limit = clamp(args.limit);
-    let (events, unread) = session.store.write(|tx| {
-        let cursor = tx.read_cursor(&me)?;
-        let after = if args.all { String::new() } else { cursor };
-        let events = store::inbox(tx.transaction(), &me, &after, limit)?;
-        if let Some(last) = events.last() {
-            tx.mark_read(&me, last)?;
-        }
-        let unread = store::inbox(tx.transaction(), &me, &tx.read_cursor(&me)?, MAX_LIMIT)?.len();
-        Ok((events, unread))
+    let events = session.store.read(|read| {
+        let events = if args.all {
+            store::inbox(read, &me, "", limit)?
+        } else {
+            store::unread(read, &me, limit)?
+        };
+        Ok(events)
     })?;
+    let pending = PendingRead::prepare(session, events, true)?;
     Ok(Outcome::Events {
-        events: view::messages(&session.book()?, &events),
-        unread: Some(unread),
+        events: message_views(session, pending.events())?,
+        unread: Some(pending.unread(session)?),
+        pending: Some(pending),
     })
 }
 
@@ -872,8 +1015,7 @@ pub(crate) fn unread(session: &Session) -> Result<Option<usize>, OpsError> {
         return Ok(None);
     };
     Ok(Some(session.store.write(|tx| {
-        let cursor = tx.read_cursor(&me)?;
-        Ok(store::inbox(tx.transaction(), &me, &cursor, MAX_LIMIT)?.len())
+        Ok(store::unread(tx.transaction(), &me, MAX_LIMIT)?.len())
     })?))
 }
 
@@ -897,11 +1039,95 @@ pub(crate) fn thread(session: &Session, args: &ThreadArgs) -> Result<Outcome, Op
         store::thread(read, &conversation, clamp(args.limit), before.as_ref())
     })?;
     Ok(Outcome::Events {
-        events: view::messages(&book, &events),
+        events: message_views(session, &events)?,
         unread: None,
+        pending: None,
+    })
+}
+
+fn message_views(
+    session: &Session,
+    events: &[domyjob_core::chat::event::Event],
+) -> Result<Vec<view::MessageView>, OpsError> {
+    let mut messages = view::messages(&session.book()?, events);
+    session.store.read(|read| {
+        for message in &mut messages {
+            let Some(event) = events.iter().find(|event| *event.id() == message.id) else {
+                continue;
+            };
+            let Body::Message {
+                conversation,
+                notice,
+                ..
+            } = event.body()
+            else {
+                continue;
+            };
+            let recipients: Vec<AgentId> = notice.as_ref().map_or_else(
+                || match conversation {
+                    Conversation::Direct(pair) => pair
+                        .agents()
+                        .into_iter()
+                        .filter(|agent| event.author().as_ref() != Some(*agent))
+                        .cloned()
+                        .collect(),
+                    Conversation::Room(_) => Vec::new(),
+                },
+                |notice| notice.recipients.agents().to_vec(),
+            );
+            for agent in recipients {
+                message
+                    .delivery
+                    .insert(agent.clone(), store::delivery(read, &agent, event.id())?);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(messages)
+}
+
+pub(crate) fn read_message(session: &Session, args: &MessageArgs) -> Result<Outcome, OpsError> {
+    session.me()?;
+    let request = EventId::try_from(args.message.clone())?;
+    let message = session.store.read(|read| {
+        store::event(read, &request)?.ok_or_else(|| StoreError::Unknown(request.to_string()))
+    })?;
+    let pending = PendingRead::prepare(session, vec![message], false)?;
+    Ok(Outcome::Events {
+        events: message_views(session, pending.events())?,
+        unread: Some(pending.unread(session)?),
+        pending: Some(pending),
+    })
+}
+
+pub(crate) fn acknowledge(session: &Session, args: &MessageArgs) -> Result<Outcome, OpsError> {
+    receipt_message(session, args, Delivery::Acknowledged)
+}
+
+fn receipt_message(
+    session: &Session,
+    args: &MessageArgs,
+    stage: Delivery,
+) -> Result<Outcome, OpsError> {
+    let agent = session.me()?;
+    let request = EventId::try_from(args.message.clone())?;
+    let message = session.store.write(|tx| {
+        let event = store::event(tx.transaction(), &request)?
+            .ok_or_else(|| StoreError::Unknown(request.to_string()))?;
+        tx.receipt(agent, &event, stage)?;
+        Ok(event)
+    })?;
+    Ok(Outcome::Events {
+        events: message_views(session, &[message])?,
+        unread: unread(session)?,
+        pending: None,
     })
 }
 
 pub(crate) fn publish_machine(store: &Store) -> Result<(), OpsError> {
     Ok(store.publish_machine()?)
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/chat_ops_notifications.rs"]
+mod notification_tests;

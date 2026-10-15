@@ -11,22 +11,28 @@ use crate::lock::{LockError, OsLock};
 use crate::state_io::{self, StateError};
 
 mod admin;
+pub(crate) mod handoff;
+mod notifications;
+pub(crate) mod observer;
 mod tables;
 mod turns;
 mod tx;
 mod views;
 
 pub(crate) use admin::{Link, LinkState};
+pub(crate) use notifications::{delivered_to, escalation, urgent};
 pub(crate) use tables::Reader;
 pub(crate) use turns::{Completion, Turn};
 pub(crate) use tx::Tx;
 pub(crate) use views::{
-    Directory, LocalAgent, Presence, agent_config, cursor, directory, event, inbox, local_agents,
-    open_asks, profile, resolution, room, rooms, thread,
+    Directory, LocalAgent, Presence, activity, agent_config, cursor, delivery, directory, event,
+    inbox, local_agents, open_asks, pending, profile, resolution, room, rooms, thread, unread,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
+    #[error(transparent)]
+    Handoff(#[from] domyjob_core::chat::handoff::ReadRefusal),
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]
@@ -107,7 +113,12 @@ fn initialize(database: &Database) -> Result<Origin, StoreError> {
         let format = crate::formats::chat();
         let known = tables::get_text(&meta, "origin")?.is_some();
         match tables::get_text(&meta, "format")? {
-            Some(found) if found != format => return Err(StoreError::Format(found)),
+            Some(found) if !crate::formats::compatible_chat(&found) => {
+                return Err(StoreError::Format(found));
+            }
+            Some(found) if found != format => {
+                meta.insert("format", format.as_str())?;
+            }
             Some(_) => {}
             None if known => return Err(StoreError::Format("unrecorded".to_owned())),
             None => {
@@ -243,6 +254,9 @@ impl Tx<'_> {
     }
 }
 
+#[cfg(test)]
+#[path = "../../tests/support/chat_store_faults.rs"]
+mod faults;
 #[cfg(test)]
 pub(crate) mod fixtures;
 #[cfg(test)]

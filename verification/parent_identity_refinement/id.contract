@@ -1,0 +1,156 @@
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
+use core::num::NonZeroU64;
+
+use serde::{Deserialize, Serialize};
+fn lower_hex(text: &str, length: usize) -> bool {
+    text.len() == length
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+const fn check(valid: bool, what: &'static str) -> Result<(), Invalid> {
+    if valid { Ok(()) } else { Err(Invalid(what)) }
+}
+
+validated_string!(Origin, Invalid, |text| check(
+    lower_hex(text, 32),
+    "machine identity"
+));
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct EventId {
+    origin: Origin,
+    seq: NonZeroU64,
+}
+
+impl EventId {
+    #[must_use]
+    pub const fn new(origin: Origin, seq: NonZeroU64) -> Self {
+        Self { origin, seq }
+    }
+
+    #[must_use]
+    pub const fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
+    #[must_use]
+    pub const fn seq(&self) -> NonZeroU64 {
+        self.seq
+    }
+}
+macro_rules! bounded_text {
+    ($(#[$doc:meta])* $name:ident, $multiline:literal, $what:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name<const MAX: usize>(String);
+
+        impl<const MAX: usize> TryFrom<String> for $name<MAX> {
+            type Error = Invalid;
+
+            fn try_from(text: String) -> Result<Self, Self::Error> {
+                if valid_text(&text, MAX, $multiline) {
+                    Ok(Self(text))
+                } else {
+                    Err(Invalid($what))
+                }
+            }
+        }
+
+        impl<const MAX: usize> From<$name<MAX>> for String {
+            fn from(value: $name<MAX>) -> Self {
+                value.0
+            }
+        }
+
+        impl<const MAX: usize> $name<MAX> {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+const MACRO_SITES: &[&str] = &[
+    r##"matches!(byte , b'a' ..= b'f')"##,
+    r##"validated_string!(Origin , Invalid , | text | check (lower_hex (text , 32) , "machine identity"))"##,
+    r##"format!("{:032x}" , u128 :: from_be_bytes (bytes))"##,
+    r##"matches!(byte , b'.' | b'-' | b'_')"##,
+    r##"validated_string!(AgentName , Invalid , | text | check (valid_handle (text) , "agent name"))"##,
+    r##"validated_string!(RoomName , Invalid , | text | check (valid_handle (text) , "room name"))"##,
+    r##"format!("{value}")"##,
+    r##"write!(formatter , "{}@{}" , self . name , self . origin)"##,
+    r##"format!("{value}")"##,
+    r##"write!(formatter , "{}:{:016x}" , self . origin , self . seq)"##,
+    r##"write!(formatter , "room:{}:{}" , self . origin , self . name)"##,
+    r##"format!("{value}")"##,
+    r##"write!(formatter , "dm:{},{}" , pair . first , pair . second)"##,
+    r##"write!(formatter , "{room}")"##,
+    r##"macro_rules! bounded_text {
+    ($(#[$doc:meta])* $name:ident, $multiline:literal, $what:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name<const MAX: usize>(String);
+        impl<const MAX: usize> TryFrom<String> for $name<MAX> {
+            type Error = Invalid;
+            fn try_from(text: String) -> Result<Self, Self::Error> {
+                if valid_text(&text, MAX, $multiline) { Ok(Self(text)) }
+                else { Err(Invalid($what)) }
+            }
+        }
+        impl<const MAX: usize> From<$name<MAX>> for String {
+            fn from(value: $name<MAX>) -> Self { value.0 }
+        }
+        impl<const MAX: usize> $name<MAX> {
+            #[must_use]
+            pub fn as_str(&self) -> &str { &self.0 }
+        }
+    };
+}"##,
+    r##"bounded_text!(Line , false , "single-line text")"##,
+    r##"bounded_text!(Paragraph , true , "paragraph")"##,
+    r##"validated_string!(Text , Invalid , | text | check (text . len () <= MAX_TEXT && ! text . trim () . is_empty () && ! text . contains ('\0') , "message text"))"##,
+    r##"matches!(pair , [first , second] if first >= second)"##,
+    r##"alloc::format!("reviewer{machine}")"##,
+    r##"alloc::format!("Bad@{machine}")"##,
+    r##"alloc::format!("zz:{:016x}" , 1)"##,
+    r##"alloc::format!("{machine}:{:016x}" , 0)"##,
+    r##"alloc::format!("{machine}:{:016x}" , 1)"##,
+    r##"assert_eq!(AgentName :: try_from (longest . clone ()) . unwrap () . as_str () , longest)"##,
+    r##"assert_eq!(super :: RoomName :: try_from (longest . clone ()) . unwrap () . as_str () , longest)"##,
+    r##"assert!(direct . admits_author (& alice) && direct . admits_author (& bob))"##,
+    r##"assert!(! direct . admits_author (& carol))"##,
+    r##"assert!(Conversation :: Room (room) . admits_author (& carol))"##,
+    r##"assert_eq!(AgentId :: try_from (String :: from (id . clone ())) . unwrap () , id)"##,
+    r##"alloc::format!("{}:{:016x}" , origin ('b') , 42)"##,
+    r##"assert_eq!(event . seq () . get () , 42)"##,
+    r##"assert_eq!(EventId :: try_from (String :: from (event . clone ())) . unwrap () , event)"##,
+    r##"assert_eq!(Conversation :: try_from (String :: from (direct . clone ())) . unwrap () , direct)"##,
+    r##"alloc::format!("room:{}:release" , origin ('c'))"##,
+    r##"assert_eq!(Conversation :: try_from (String :: from (room . clone ())) . unwrap () , room)"##,
+    r##"alloc::format!("{}:{:016x}" , origin ('a') , 0)"##,
+    r##"alloc::format!("{}:{:016X}" , origin ('a') , 10)"##,
+    r##"alloc::format!("{}:{:x}" , origin ('a') , 10)"##,
+    r##"alloc::format!("dm:{bob},{alice}")"##,
+    r##"alloc::format!("dm:{alice},{alice}")"##,
+    r##"assert_eq!(pair , DirectPair :: between (& second , & first) . unwrap ())"##,
+    r##"assert_eq!(pair . other (& first) , Some (& second))"##,
+    r##"assert_eq!(pair . other (& agent ("c" , '2')) , None)"##,
+    r##"vec![origin ('b') , origin ('a')]"##,
+    r##"vec![origin ('a') , origin ('a')]"##,
+    r##"vec![]"##,
+    r##"vec![origin ('a') , origin ('b')]"##,
+    r##"assert!(audience . includes (& origin ('b')))"##,
+    r##"assert!(! audience . includes (& origin ('c')))"##,
+    r##"assert_eq!(vec :: Vec :: from (audience) , vec ! [origin ('a') , origin ('b')])"##,
+    r##"assert_eq!(largest . members () . len () , super :: MAX_AUDIENCE)"##,
+];

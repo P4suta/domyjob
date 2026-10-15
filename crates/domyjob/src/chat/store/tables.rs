@@ -47,6 +47,13 @@ tables! {
     LOCAL_AGENTS: &'static str => &'static str = "local_agents";
     TURNS: &'static str => &'static str = "turns";
     READS: &'static str => &'static str = "reads";
+    DELIVERY: &'static str => &'static str = "delivery";
+    ACTIVITY: &'static str => &'static str = "activity";
+    ESCALATIONS: &'static str => &'static str = "escalations";
+    URGENT: &'static str => &'static str = "urgent";
+    HANDOFF_HEADERS: &'static str => &'static str = "handoff_headers";
+    HANDOFF_READERS: &'static str => &'static str = "handoff_readers";
+    HANDOFF_READS: &'static str => &'static str = "handoff_reads";
     PEERS: &'static str => &'static str = "peers";
     LINKS: &'static str => &'static str = "links";
 }
@@ -140,4 +147,8 @@ pub(super) fn room_key(room: &RoomId) -> String {
 
 pub(super) fn event_key(id: &EventId) -> String {
     id.to_string()
+}
+
+pub(super) fn delivery_key(agent: &AgentId, request: &EventId) -> String {
+    format!("{agent}\u{1f}{request}")
 }

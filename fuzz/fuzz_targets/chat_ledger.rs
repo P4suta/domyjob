@@ -6,9 +6,28 @@ use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, Line, Origin, RoomId, RoomName, Text,
 };
 use domyjob_core::chat::model::Model;
+use domyjob_core::chat::notification::{Activity, ActivityState, Delivery, Notice};
 use domyjob_core::chat::policy::audience;
 
 const MACHINES: usize = 3;
+const OPERATIONS: u8 = 12;
+const OP_DIRECT_ASK: u8 = 2;
+const OP_ROOM_ASK: u8 = 3;
+const OP_REPLY: u8 = 4;
+const OP_WITHDRAW: u8 = 5;
+const OP_FAIL: u8 = 6;
+const OP_DELIVERED: u8 = 8;
+const OP_READ: u8 = 9;
+const OP_ACKNOWLEDGED: u8 = 10;
+const OP_ACTIVITY: u8 = 11;
+const ACTIVITY_VARIANTS: usize = 2;
+const CONVERGENCE_PAIR_SIZE: usize = 2;
+const ROLE_VARIANTS: usize = 5;
+const MAX_PARTIAL_ROUNDS: usize = 4;
+const INPUT_STEP_BYTES: usize = 3;
+const INPUT_Y_INDEX: usize = 2;
+const MAX_STEPS: usize = 256;
+const CONVERGENCE_ROUNDS: usize = 64;
 
 fn origin(machine: usize) -> Origin {
     Origin::from_entropy([u8::try_from(machine).unwrap().wrapping_add(1); 16])
@@ -51,6 +70,18 @@ fn message(from: &AgentId, conversation: Conversation, to: &[&AgentId], intent: 
         audience: audience(to.iter().copied().chain([from])).unwrap(),
         intent,
         at: Stamp::from_unix_millis(0),
+        notice: Some(Notice {
+            recipients: Members::try_from(
+                to.iter()
+                    .filter(|agent| ***agent != *from)
+                    .map(|agent| (*agent).clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            urgent: false,
+            subject: None,
+            question: None,
+        }),
     }
 }
 
@@ -67,6 +98,7 @@ fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Option<
                 request: request.id().clone(),
             },
             at: Stamp::from_unix_millis(0),
+            notice: None,
         },
         Some(outcome) => Body::Resolved {
             request: request.id().clone(),
@@ -119,11 +151,11 @@ impl World {
 
     fn step(&mut self, operation: u8, x: usize, y: usize) {
         let (from, to) = (x % MACHINES, y % MACHINES);
-        match operation % 8 {
+        match operation % OPERATIONS {
             0 => {
                 let body = Body::Profile {
                     agent: agent(from, 1).name().clone(),
-                    card: card(u8::try_from(y % 5).unwrap()),
+                    card: card(u8::try_from(y % ROLE_VARIANTS).unwrap()),
                 };
                 self.write(from, body);
             }
@@ -138,9 +170,10 @@ impl World {
                     message(&sender, conversation, &[&receiver], Intent::Send {}),
                 );
             }
-            2 | 3 => {
+            OP_DIRECT_ASK | OP_ROOM_ASK => {
                 let sender = agent(from, 0);
-                let (conversation, responder, audience) = if operation % 8 == 2 {
+                let (conversation, responder, audience) = if operation % OPERATIONS == OP_DIRECT_ASK
+                {
                     let responder = agent(to, 1);
                     let direct = Conversation::direct(&sender, &responder).unwrap();
                     (direct, responder.clone(), vec![responder])
@@ -161,7 +194,7 @@ impl World {
                     self.asks.push((from, to, event));
                 }
             }
-            4..=6 if !self.asks.is_empty() => {
+            OP_REPLY..=OP_FAIL if !self.asks.is_empty() => {
                 let (asker, responder_machine, request) = self.asks[x % self.asks.len()].clone();
                 let Some(responder) = (match request.body() {
                     Body::Message {
@@ -172,17 +205,62 @@ impl World {
                 }) else {
                     return;
                 };
-                let (machine, by, outcome) = match operation % 8 {
-                    4 => (responder_machine, responder, None),
-                    5 => (asker, request.author().unwrap(), Some(Outcome::Withdrawn)),
+                let (machine, by, outcome) = match operation % OPERATIONS {
+                    OP_REPLY => (responder_machine, responder, None),
+                    OP_WITHDRAW => (asker, request.author().unwrap(), Some(Outcome::Withdrawn)),
                     _ => (responder_machine, responder, Some(Outcome::Failed)),
                 };
                 if let Some(body) = follow_up(&request, &by, outcome) {
                     self.try_write(machine, body);
                 }
             }
-            4..=6 => {}
-            _ => self.sync(from, to, 1 + y % 4),
+            OP_REPLY..=OP_FAIL => {}
+            OP_DELIVERED..=OP_ACKNOWLEDGED if !self.asks.is_empty() => {
+                let (_, machine, request) = self.asks[x % self.asks.len()].clone();
+                let Body::Message {
+                    intent: Intent::Ask { responder, .. },
+                    conversation,
+                    audience,
+                    ..
+                } = request.body()
+                else {
+                    return;
+                };
+                let delivery = match operation % OPERATIONS {
+                    OP_DELIVERED => Delivery::Delivered,
+                    OP_READ => Delivery::Read,
+                    _ => Delivery::Acknowledged,
+                };
+                self.try_write(
+                    machine,
+                    Body::Receipt {
+                        request: request.id().clone(),
+                        conversation: conversation.clone(),
+                        audience: audience.clone(),
+                        agent: responder.name().clone(),
+                        delivery,
+                    },
+                );
+            }
+            OP_DELIVERED..=OP_ACKNOWLEDGED => {}
+            OP_ACTIVITY => {
+                self.write(
+                    from,
+                    Body::Activity {
+                        agent: agent(from, 0).name().clone(),
+                        activity: Activity {
+                            state: if y % ACTIVITY_VARIANTS == 0 {
+                                ActivityState::Working
+                            } else {
+                                ActivityState::Waiting
+                            },
+                            at: Stamp::from_unix_millis(u64::try_from(x).unwrap()),
+                            status: None,
+                        },
+                    },
+                );
+            }
+            _ => self.sync(from, to, 1 + y % MAX_PARTIAL_ROUNDS),
         }
     }
 }
@@ -204,14 +282,14 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
             },
         )
         .expect("the owner opens its room");
-    for chunk in bytes.chunks(3).take(256) {
+    for chunk in bytes.chunks(INPUT_STEP_BYTES).take(MAX_STEPS) {
         let byte = |index: usize| usize::from(chunk.get(index).copied().unwrap_or(0));
-        world.step(chunk[0], byte(1), byte(2));
+        world.step(chunk[0], byte(1), byte(INPUT_Y_INDEX));
     }
     for _ in 0..MACHINES + 1 {
         for first in 0..MACHINES {
             for second in 0..MACHINES {
-                world.sync(first, second, 64);
+                world.sync(first, second, CONVERGENCE_ROUNDS);
             }
         }
     }
@@ -222,7 +300,9 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
             }
             let (low, high) = (first.min(second), first.max(second));
             let (left, right) = world.models.split_at_mut(high);
-            let progress = left[low].sync_with(&mut right[0], 64).unwrap();
+            let progress = left[low]
+                .sync_with(&mut right[0], CONVERGENCE_ROUNDS)
+                .unwrap();
             assert_eq!(
                 progress.received.rejected, None,
                 "a converged exchange rejects nothing"
@@ -249,8 +329,38 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
         );
         assert_eq!(model.profiles(), reference.profiles());
         assert_eq!(model.rooms(), reference.rooms());
+        assert_eq!(model.activities(), reference.activities());
     }
     for (_, _, request) in &world.asks {
+        if let Body::Message {
+            intent: Intent::Ask { responder, .. },
+            ..
+        } = request.body()
+        {
+            let receipts: Vec<_> = world
+                .models
+                .iter()
+                .filter(|model| {
+                    model
+                        .ordered()
+                        .iter()
+                        .any(|event| event.id() == request.id() && event.body() == request.body())
+                })
+                .map(|model| {
+                    model
+                        .deliveries()
+                        .get(&(request.id().clone(), responder.clone()))
+                        .copied()
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert!(
+                receipts
+                    .windows(CONVERGENCE_PAIR_SIZE)
+                    .all(|pair| pair[0] == pair[1]),
+                "every audience machine projects the same receipt state"
+            );
+        }
         let seen: Vec<_> = world
             .models
             .iter()
@@ -263,7 +373,8 @@ libfuzzer_sys::fuzz_target!(|bytes: &[u8]| {
             .map(|model| model.resolutions().get(request.id()).cloned())
             .collect();
         assert!(
-            seen.windows(2).all(|pair| pair[0] == pair[1]),
+            seen.windows(CONVERGENCE_PAIR_SIZE)
+                .all(|pair| pair[0] == pair[1]),
             "every audience machine selects the same ending"
         );
         for model in &world.models {

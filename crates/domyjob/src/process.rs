@@ -3,6 +3,7 @@ use std::io;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
+use domyjob_core::capture_policy::{CaptureAdmission, CapturePolicy, admit};
 use domyjob_core::domain::JobId;
 use thiserror::Error;
 
@@ -81,7 +82,8 @@ pub(crate) struct ReadyToken(String);
 
 impl ReadyToken {
     pub(crate) fn parse(value: String) -> Result<Self, ProcessError> {
-        if value.len() == 32
+        const READY_TOKEN_HEX_CHARS: usize = 32;
+        if value.len() == READY_TOKEN_HEX_CHARS
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -110,6 +112,7 @@ pub(crate) struct Tool<'a> {
     program: &'a str,
     arguments: &'a [String],
     environment: Vec<(&'static str, String)>,
+    output: CapturePolicy,
 }
 
 impl<'a> Tool<'a> {
@@ -119,12 +122,19 @@ impl<'a> Tool<'a> {
             program,
             arguments,
             environment: Vec::new(),
+            output: CapturePolicy::Prefix,
         }
     }
 
     #[must_use]
     pub(crate) fn env(mut self, name: &'static str, value: String) -> Self {
         self.environment.push((name, value));
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn output(mut self, policy: CapturePolicy) -> Self {
+        self.output = policy;
         self
     }
 }
@@ -146,12 +156,18 @@ pub(crate) enum ToolError {
 
 const MAX_TOOL_OUTPUT: usize = 1024 * 1024;
 
-fn capture(stream: Option<impl io::Read>) -> io::Result<String> {
+fn capture(stream: Option<impl io::Read>, policy: CapturePolicy) -> io::Result<String> {
     let Some(mut stream) = stream else {
         return Ok(String::new());
     };
     let bytes = crate::bounded::prefix(&mut stream, MAX_TOOL_OUTPUT)?;
-    io::copy(&mut stream, &mut io::sink())?;
+    let omitted = io::copy(&mut stream, &mut io::sink())?;
+    if admit(policy, omitted) == CaptureAdmission::RefuseTruncated {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tool output exceeds {MAX_TOOL_OUTPUT} bytes; a complete response is required"),
+        ));
+    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -175,11 +191,13 @@ pub(crate) fn run_tool(tool: &Tool<'_>) -> Result<ToolOutput, ToolError> {
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(failed)?;
     let errors = child.stderr.take();
-    let reader = std::thread::spawn(move || capture(errors));
-    let stdout = capture(child.stdout.take()).map_err(failed)?;
-    let status = child.wait().map_err(failed)?;
-    let stderr = reader
-        .join()
+    let reader = std::thread::spawn(move || capture(errors, CapturePolicy::Prefix));
+    let stdout = capture(child.stdout.take(), tool.output);
+    let status = child.wait();
+    let stderr = reader.join();
+    let stdout = stdout.map_err(failed)?;
+    let status = status.map_err(failed)?;
+    let stderr = stderr
         .map_err(|_panic| failed(io::Error::other("the output reader panicked")))?
         .map_err(failed)?;
     Ok(ToolOutput {
@@ -432,8 +450,11 @@ impl Drop for Group {
 }
 
 #[cfg(all(test, unix))]
+const FIXTURE_SHELL: &str = "/bin/sh";
+
+#[cfg(all(test, unix))]
 pub(crate) fn signal_termination_fixture() -> (Command, bool) {
-    let mut command = command("/bin/sh");
+    let mut command = command(FIXTURE_SHELL);
     command.args(["-c", "kill -TERM $$"]);
     (command, true)
 }
@@ -450,7 +471,7 @@ pub(crate) const STDOUT_THEN_STDERR: &[u8] = b"0123456789\r\nabcdefghij\r\n";
 
 #[cfg(all(test, unix))]
 pub(crate) fn stdout_then_stderr() -> Command {
-    let mut command = command("/bin/sh");
+    let mut command = command(FIXTURE_SHELL);
     command.args(["-c", "printf 0123456789; printf abcdefghij >&2"]);
     command
 }
@@ -466,7 +487,96 @@ pub(crate) fn stdout_then_stderr() -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOOL_OUTPUT, Tool, run_tool};
+    use super::{MAX_TOOL_OUTPUT, Tool, capture, run_tool};
+    use domyjob_core::capture_policy::CapturePolicy;
+    use std::io::{self, Read as _};
+
+    struct FailingReader;
+
+    impl io::Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected tool stream failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn complete_capture_admits_the_exact_budget_and_refuses_a_drained_suffix() {
+        let exact = vec![b'x'; MAX_TOOL_OUTPUT];
+        assert_eq!(
+            capture(Some(exact.as_slice()), CapturePolicy::Complete)
+                .unwrap()
+                .len(),
+            MAX_TOOL_OUTPUT
+        );
+        let larger = vec![b'x'; MAX_TOOL_OUTPUT.saturating_add(1)];
+        let mut stream = io::Cursor::new(&larger);
+        let error = capture(Some(&mut stream), CapturePolicy::Complete).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(stream.position(), u64::try_from(larger.len()).unwrap());
+        let mut prefix = io::Cursor::new(&larger);
+        assert_eq!(
+            capture(Some(&mut prefix), CapturePolicy::Prefix)
+                .unwrap()
+                .len(),
+            MAX_TOOL_OUTPUT
+        );
+        assert_eq!(prefix.position(), u64::try_from(larger.len()).unwrap());
+    }
+
+    #[test]
+    fn tool_capture_preserves_read_errors_before_and_after_the_budget() {
+        let prefix = vec![b'x'; MAX_TOOL_OUTPUT];
+        for policy in [CapturePolicy::Prefix, CapturePolicy::Complete] {
+            let before = capture(Some(FailingReader), policy).unwrap_err();
+            assert_eq!(before.kind(), io::ErrorKind::PermissionDenied);
+            let after = capture(Some(prefix.as_slice().chain(FailingReader)), policy).unwrap_err();
+            assert_eq!(after.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_tool_refuses_stdout_overflow_after_draining_both_streams() {
+        const DIAGNOSTIC_MULTIPLIER: usize = 3;
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("finished");
+        let arguments = [
+            "-c".to_owned(),
+            format!(
+                "umask 077; head -c {} /dev/zero; head -c {} /dev/zero >&2; exec 1>&- 2>&-; printf done > \"$1\"",
+                MAX_TOOL_OUTPUT.saturating_add(1),
+                MAX_TOOL_OUTPUT * DIAGNOSTIC_MULTIPLIER
+            ),
+            "tool-fixture".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let error =
+            run_tool(&Tool::new("sh", &arguments).output(CapturePolicy::Complete)).unwrap_err();
+        assert!(
+            matches!(error, super::ToolError::Run { source, .. } if source.kind() == io::ErrorKind::InvalidData)
+        );
+        assert_eq!(
+            crate::state_io::read_bytes(&marker).unwrap(),
+            Some(b"done".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_capture_preserves_a_nonzero_tool_outcome_and_diagnostics() {
+        let arguments = [
+            "-c".to_owned(),
+            "printf structured; printf diagnostic >&2; exit 7".to_owned(),
+        ];
+        let output =
+            run_tool(&Tool::new("sh", &arguments).output(CapturePolicy::Complete)).unwrap();
+        assert!(!output.success);
+        assert_eq!(output.stdout, "structured");
+        assert_eq!(output.stderr, "diagnostic");
+    }
 
     #[test]
     fn a_tool_that_prints_past_the_limit_keeps_its_own_outcome() {

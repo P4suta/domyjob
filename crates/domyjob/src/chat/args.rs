@@ -3,6 +3,9 @@ use domyjob_core::chat::card::{Access, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+mod handoff;
+pub(crate) use handoff::{HandoffCreateArgs, HandoffListArgs, HandoffReadArgs};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[schemars(description = "An AI command-line client.")]
@@ -219,10 +222,68 @@ pub(crate) struct SendArgs {
     #[arg(help = "The message")]
     #[schemars(description = "The message.")]
     pub(crate) text: String,
+    #[command(flatten)]
+    #[serde(default)]
+    pub(crate) notification: NotificationArgs,
+}
+
+#[derive(Debug, Clone, Default, Args, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NotificationArgs {
+    #[arg(long = "mention")]
+    #[serde(default)]
+    #[schemars(description = "Recipients to notify; omitted means the conversation's recipients.")]
+    pub(crate) mentions: Vec<String>,
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(description = "Block recipients' stop hooks until they reply or acknowledge.")]
+    pub(crate) urgent: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    #[arg(long, requires = "fallback")]
+    #[serde(default)]
+    #[schemars(description = "The answer or action expected from the recipient.")]
+    pub(crate) expected: Option<String>,
+    #[arg(long, requires = "expected")]
+    #[serde(default)]
+    #[schemars(
+        description = "The agent to ask if the answer has not arrived before the fallback delay."
+    )]
+    pub(crate) fallback: Option<String>,
+    #[arg(long, default_value_t = default_timeout())]
+    #[serde(default = "default_timeout")]
+    pub(crate) after: u64,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HookPhase {
+    Start,
+    Pre,
+    Post,
+    Stop,
+}
+
+#[derive(Debug, Args, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HookArgs {
+    #[arg(value_enum)]
+    pub(crate) phase: HookPhase,
+    #[arg(long)]
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[arg(long, value_enum)]
+    #[serde(default)]
+    pub(crate) client: Option<ToolArg>,
+    #[arg(long, help = "Skip this hook when no domyjob agent is bound")]
+    #[serde(default)]
+    pub(crate) if_bound: bool,
 }
 
 pub(crate) const fn default_timeout() -> u64 {
-    120
+    const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+    DEFAULT_TIMEOUT_SECONDS
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -244,6 +305,9 @@ pub(crate) struct AskArgs {
     #[arg(help = "Seconds to wait for the ending, at most 600; 0 returns at once")]
     #[schemars(description = "Seconds to wait for the ending, at most 600; 0 returns at once.")]
     pub(crate) timeout: u64,
+    #[command(flatten)]
+    #[serde(default)]
+    pub(crate) notification: NotificationArgs,
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]
@@ -271,7 +335,8 @@ pub(crate) struct MessageArgs {
 }
 
 pub(crate) const fn default_limit() -> usize {
-    50
+    const DEFAULT_INBOX_LIMIT: usize = 50;
+    DEFAULT_INBOX_LIMIT
 }
 
 #[derive(Debug, Args, Deserialize, JsonSchema)]

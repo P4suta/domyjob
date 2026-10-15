@@ -7,8 +7,9 @@ use domyjob_core::chat::id::{Conversation, EventId};
 use serde_json::json;
 
 use super::args::{
-    AskArgs, DirectoryArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs,
-    ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
+    AskArgs, DirectoryArgs, HandoffCreateArgs, HandoffListArgs, HandoffReadArgs, HookArgs,
+    InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs, ReplyArgs, RoomArgs,
+    SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
 };
 use super::ops::{self, OpsError, RoomChange, Session};
 use super::pulse::{Pulse, PulseError};
@@ -18,6 +19,11 @@ use super::sync;
 use super::view::{MessageView, Outcome};
 use crate::output::Output;
 use crate::platform::clock::Deadline;
+
+const BLOCKED_STOP_EXIT: u8 = 3;
+const SYNC_TIMEOUT_SECONDS: u64 = 120;
+const REPLACE_TIMEOUT_SECONDS: u64 = 900;
+const WATCH_INTERVAL_MILLIS: u64 = 2000;
 
 #[derive(Debug, Args)]
 pub(crate) struct ChatArgs {
@@ -33,6 +39,11 @@ pub(crate) struct ChatArgs {
 
 #[derive(Debug, Subcommand)]
 enum ChatCommand {
+    #[command(about = "Create or read a scoped handoff under the acting agent's own identity")]
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
     #[command(
         about = "Pin peers, start the background service, and register the MCP server with AI clients"
     )]
@@ -94,6 +105,12 @@ enum ChatCommand {
     Wait(MessageArgs),
     #[command(about = "Read unread messages addressed to the acting agent")]
     Inbox(InboxArgs),
+    #[command(about = "Read the full body of one addressed message")]
+    Read(MessageArgs),
+    #[command(about = "Acknowledge an addressed message")]
+    Acknowledge(MessageArgs),
+    #[command(about = "Deliver chat context and update presence from an agent lifecycle hook")]
+    Hook(HookArgs),
     #[command(about = "Read a conversation")]
     Thread(ThreadArgs),
     #[command(about = "Follow a conversation as it grows")]
@@ -113,6 +130,16 @@ struct SetupArgs {
     #[arg(long)]
     #[arg(help = "Do not register the MCP server with Claude Code, Codex, or OpenCode")]
     no_clients: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum HandoffCommand {
+    #[command(about = "Publish a handoff with explicit named reader grants")]
+    Create(HandoffCreateArgs),
+    #[command(about = "Discover bounded metadata without reading handoff bodies")]
+    List(HandoffListArgs),
+    #[command(about = "Read the selected body and record the acting reader after output succeeds")]
+    Read(HandoffReadArgs),
 }
 
 impl SetupArgs {
@@ -203,12 +230,16 @@ fn environment_value(
 
 fn session_inputs(
     actor: Option<String>,
+    if_bound: bool,
     mut read_environment: impl FnMut(&str) -> Result<Option<String>, CliError>,
 ) -> Result<(Option<String>, Option<String>), CliError> {
     let actor = match actor {
         Some(actor) => Some(actor),
         None => read_environment("DOMYJOB_CHAT_AGENT")?,
     };
+    if if_bound && actor.is_none() {
+        return Ok((None, None));
+    }
     let turn = read_environment("DOMYJOB_CHAT_TURN")?;
     Ok((actor, turn))
 }
@@ -220,7 +251,9 @@ struct Printer<'out> {
 
 impl Printer<'_> {
     fn print(&self, value: &serde_json::Value, text: &str) -> Result<(), CliError> {
-        print_using(self.json, value, text, |line| self.output.line(line))
+        print_using(self.json, value, text, |line| {
+            self.output.write(format!("{line}\n").as_bytes())
+        })
     }
 }
 
@@ -296,6 +329,7 @@ fn machine(
         ChatCommand::Reset { yes: true } => reset(out).map(Ok),
         ChatCommand::Clean { target } => clean(target, out).map(Ok),
         other @ (ChatCommand::Directory(_)
+        | ChatCommand::Handoff { .. }
         | ChatCommand::Whoami
         | ChatCommand::Profile(_)
         | ChatCommand::Status { .. }
@@ -307,13 +341,20 @@ fn machine(
         | ChatCommand::Withdraw(_)
         | ChatCommand::Wait(_)
         | ChatCommand::Inbox(_)
+        | ChatCommand::Read(_)
+        | ChatCommand::Acknowledge(_)
+        | ChatCommand::Hook(_)
         | ChatCommand::Thread(_)
         | ChatCommand::Watch(_)) => Ok(Err(other)),
     }
 }
 
 fn sync_now(machine: Option<&str>, out: &Printer<'_>) -> Result<ExitCode, CliError> {
-    let report = sync::sync(&Store::open()?, machine, Deadline::after_seconds(120))?;
+    let report = sync::sync(
+        &Store::open()?,
+        machine,
+        Deadline::after_seconds(SYNC_TIMEOUT_SECONDS),
+    )?;
     sync_report(&report, |value, text| out.print(value, text))
 }
 
@@ -400,8 +441,10 @@ fn peer(command: PeerCommand, out: &Printer<'_>) -> Result<ExitCode, CliError> {
             out.print(&value, text)?;
         }
         PeerCommand::Replace { machine } => {
-            let origin =
-                sync::identify(&mut sync::Ssh::new(&machine)?, Deadline::after_seconds(900))?;
+            let origin = sync::identify(
+                &mut sync::Ssh::new(&machine)?,
+                Deadline::after_seconds(REPLACE_TIMEOUT_SECONDS),
+            )?;
             store.pin(&machine, &origin, true)?;
             out.print(
                 &json!({"machine": machine, "origin": origin}),
@@ -423,8 +466,12 @@ const fn reads(command: &ChatCommand) -> bool {
     matches!(
         command,
         ChatCommand::Directory(_)
+            | ChatCommand::Handoff {
+                command: HandoffCommand::List(_) | HandoffCommand::Read(_)
+            }
             | ChatCommand::Whoami
             | ChatCommand::Inbox(_)
+            | ChatCommand::Read(_)
             | ChatCommand::Thread(_)
             | ChatCommand::Wait(_)
             | ChatCommand::Room {
@@ -438,6 +485,11 @@ const fn reads(command: &ChatCommand) -> bool {
 
 fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError> {
     Ok(match command {
+        ChatCommand::Handoff { command } => match command {
+            HandoffCommand::Create(args) => ops::create_handoff(session, &args)?,
+            HandoffCommand::List(args) => ops::handoffs(session, &args)?,
+            HandoffCommand::Read(args) => ops::read_handoff(session, &args)?,
+        },
         ChatCommand::Directory(args)
         | ChatCommand::Agent {
             command: AgentCommand::List(args),
@@ -478,8 +530,11 @@ fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError>
         ChatCommand::Withdraw(args) => ops::withdraw(session, &args)?,
         ChatCommand::Wait(args) => ops::wait(session, &args)?,
         ChatCommand::Inbox(args) => ops::inbox(session, &args)?,
+        ChatCommand::Read(args) => ops::read_message(session, &args)?,
+        ChatCommand::Acknowledge(args) => ops::acknowledge(session, &args)?,
         ChatCommand::Thread(args) | ChatCommand::Watch(args) => ops::thread(session, &args)?,
         ChatCommand::Setup(_)
+        | ChatCommand::Hook(_)
         | ChatCommand::Doctor
         | ChatCommand::Sync { .. }
         | ChatCommand::Peer { .. }
@@ -491,7 +546,7 @@ fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError>
 }
 
 fn watch(session: &Session, args: &ThreadArgs, out: &Printer<'_>) -> Result<ExitCode, CliError> {
-    let mut pulse = Pulse::new(&session.store, 2000)?;
+    let mut pulse = Pulse::new(&session.store, WATCH_INTERVAL_MILLIS)?;
     let mut shown = BTreeSet::new();
     loop {
         session.refresh()?;
@@ -500,7 +555,7 @@ fn watch(session: &Session, args: &ThreadArgs, out: &Printer<'_>) -> Result<Exit
                 out.print(&single.json(), &single.text())
             })?;
         }
-        pulse.next(Deadline::after_millis(2000))?;
+        pulse.next(Deadline::after_millis(WATCH_INTERVAL_MILLIS))?;
     }
 }
 
@@ -514,6 +569,7 @@ fn emit_new_events(
             emit(&Outcome::Events {
                 events: vec![event],
                 unread: None,
+                pending: None,
             })?;
         }
     }
@@ -531,19 +587,111 @@ pub(crate) fn run(args: ChatArgs, output: &Output) -> Result<ExitCode, CliError>
         Ok(code) => return Ok(code),
         Err(command) => command,
     };
-    let (actor, turn) = session_inputs(actor, environment)?;
+    let if_bound = matches!(&command, ChatCommand::Hook(hook) if hook.if_bound);
+    let (actor, turn) = session_inputs(actor, if_bound, environment)?;
+    if let ChatCommand::Hook(hook) = &command
+        && hook.if_bound
+        && actor.is_none()
+    {
+        if hook.client.is_some() {
+            out.print(&json!({}), "{}")?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut session = Session::open(actor.as_deref(), turn.as_deref())?;
+    if let ChatCommand::Hook(hook) = &command {
+        return hook_using(&session, hook, |value, text| out.print(value, text));
+    }
     if let ChatCommand::Watch(thread) = &command {
         return watch(&session, thread, &out);
     }
     let read = reads(&command);
     let outcome = ops::around(&mut session, read, |session| act(session, command))?;
-    out.print(&outcome.json(), &outcome.text())?;
+    deliver_outcome(&session, &outcome, |value, text| out.print(value, text))?;
     Ok(ExitCode::from(outcome.exit_code()))
+}
+
+fn deliver_outcome(
+    session: &Session,
+    outcome: &Outcome,
+    emit: impl FnOnce(&serde_json::Value, &str) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    emit(&outcome.json(), &outcome.text())?;
+    if let Some(pending) = outcome.pending_read() {
+        ops::complete_read(session, pending)?;
+    }
+    if let Some(pending) = outcome.pending_handoff() {
+        ops::observe_handoff(session, pending)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "cli/handoff_tests.rs"]
+mod handoff_tests;
+
+fn hook_using(
+    session: &Session,
+    args: &HookArgs,
+    emit: impl FnOnce(&serde_json::Value, &str) -> Result<(), CliError>,
+) -> Result<ExitCode, CliError> {
+    session.refresh()?;
+    let context = super::hook::prepare(&session.store, session.me()?, args)?;
+    let value = if args.client.is_some() {
+        context.output(args.phase)
+    } else {
+        json!(context)
+    };
+    if args.client.is_some() {
+        emit(&value, &value.to_string())?;
+    } else {
+        emit(&value, &context.context)?;
+    }
+    super::hook::delivered(&session.store, &context)?;
+    session.refresh()?;
+    Ok(if args.client.is_none() && context.block_stop {
+        ExitCode::from(BLOCKED_STOP_EXIT)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_read_and_inbox_output_preserves_unread_until_successful_delivery() {
+        use crate::chat::ops::reads::tests::{fixture, read_args, stage};
+        use domyjob_core::chat::notification::Delivery;
+        for inbox in [false, true] {
+            let fixture = fixture();
+            let outcome = if inbox {
+                crate::chat::ops::inbox(
+                    &fixture.session,
+                    &crate::chat::args::InboxArgs {
+                        all: false,
+                        limit: 10,
+                    },
+                )
+                .unwrap()
+            } else {
+                crate::chat::ops::read_message(&fixture.session, &read_args(&fixture)).unwrap()
+            };
+            let error = super::deliver_outcome(&fixture.session, &outcome, |_, _| {
+                Err(CliError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "controlled read output failure",
+                )))
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, CliError::Io(cause) if cause.kind() == std::io::ErrorKind::BrokenPipe)
+            );
+            assert_eq!(stage(&fixture), Delivery::Pending);
+            super::deliver_outcome(&fixture.session, &outcome, |_, _| Ok(())).unwrap();
+            assert_eq!(stage(&fixture), Delivery::Read);
+        }
+    }
+
     use super::{
         CliError, SetupArgs, clean_conversation, emit_new_events, environment_value,
         findings_using, peer_removal_report, print_using, replace_store, session_inputs,
@@ -565,6 +713,23 @@ mod tests {
 
     fn broken_pipe(_value: &serde_json::Value, _text: &str) -> Result<(), CliError> {
         Err(CliError::Io(std::io::ErrorKind::BrokenPipe.into()))
+    }
+
+    #[test]
+    fn failed_hook_output_leaves_the_message_pending() {
+        use crate::chat::args::{HookArgs, HookPhase};
+        use crate::chat::ops::reads::tests::{fixture, stage};
+        use domyjob_core::chat::notification::Delivery;
+        let fixture = fixture();
+        let args = HookArgs {
+            phase: HookPhase::Pre,
+            status: None,
+            client: None,
+            if_bound: false,
+        };
+        let error = super::hook_using(&fixture.session, &args, broken_pipe).unwrap_err();
+        assert_io_error(error, std::io::ErrorKind::BrokenPipe);
+        assert_eq!(stage(&fixture), Delivery::Pending);
     }
 
     fn finding(area: &'static str, ok: bool, detail: &str, fix: Option<&str>) -> Finding {
@@ -620,6 +785,7 @@ mod tests {
             responder: None,
             request: None,
             at: None,
+            delivery: std::collections::BTreeMap::new(),
         };
         let mut shown = std::collections::BTreeSet::new();
         let mut emitted = Vec::new();
@@ -678,8 +844,12 @@ mod tests {
 
     #[test]
     fn non_unicode_chat_environment_values_retain_the_usage_error() {
-        let value = std::ffi::OsString::from("an environment value rejected by std::env::var");
-        let error = environment_value(Err(std::env::VarError::NotUnicode(value))).unwrap_err();
+        let value = crate::platform::non_unicode_environment_value();
+        let std::env::VarError::NotUnicode(ref string) = value else {
+            panic!("the platform fixture must reject UTF-8 decoding");
+        };
+        assert!(string.to_str().is_none());
+        let error = environment_value(Err(value)).unwrap_err();
         assert!(matches!(
             error,
             CliError::Usage("chat environment variables must be UTF-8")
@@ -688,7 +858,7 @@ mod tests {
 
     #[test]
     fn a_supplied_actor_takes_precedence_and_the_turn_is_still_read() {
-        let (actor, turn) = session_inputs(Some("explicit".to_owned()), |name| {
+        let (actor, turn) = session_inputs(Some("explicit".to_owned()), false, |name| {
             assert_eq!(name, "DOMYJOB_CHAT_TURN");
             Ok(Some("event:turn".to_owned()))
         })
@@ -700,7 +870,7 @@ mod tests {
     #[test]
     fn an_absent_actor_is_read_before_the_turn() {
         let mut names = Vec::new();
-        let (actor, turn) = session_inputs(None, |name| {
+        let (actor, turn) = session_inputs(None, false, |name| {
             names.push(name.to_owned());
             Ok(Some(name.to_owned()))
         })
@@ -712,15 +882,48 @@ mod tests {
 
     #[test]
     fn an_unreadable_turn_value_is_refused_even_with_a_supplied_actor() {
-        let error = session_inputs(Some("explicit".to_owned()), |name| {
-            assert_eq!(name, "DOMYJOB_CHAT_TURN");
-            Err(CliError::Usage("the turn cannot be decoded"))
+        for if_bound in [false, true] {
+            let error = session_inputs(Some("explicit".to_owned()), if_bound, |name| {
+                assert_eq!(name, "DOMYJOB_CHAT_TURN");
+                environment_value(Err(crate::platform::non_unicode_environment_value()))
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                CliError::Usage("chat environment variables must be UTF-8")
+            ));
+        }
+    }
+
+    #[test]
+    fn unbound_optional_hooks_skip_non_unicode_turn_environment_values() {
+        let mut names = Vec::new();
+        let inputs = session_inputs(None, true, |name| {
+            names.push(name.to_owned());
+            invalid_turn_environment(name)
         })
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(inputs, (None, None));
+        assert_eq!(names, ["DOMYJOB_CHAT_AGENT"]);
+    }
+
+    #[test]
+    fn unbound_commands_without_optional_hooks_still_refuse_non_unicode_turns() {
+        let error = session_inputs(None, false, invalid_turn_environment).unwrap_err();
         assert!(matches!(
             error,
-            CliError::Usage("the turn cannot be decoded")
+            CliError::Usage("chat environment variables must be UTF-8")
         ));
+    }
+
+    fn invalid_turn_environment(name: &str) -> Result<Option<String>, CliError> {
+        match name {
+            "DOMYJOB_CHAT_AGENT" => Ok(None),
+            "DOMYJOB_CHAT_TURN" => {
+                environment_value(Err(crate::platform::non_unicode_environment_value()))
+            }
+            _ => Err(CliError::Usage("unexpected environment input")),
+        }
     }
 
     #[test]

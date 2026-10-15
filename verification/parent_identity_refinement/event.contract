@@ -1,0 +1,149 @@
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::num::NonZeroU64;
+
+use serde::{Deserialize, Serialize};
+
+use super::card::{Card, MachineCard};
+use super::handoff::{Metadata as HandoffMetadata, Observation as HandoffObservation};
+use super::id::{
+    AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
+};
+use super::notification::{Activity, Delivery, MILLIS_PER_SECOND, Notice};
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawEvent", into = "RawEvent")]
+pub struct Event {
+    id: EventId,
+    clock: u64,
+    body: Body,
+}
+
+impl Event {
+    #[must_use]
+    pub const fn id(&self) -> &EventId {
+        &self.id
+    }
+}
+macro_rules! agent_list {
+    ($(#[$doc:meta])* $name:ident, $min:literal, $max:expr, $what:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "Vec<AgentId>", into = "Vec<AgentId>")]
+        pub struct $name(Vec<AgentId>);
+
+        impl TryFrom<Vec<AgentId>> for $name {
+            type Error = Invalid;
+
+            fn try_from(agents: Vec<AgentId>) -> Result<Self, Self::Error> {
+                if !($min..=$max).contains(&agents.len()) {
+                    return Err(Invalid($what));
+                }
+                let mut sorted: Vec<&AgentId> = agents.iter().collect();
+                sorted.sort();
+                if sorted.windows(DUPLICATE_WINDOW).any(|pair| matches!(pair, [first, second] if first == second)) {
+                    return Err(Invalid($what));
+                }
+                Ok(Self(agents))
+            }
+        }
+
+        impl From<$name> for Vec<AgentId> {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl $name {
+            #[must_use]
+            pub fn agents(&self) -> &[AgentId] {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn contains(&self, agent: &AgentId) -> bool {
+                self.0.contains(agent)
+            }
+
+            #[must_use]
+            pub const fn is_empty(&self) -> bool {
+                self.0.is_empty()
+            }
+        }
+    };
+}
+
+const MACRO_SITES: &[&str] = &[
+    r##"macro_rules! agent_list {
+    ($(#[$doc:meta])* $name:ident, $min:literal, $max:expr, $what:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "Vec<AgentId>", into = "Vec<AgentId>")]
+        pub struct $name(Vec<AgentId>);
+        impl TryFrom<Vec<AgentId>> for $name {
+            type Error = Invalid;
+            fn try_from(agents: Vec<AgentId>) -> Result<Self, Self::Error> {
+                if !($min..=$max).contains(&agents.len()) { return Err(Invalid($what)); }
+                let mut sorted: Vec<&AgentId> = agents.iter().collect();
+                sorted.sort();
+                if sorted.windows(DUPLICATE_WINDOW).any(|pair| matches!(pair, [first, second] if first == second)) { return Err(Invalid($what)); }
+                Ok(Self(agents))
+            }
+        }
+        impl From<$name> for Vec<AgentId> {
+            fn from(value: $name) -> Self { value.0 }
+        }
+        impl $name {
+            #[must_use]
+            pub fn agents(&self) -> &[AgentId] { &self.0 }
+            #[must_use]
+            pub fn contains(&self, agent: &AgentId) -> bool { self.0.contains(agent) }
+            #[must_use]
+            pub const fn is_empty(&self) -> bool { self.0.is_empty() }
+        }
+    };
+}"##,
+    r##"agent_list!(# [derive (Default)] Chain , 0 , MAX_CHAIN , "delegation chain")"##,
+    r##"agent_list!(Members , 1 , MAX_MEMBERS , "room members")"##,
+    r##"write!(formatter , "{seconds}s ago")"##,
+    r##"write!(formatter , "{}m ago" , seconds / SECONDS_PER_MINUTE)"##,
+    r##"write!(formatter , "{}h ago" , seconds / SECONDS_PER_HOUR)"##,
+    r##"write!(formatter , "{}d ago" , seconds / SECONDS_PER_DAY)"##,
+    r##"matches!(audience.members(), [only] if only == first)"##,
+    r##"matches!(audience.members(), [lower, upper] if lower == first && upper == second)"##,
+    r##"matches!(audience.members(), [lower, upper] if lower == second && upper == first)"##,
+    r##"matches!(conversation , Conversation :: Direct (pair) if ! pair . includes (agent))"##,
+    r##"matches!(intent , Intent :: Ask { chain , .. } if ! chain . contains (question . fallback ()))"##,
+    r##"matches!(intent , Intent :: Ask { responder , .. } if ! notice . recipients . contains (responder))"##,
+    r##"matches!(body , Body :: Receipt { delivery : Delivery :: Pending , .. })"##,
+    r##"assert_eq!(alloc :: format ! ("{}" , sent . age (Stamp :: from_unix_millis (millis))) , expected , "age at {millis} milliseconds")"##,
+    r##"assert_eq!(alloc :: format ! ("{}" , Stamp :: from_unix_millis (1000) . age (Stamp :: from_unix_millis (0))) , "0s ago")"##,
+    r##"assert_eq!(outcome . as_str () , name)"##,
+    r##"assert_eq!(serde_json :: to_string (& outcome) . unwrap () , alloc :: format ! ("\"{name}\""))"##,
+    r##"assert_eq!(reply . request () , None)"##,
+    r##"assert_eq!(body . request () , Some (& request))"##,
+    r##"assert_eq!(Body :: Omitted { } . request () , None)"##,
+    r##"alloc::format!(r#"{{"origin":"{}","seq":1,"clock":1,"body":{{"kind":"omitted"{extra}}}}}"# , origin ('a'))"##,
+    r##"panic!("fixture is a message")"##,
+    r##"vec![bob . clone ()]"##,
+    r##"vec![agent ("x" , 'a') , agent ("x" , 'a')]"##,
+    r##"alloc::format!("a{index}")"##,
+    r##"assert_eq!(conversation, Conversation::direct(&second, &first).unwrap())"##,
+    r##"assert!(super::valid_thread(&conversation, &exact, author))"##,
+    r##"assert!(!super::valid_thread(&conversation, &exact, author))"##,
+    r##"assert!(!super::valid_thread(&conversation, audience, &first))"##,
+    r##"assert!(!super::valid_thread(&conversation, &missing, &first))"##,
+    r##"assert!(!super::valid_thread(&conversation, &substituted, &first))"##,
+    r##"assert!(super::valid_thread(&conversation, &audience, &agent("outsider", 'c')))"##,
+    r##"assert_eq!(event . export (& origin ('b')) , event)"##,
+    r##"assert_eq!((hidden . id () , hidden . clock ()) , (event . id () , 7))"##,
+    r##"assert_eq!(hidden . body () , & Body :: Omitted { })"##,
+    r##"assert_eq!(profile . export (& origin ('c')) , profile)"##,
+    r##"assert_eq!(first . digest () , Sealed :: new (event) . unwrap () . digest ())"##,
+    r##"assert_eq!(first . digest () , super :: Digest :: of (first . encoded () . as_bytes ()))"##,
+    r##"alloc::format!("{index:0MAX_HANDLE_BYTES$}")"##,
+    r##"alloc::format!("c{index:0width$}" , width = MAX_HANDLE_BYTES - 1)"##,
+    r##"assert_eq!(sealed . encoded () . len () , MAXIMAL_NOTIFICATION_BYTES)"##,
+    r##"assert!(sealed . encoded () . len () < super :: MAX_EVENT_BYTES)"##,
+    r##"assert_eq!(decode (sealed . encoded ()) . unwrap () , * sealed . event ())"##,
+];

@@ -6,14 +6,14 @@ path = "crates/domyjob-core/src/chat/model.rs"
 item = "<Model as Outbox>::outgoing"
 rule = "break-to-continue"
 original = "break"
-line = 201
+line = 228
 reason = "once the batch is full every further offer is refused, so continuing leaves the batch and its more flag unchanged"
 outcome = "survived"
 
 [[mutation.skip]]
 path = "crates/domyjob-core/src/chat/ledger.rs"
-lines = "477-477"
-reason = "an event that decoded always seals within the event size limit, so the arm for an event that cannot seal is never reached"
+lines = "570-570"
+reason = "the maximal admitted notification event encodes to 404147 bytes below the 409600-byte limit, and typed event serializers are infallible, so the unsealable decoded-event arm cannot be reached"
 
 [[mutation.expect]]
 path = "crates/domyjob-core/src/domain.rs"
@@ -210,7 +210,7 @@ path = "crates/domyjob-core/src/chat/model.rs"
 item = "Model::sync_with"
 rule = "question-to-unwrap"
 original = "?"
-line = 94
+line = 111
 reason = "the model stores consecutive owner-specific events and exports only valid typed events, so its outgoing batch cannot produce an inconsistent offer"
 outcome = "survived"
 
@@ -219,7 +219,7 @@ path = "crates/domyjob-core/src/chat/event.rs"
 item = "Sealed::new"
 rule = "question-to-unwrap"
 original = "?"
-line = 432
+line = 510
 reason = "typed events contain no fallible custom serializers, floating-point values or maps with non-string keys, so their JSON encoding cannot fail"
 outcome = "survived"
 
@@ -228,8 +228,8 @@ path = "crates/domyjob-core/src/chat/event.rs"
 item = "Sealed::new"
 rule = "condition-to-false"
 original = "encoded.len() > MAX_EVENT_BYTES"
-line = 433
-reason = "the largest message uses at most 64 KiB of text expanded sixfold, 64 audience origins and eight chain members; even maximum fields encode to 396767 bytes, below the 409600-byte limit"
+line = 511
+reason = "the maximal typed notification message includes 64 KiB of text expanded sixfold, 64 audience origins and recipients, eight chain members and maximal question fields; the production boundary fixture encodes it to 404147 bytes below the 409600-byte limit"
 outcome = "survived"
 
 [[mutation.expect]]
@@ -237,7 +237,7 @@ path = "crates/domyjob-core/src/chat/event.rs"
 item = "Sealed::new"
 rule = "gt-to-ge"
 original = ">"
-line = 433
+line = 511
 reason = "bounded typed events cannot reach the 409600-byte encoding limit, so rejecting equality cannot reject any additional event"
 outcome = "survived"
 

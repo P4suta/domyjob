@@ -1,0 +1,1 @@
+{"description":"owner","hooks":{"Stop":[{"hooks":[{"type":"command","command":"owner-stop"}]}],"PreCompact":[{"hooks":[{"type":"command","command":"owner-compact"}]}]}}

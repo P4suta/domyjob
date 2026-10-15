@@ -26,9 +26,10 @@ description = "Format Rust and TOML"
 run = [
   "cargo fmt --all",
   "cargo fmt --manifest-path fuzz/Cargo.toml",
-  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
+  "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/chat-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 verification/login-reply.rs",
   "rustfmt --edition 2024 verification/worker-handoff.rs",
+  "rustfmt --edition 2024 verification/proof-exit-policy.rs",
   "taplo fmt",
 ]
 env = { RUST_LOG = "warn" }
@@ -38,9 +39,10 @@ description = "Check Rust and TOML formatting"
 run = [
   "cargo fmt --all -- --check",
   "cargo fmt --manifest-path fuzz/Cargo.toml -- --check",
-  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
+  "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/chat-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 --check verification/login-reply.rs",
   "rustfmt --edition 2024 --check verification/worker-handoff.rs",
+  "rustfmt --edition 2024 --check verification/proof-exit-policy.rs",
   "taplo fmt --check",
   "taplo lint",
 ]
@@ -94,7 +96,7 @@ description = "Check protocol induction and replay 100 fixed-seed Quint traces"
 run = "cargo xtask verify models"
 
 [tasks."fuzz:replay"]
-description = "Replay the nine preserved wire, source, and process-group seeds through production ingress"
+description = "Replay preserved production ingress corpora"
 run = "cargo xtask verify fuzz"
 
 [tasks.miri]
@@ -111,6 +113,9 @@ run = [
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test process_group --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --bin domyjob -E 'test(source::metadata_directories::tests)' --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob --test input_controller --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test notifications --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test hook_clients -E 'test(=codex_setup_preserves_foreign_hooks_and_replaces_only_its_own_groups) | test(=malformed_hook_documents_are_refused_without_replacing_the_user_document)' --no-tests=fail --test-threads=1",
+  "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --test capture_policy --no-tests=fail --test-threads=1",
 ]
 
 [tasks."resource-contracts"]
@@ -133,6 +138,7 @@ run = [
   "cargo +nightly-2026-10-01 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
   "cargo +nightly-2026-10-01 fuzz run source_paths corpus/source_paths -- -runs=20000 -seed=1 -verbosity=0",
   "cargo +nightly-2026-10-01 fuzz run process_group corpus/process_group -- -runs=20000 -seed=1 -verbosity=0",
+  "cargo +nightly-2026-10-01 fuzz run hook_clients corpus/hook_clients -- -runs=20000 -seed=1 -verbosity=0",
 ]
 
 [tasks.mutants]
@@ -172,11 +178,11 @@ run = "cargo xtask ci hook"
 
 [tasks."check:linux"]
 description = "Lint and test this checkout on Linux through domyjob"
-run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
+run = "cargo run --quiet --locked -p domyjob -- run linux --wait -- /bin/bash -lc 'export MISE_TRUSTED_CONFIG_PATHS=\"$PWD\" CARGO_TARGET_DIR=\"$HOME/.cache/domyjob/check-target\" CARGO_BUILD_JOBS=2 RUSTC_WRAPPER=; trap \"mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask\" EXIT; mise run clippy && mise run gates && mise run test'"
 
 [tasks."check:win"]
 description = "Lint and test this checkout on Windows through domyjob"
-run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo xtask windows-contracts; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
+run = "cargo run --quiet --locked -p domyjob -- run win --wait -- powershell.exe -NoProfile -Command '$env:MISE_TRUSTED_CONFIG_PATHS=(Get-Location).Path; $env:CARGO_TARGET_DIR=Join-Path $env:LOCALAPPDATA \"domyjob/check-target\"; $env:CARGO_BUILD_JOBS=\"2\"; $env:RUSTC_WRAPPER=\"\"; mise run clippy; $code=$LASTEXITCODE; if ($code -eq 0) { mise run gates; $code=$LASTEXITCODE }; if ($code -eq 0) { mise x -- cargo xtask windows-contracts; $code=$LASTEXITCODE }; if ($code -eq 0) { mise run test; $code=$LASTEXITCODE }; mise x -- cargo clean --quiet -p domyjob -p domyjob-core -p xtask; exit $code'"
 
 [tasks."check:fleet"]
 description = "Run this checkout's checks on Linux and Windows"

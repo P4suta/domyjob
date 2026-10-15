@@ -16,6 +16,20 @@ serde_json = "1"
 [workspace]
 
 [[bin]]
+name = "handoff_metadata"
+path = "fuzz_targets/handoff_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal_input"
+path = "fuzz_targets/terminal_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wire"
 path = "fuzz_targets/wire.rs"
 test = false
@@ -25,6 +39,13 @@ bench = false
 [[bin]]
 name = "state"
 path = "fuzz_targets/state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hook_clients"
+path = "fuzz_targets/hook_clients.rs"
 test = false
 doc = false
 bench = false
