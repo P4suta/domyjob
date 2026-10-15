@@ -127,4 +127,5 @@ pub fn accept<L: Outbox + ?Sized>(
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/exchange_tests.rs"]
 mod tests;

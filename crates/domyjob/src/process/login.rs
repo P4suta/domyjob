@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, Write as _};
+use std::io;
 use std::net::Shutdown;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::FileTypeExt as _;
@@ -91,33 +91,72 @@ fn hand_off(path: &Path, logged_in: bool) -> Result<UnixStream, ProcessError> {
     })
 }
 
-fn exchange(mut stream: UnixStream, request: &Handoff) -> Result<(), ProcessError> {
-    clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS).map_err(refused)?;
-    let bytes = serde_json::to_vec(request).map_err(refused)?;
-    if bytes.len() > MAX_CONTROL_BYTES {
-        return Err(refused(
-            "the login-session hand-off exceeds the 1 MiB limit",
-        ));
-    }
-    stream.write_all(&bytes).map_err(refused)?;
-    stream.shutdown(Shutdown::Write).map_err(refused)?;
-    let reply = crate::bounded::read(&mut stream, MAX_REPLY_BYTES)
-        .map_err(refused)?
-        .ok_or_else(|| refused("the login-session agent returned an oversized reply"))?;
-    if reply == b"R" {
-        Ok(())
-    } else {
-        Err(refused(format!(
-            "the login-session agent refused the hand-off: {}",
-            String::from_utf8_lossy(&reply)
-        )))
+struct PreparedHandoff(Vec<u8>);
+
+impl PreparedHandoff {
+    fn new(request: &Handoff) -> Result<Self, ProcessError> {
+        let bytes = serde_json::to_vec(request).map_err(refused)?;
+        if bytes.len() > MAX_CONTROL_BYTES {
+            return Err(refused(
+                "the login-session hand-off exceeds the 1 MiB limit",
+            ));
+        }
+        Ok(Self(bytes))
     }
 }
 
+fn exchange(
+    request: &Handoff,
+    connect: impl FnOnce() -> Result<UnixStream, ProcessError>,
+) -> Result<(), ProcessError> {
+    let prepared = PreparedHandoff::new(request)?;
+    let mut stream = connect()?;
+    clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS).map_err(refused)?;
+    exchange_using(&mut stream, &prepared, |socket| {
+        socket.shutdown(Shutdown::Write)
+    })
+}
+
+fn exchange_using<S: io::Read + io::Write>(
+    stream: &mut S,
+    request: &PreparedHandoff,
+    finish: impl FnOnce(&mut S) -> io::Result<()>,
+) -> Result<(), ProcessError> {
+    stream
+        .write_all(&request.0)
+        .map_err(|error| refused(format!("request write: {error}")))?;
+    finish(stream).map_err(|error| refused(format!("request finish: {error}")))?;
+    let reply = crate::bounded::read(stream, MAX_REPLY_BYTES)
+        .map_err(|error| sent_refusal(format!("reply read: {error}"), request.0.len()))?
+        .ok_or_else(|| {
+            sent_refusal(
+                "the login-session agent returned an oversized reply",
+                request.0.len(),
+            )
+        })?;
+    if reply == b"R" {
+        Ok(())
+    } else {
+        Err(sent_refusal(
+            format!(
+                "the login-session agent refused the hand-off: {}",
+                String::from_utf8_lossy(&reply)
+            ),
+            request.0.len(),
+        ))
+    }
+}
+
+fn sent_refusal(cause: impl std::fmt::Display, bytes: usize) -> ProcessError {
+    refused(format!(
+        "{cause}; sender bytes={bytes}; write_complete=true; write_half_closed=true"
+    ))
+}
+
 pub(super) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
+    let request = Handoff::current(job).map_err(refused)?;
     let path = platform::login_directory().map_err(refused)?.join("socket");
-    let stream = hand_off(&path, logged_in()?)?;
-    exchange(stream, &Handoff::current(job).map_err(refused)?)
+    exchange(&request, || hand_off(&path, logged_in()?))
 }
 
 fn launch(request: Handoff) -> Result<(), ProcessError> {
@@ -141,15 +180,42 @@ fn receive(
     launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
 ) -> io::Result<()> {
     clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS)?;
-    let started = receive_request(&mut stream, launch);
+    let mut reader = RequestReader {
+        inner: &mut stream,
+        bytes: 0,
+        eof: false,
+    };
+    let started = receive_request(&mut reader, launch);
+    let bytes = reader.bytes;
+    let eof = reader.eof;
     match started {
         Ok(()) => reply::complete(&mut stream, b"R", |socket| socket.shutdown(Shutdown::Write)),
         Err(error) => {
-            let detail = refusal_detail(&error);
+            let detail = format!(
+                "{}; receiver bytes={bytes}; request_eof={eof}",
+                refusal_detail(&error)
+            );
             reply::complete(&mut stream, detail.as_bytes(), |socket| {
                 socket.shutdown(Shutdown::Write)
             })
         }
+    }
+}
+
+struct RequestReader<R> {
+    inner: R,
+    bytes: usize,
+    eof: bool,
+}
+
+impl<R: io::Read> io::Read for RequestReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes = self.bytes.saturating_add(count);
+        if !buffer.is_empty() && count == 0 {
+            self.eof = true;
+        }
+        Ok(count)
     }
 }
 
@@ -237,6 +303,104 @@ mod tests {
     use domyjob_core::domain::{IDENTIFIER_HEX_BYTES, JobId};
     use std::os::unix::net::UnixStream;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TransportFault {
+        Write,
+        Finish,
+        Read,
+    }
+
+    struct FaultyTransport {
+        fault: TransportFault,
+        sent: Vec<u8>,
+        finished: bool,
+        read: bool,
+        flushed: bool,
+    }
+
+    fn transport_fault() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "injected transport fault")
+    }
+
+    impl std::io::Write for FaultyTransport {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.finished || self.read {
+                return Err(std::io::Error::other(
+                    "write occurred after request completion",
+                ));
+            }
+            if self.fault == TransportFault::Write {
+                return Err(transport_fault());
+            }
+            self.sent.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushed = true;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "flushing cannot replace the request half-close",
+            ))
+        }
+    }
+
+    impl std::io::Read for FaultyTransport {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.read = true;
+            if !self.finished || self.fault != TransportFault::Read {
+                return Err(std::io::Error::other(
+                    "reply read preceded request completion",
+                ));
+            }
+            Err(transport_fault())
+        }
+    }
+
+    #[test]
+    fn client_transport_faults_preserve_the_phase_and_stop_later_effects() {
+        for (fault, phase) in [
+            (TransportFault::Write, "request write"),
+            (TransportFault::Finish, "request finish"),
+            (TransportFault::Read, "reply read"),
+        ] {
+            let packet = request();
+            let bytes = serde_json::to_vec(&packet).unwrap();
+            let mut stream = FaultyTransport {
+                fault,
+                sent: Vec::new(),
+                finished: false,
+                read: false,
+                flushed: false,
+            };
+            let prepared = super::PreparedHandoff::new(&packet).unwrap();
+            let result = super::exchange_using(&mut stream, &prepared, |stream| {
+                assert_eq!(stream.sent, bytes);
+                assert!(!stream.read);
+                stream.finished = true;
+                if stream.fault == TransportFault::Finish {
+                    Err(transport_fault())
+                } else {
+                    Ok(())
+                }
+            });
+            let detail =
+                format!("macOS login-session hand-off refused: {phase}: injected transport fault");
+            let detail = if fault == TransportFault::Read {
+                format!(
+                    "{detail}; sender bytes={}; write_complete=true; write_half_closed=true",
+                    bytes.len()
+                )
+            } else {
+                detail
+            };
+            assert_eq!(result.unwrap_err().to_string(), detail);
+            assert_eq!(stream.finished, fault != TransportFault::Write);
+            assert_eq!(stream.read, fault == TransportFault::Read);
+            assert!(!stream.flushed);
+        }
+    }
+
     #[test]
     fn request_read_fault_keeps_phase_cause_and_never_launches() {
         use std::io::Read as _;
@@ -283,6 +447,59 @@ mod tests {
             job: JobId::try_from("1".repeat(IDENTIFIER_HEX_BYTES)).unwrap(),
             environment: vec![("PATH".to_owned(), b"/usr/bin".to_vec())],
         }
+    }
+
+    #[test]
+    fn an_oversized_request_is_refused_before_connecting() {
+        let mut packet = request();
+        packet.environment.push((
+            "PATH".to_owned(),
+            vec![b'x'; domyjob_core::wire::MAX_CONTROL_BYTES],
+        ));
+        let connected = std::cell::Cell::new(false);
+        let error = exchange(&packet, || {
+            connected.set(true);
+            Err(ProcessError::NotStarted("unexpected connection".to_owned()))
+        })
+        .unwrap_err();
+        assert!(!connected.get());
+        assert!(error.to_string().contains("1 MiB"));
+    }
+
+    #[test]
+    fn request_observation_distinguishes_partial_data_from_eof_without_payloads() {
+        use std::io::Read as _;
+
+        struct Refuses;
+
+        impl std::io::Read for Refuses {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(transport_fault())
+            }
+        }
+
+        let mut complete = super::RequestReader {
+            inner: &b"private payload"[..],
+            bytes: 0,
+            eof: false,
+        };
+        assert_eq!(complete.read(&mut []).unwrap(), 0);
+        assert!(!complete.eof);
+        crate::bounded::read(&mut complete, super::MAX_CONTROL_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.bytes, b"private payload".len());
+        assert!(complete.eof);
+
+        let mut partial = super::RequestReader {
+            inner: (&b"private payload"[..]).chain(Refuses),
+            bytes: 0,
+            eof: false,
+        };
+        let error = crate::bounded::read(&mut partial, super::MAX_CONTROL_BYTES).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(partial.bytes, b"private payload".len());
+        assert!(!partial.eof);
     }
 
     #[test]
@@ -357,12 +574,16 @@ mod tests {
                 stream.shutdown(std::net::Shutdown::Write)
             })
         });
-        let observed = exchange(client, &request());
+        let packet = request();
+        let sent = serde_json::to_vec(&packet).unwrap().len();
+        let observed = exchange(&packet, || Ok(client));
         let completed = receiver.join();
         completed.unwrap().unwrap();
         assert_eq!(
             observed.unwrap_err().to_string(),
-            "macOS login-session hand-off refused: the login-session agent refused the hand-off: legacy refusal"
+            format!(
+                "macOS login-session hand-off refused: the login-session agent refused the hand-off: legacy refusal; sender bytes={sent}; write_complete=true; write_half_closed=true"
+            )
         );
     }
 
@@ -381,7 +602,8 @@ mod tests {
             });
             (completed, launches)
         });
-        let sent = std::io::Write::write_all(&mut client, b"{\"program\":");
+        let partial = b"{\"program\":";
+        let sent = std::io::Write::write_all(&mut client, partial);
         let observed = crate::bounded::read(&mut client, super::MAX_REPLY_BYTES);
         drop(client);
         let joined = receiver.join();
@@ -391,7 +613,13 @@ mod tests {
         assert_eq!(launches, 0);
         let detail = String::from_utf8(observed.unwrap().unwrap()).unwrap();
         let cause = std::io::Error::from_raw_os_error(MACOS_WOULD_BLOCK).to_string();
-        assert_eq!(detail, format!("request read: {cause}"));
+        assert_eq!(
+            detail,
+            format!(
+                "request read: {cause}; receiver bytes={}; request_eof=false",
+                partial.len()
+            )
+        );
     }
 
     #[test]
@@ -420,7 +648,7 @@ mod tests {
             })
             .unwrap();
         });
-        exchange(client, &request()).unwrap();
+        exchange(&request(), || Ok(client)).unwrap();
         receiver.join().unwrap();
     }
 
@@ -478,13 +706,20 @@ mod tests {
                     .environment
                     .push(("GH_TOKEN".to_owned(), b"never-forward".to_vec()));
             }
-            let error = exchange(client, &packet).unwrap_err();
+            let bytes = serde_json::to_vec(&packet).unwrap().len();
+            let error = exchange(&packet, || Ok(client)).unwrap_err();
             let cause = if unapproved {
                 "allowlist"
             } else {
                 "worker refused"
             };
-            assert!(error.to_string().contains(cause));
+            let detail = error.to_string();
+            assert!(detail.contains(cause));
+            assert!(detail.contains(&format!("receiver bytes={bytes}; request_eof=true")));
+            assert!(detail.contains(&format!(
+                "sender bytes={bytes}; write_complete=true; write_half_closed=true"
+            )));
+            assert!(!detail.contains("never-forward"));
             receiver.join().unwrap();
         }
     }
@@ -531,7 +766,7 @@ mod tests {
             vec![b'x'; domyjob_core::wire::MAX_CONTROL_BYTES],
         ));
         assert!(
-            exchange(client, &packet)
+            exchange(&packet, || Ok(client))
                 .unwrap_err()
                 .to_string()
                 .contains("1 MiB")

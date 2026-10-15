@@ -1,12 +1,26 @@
 const CHAT: &[u8] = include_bytes!("../formats/chat.txt");
+const PREVIOUS_CHAT: &[u8] = include_bytes!("../formats/chat-v1.txt");
 const RUNNER: &[u8] = include_bytes!("../formats/runner.txt");
+const FORMAT_DIGEST_HEX_CHARS: usize = 16;
 
 fn identity(specimen: &[u8]) -> String {
-    blake3::hash(specimen).to_hex().chars().take(16).collect()
+    blake3::hash(specimen)
+        .to_hex()
+        .chars()
+        .take(FORMAT_DIGEST_HEX_CHARS)
+        .collect()
 }
 
 pub(crate) fn chat() -> String {
     identity(CHAT)
+}
+
+pub(crate) fn previous_chat() -> String {
+    identity(PREVIOUS_CHAT)
+}
+
+pub(crate) fn compatible_chat(format: &str) -> bool {
+    format == chat() || format == previous_chat()
 }
 
 pub(crate) fn runner() -> String {

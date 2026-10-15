@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use super::card::{Card, MachineCard};
 use super::event::{Body, Event, Intent, Members, Outcome, Sealed};
 use super::id::{AgentId, Audience, Conversation, EventId, Invalid, Line, Origin, RoomId};
+use super::notification::{Activity, Delivery};
+
+mod parent_identity;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
@@ -17,6 +20,16 @@ pub enum Parent {
     Present(Box<Event>),
     Opaque,
     Missing,
+}
+
+impl Parent {
+    fn matches(&self, request: &EventId) -> bool {
+        let identity = match self {
+            Self::Present(parent) => Some(parent.id()),
+            Self::Opaque | Self::Missing => None,
+        };
+        parent_identity::matches(identity, request)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,9 +60,11 @@ impl Resolution {
 #[serde(deny_unknown_fields)]
 pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<Line<256>>,
+    pub topic: Option<Line<MAX_ROOM_TOPIC_BYTES>>,
     pub members: Members,
 }
+
+pub const MAX_ROOM_TOPIC_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reason")]
@@ -102,6 +117,15 @@ pub enum Change {
         resolution: Box<Resolution>,
         wins: bool,
     },
+    Receipt {
+        request: EventId,
+        agent: AgentId,
+        delivery: Delivery,
+    },
+    Activity {
+        agent: AgentId,
+        activity: Activity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +163,20 @@ pub enum Failure<E> {
     Invalid(Invalid),
 }
 
+fn checked_parent<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    request: &EventId,
+) -> Result<Parent, Failure<L::Error>> {
+    let parent = ledger.parent(request).map_err(Failure::Store)?;
+    if !parent.matches(request) {
+        return Err(Failure::Rejected(Rejection::Mismatch {
+            event: event.id().clone(),
+        }));
+    }
+    Ok(parent)
+}
+
 fn same_thread(
     event: &Event,
     conversation: &Conversation,
@@ -150,26 +188,20 @@ fn same_thread(
         && event.clock() > parent.clock()
 }
 
-fn ask_of(parent: &Event) -> Option<(AgentId, &AgentId)> {
-    match parent.body() {
-        Body::Message {
-            from,
-            intent: Intent::Ask { responder, .. },
-            ..
-        } => Some((
-            AgentId::new(from.clone(), parent.origin().clone()),
-            responder,
-        )),
-        Body::Message { .. }
-        | Body::Profile { .. }
-        | Body::Left { .. }
-        | Body::Machine { .. }
-        | Body::Room { .. }
-        | Body::RoomClosed { .. }
-        | Body::TurnStarted { .. }
-        | Body::Resolved { .. }
-        | Body::Omitted {} => None,
-    }
+#[must_use]
+pub fn ask_of(parent: &Event) -> Option<(AgentId, &AgentId)> {
+    let Body::Message {
+        from,
+        intent: Intent::Ask { responder, .. },
+        ..
+    } = parent.body()
+    else {
+        return None;
+    };
+    Some((
+        AgentId::new(from.clone(), parent.origin().clone()),
+        responder,
+    ))
 }
 
 struct Candidate {
@@ -202,7 +234,7 @@ fn resolve<L: Ledger + ?Sized>(
         (None, _) | (_, None) => return Ok(Change::Nothing),
     };
     let current = ledger.resolution(request).map_err(Failure::Store)?;
-    let (asker, responder) = match ledger.parent(request).map_err(Failure::Store)? {
+    let (asker, responder) = match checked_parent(ledger, event, request)? {
         Parent::Missing => {
             return Err(Failure::Rejected(Rejection::MissingDependency {
                 event: event.id().clone(),
@@ -255,42 +287,124 @@ fn plain_reply<E>(event: &Event, ending: Ending) -> Result<Change, Failure<E>> {
     }
 }
 
-fn started<L: Ledger + ?Sized>(
+struct ThreadParent<'a> {
+    conversation: &'a Conversation,
+    audience: &'a Audience,
+    agent: AgentId,
+    parent: Box<Event>,
+}
+
+fn thread_parent<'a, L: Ledger + ?Sized>(
     ledger: &L,
-    event: &Event,
+    event: &'a Event,
     request: &EventId,
-) -> Result<Change, Failure<L::Error>> {
+) -> Result<Option<ThreadParent<'a>>, Failure<L::Error>> {
     let (Some(conversation), Some(audience), Some(agent)) = (
         event.body().conversation(),
         event.body().audience(),
         event.author(),
     ) else {
-        return Ok(Change::Nothing);
+        return Ok(None);
     };
-    match ledger.parent(request).map_err(Failure::Store)? {
+    match checked_parent(ledger, event, request)? {
         Parent::Missing => Err(Failure::Rejected(Rejection::MissingDependency {
             event: event.id().clone(),
             request: request.clone(),
         })),
-        Parent::Opaque => Ok(Change::Nothing),
-        Parent::Present(parent) => match ask_of(&parent) {
-            Some((_, responder))
-                if *responder == agent && same_thread(event, conversation, audience, &parent) =>
-            {
-                Ok(Change::Started {
-                    request: request.clone(),
-                    agent,
-                })
-            }
-            Some(_) | None => Err(Failure::Rejected(Rejection::Mismatch {
-                event: event.id().clone(),
-            })),
-        },
+        Parent::Opaque => Ok(None),
+        Parent::Present(parent) => Ok(Some(ThreadParent {
+            conversation,
+            audience,
+            agent,
+            parent,
+        })),
     }
 }
 
+fn started<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    request: &EventId,
+) -> Result<Change, Failure<L::Error>> {
+    let Some(context) = thread_parent(ledger, event, request)? else {
+        return Ok(Change::Nothing);
+    };
+    match ask_of(&context.parent) {
+        Some((_, responder))
+            if *responder == context.agent
+                && same_thread(
+                    event,
+                    context.conversation,
+                    context.audience,
+                    &context.parent,
+                ) =>
+        {
+            Ok(Change::Started {
+                request: request.clone(),
+                agent: context.agent,
+            })
+        }
+        Some(_) | None => Err(Failure::Rejected(Rejection::Mismatch {
+            event: event.id().clone(),
+        })),
+    }
+}
+
+fn receipt<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    request: &EventId,
+    delivery: Delivery,
+) -> Result<Change, Failure<L::Error>> {
+    let Some(context) = thread_parent(ledger, event, request)? else {
+        return Ok(Change::Nothing);
+    };
+    receipt_change(event, request, delivery, context).map_err(Failure::Rejected)
+}
+
+fn receipt_change(
+    event: &Event,
+    request: &EventId,
+    delivery: Delivery,
+    context: ThreadParent<'_>,
+) -> Result<Change, Rejection> {
+    let addressed = match context.parent.body() {
+        Body::Message {
+            notice: Some(notice),
+            ..
+        } => notice.recipients.contains(&context.agent),
+        Body::Message { .. } => context.parent.author().as_ref() != Some(&context.agent),
+        Body::Profile { .. }
+        | Body::Left { .. }
+        | Body::Machine { .. }
+        | Body::Room { .. }
+        | Body::RoomClosed { .. }
+        | Body::TurnStarted { .. }
+        | Body::Resolved { .. }
+        | Body::Receipt { .. }
+        | Body::Activity { .. }
+        | Body::Omitted {} => false,
+    };
+    if !addressed
+        || !same_thread(
+            event,
+            context.conversation,
+            context.audience,
+            &context.parent,
+        )
+    {
+        return Err(Rejection::Mismatch {
+            event: event.id().clone(),
+        });
+    }
+    Ok(Change::Receipt {
+        request: request.clone(),
+        agent: context.agent,
+        delivery,
+    })
+}
+
 fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failure<L::Error>> {
-    let origin = event.origin();
     Ok(match event.body() {
         Body::Omitted {}
         | Body::Message {
@@ -298,27 +412,34 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
             ..
         } => Change::Nothing,
         Body::Profile { agent, card } => Change::Profile {
-            agent: AgentId::new(agent.clone(), origin.clone()),
+            agent: AgentId::new(agent.clone(), event.origin().clone()),
             card: Some(card.clone()),
         },
         Body::Left { agent } => Change::Profile {
-            agent: AgentId::new(agent.clone(), origin.clone()),
+            agent: AgentId::new(agent.clone(), event.origin().clone()),
             card: None,
         },
+        Body::Activity { agent, activity } => Change::Activity {
+            agent: AgentId::new(agent.clone(), event.origin().clone()),
+            activity: activity.clone(),
+        },
+        Body::Receipt {
+            request, delivery, ..
+        } => receipt(ledger, event, request, *delivery)?,
         Body::Machine { card } => Change::Machine { card: card.clone() },
         Body::Room {
             name,
             topic,
             members,
         } => Change::Room {
-            id: RoomId::new(origin.clone(), name.clone()),
+            id: RoomId::new(event.origin().clone(), name.clone()),
             room: Some(Box::new(Room {
                 topic: topic.clone(),
                 members: members.clone(),
             })),
         },
         Body::RoomClosed { name } => Change::Room {
-            id: RoomId::new(origin.clone(), name.clone()),
+            id: RoomId::new(event.origin().clone(), name.clone()),
             room: None,
         },
         Body::Message {
@@ -332,7 +453,7 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
             intent: Intent::Reply { request },
             ..
         } => {
-            let author = AgentId::new(from.clone(), origin.clone());
+            let author = AgentId::new(from.clone(), event.origin().clone());
             resolve(
                 ledger,
                 event,
@@ -355,7 +476,7 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
             request,
             &Candidate {
                 ending: Ending::Ended(*outcome),
-                author: AgentId::new(agent.clone(), origin.clone()),
+                author: AgentId::new(agent.clone(), event.origin().clone()),
             },
         )?,
     })
@@ -455,12 +576,19 @@ pub fn receive<L: Ledger + ?Sized>(
             Err(Failure::Rejected(Rejection::Unauthorized {
                 event: event.id().clone(),
             }))
-        } else if !ledger.has_room()? {
-            Err(Failure::Rejected(Rejection::ResourceLimit))
         } else {
             Sealed::new(event.clone())
                 .map_err(Failure::Invalid)
-                .and_then(|sealed| commit(ledger, &sealed))
+                .and_then(|sealed| match admit(ledger, &sealed)? {
+                    Decision::Duplicate => Ok(false),
+                    Decision::Append(admitted) => {
+                        if !ledger.has_room().map_err(Failure::Store)? {
+                            return Err(Failure::Rejected(Rejection::ResourceLimit));
+                        }
+                        ledger.commit(&sealed, admitted).map_err(Failure::Store)?;
+                        Ok(true)
+                    }
+                })
         };
         match outcome {
             Ok(true) => appended = appended.saturating_add(1),

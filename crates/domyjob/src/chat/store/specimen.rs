@@ -7,11 +7,20 @@ use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, EventId, Line, Origin, Paragraph, RoomId, RoomName, Text,
 };
 use domyjob_core::chat::ledger::{Ending, Resolution, Room};
+use domyjob_core::chat::notification::{Activity, ActivityState, Delivery, Notice, Question};
 use domyjob_core::chat::policy::audience;
 
 use super::admin::{Link, LinkState};
 use super::tables::{encode, event_key, joined_key, manifest, order_key, room_key, thread_key};
 use super::views::LocalAgent;
+
+const SPECIMEN_MILLIS: u64 = 1_700_000_000_000;
+const RECEIPT_REQUEST_SEQUENCE: u64 = 7;
+const SPECIMEN_FALLBACK_SECONDS: u64 = 120;
+const ORIGIN_HEX_BYTES: usize = 32;
+const RESOLUTION_SEQUENCE: u64 = 9;
+const RESOLUTION_CLOCK: u64 = 9;
+const SPECIMEN_CWD: &str = "/home/user/project";
 
 const fn kind(body: &Body) -> &'static str {
     match body {
@@ -24,10 +33,12 @@ const fn kind(body: &Body) -> &'static str {
         Body::TurnStarted { .. } => "turn_started",
         Body::Resolved { .. } => "resolved",
         Body::Omitted {} => "omitted",
+        Body::Receipt { .. } => "receipt",
+        Body::Activity { .. } => "activity",
     }
 }
 
-const KINDS: [&str; 9] = [
+const KINDS: [&str; 11] = [
     "profile",
     "left",
     "machine",
@@ -37,10 +48,12 @@ const KINDS: [&str; 9] = [
     "turn_started",
     "resolved",
     "omitted",
+    "receipt",
+    "activity",
 ];
 
 fn origin(digit: char) -> Origin {
-    Origin::try_from(std::iter::repeat_n(digit, 32).collect::<String>()).unwrap()
+    Origin::try_from(std::iter::repeat_n(digit, ORIGIN_HEX_BYTES).collect::<String>()).unwrap()
 }
 
 fn name(text: &str) -> AgentName {
@@ -128,7 +141,8 @@ fn thread_bodies() -> Vec<(char, Body)> {
         text: Text::try_from("text".to_owned()).unwrap(),
         audience: pair.clone(),
         intent,
-        at: Stamp::from_unix_millis(1_700_000_000_000),
+        at: Stamp::from_unix_millis(SPECIMEN_MILLIS),
+        notice: None,
     };
     let chain = Chain::try_from(vec![agent("waiting", 'c')]).unwrap();
     let mut bodies = vec![
@@ -151,7 +165,7 @@ fn thread_bodies() -> Vec<(char, Body)> {
         (
             'b',
             Body::TurnStarted {
-                request: id('a', 7),
+                request: id('a', RECEIPT_REQUEST_SEQUENCE),
                 conversation: direct.clone(),
                 audience: pair.clone(),
                 agent: responder.name().clone(),
@@ -163,12 +177,13 @@ fn thread_bodies() -> Vec<(char, Body)> {
                 &direct,
                 &responder,
                 Intent::Reply {
-                    request: id('a', 7),
+                    request: id('a', RECEIPT_REQUEST_SEQUENCE),
                 },
             ),
         ),
         ('b', Body::Omitted {}),
     ];
+    bodies.extend(notification_bodies());
     for outcome in [
         Outcome::Failed,
         Outcome::Interrupted,
@@ -183,7 +198,7 @@ fn thread_bodies() -> Vec<(char, Body)> {
         bodies.push((
             digit,
             Body::Resolved {
-                request: id('a', 7),
+                request: id('a', RECEIPT_REQUEST_SEQUENCE),
                 conversation: direct.clone(),
                 audience: pair.clone(),
                 agent: by.name().clone(),
@@ -191,6 +206,63 @@ fn thread_bodies() -> Vec<(char, Body)> {
             },
         ));
     }
+    bodies
+}
+
+fn notification_bodies() -> Vec<(char, Body)> {
+    let (asker, responder) = (agent("asker", 'a'), agent("responder", 'b'));
+    let direct = Conversation::direct(&asker, &responder).unwrap();
+    let pair = audience([&asker, &responder]).unwrap();
+    let mut bodies = vec![(
+        'b',
+        Body::Activity {
+            agent: responder.name().clone(),
+            activity: Activity {
+                state: ActivityState::Working,
+                at: Stamp::from_unix_millis(SPECIMEN_MILLIS),
+                status: Some(Line::try_from("reviewing".to_owned()).unwrap()),
+            },
+        },
+    )];
+    for delivery in [Delivery::Delivered, Delivery::Read, Delivery::Acknowledged] {
+        bodies.push((
+            'b',
+            Body::Receipt {
+                request: id('a', RECEIPT_REQUEST_SEQUENCE),
+                conversation: direct.clone(),
+                audience: pair.clone(),
+                agent: responder.name().clone(),
+                delivery,
+            },
+        ));
+    }
+    bodies.push((
+        'a',
+        Body::Message {
+            conversation: Conversation::Room(room()),
+            from: asker.name().clone(),
+            text: Text::try_from("text".to_owned()).unwrap(),
+            audience: pair,
+            intent: Intent::Ask {
+                responder: responder.clone(),
+                chain: Chain::default(),
+            },
+            at: Stamp::from_unix_millis(SPECIMEN_MILLIS),
+            notice: Some(Notice {
+                recipients: Members::try_from(vec![responder.clone()]).unwrap(),
+                urgent: true,
+                subject: Some(Line::try_from("Review".to_owned()).unwrap()),
+                question: Some(
+                    Question::new(
+                        Line::try_from("Approve or explain".to_owned()).unwrap(),
+                        SPECIMEN_FALLBACK_SECONDS,
+                        responder,
+                    )
+                    .unwrap(),
+                ),
+            }),
+        },
+    ));
     bodies
 }
 
@@ -242,8 +314,8 @@ fn specimen() -> String {
         lines.push(format!(
             "record resolution {}",
             encode(&Resolution {
-                event: id('b', 9),
-                clock: 9,
+                event: id('b', RESOLUTION_SEQUENCE),
+                clock: RESOLUTION_CLOCK,
                 ending,
                 asker: agent("asker", 'a'),
                 responder: agent("responder", 'b'),
@@ -254,7 +326,7 @@ fn specimen() -> String {
     lines.push(format!(
         "record local_agent {}",
         encode(&LocalAgent {
-            cwd: "/home/user/project".to_owned(),
+            cwd: SPECIMEN_CWD.to_owned(),
             session: Some("0199aa6e-3f1c-7b9a-9d7e-2c4b5a6f7e80".to_owned()),
         })
         .unwrap()
@@ -265,7 +337,7 @@ fn specimen() -> String {
             encode(&Link {
                 state,
                 detail: Some("detail".to_owned()),
-                at: Stamp::from_unix_millis(1_700_000_000_000),
+                at: Stamp::from_unix_millis(SPECIMEN_MILLIS),
             })
             .unwrap()
         ));

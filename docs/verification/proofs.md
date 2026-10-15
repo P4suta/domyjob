@@ -1,11 +1,57 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
-This head registers twenty-eight positive Kani harnesses, fourteen named negative controls, and seventy-five required covers.
+This head registers forty-six positive Kani harnesses, twenty-five named negative controls, and 130 required covers.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
 An optional standalone source selects that maintained source explicitly; omission selects the core Cargo lane and never makes execution optional.
+
+`cargo xtask verify parent-identity` is a closed native Linux calibration.
+It validates the full inventory and the actual Parent source refinement, then runs the imported proof-controller exit policy before the complete Parent identity pair.
+The exit policy quantifies both proof phases and every optional i32 code with four covers and `NEGATIVE_PROOF_EXIT_CODE` as the false admission claim.
+The Parent proof quantifies every canonical 128-bit origin and nonzero u64 sequence independently for parent and request, with six identity and classification covers and `NEGATIVE_PARENT_IDENTITY` as its false claim.
+The actual runner requires normal zero for positive proofs and normal one for named counterexamples before it reads the unchanged strict report decoder.
+Its native-default arguments use one proof job, two build jobs, the unchanged sixty-second harness budget, and positive-only fail-fast.
+Source-after binding runs even after proof refusal and retains both failures when needed.
+Each proof captures the actual selected Kani proxies, mise and Cargo launchers, linked compiler and toolchain, required backend roles, runtime support files, and exact child version observations before execution.
+The independent after observation still runs after admission, compiler, process, or report refusal and retains both causes when they fail.
+Owned evidence directories retain the raw report and tool observations after the command returns.
+The current source epoch still requires actual native qualification and Parent proof results; implementing these checks does not supply those results.
+This scoped calibration does not certify all registered proofs, other platforms, notice admission, receipt authorization, Question delay, or hook formatting.
+
+`cargo xtask verify parent-identity-component generator|present|absent` selects exactly one of three additive Parent components for native Linux calibration.
+Each invocation validates the full inventory and seven-file actual source refinement, runs the required exit-policy pair first, and then runs the selected registered component with the unchanged `NEGATIVE_PARENT_IDENTITY` control.
+Unknown names, arbitrary harnesses, source paths, extra arguments, and solver or deadline overrides refuse before proof execution.
+The generator component checks the real full-domain factory and every preserved Origin byte, with one additional minimum-sequence reachability cover.
+Present checks exact complete identity equality and its four origin/sequence classes.
+Absent checks both Opaque and Missing identity decisions with two separate covers; it does not authorize a missing Ledger dependency.
+Present and Absent each retain the original two real full-domain identity generators and both byte-preservation assertions.
+The one-call generator component provides additional diagnostic evidence rather than a constructor summary assumed by either decision component.
+The existing exact normal-code policy, cover and assertion admission, default proof flags, resource bounds, and independent source-after check remain required.
+The physical native tool/configuration binding is enforced for each proof as in the aggregate calibration.
+The original aggregate harness and its six covers remain registered and required by `parent-identity` and full verification.
+Individual component success cannot complete that aggregate, and the prior aggregate timeout remains missing evidence.
+No checked composition or derived-obligation substitution is implemented.
+
+`cargo xtask verify parent-identity-encoder` selects one proof-only arithmetic hexadecimal encoder theorem and its independent `NEGATIVE_PARENT_HEX_ENCODER` control after the required exact exit-policy pair.
+It retains the full inventory, seven-file Parent refinement, actual tool binding, and independent source-after checks.
+The theorem quantifies every u8 input, proves exact equality to the original sixteen-byte lookup, proves the lowercase hexadecimal range, and supplies an inverse for every valid output byte without assumptions.
+Two covers require the zero digit and final lowercase letter to remain reachable.
+The factory maps all thirty-two independent u8 choices through the pointwise-equivalent arithmetic encoder, actual UTF-8 conversion, Origin validation, and EventId construction.
+The separate encoder theorem supplies no factory or aggregate completion by itself.
+The generator-only sixty-second timeout establishes missing evidence without identifying the responsible operation inside the factory.
+
+`cargo xtask verify native-default` selects only the fixed tool-qualification inventory after the complete source inventory and Parent refinement checks.
+It requires five positive harnesses, five exact named counterexamples, and twelve covers for the actual imported native-default kernel.
+Those obligations cover both supported object-header representations, full-width member and byte budgets, every required role, every identity field and digest byte, the builtin configuration, and the pinned loader-tail filter.
+Unknown names, source substitutions, missing or duplicated obligations, altered cover counts, and changed negative assertions refuse the selector.
+The ordinary proof command uses the pinned native-default backend and command-local loader isolation; standalone sources receive the same Rust 2024 edition as the workspace.
+The report must agree with its actual target and observed tools, exactly one builtin Cadical solver with an explicit null version, sixteen object bits, complete unique harness observations, full property counts, and the required clean or PanicsOnly assertion-failure phase.
+Tool snapshots cap each member at 256 MiB, all member bytes at 1024 MiB, and member count at 1024; the 16 MiB report and existing source-transfer bounds remain separate.
+Version probes retain the ten-second deadline and one-MiB diagnostic bound, and actual proofs retain the sixty-second per-harness budget and one solver job.
+Native paths, filesystem identity, SHA-256 implementation, process execution, and the operating system remain adapter trust boundaries, with specific replacement, alias, loader, identity, and failure controls.
+Current-source native execution is required before this qualification can be reported as passed.
 
 Kani 0.68.0 checks the production execution-result, resource-budget, job-state, persistent-protocol and source-admission decisions.
 Execution outcomes quantify every `i32` exit code with a fixed valid launch-error payload and four reachable outcomes.
@@ -29,6 +75,11 @@ Native text fixtures preserve the exact prior integer parsing, error text, and c
 The job-state proof checks the finite phase and event variants, arbitrary PID and exit-code inputs, a representative prior nonzero PID, and a one-byte launch reason with unwind sixteen and three covers.
 The persistent-protocol proof checks every durable state and action, including both request-equivalence values, without loops or input assumptions and with four covers.
 The resource negative must fail its `NEGATIVE_RESOURCE_CONTROL` assertion, and the disconnect-loss negative must fail its `NEGATIVE_JOB_CONTROL` assertion.
+The five notification harnesses check the actual recipient join, urgent-stop decision, elapsed deadline, activity expiry, and checked context admission with seventeen required covers.
+Their complete scalar domains include all receipt stages, urgency and activity variants, arbitrary u64 timestamps, and every usize budget.
+The hook compaction harness checks the actual retained-group ordering over at most four arbitrary groups with three covers.
+The complete-output capture harness checks every u64 omitted-byte count and both production policies with four covers.
+Their named false claims must fail `NEGATIVE_CHAT_CONTROL`, `NEGATIVE_HOOK_CONTROL`, and `NEGATIVE_TOOL_CAPTURE_CONTROL` respectively.
 Complete reports must contain every harness, unique check identities, successful assertions, and the exact individually satisfied cover count.
 Unwinding failures and incomplete result summaries cannot pass.
 
@@ -67,15 +118,18 @@ The fuzz phase copies exactly three checked-in wire seeds into a fresh replay di
 It also copies the checked-in source seeds `tracked`, `metadata` and `malformed` into a separate fresh replay directory.
 Missing or empty required corpus files fail before libFuzzer starts.
 The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add a third isolated replay directory.
-The maintained cargo-fuzz 0.13.2 targets replay those nine inputs through production wire, source, and process-group ingress with zero mutation runs and seed one.
+The checked-in `chat_ledger/notifications` seed and `hook_clients/foreign` and `hook_clients/malformed` seeds add three nonempty receipt/activity and hook-document inputs.
+The maintained cargo-fuzz 0.13.2 targets replay those twelve inputs through five production ingress and model targets with zero mutation runs and seed one.
 Exploratory corpus output cannot change the required replay set.
 
-`mise run miri` interprets eleven finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, worker handoff, login reply, and input-controller lanes through nightly-2026-10-01.
+`mise run miri` interprets fourteen finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, worker handoff, login reply, input-controller, notification, hook-merge, and capture-policy lanes through nightly-2026-10-01.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
 The worker handoff core test checks owned error preservation, exact stage order, admitted request forwarding, and each refusal phase through the production function.
 Miri establishes its checks for those concrete executions under supported memory semantics; it does not establish soundness for every caller or schedule.
+
+The [notification contracts](notifications.md) and [client hooks](client-hooks.md) record ledger/store linkage, output-before-delivery ordering, client trust, and the limits of those checks.
 
 Bootstrap sends the bounded source archive, unchanged original frame, and snapshot payload over one connection.
 The exact source prefix is consumed before a private installer runs with isolated stdin and diagnostic stderr; the first node inherits the untouched remainder and EOF.

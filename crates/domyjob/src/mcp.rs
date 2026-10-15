@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use domyjob_core::chat::card::Tool;
+use domyjob_core::chat::notification::{ResponseDelivery, reading_after_delivery};
 use domyjob_core::ingress;
 
 use crate::output::Output;
@@ -21,6 +22,13 @@ use crate::chat::view::Outcome;
 
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_CALLS: usize = 32;
+const PARSE_ERROR: i32 = -32700;
+const INVALID_REQUEST: i32 = -32600;
+const METHOD_NOT_FOUND: i32 = -32601;
+const INVALID_PARAMS: i32 = -32602;
+const INTERNAL_ERROR: i32 = -32603;
+const SERVER_NOT_INITIALIZED: i32 = -32002;
+const REQUEST_REFUSED: i32 = -32000;
 const INSTRUCTIONS: &str = "Chat with AI agents on this and other machines. \
 Call chat_whoami, or chat_join to register this session under a name before sending. \
 Use chat_directory to find the agent whose role and skills fit a task, then chat_ask it; \
@@ -66,9 +74,9 @@ fn decode<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
 
 fn parse(bytes: &[u8]) -> Result<Request, Value> {
     let value: Value = ingress::json(bytes, MAX_CONTROL_BYTES)
-        .map_err(|_invalid| error(&Value::Null, -32700, "Parse error"))?;
-    let request: Request =
-        decode(value).map_err(|_invalid| error(&Value::Null, -32600, "Invalid Request"))?;
+        .map_err(|_invalid| error(&Value::Null, PARSE_ERROR, "Parse error"))?;
+    let request: Request = decode(value)
+        .map_err(|_invalid| error(&Value::Null, INVALID_REQUEST, "Invalid Request"))?;
     if request.jsonrpc != "2.0"
         || request
             .id
@@ -76,7 +84,7 @@ fn parse(bytes: &[u8]) -> Result<Request, Value> {
             .is_some_and(|id| !id.is_string() && !id.is_i64() && !id.is_u64())
         || (!request.params.is_null() && !request.params.is_object())
     {
-        return Err(error(&Value::Null, -32600, "Invalid Request"));
+        return Err(error(&Value::Null, INVALID_REQUEST, "Invalid Request"));
     }
     Ok(request)
 }
@@ -300,6 +308,22 @@ tools!(
         Effect::Read,
         |session, args, _client| ops::thread(session, args)
     ),
+    (
+        "chat_read",
+        "Read message",
+        "Read the full body of an addressed message and record it as read.",
+        MessageArgs,
+        Effect::Write,
+        |session, args, _client| ops::read_message(session, args)
+    ),
+    (
+        "chat_acknowledge",
+        "Acknowledge",
+        "Acknowledge an addressed message and release its urgent stop block.",
+        MessageArgs,
+        Effect::Write,
+        |session, args, _client| ops::acknowledge(session, args)
+    ),
 );
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +340,25 @@ struct Server<W> {
     session: Mutex<Session>,
     client: Mutex<Option<Tool>>,
     calls: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+}
+
+struct ReadCompletion {
+    session: Session,
+    pending: ops::PendingRead,
+}
+
+struct CallReply {
+    value: Value,
+    reading: Option<ReadCompletion>,
+}
+
+impl From<Value> for CallReply {
+    fn from(value: Value) -> Self {
+        Self {
+            value,
+            reading: None,
+        }
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -336,19 +379,24 @@ fn client_tool(params: &Value) -> Option<Tool> {
 }
 
 impl<W: Write + Send> Server<W> {
-    fn send(&self, value: &Value) -> io::Result<()> {
+    fn send(&self, value: &Value) -> io::Result<ResponseDelivery> {
         let mut bytes = serde_json::to_vec(value)?;
-        if bytes.len() > MAX_CONTROL_BYTES {
+        let delivered = if bytes.len() > MAX_CONTROL_BYTES {
             bytes = serde_json::to_vec(&error(
                 value.get("id").unwrap_or(&Value::Null),
-                -32603,
+                INTERNAL_ERROR,
                 "The result exceeds 1 MiB; request fewer events",
             ))?;
-        }
+            ResponseDelivery::Replaced
+        } else {
+            ResponseDelivery::Original
+        };
         let mut output = lock(&self.output);
         output.write_all(&bytes)?;
         output.write_all(b"\n")?;
-        output.flush()
+        output.flush()?;
+        drop(output);
+        Ok(delivered)
     }
 
     fn initialize(&self, id: &Value, params: &Value) -> Value {
@@ -361,7 +409,7 @@ impl<W: Write + Send> Server<W> {
         {
             let mut phase = lock(&self.phase);
             if !valid || *phase != Phase::New {
-                return error(id, -32602, "Invalid initialization");
+                return error(id, INVALID_PARAMS, "Invalid initialization");
             }
             *phase = Phase::Negotiated;
         }
@@ -380,9 +428,9 @@ impl<W: Write + Send> Server<W> {
         )
     }
 
-    fn call(&self, id: &Value, params: Value, cancelled: &Arc<AtomicBool>) -> Option<Value> {
+    fn call(&self, id: &Value, params: Value, cancelled: &Arc<AtomicBool>) -> Option<CallReply> {
         let Ok(call) = decode::<Call>(params) else {
-            return Some(error(id, -32602, "Invalid tool parameters"));
+            return Some(error(id, INVALID_PARAMS, "Invalid tool parameters").into());
         };
         let mut session = lock(&self.session).clone_for(Arc::clone(cancelled));
         let client = *lock(&self.client);
@@ -393,28 +441,55 @@ impl<W: Write + Send> Server<W> {
         if call.name == "chat_join" && outcome.is_ok() {
             lock(&self.session).adopt(&session);
         }
-        Some(match outcome {
+        let (value, pending) = match outcome {
             Ok(outcome) => {
+                let pending = outcome.pending_read().cloned();
                 let mut value = outcome.json();
-                if let (Value::Object(fields), Ok(Some(unread))) =
-                    (&mut value, ops::unread(&session))
+                if pending.is_none()
+                    && let (Value::Object(fields), Ok(Some(unread))) =
+                        (&mut value, ops::unread(&session))
                 {
                     fields.insert("unread".to_owned(), json!(unread));
                 }
-                result(
-                    id,
-                    &json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false}),
+                (
+                    result(
+                        id,
+                        &json!({"content": [{"type": "text", "text": value.to_string()}], "structuredContent": value, "isError": false}),
+                    ),
+                    pending,
                 )
             }
-            Err(CallError::Unknown) => error(id, -32602, "Unknown tool"),
-            Err(CallError::Arguments(problem)) => {
-                error(id, -32602, &format!("Invalid arguments: {problem}"))
-            }
-            Err(CallError::Ops(problem)) => result(
-                id,
-                &json!({"content": [{"type": "text", "text": problem.to_string()}], "isError": true}),
+            Err(CallError::Unknown) => (error(id, INVALID_PARAMS, "Unknown tool"), None),
+            Err(CallError::Arguments(problem)) => (
+                error(id, INVALID_PARAMS, &format!("Invalid arguments: {problem}")),
+                None,
             ),
+            Err(CallError::Ops(problem)) => (
+                result(
+                    id,
+                    &json!({"content": [{"type": "text", "text": problem.to_string()}], "isError": true}),
+                ),
+                None,
+            ),
+        };
+        Some(CallReply {
+            value,
+            reading: pending.map(|pending| ReadCompletion { session, pending }),
         })
+    }
+
+    fn deliver_call(&self, reply: CallReply, cancelled: &AtomicBool) -> Result<(), McpError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let delivered = self.send(&reply.value)?;
+        let _calls = lock(&self.calls);
+        if reading_after_delivery(delivered, cancelled.load(Ordering::Acquire))
+            && let Some(reading) = reply.reading
+        {
+            ops::complete_read(&reading.session, &reading.pending)?;
+        }
+        Ok(())
     }
 
     fn respond(&self, id: &Value, method: &str, params: &Value) -> Value {
@@ -423,8 +498,10 @@ impl<W: Write + Send> Server<W> {
             "initialize" => self.initialize(id, params),
             "ping" => result(id, &json!({})),
             "tools/list" if ready => result(id, &json!({"tools": catalog()})),
-            "tools/list" | "tools/call" => error(id, -32002, "Server not initialized"),
-            _ => error(id, -32601, "Method not found"),
+            "tools/list" | "tools/call" => {
+                error(id, SERVER_NOT_INITIALIZED, "Server not initialized")
+            }
+            _ => error(id, METHOD_NOT_FOUND, "Method not found"),
         }
     }
 }
@@ -448,7 +525,11 @@ fn serve_io<W: Write + Send>(mut input: impl BufRead, server: &Server<W>) -> io:
     std::thread::scope(|scope| -> io::Result<()> {
         while let Some(line) = read_line(&mut input)? {
             if line.len() > MAX_CONTROL_BYTES {
-                server.send(&error(&Value::Null, -32600, "Request exceeds 1 MiB"))?;
+                server.send(&error(
+                    &Value::Null,
+                    INVALID_REQUEST,
+                    "Request exceeds 1 MiB",
+                ))?;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "oversized MCP request",
@@ -482,15 +563,15 @@ fn serve_io<W: Write + Send>(mut input: impl BufRead, server: &Server<W>) -> io:
                 }
             };
             if let Some(message) = refusal {
-                server.send(&error(&id, -32000, message))?;
+                server.send(&error(&id, REQUEST_REFUSED, message))?;
                 continue;
             }
             scope.spawn(move || {
                 let reply = server.call(&id, request.params, &cancelled);
-                lock(&server.calls).remove(&key(&id));
                 if let Some(reply) = reply {
-                    let _written = server.send(&reply);
+                    let _written = server.deliver_call(reply, &cancelled);
                 }
+                lock(&server.calls).remove(&key(&id));
             });
         }
         Ok(())

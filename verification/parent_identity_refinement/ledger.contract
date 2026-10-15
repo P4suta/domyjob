@@ -1,0 +1,143 @@
+use alloc::boxed::Box;
+
+use serde::{Deserialize, Serialize};
+
+use super::card::{Card, MachineCard};
+use super::event::{Body, Event, Intent, Members, Outcome, Sealed};
+use super::id::{AgentId, Audience, Conversation, EventId, Invalid, Line, Origin, RoomId};
+use super::notification::{Activity, Delivery};
+mod parent_identity;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parent {
+    Present(Box<Event>),
+    Opaque,
+    Missing,
+}
+
+impl Parent {
+    fn matches(&self, request: &EventId) -> bool {
+        let identity = match self {
+            Self::Present(parent) => Some(parent.id()),
+            Self::Opaque | Self::Missing => None,
+        };
+        parent_identity::matches(identity, request)
+    }
+}
+
+pub trait Ledger {
+    type Error;
+
+    fn local(&self) -> &Origin;
+    fn cursor(&self, origin: &Origin) -> Result<Cursor, Self::Error>;
+    fn digest(&self, id: &EventId) -> Result<Option<super::event::Digest>, Self::Error>;
+    fn parent(&self, id: &EventId) -> Result<Parent, Self::Error>;
+    fn resolution(&self, request: &EventId) -> Result<Option<Resolution>, Self::Error>;
+    fn clock(&self) -> Result<u64, Self::Error>;
+    fn has_room(&self) -> Result<bool, Self::Error>;
+    fn commit(&mut self, sealed: &Sealed, admitted: Admitted) -> Result<(), Self::Error>;
+}
+fn checked_parent<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    request: &EventId,
+) -> Result<Parent, Failure<L::Error>> {
+    let parent = ledger.parent(request).map_err(Failure::Store)?;
+    if !parent.matches(request) {
+        return Err(Failure::Rejected(Rejection::Mismatch {
+            event: event.id().clone(),
+        }));
+    }
+    Ok(parent)
+}
+fn resolve<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    request: &EventId,
+    candidate: &Candidate,
+) -> Result<Change, Failure<L::Error>> {
+    let mismatch = || {
+        Failure::Rejected(Rejection::Mismatch {
+            event: event.id().clone(),
+        })
+    };
+    let (conversation, audience) = match (event.body().conversation(), event.body().audience()) {
+        (Some(conversation), Some(audience)) => (conversation, audience),
+        (None, _) | (_, None) => return Ok(Change::Nothing),
+    };
+    let current = ledger.resolution(request).map_err(Failure::Store)?;
+    let (asker, responder) = match checked_parent(ledger, event, request)? {
+        Parent::Missing => {
+            return Err(Failure::Rejected(Rejection::MissingDependency {
+                event: event.id().clone(),
+                request: request.clone(),
+            }));
+        }
+        Parent::Present(parent) => {
+            if !same_thread(event, conversation, audience, &parent) {
+                return Err(mismatch());
+            }
+            match ask_of(&parent) {
+                Some((asker, responder)) => (asker, responder.clone()),
+                None => return plain_reply(event, candidate.ending),
+            }
+        }
+        Parent::Opaque => match &current {
+            Some(known) => (known.asker.clone(), known.responder.clone()),
+            None => return plain_reply(event, candidate.ending),
+        },
+    };
+    if !candidate.authorized(&asker, &responder) {
+        return match candidate.ending {
+            Ending::Answered => Ok(Change::Nothing),
+            Ending::Ended(_) => Err(mismatch()),
+        };
+    }
+    let resolution = Resolution {
+        event: event.id().clone(),
+        clock: event.clock(),
+        ending: candidate.ending,
+        asker,
+        responder,
+    };
+    let wins = current
+        .as_ref()
+        .is_none_or(|known| resolution.precedes(known));
+    Ok(Change::Resolution {
+        request: request.clone(),
+        resolution: Box::new(resolution),
+        wins,
+    })
+}
+struct ThreadParent<'a> {
+    conversation: &'a Conversation,
+    audience: &'a Audience,
+    agent: AgentId,
+    parent: Box<Event>,
+}
+
+fn thread_parent<'a, L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &'a Event,
+    request: &EventId,
+) -> Result<Option<ThreadParent<'a>>, Failure<L::Error>> {
+    let (Some(conversation), Some(audience), Some(agent)) = (
+        event.body().conversation(),
+        event.body().audience(),
+        event.author(),
+    ) else {
+        return Ok(None);
+    };
+    match checked_parent(ledger, event, request)? {
+        Parent::Missing => Err(Failure::Rejected(Rejection::MissingDependency {
+            event: event.id().clone(),
+            request: request.clone(),
+        })),
+        Parent::Opaque => Ok(None),
+        Parent::Present(parent) => Ok(Some(ThreadParent {
+            conversation,
+            audience,
+            agent,
+            parent,
+        })),
+    }
+}

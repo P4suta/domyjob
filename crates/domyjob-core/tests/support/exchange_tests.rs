@@ -16,6 +16,7 @@ fn sized_event(seq: u64, encoded_bytes: usize) -> Sealed {
         audience: audience([&alice, &bob]).unwrap(),
         intent: Intent::Send {},
         at: Stamp::from_unix_millis(0),
+        notice: None,
     };
     let base = Sealed::new(Event::new(id('a', seq), seq, body("x")).unwrap()).unwrap();
     let payload = encoded_bytes

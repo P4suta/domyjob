@@ -4,15 +4,18 @@ use domyjob_core::chat::card::{Card, MachineCard};
 use domyjob_core::chat::event::{Body, Digest, Event};
 use domyjob_core::chat::id::{AgentId, AgentName, Conversation, EventId, Origin, RoomId};
 use domyjob_core::chat::ledger::{Cursor, Resolution, Room};
+use domyjob_core::chat::notification::{
+    Activity, ActivityState, Delivery, MAX_STATUS_BYTES, STALLED_MILLIS, activity_state,
+};
 use domyjob_core::chat::policy::Usage;
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
 use super::StoreError;
 use super::tables::{
-    COUNTERS, CURSORS, EVENTS, JOINED, LOCAL_AGENTS, MACHINES, OPEN, PROFILES, RESOLUTIONS, ROOMS,
-    Reader, STARTED, THREADS, TOMBSTONES, decode, event_key, get_json, get_number, order_key,
-    room_key, thread_bounds, thread_key,
+    ACTIVITY, COUNTERS, CURSORS, DELIVERY, EVENTS, JOINED, LOCAL_AGENTS, MACHINES, OPEN, PROFILES,
+    READS, RESOLUTIONS, ROOMS, Reader, STARTED, THREADS, TOMBSTONES, decode, delivery_key,
+    event_key, get_json, get_number, get_text, order_key, room_key, thread_bounds, thread_key,
 };
 
 #[derive(Debug)]
@@ -25,8 +28,12 @@ pub(crate) fn stored(reader: &impl Reader, id: &EventId) -> Result<Option<Stored
     let key = event_key(id);
     if let Some(encoded) = reader.table(EVENTS)?.get(key.as_str())? {
         let encoded = encoded.value().to_owned();
+        let event: Event = decode(&encoded)?;
+        if event.id() != id {
+            return Err(StoreError::Corrupt("event identity"));
+        }
         return Ok(Some(Stored::Event {
-            event: Box::new(decode(&encoded)?),
+            event: Box::new(event),
             encoded,
         }));
     }
@@ -66,6 +73,21 @@ pub(crate) fn resolution(
     request: &EventId,
 ) -> Result<Option<Resolution>, StoreError> {
     get_json(&reader.table(RESOLUTIONS)?, &event_key(request))
+}
+
+pub(crate) fn delivery(
+    reader: &impl Reader,
+    agent: &AgentId,
+    request: &EventId,
+) -> Result<Delivery, StoreError> {
+    Ok(get_json(&reader.table(DELIVERY)?, &delivery_key(agent, request))?.unwrap_or_default())
+}
+
+pub(crate) fn activity(
+    reader: &impl Reader,
+    agent: &AgentId,
+) -> Result<Option<Activity>, StoreError> {
+    get_json(&reader.table(ACTIVITY)?, &agent.to_string())
 }
 
 pub(crate) fn profile(reader: &impl Reader, agent: &AgentId) -> Result<Option<Card>, StoreError> {
@@ -191,7 +213,23 @@ fn conversations_of(
             found.push(conversation);
         }
     }
+    found.sort_unstable();
+    found.dedup();
     Ok(found)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InboxMode {
+    All,
+    Unread,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InboxQuery<'a> {
+    after: &'a str,
+    limit: usize,
+    mode: InboxMode,
 }
 
 pub(crate) fn inbox(
@@ -200,6 +238,23 @@ pub(crate) fn inbox(
     after: &str,
     limit: usize,
 ) -> Result<Vec<Event>, StoreError> {
+    find_messages(
+        reader,
+        agent,
+        InboxQuery {
+            after,
+            limit,
+            mode: InboxMode::All,
+        },
+    )
+}
+
+fn find_messages(
+    reader: &impl Reader,
+    agent: &AgentId,
+    query: InboxQuery<'_>,
+) -> Result<Vec<Event>, StoreError> {
+    let InboxQuery { after, limit, mode } = query;
     let table = reader.table(THREADS)?;
     let mut found: Vec<(String, String)> = Vec::new();
     for conversation in conversations_of(reader, agent)? {
@@ -226,20 +281,90 @@ pub(crate) fn inbox(
         let Some(event) = event_at(reader, &id)? else {
             continue;
         };
-        let addressed = !matches!(event.body(), Body::TurnStarted { .. })
-            && event.author().as_ref() != Some(agent);
-        if addressed {
+        let addressed = matches!(event.body(), Body::Message { notice, .. }
+            if event.author().as_ref() != Some(agent)
+            && notice.as_ref().is_none_or(|notice| notice.recipients.contains(agent)))
+            || matches!(event.body(), Body::Resolved { .. })
+                && event.author().as_ref() != Some(agent);
+        let selected = match mode {
+            InboxMode::All => true,
+            InboxMode::Unread => {
+                if matches!(event.body(), Body::Message { .. }) {
+                    delivery(reader, agent, event.id())? < Delivery::Read
+                } else {
+                    order_key(&event)
+                        > get_text(&reader.table(READS)?, &agent.to_string())?.unwrap_or_default()
+                }
+            }
+            InboxMode::Pending => {
+                matches!(event.body(), Body::Message { .. })
+                    && delivery(reader, agent, event.id())? == Delivery::Pending
+            }
+        };
+        if addressed && selected {
             events.push(event);
         }
     }
     Ok(events)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub(crate) fn unread(
+    reader: &impl Reader,
+    agent: &AgentId,
+    limit: usize,
+) -> Result<Vec<Event>, StoreError> {
+    selected_inbox(reader, agent, limit, InboxMode::Unread)
+}
+
+pub(crate) fn pending(
+    reader: &impl Reader,
+    agent: &AgentId,
+    limit: usize,
+) -> Result<Vec<Event>, StoreError> {
+    selected_inbox(reader, agent, limit, InboxMode::Pending)
+}
+
+fn selected_inbox(
+    reader: &impl Reader,
+    agent: &AgentId,
+    limit: usize,
+    mode: InboxMode,
+) -> Result<Vec<Event>, StoreError> {
+    find_messages(
+        reader,
+        agent,
+        InboxQuery {
+            after: "",
+            limit,
+            mode,
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Presence {
     pub(crate) queued: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) working_on: Option<EventId>,
+    pub(crate) online: bool,
+    pub(crate) state: ActivityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) latest_call: Option<domyjob_core::chat::event::Stamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<domyjob_core::chat::id::Line<MAX_STATUS_BYTES>>,
+}
+
+impl Default for Presence {
+    fn default() -> Self {
+        Self {
+            queued: 0,
+            working_on: None,
+            online: false,
+            state: ActivityState::Stalled,
+            latest_call: None,
+            status: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -251,7 +376,23 @@ pub(crate) struct Directory {
 pub(crate) fn directory(reader: &impl Reader) -> Result<Directory, StoreError> {
     let mut directory = Directory::default();
     for (agent, card) in parse_entries::<AgentId, Card>(&reader.table(PROFILES)?)? {
-        directory.agents.insert(agent, (card, Presence::default()));
+        let current = activity(reader, &agent)?;
+        let state = current.as_ref().map_or(ActivityState::Stalled, |activity| {
+            activity_state(
+                activity.state,
+                activity.at.millis(),
+                crate::platform::clock::stamp().millis(),
+                STALLED_MILLIS,
+            )
+        });
+        let presence = Presence {
+            online: state != ActivityState::Stalled,
+            state,
+            latest_call: current.as_ref().map(|activity| activity.at),
+            status: current.and_then(|activity| activity.status),
+            ..Presence::default()
+        };
+        directory.agents.insert(agent, (card, presence));
     }
     for (_, responder) in open_asks(reader)? {
         if let Some((_, presence)) = directory.agents.get_mut(&responder) {

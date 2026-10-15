@@ -8,7 +8,17 @@ use crate::world::{
 };
 use crate::{Failure, Scenario};
 
-pub(crate) const ALL: [Scenario; 14] = [
+pub(crate) const ALL: [Scenario; 16] = [
+    Scenario {
+        name: "dashboard_and_help_respect_redirected_cli_boundaries",
+        machines: &["alpha"],
+        run: dashboard_and_help_respect_redirected_cli_boundaries,
+    },
+    Scenario {
+        name: "failure_diagnostics_keep_only_bounded_owned_service_logs",
+        machines: &["alpha"],
+        run: failure_diagnostics_keep_only_bounded_owned_service_logs,
+    },
     Scenario {
         name: "bootstrap_preserves_first_request_and_cleans_its_owned_work",
         machines: &["alpha", "beta"],
@@ -80,6 +90,129 @@ pub(crate) const ALL: [Scenario; 14] = [
         run: resource_probe_recognizes_its_parent_scope,
     },
 ];
+
+fn dashboard_and_help_respect_redirected_cli_boundaries(world: &World) -> Result<(), Failure> {
+    let alpha = world.machine("alpha");
+    ensure!(
+        matches!(std::fs::symlink_metadata(alpha.state()), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "the CLI boundary fixture must start without durable state"
+    );
+    for arguments in [&[][..], &["tui"][..]] {
+        let refused = alpha.run(arguments)?;
+        refused.exited(1)?;
+        ensure!(
+            refused.stdout.is_empty()
+                && refused.stderr.contains("terminal input and output")
+                && refused.stderr.lines().count() == 1
+                && !refused.stderr.contains("Usage:")
+                && !refused.stderr.contains("Commands:"),
+            "a redirected dashboard needs a concise terminal hint without a help dump: {refused}"
+        );
+    }
+    let help = alpha.run(&["--help"])?;
+    help.exited(0)?;
+    ensure!(
+        help.stderr.is_empty() && help.stdout.contains("tui") && help.stdout.contains("--help"),
+        "explicit help must remain available without a terminal: {help}"
+    );
+    ensure!(
+        matches!(std::fs::symlink_metadata(alpha.state()), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "redirected dashboard and help commands must not initialize durable state"
+    );
+    ensure!(
+        world.ssh_log()?.is_empty(),
+        "dashboard and help commands must not contact a peer"
+    );
+    Ok(())
+}
+
+fn failure_diagnostics_keep_only_bounded_owned_service_logs(world: &World) -> Result<(), Failure> {
+    const OVERSIZED_LOG_BYTES: usize = 8192;
+    const EXTRA_LOGS: usize = 10;
+    const MAX_CAPTURED_LOGS: usize = 8;
+    let service = world.root().join("alpha-chat-serve.log");
+    std::fs::write(&service, vec![b'x'; OVERSIZED_LOG_BYTES])
+        .map_err(|error| Failure::new(format!("writing the oversized service log: {error}")))?;
+    let job = world
+        .machine("alpha")
+        .state()
+        .join("runner-fixture/jobs/fixture");
+    std::fs::create_dir_all(job.join("workspace"))
+        .map_err(|error| Failure::new(format!("preparing diagnostic fixtures: {error}")))?;
+    for (path, bytes) in [
+        (
+            job.join("supervisor.log"),
+            b"worker startup cause".as_slice(),
+        ),
+        (job.join("output.log"), b"private job output".as_slice()),
+        (
+            job.join("workspace/supervisor.log"),
+            b"untrusted workspace log".as_slice(),
+        ),
+    ] {
+        std::fs::write(path, bytes)
+            .map_err(|error| Failure::new(format!("writing diagnostic fixtures: {error}")))?;
+    }
+    let diagnostics = world.failure_diagnostics()?;
+    ensure!(
+        diagnostics.contains("alpha-chat-serve.log")
+            && diagnostics.contains("[log truncated]")
+            && diagnostics.contains("worker startup cause")
+            && !diagnostics.contains("private job output")
+            && !diagnostics.contains("untrusted workspace log")
+            && !diagnostics
+                .contains(&"x".repeat(crate::world::FAILURE_LOG_BYTES.saturating_add(1))),
+        "failure diagnostics must retain bounded service causes without job payloads"
+    );
+    for index in 0..EXTRA_LOGS {
+        std::fs::write(
+            world.root().join(format!("{index}-chat-serve.log")),
+            b"bounded service marker",
+        )
+        .map_err(|error| Failure::new(format!("writing service count fixtures: {error}")))?;
+    }
+    let limited = world.failure_diagnostics()?;
+    ensure!(
+        limited.matches("--- ").count() == MAX_CAPTURED_LOGS
+            && limited.contains("[diagnostic scan limit reached]"),
+        "diagnostics must cap the number of captured service logs"
+    );
+    let binaries = crate::world::prepare_binaries()?;
+    let captured = match crate::attempt(
+        &Scenario {
+            name: "controlled_failure_diagnostic",
+            machines: &["alpha"],
+            run: controlled_failure_diagnostic,
+        },
+        binaries.path(),
+        false,
+    ) {
+        Err(error) => error,
+        Ok(()) => {
+            return Err(Failure::new(
+                "the controlled diagnostic failure disappeared",
+            ));
+        }
+    };
+    ensure!(
+        captured
+            .0
+            .starts_with("original controlled scenario failure")
+            && captured.0.contains("owned failure diagnostics:")
+            && captured.0.contains("controlled service cause"),
+        "the real failure pipeline must retain its original cause and capture logs before cleanup"
+    );
+    Ok(())
+}
+
+fn controlled_failure_diagnostic(world: &World) -> Result<(), Failure> {
+    std::fs::write(
+        world.root().join("alpha-chat-serve.log"),
+        b"controlled service cause",
+    )
+    .map_err(|error| Failure::new(format!("writing the controlled failure log: {error}")))?;
+    Err(Failure::new("original controlled scenario failure"))
+}
 
 fn fake_ssh_stands_in_for_openssh(world: &World) -> Result<(), Failure> {
     crate::ssh::check_recognizer()?;

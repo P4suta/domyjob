@@ -5,6 +5,7 @@ use domyjob_core::chat::card::{Access, Card, Mode, Os, Relevance, Tag};
 use domyjob_core::chat::event::{Body, Event, Intent, Stamp};
 use domyjob_core::chat::id::{AgentId, Conversation, EventId};
 use domyjob_core::chat::ledger::{Ending, Resolution, Room};
+use domyjob_core::chat::notification::{ActivityState, Delivery};
 use domyjob_core::domain::terminal_text;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -13,6 +14,8 @@ use super::address::Book;
 pub(crate) use super::store::Presence;
 use super::store::{Directory, Link, LinkState};
 use crate::platform::clock;
+
+const WAITING_EXIT: u8 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AgentView {
@@ -55,6 +58,7 @@ pub(crate) struct MessageView {
     pub(crate) request: Option<EventId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) at: Option<Stamp>,
+    pub(crate) delivery: BTreeMap<AgentId, Delivery>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +70,11 @@ pub(crate) struct AskState {
     pub(crate) answer: Option<MessageView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ended_by: Option<EventId>,
+    pub(crate) waited_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) escalated_to: Option<EventId>,
 }
 
 impl AskState {
@@ -78,7 +87,7 @@ impl AskState {
     pub(crate) fn exit_code(&self) -> u8 {
         match self.state {
             "answered" => 0,
-            "pending" | "working" => 3,
+            "pending" | "working" => WAITING_EXIT,
             _ => 1,
         }
     }
@@ -102,6 +111,7 @@ pub(crate) enum Outcome {
     Events {
         events: Vec<MessageView>,
         unread: Option<usize>,
+        pending: Option<super::ops::PendingRead>,
     },
 }
 
@@ -140,6 +150,8 @@ fn view(book: &Book, event: &Event) -> Option<MessageView> {
         | Body::Machine { .. }
         | Body::Room { .. }
         | Body::RoomClosed { .. }
+        | Body::Receipt { .. }
+        | Body::Activity { .. }
         | Body::Omitted {} => return None,
     };
     Some(MessageView {
@@ -151,6 +163,7 @@ fn view(book: &Book, event: &Event) -> Option<MessageView> {
         responder,
         request,
         at,
+        delivery: BTreeMap::new(),
     })
 }
 
@@ -176,26 +189,25 @@ pub(crate) fn ask_state(book: &Book, facts: &AskFacts<'_>) -> AskState {
         answer,
         working,
     } = *facts;
-    let responder = match request.body() {
-        Body::Message {
-            intent: Intent::Ask { responder, .. },
-            ..
-        } => book.agent_label(responder),
-        Body::Message { .. }
-        | Body::Profile { .. }
-        | Body::Left { .. }
-        | Body::Machine { .. }
-        | Body::Room { .. }
-        | Body::RoomClosed { .. }
-        | Body::TurnStarted { .. }
-        | Body::Resolved { .. }
-        | Body::Omitted {} => String::new(),
-    };
+    let responder = domyjob_core::chat::ledger::ask_of(request)
+        .map_or_else(String::new, |(_, responder)| book.agent_label(responder));
     let state = match (resolution.map(|resolution| resolution.ending), working) {
         (Some(Ending::Answered), _) => "answered",
         (Some(Ending::Ended(outcome)), _) => outcome.as_str(),
         (None, true) => "working",
         (None, false) => "pending",
+    };
+    let (waited_seconds, expected) = if let Body::Message { at, notice, .. } = request.body() {
+        (
+            clock::stamp().millis().saturating_sub(at.millis())
+                / domyjob_core::chat::notification::MILLIS_PER_SECOND,
+            notice
+                .as_ref()
+                .and_then(|notice| notice.question.as_ref())
+                .map(|question| question.expected().as_str().to_owned()),
+        )
+    } else {
+        (0, None)
     };
     AskState {
         message_id: request.id().clone(),
@@ -203,6 +215,9 @@ pub(crate) fn ask_state(book: &Book, facts: &AskFacts<'_>) -> AskState {
         responder,
         answer: answer.and_then(|event| view(book, event)),
         ended_by: resolution.map(|resolution| resolution.event.clone()),
+        waited_seconds,
+        expected,
+        escalated_to: None,
     }
 }
 
@@ -326,6 +341,18 @@ fn describe_card(card: &Card, presence: &Presence) -> String {
         &mut text,
         format_args!(" [{} · {mode} · {access}]", card.tool.as_str()),
     );
+    let state = match presence.state {
+        ActivityState::Working => "working",
+        ActivityState::Waiting => "waiting",
+        ActivityState::Stalled => "stalled",
+    };
+    append(
+        &mut text,
+        format_args!(
+            " [{state} · {}]",
+            if presence.online { "online" } else { "offline" }
+        ),
+    );
     let skills: Vec<&str> = card.skills.tags().iter().map(Tag::as_str).collect();
     if !skills.is_empty() {
         append(
@@ -348,7 +375,7 @@ fn describe_card(card: &Card, presence: &Presence) -> String {
             ),
         );
     }
-    if let Some(status) = &card.status {
+    if let Some(status) = presence.status.as_ref().or(card.status.as_ref()) {
         append(
             &mut text,
             format_args!("\n    status: {}", safe(status.as_str())),
@@ -380,10 +407,45 @@ fn message_line(message: &MessageView) -> String {
         (None, _, Some(request)) => format!("{} {request}", message.kind),
         (None, _, None) => message.kind.to_owned(),
     };
-    format!("{when}{} {}: {body}", message.id, safe(&message.from))
+    let states = message
+        .delivery
+        .iter()
+        .map(|(agent, delivery)| {
+            let state = match delivery {
+                Delivery::Pending => "pending",
+                Delivery::Delivered => "delivered",
+                Delivery::Read => "read",
+                Delivery::Acknowledged => "acknowledged",
+            };
+            format!("{agent}: {state}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let delivery = if states.is_empty() {
+        String::new()
+    } else {
+        format!(" [{states}]")
+    };
+    format!(
+        "{when}{} {}: {body}{delivery}",
+        message.id,
+        safe(&message.from)
+    )
 }
 
 impl Outcome {
+    pub(crate) const fn pending_read(&self) -> Option<&super::ops::PendingRead> {
+        match self {
+            Self::Events { pending, .. } => pending.as_ref(),
+            Self::Agent { .. }
+            | Self::Removed { .. }
+            | Self::Directory(_)
+            | Self::Rooms(_)
+            | Self::Posted(_)
+            | Self::Asked(_) => None,
+        }
+    }
+
     #[must_use]
     pub(crate) fn json(&self) -> Value {
         match self {
@@ -397,7 +459,7 @@ impl Outcome {
             Self::Rooms(rooms) => json!({"rooms": rooms}),
             Self::Posted(event) => json!({"message_id": event.id()}),
             Self::Asked(state) => json!(state),
-            Self::Events { events, unread } => json!({"events": events, "unread": unread}),
+            Self::Events { events, unread, .. } => json!({"events": events, "unread": unread}),
         }
     }
 
@@ -440,7 +502,7 @@ impl Outcome {
                 Some(answer) => message_line(answer),
                 None => format!("{} {}", state.message_id, state.state),
             },
-            Self::Events { events, unread } => {
+            Self::Events { events, unread, .. } => {
                 let mut lines: Vec<String> = events.iter().map(message_line).collect();
                 if let Some(unread) = unread.filter(|count| *count > 0) {
                     lines.push(format!("{unread} more unread"));

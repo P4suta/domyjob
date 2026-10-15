@@ -8,6 +8,7 @@ use super::event::{Body, Digest, Event, Sealed};
 use super::exchange::{Outbox, Outgoing, Progress, accept, offer, offer_event, respond};
 use super::id::{AgentId, EventId, Origin, RoomId};
 use super::ledger::{Admitted, Change, Cursor, Failure, Ledger, Parent, Resolution, Room, append};
+use super::notification::{Activity, Delivery};
 
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -22,6 +23,8 @@ pub struct Model {
     rooms: BTreeMap<RoomId, Box<Room>>,
     open: BTreeSet<(AgentId, EventId)>,
     started: BTreeMap<EventId, AgentId>,
+    deliveries: BTreeMap<(EventId, AgentId), Delivery>,
+    activities: BTreeMap<AgentId, Activity>,
 }
 
 impl Model {
@@ -39,6 +42,8 @@ impl Model {
             rooms: BTreeMap::new(),
             open: BTreeSet::new(),
             started: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            activities: BTreeMap::new(),
         }
     }
 
@@ -81,6 +86,16 @@ impl Model {
     #[must_use]
     pub const fn started(&self) -> &BTreeMap<EventId, AgentId> {
         &self.started
+    }
+
+    #[must_use]
+    pub const fn deliveries(&self) -> &BTreeMap<(EventId, AgentId), Delivery> {
+        &self.deliveries
+    }
+
+    #[must_use]
+    pub const fn activities(&self) -> &BTreeMap<AgentId, Activity> {
+        &self.activities
     }
 
     pub fn sync_with(
@@ -147,6 +162,18 @@ impl Ledger for Model {
         self.events.insert(event.id().clone(), sealed.clone());
         match admitted.change {
             Change::Nothing => {}
+            Change::Receipt {
+                request,
+                agent,
+                delivery,
+            } => {
+                let key = (request, agent);
+                let current = self.deliveries.get(&key).copied().unwrap_or_default();
+                self.deliveries.insert(key, current.observe(delivery));
+            }
+            Change::Activity { agent, activity } => {
+                self.activities.insert(agent, activity);
+            }
             Change::Profile { agent, card } => match card {
                 Some(card) => {
                     self.profiles.insert(agent, card);
@@ -220,6 +247,8 @@ impl Outbox for Model {
 }
 
 #[cfg(test)]
+#[path = "../../tests/support/model_exhaustive.rs"]
 mod exhaustive;
 #[cfg(test)]
+#[path = "../../tests/support/model_tests.rs"]
 mod tests;

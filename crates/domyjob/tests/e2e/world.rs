@@ -1,6 +1,6 @@
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
-use std::io::{self, BufRead as _, Write as _};
+use std::io::{self, BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError, mpsc};
@@ -16,6 +16,10 @@ const POLL_MILLISECONDS: u64 = 50;
 pub(crate) const POLLS: u32 = 2400;
 
 const PREFIX: &str = "domyjob-e2e-";
+pub(crate) const FAILURE_LOG_BYTES: usize = 4096;
+const FAILURE_LOG_FILES: usize = 8;
+const FAILURE_SCAN_ENTRIES: usize = 128;
+const FAILURE_SCAN_DEPTH: u8 = 4;
 
 pub(crate) fn prepare_binaries() -> Result<tempfile::TempDir, Failure> {
     let binaries = tempfile::Builder::new()
@@ -76,6 +80,50 @@ impl World {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn failure_diagnostics(&self) -> Result<String, Failure> {
+        let mut remaining = FAILURE_SCAN_ENTRIES;
+        let mut files = Vec::new();
+        failure_logs(self.root(), 0, &mut remaining, &mut files)?;
+        for name in &self.machines {
+            failure_logs(
+                &self.machine(name).state(),
+                FAILURE_SCAN_DEPTH,
+                &mut remaining,
+                &mut files,
+            )?;
+        }
+        let mut output = String::new();
+        let read_limit = u64::try_from(FAILURE_LOG_BYTES.saturating_add(1))
+            .context("representing the diagnostic byte limit")?;
+        for path in &files {
+            let mut bytes = Vec::new();
+            fs::File::open(path)
+                .context(&format!("opening diagnostic {}", path.display()))?
+                .take(read_limit)
+                .read_to_end(&mut bytes)
+                .context(&format!("reading diagnostic {}", path.display()))?;
+            let truncated = bytes.len() > FAILURE_LOG_BYTES;
+            bytes.truncate(FAILURE_LOG_BYTES);
+            let relative = path
+                .strip_prefix(self.root())
+                .context("diagnostic escaped its owned world")?;
+            writeln!(
+                output,
+                "--- {} ---\n{}",
+                relative.display(),
+                String::from_utf8_lossy(&bytes)
+            )
+            .context("formatting owned failure diagnostics")?;
+            if truncated {
+                output.push_str("[log truncated]\n");
+            }
+        }
+        if remaining == 0 || files.len() == FAILURE_LOG_FILES {
+            output.push_str("[diagnostic scan limit reached]\n");
+        }
+        Ok(output)
     }
 
     fn bin(&self) -> PathBuf {
@@ -265,6 +313,47 @@ impl World {
         }
         Ok(held)
     }
+}
+
+fn failure_logs(
+    directory: &Path,
+    depth: u8,
+    remaining: &mut usize,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Failure> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Failure::new(format!(
+                "listing diagnostics in {}: {error}",
+                directory.display()
+            )));
+        }
+    };
+    for entry in entries {
+        if *remaining == 0 || files.len() == FAILURE_LOG_FILES {
+            break;
+        }
+        *remaining = remaining.saturating_sub(1);
+        let entry = entry.context("listing an owned diagnostic entry")?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .context("inspecting an owned diagnostic")?;
+        if kind.is_dir() && depth != 0 && entry.file_name() != "workspace" {
+            failure_logs(&path, depth.saturating_sub(1), remaining, files)?;
+        } else if kind.is_file()
+            && path.file_name().is_some_and(|name| {
+                name == "supervisor.log"
+                    || name == "worker.log"
+                    || name.to_string_lossy().ends_with("-serve.log")
+            })
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -41,9 +41,12 @@ macro_rules! validated_string {
     };
 }
 
+pub mod capture_policy;
 pub mod chat;
 pub mod chat_wire;
+pub mod dashboard;
 pub mod domain;
+pub mod hook_clients;
 pub mod ingress;
 pub mod job_protocol;
 pub mod jsonc;
@@ -57,5 +60,6 @@ mod resource_proofs;
 pub mod service;
 pub mod source_paths;
 pub mod state;
+pub mod terminal_input;
 pub mod wire;
 pub mod worker_handoff;

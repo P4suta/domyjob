@@ -1,15 +1,16 @@
-use domyjob_core::chat::event::{Body, Digest, Event, Sealed};
+use domyjob_core::chat::event::{Body, Digest, Event, Intent, Sealed};
 use domyjob_core::chat::exchange::{Outbox, Outgoing, offer_event};
-use domyjob_core::chat::id::{Conversation, EventId, Origin};
+use domyjob_core::chat::id::{AgentId, Conversation, EventId, Origin};
 use domyjob_core::chat::ledger::{Admitted, Change, Cursor, Ledger, Parent, Resolution};
+use domyjob_core::chat::notification::Delivery;
 use domyjob_core::chat::policy;
 use redb::WriteTransaction;
 
 use super::StoreError;
 use super::tables::{
-    self, ACKS, COUNTERS, CURSORS, EVENTS, JOINED, MACHINES, OPEN, ORDER, PROFILES, RESOLUTIONS,
-    ROOMS, STARTED, THREADS, encode, event_key, get_number, joined_key, order_key, room_key,
-    thread_key,
+    self, ACKS, ACTIVITY, COUNTERS, CURSORS, DELIVERY, EVENTS, JOINED, MACHINES, OPEN, ORDER,
+    PROFILES, RESOLUTIONS, ROOMS, STARTED, THREADS, URGENT, delivery_key, encode, event_key,
+    get_number, joined_key, order_key, room_key, thread_key,
 };
 use super::views::{self, Stored};
 
@@ -70,6 +71,32 @@ fn record(write: &WriteTransaction, sealed: &Sealed, cursor: Cursor) -> Result<(
                 joined.insert(joined_key(agent, conversation).as_str(), "")?;
             }
         }
+    }
+    if let Body::Message {
+        conversation,
+        notice: Some(notice),
+        ..
+    } = event.body()
+    {
+        let mut urgent = write.open_table(URGENT)?;
+        let mut joined = write.open_table(JOINED)?;
+        for agent in notice.recipients.agents() {
+            joined.insert(joined_key(agent, conversation).as_str(), "")?;
+            if notice.urgent {
+                urgent.insert(delivery_key(agent, event.id()).as_str(), id.as_str())?;
+            }
+        }
+    }
+    if let Body::Message {
+        intent: Intent::Reply { request },
+        ..
+    } = event.body()
+        && let (Some(author), Some(parent)) = (event.author(), views::event(write, request)?)
+        && matches!(parent.body(), Body::Message { notice, .. }
+            if parent.author().as_ref() != Some(&author)
+            && notice.as_ref().is_none_or(|notice| notice.recipients.contains(&author)))
+    {
+        record_receipt(write, &author, request, Delivery::Acknowledged)?;
     }
     write
         .open_table(CURSORS)?
@@ -137,6 +164,32 @@ fn project(write: &WriteTransaction, event: &Event, change: Change) -> Result<()
                 write.open_table(STARTED)?.remove(key.as_str())?;
             }
         }
+        Change::Receipt {
+            request,
+            agent,
+            delivery,
+        } => {
+            record_receipt(write, &agent, &request, delivery)?;
+        }
+        Change::Activity { agent, activity } => {
+            upsert(write, ACTIVITY, &agent.to_string(), Some(&activity))?;
+        }
+    }
+    Ok(())
+}
+
+fn record_receipt(
+    write: &WriteTransaction,
+    agent: &AgentId,
+    request: &EventId,
+    received: Delivery,
+) -> Result<(), StoreError> {
+    let current = views::delivery(write, agent, request)?;
+    let delivery = current.observe(received);
+    let key = delivery_key(agent, request);
+    upsert(write, DELIVERY, &key, Some(&delivery))?;
+    if delivery == Delivery::Acknowledged {
+        write.open_table(URGENT)?.remove(key.as_str())?;
     }
     Ok(())
 }

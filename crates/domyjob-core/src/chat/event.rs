@@ -9,14 +9,20 @@ use super::card::{Card, MachineCard};
 use super::id::{
     AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
 };
+use super::notification::{Activity, Delivery, MILLIS_PER_SECOND, Notice};
 
 pub const MAX_EVENT_BYTES: usize = 400 * 1024;
 pub const MAX_CHAIN: usize = 8;
+pub const MAX_MEMBERS: usize = 64;
+const DUPLICATE_WINDOW: usize = 2;
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 3600;
+const SECONDS_PER_DAY: u64 = 86_400;
 
 macro_rules! agent_list {
     ($(#[$doc:meta])* $name:ident, $min:literal, $max:expr, $what:literal) => {
         $(#[$doc])*
-        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(try_from = "Vec<AgentId>", into = "Vec<AgentId>")]
         pub struct $name(Vec<AgentId>);
 
@@ -29,7 +35,7 @@ macro_rules! agent_list {
                 }
                 let mut sorted: Vec<&AgentId> = agents.iter().collect();
                 sorted.sort();
-                if sorted.windows(2).any(|pair| matches!(pair, [first, second] if first == second)) {
+                if sorted.windows(DUPLICATE_WINDOW).any(|pair| matches!(pair, [first, second] if first == second)) {
                     return Err(Invalid($what));
                 }
                 Ok(Self(agents))
@@ -61,8 +67,14 @@ macro_rules! agent_list {
     };
 }
 
-agent_list!(Chain, 0, MAX_CHAIN, "delegation chain");
-agent_list!(Members, 1, 64, "room members");
+agent_list!(
+    #[derive(Default)]
+    Chain,
+    0,
+    MAX_CHAIN,
+    "delegation chain"
+);
+agent_list!(Members, 1, MAX_MEMBERS, "room members");
 
 impl Chain {
     pub fn extended(&self, waiting: AgentId) -> Result<Self, Invalid> {
@@ -113,13 +125,18 @@ pub struct Stamp(u64);
 
 impl Stamp {
     #[must_use]
+    pub const fn millis(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
     pub const fn from_unix_millis(millis: u64) -> Self {
         Self(millis)
     }
 
     #[must_use]
     pub const fn age(self, now: Self) -> Age {
-        Age(now.0.saturating_sub(self.0) / 1000)
+        Age(now.0.saturating_sub(self.0) / MILLIS_PER_SECOND)
     }
 }
 
@@ -130,10 +147,14 @@ impl core::fmt::Display for Age {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let seconds = self.0;
         match seconds {
-            0..60 => write!(formatter, "{seconds}s ago"),
-            60..3600 => write!(formatter, "{}m ago", seconds / 60),
-            3600..86_400 => write!(formatter, "{}h ago", seconds / 3600),
-            _ => write!(formatter, "{}d ago", seconds / 86_400),
+            0..SECONDS_PER_MINUTE => write!(formatter, "{seconds}s ago"),
+            SECONDS_PER_MINUTE..SECONDS_PER_HOUR => {
+                write!(formatter, "{}m ago", seconds / SECONDS_PER_MINUTE)
+            }
+            SECONDS_PER_HOUR..SECONDS_PER_DAY => {
+                write!(formatter, "{}h ago", seconds / SECONDS_PER_HOUR)
+            }
+            _ => write!(formatter, "{}d ago", seconds / SECONDS_PER_DAY),
         }
     }
 }
@@ -167,6 +188,19 @@ pub enum Body {
         audience: Audience,
         intent: Intent,
         at: Stamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<Notice>,
+    },
+    Receipt {
+        request: EventId,
+        conversation: Conversation,
+        audience: Audience,
+        agent: AgentName,
+        delivery: Delivery,
+    },
+    Activity {
+        agent: AgentName,
+        activity: Activity,
     },
     TurnStarted {
         request: EventId,
@@ -202,12 +236,18 @@ impl Body {
                 conversation,
                 audience,
                 ..
+            }
+            | Self::Receipt {
+                conversation,
+                audience,
+                ..
             } => Some((conversation, audience)),
             Self::Profile { .. }
             | Self::Left { .. }
             | Self::Machine { .. }
             | Self::Room { .. }
             | Self::RoomClosed { .. }
+            | Self::Activity { .. }
             | Self::Omitted {} => None,
         }
     }
@@ -229,7 +269,8 @@ impl Body {
             ..
         }
         | Self::TurnStarted { request, .. }
-        | Self::Resolved { request, .. } = self
+        | Self::Resolved { request, .. }
+        | Self::Receipt { request, .. } = self
         {
             Some(request)
         } else {
@@ -244,7 +285,9 @@ impl Body {
             | Self::Profile { agent, .. }
             | Self::Left { agent }
             | Self::TurnStarted { agent, .. }
-            | Self::Resolved { agent, .. } => Some(agent),
+            | Self::Resolved { agent, .. }
+            | Self::Receipt { agent, .. }
+            | Self::Activity { agent, .. } => Some(agent),
             Self::Machine { .. }
             | Self::Room { .. }
             | Self::RoomClosed { .. }
@@ -318,6 +361,23 @@ fn valid_thread(conversation: &Conversation, audience: &Audience, author: &Agent
     }
 }
 
+fn valid_notice(
+    sender: &AgentId,
+    (conversation, audience): (&Conversation, &Audience),
+    intent: &Intent,
+    notice: &Notice,
+) -> bool {
+    !(notice.recipients.contains(sender)
+        || notice.recipients.agents().iter().any(|agent| {
+            !audience.includes(agent.origin())
+                || matches!(conversation, Conversation::Direct(pair) if !pair.includes(agent))
+        }) || notice.question.as_ref().is_some_and(|question| {
+        question.fallback() == sender
+            || !matches!(intent, Intent::Ask { chain, .. } if !chain.contains(question.fallback()))
+    })
+        || matches!(intent, Intent::Ask { responder, .. } if !notice.recipients.contains(responder)))
+}
+
 impl Event {
     pub fn new(id: EventId, clock: u64, body: Body) -> Result<Self, Invalid> {
         if clock == 0 || clock == u64::MAX {
@@ -345,6 +405,31 @@ impl Event {
             if !valid_ask(&sender, conversation, audience, (responder, chain)) {
                 return Err(Invalid("ask responder, conversation, or delegation chain"));
             }
+        }
+        if let Body::Message {
+            conversation,
+            from,
+            audience,
+            notice: Some(notice),
+            intent,
+            ..
+        } = &body
+        {
+            let sender = AgentId::new(from.clone(), id.origin().clone());
+            if !valid_notice(&sender, (conversation, audience), intent, notice) {
+                return Err(Invalid("message notification recipients"));
+            }
+        }
+        if matches!(
+            body,
+            Body::Receipt {
+                delivery: Delivery::Pending,
+                ..
+            }
+        ) {
+            return Err(Invalid(
+                "a receipt must record delivery, reading, or acknowledgment",
+            ));
         }
         Ok(Self { id, clock, body })
     }
@@ -593,6 +678,7 @@ mod tests {
             audience: audience.clone(),
             intent: Intent::Ask { responder, chain },
             at: Stamp::from_unix_millis(1),
+            notice: None,
         };
         let bob = agent("bob", 'b');
         let cycle = Chain::try_from(vec![bob.clone()]).unwrap();
@@ -606,6 +692,7 @@ mod tests {
             audience: audience.clone(),
             intent: Intent::Send {},
             at: Stamp::from_unix_millis(1),
+            notice: None,
         };
         Event::new(id('a', 1), 1, outsider).unwrap_err();
         Chain::try_from(vec![agent("x", 'a'), agent("x", 'a')]).unwrap_err();
@@ -647,5 +734,91 @@ mod tests {
             first.digest(),
             super::Digest::of(first.encoded().as_bytes())
         );
+    }
+
+    fn maximal_notification_event() -> Event {
+        use crate::chat::id::{
+            AgentId, AgentName, Audience, EventId, Line, MAX_AUDIENCE, MAX_TEXT, Origin, RoomId,
+            RoomName, Text,
+        };
+        use crate::chat::notification::{
+            MAX_EXPECTED_BYTES, MAX_FALLBACK_SECONDS, MAX_SUBJECT_BYTES, Notice, Question,
+        };
+        use core::num::NonZeroU64;
+
+        const MAX_HANDLE_BYTES: usize = 64;
+        const ORIGIN_ENTROPY_BYTES: usize = 16;
+        let origins: Vec<_> = (0..MAX_AUDIENCE)
+            .map(|index| Origin::from_entropy([u8::try_from(index).unwrap(); ORIGIN_ENTROPY_BYTES]))
+            .collect();
+        let local = origins.first().unwrap().clone();
+        let recipients: Vec<_> = origins
+            .iter()
+            .enumerate()
+            .map(|(index, origin)| {
+                AgentId::new(
+                    AgentName::try_from(alloc::format!("{index:0MAX_HANDLE_BYTES$}")).unwrap(),
+                    origin.clone(),
+                )
+            })
+            .collect();
+        let responder = recipients.first().unwrap().clone();
+        let chain = Chain::try_from(
+            (0..super::MAX_CHAIN)
+                .map(|index| {
+                    AgentId::new(
+                        AgentName::try_from(alloc::format!(
+                            "c{index:0width$}",
+                            width = MAX_HANDLE_BYTES - 1
+                        ))
+                        .unwrap(),
+                        local.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let fallback = AgentId::new(
+            AgentName::try_from("f".repeat(MAX_HANDLE_BYTES)).unwrap(),
+            local.clone(),
+        );
+        Event::new(
+            EventId::new(local.clone(), NonZeroU64::new(u64::MAX).unwrap()),
+            u64::MAX - 1,
+            Body::Message {
+                conversation: Conversation::Room(RoomId::new(
+                    local,
+                    RoomName::try_from("r".repeat(MAX_HANDLE_BYTES)).unwrap(),
+                )),
+                from: AgentName::try_from("s".repeat(MAX_HANDLE_BYTES)).unwrap(),
+                text: Text::try_from("\u{0001}".repeat(MAX_TEXT)).unwrap(),
+                audience: Audience::try_from(origins).unwrap(),
+                intent: Intent::Ask { responder, chain },
+                at: Stamp::from_unix_millis(u64::MAX),
+                notice: Some(Notice {
+                    recipients: super::Members::try_from(recipients).unwrap(),
+                    urgent: false,
+                    subject: Some(Line::try_from("\"".repeat(MAX_SUBJECT_BYTES)).unwrap()),
+                    question: Some(
+                        Question::new(
+                            Line::try_from("\"".repeat(MAX_EXPECTED_BYTES)).unwrap(),
+                            MAX_FALLBACK_SECONDS,
+                            fallback,
+                        )
+                        .unwrap(),
+                    ),
+                }),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn maximal_notification_fields_still_seal_within_the_event_limit() {
+        const MAXIMAL_NOTIFICATION_BYTES: usize = 404_147;
+        let sealed = Sealed::new(maximal_notification_event()).unwrap();
+        assert_eq!(sealed.encoded().len(), MAXIMAL_NOTIFICATION_BYTES);
+        assert!(sealed.encoded().len() < super::MAX_EVENT_BYTES);
+        assert_eq!(decode(sealed.encoded()).unwrap(), *sealed.event());
     }
 }

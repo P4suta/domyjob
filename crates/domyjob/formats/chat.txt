@@ -16,6 +16,10 @@ table tombstones: &'static str => (u64, &'static [u8])
 table local_agents: &'static str => &'static str
 table turns: &'static str => &'static str
 table reads: &'static str => &'static str
+table delivery: &'static str => &'static str
+table activity: &'static str => &'static str
+table escalations: &'static str => &'static str
+table urgent: &'static str => &'static str
 table peers: &'static str => &'static str
 table links: &'static str => &'static str
 key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000001
@@ -63,24 +67,47 @@ key order 000000000000000b:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000b
 event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":11,"clock":11,"body":{"kind":"omitted"}}
 key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000c
 key order 000000000000000c:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000c
-key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}000000000000000c:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000c"
-key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":12,"clock":12,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"failed"}}
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":12,"clock":12,"body":{"kind":"activity","agent":"responder","activity":{"state":"working","at":1700000000000,"status":"reviewing"}}}
 key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000d
 key order 000000000000000d:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000d
 key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}000000000000000d:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000d"
 key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":13,"clock":13,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"interrupted"}}
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":13,"clock":13,"body":{"kind":"receipt","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","delivery":"delivered"}}
 key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000e
 key order 000000000000000e:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000e
 key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}000000000000000e:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000e"
 key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":14,"clock":14,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"unavailable"}}
-key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:000000000000000f
-key order 000000000000000f:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:000000000000000f
-key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}000000000000000f:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:000000000000000f"
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":14,"clock":14,"body":{"kind":"receipt","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","delivery":"read"}}
+key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000f
+key order 000000000000000f:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000f
+key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}000000000000000f:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:000000000000000f"
 key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-event {"origin":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":15,"clock":15,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"asker","outcome":"withdrawn"}}
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":15,"clock":15,"body":{"kind":"receipt","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","delivery":"acknowledged"}}
+key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000010
+key order 0000000000000010:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000010
+key thread "room:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:release\u{1f}0000000000000010:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000010"
+key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}room:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:release"
+event {"origin":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":16,"clock":16,"body":{"kind":"message","conversation":"room:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:release","from":"asker","text":"text","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"intent":{"ask":{"responder":"responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"at":1700000000000,"notice":{"recipients":["responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"urgent":true,"subject":"Review","question":{"expected":"Approve or explain","after_seconds":120,"fallback":"responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}
+key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000011
+key order 0000000000000011:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000011
+key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}0000000000000011:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000011"
+key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":17,"clock":17,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"failed"}}
+key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000012
+key order 0000000000000012:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000012
+key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}0000000000000012:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000012"
+key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":18,"clock":18,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"interrupted"}}
+key event bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000013
+key order 0000000000000013:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000013
+key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}0000000000000013:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0000000000000013"
+key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+event {"origin":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","seq":19,"clock":19,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"responder","outcome":"unavailable"}}
+key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000014
+key order 0000000000000014:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000014
+key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}0000000000000014:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000014"
+key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+event {"origin":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":20,"clock":20,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"asker","outcome":"withdrawn"}}
 key room room:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:release
 record card {"display_name":"Reviewer","role":"reviewer","description":"Reviews Rust changes.","skills":["rust"],"project":"domyjob","status":"reviewing","tool":"codex","mode":"managed","access":"read"}
 record room {"topic":"the release","members":["asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}

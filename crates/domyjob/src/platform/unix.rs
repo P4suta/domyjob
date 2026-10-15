@@ -30,6 +30,12 @@ impl std::fmt::Display for Mode {
 }
 
 impl System for Unix {
+    #[cfg(test)]
+    fn non_unicode_string() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(vec![0xff])
+    }
+
     const OS: Os = if cfg!(target_os = "macos") {
         Os::Macos
     } else if cfg!(target_os = "linux") {

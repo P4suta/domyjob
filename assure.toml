@@ -1,7 +1,37 @@
 [[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/hook_clients.rs"
+by = "fuzz/fuzz_targets/hook_clients.rs"
+
+[[owner]]
 shape = "protocol"
 path = "crates/domyjob-core/src/job_protocol.rs"
 by = "xtask/src/verification.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/terminal_input.rs"
+by = "fuzz/fuzz_targets/terminal_input.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/terminal_input/decoder.rs"
+by = "fuzz/fuzz_targets/terminal_input.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/terminal_input/control.rs"
+by = "fuzz/fuzz_targets/terminal_input.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/terminal_input/utf16.rs"
+by = "fuzz/fuzz_targets/terminal_input.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/terminal_input/unicode.rs"
+by = "fuzz/fuzz_targets/terminal_input.rs"
 
 [[owner]]
 shape = "parser"

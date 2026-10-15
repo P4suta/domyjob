@@ -71,6 +71,11 @@ pub(crate) fn stamp() -> Stamp {
     Stamp::from_unix_millis(raw::wall_millis().map_or(0, saturate))
 }
 
+#[must_use]
+pub(crate) fn observed_millis() -> Option<u64> {
+    raw::wall_millis().map(saturate)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deadline(u64);
 
@@ -95,7 +100,7 @@ impl Deadline {
         Self(self.0.min(other.0))
     }
 
-    fn left_millis(self) -> u64 {
+    pub(crate) fn left_millis(self) -> u64 {
         self.0.saturating_sub(monotonic())
     }
 }

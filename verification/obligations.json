@@ -5,6 +5,105 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "source": null,
+      "name": "chat::ledger::parent_identity::proofs::canonical_parent_hex_encoder_preserves_the_exact_full_domain",
+      "covers": 2,
+      "contract": "The actual proof-only arithmetic encoder equals the original sixteen-byte table for every u8, returns only lowercase hexadecimal ASCII, and has an explicit inverse for every valid output byte.",
+      "input_domain": "Every independent u8 input and desired output, with the inverse obligation conditional on actual digit or lowercase a-through-f classification. No assumptions, shortened origin, fixed identity or factory stub.",
+      "bound": "Loop-free byte arithmetic with checked additions and subtraction; both zero-digit and final-letter covers are required. The full original thirty-two-byte factory map and actual UTF-8, Origin and EventId calls remain unchanged until this candidate is verified.",
+      "production": "crates/domyjob-core/src/chat/ledger/parent_identity.rs proof-only hex_digit imported directly by its harness. This exact-domain candidate does not certify the factory or replace the required Parent aggregate."
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "name": "native_default::native_default_loader_search_path_filter",
+      "covers": 2,
+      "contract": "Actual pinned proxy loader filtering removes exactly a toolchains/any-present-component/lib suffix and preserves all other projected native path tails.",
+      "input_domain": "Every independent Library, Toolchains, Other or Missing tag in all three actual reverse native path positions, including short and inconsistent projected tails; no suffix-validity assumption.",
+      "bound": "Loop-free actual production tail decision; native Path component projection and join/split operations remain explicitly tested standard-library adapter boundaries.",
+      "production": "xtask/src/proof_tools/native_default.rs retain_loader_tail, called by actual command-local proxy runtime loader filtering"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "name": "native_default::native_default_target_and_object_admission",
+      "covers": 2,
+      "contract": "Actual NativeDefault object admission requires the supported target architecture and executable or library header; opaque support inputs remain separately budgeted.",
+      "input_domain": "Both supported native targets, every object kind, every thirty-two-byte header, every u8 prefix choice and every u64 physical length. Oversize prefix choices refuse the actual bounded prefix representation; no assumed valid header.",
+      "bound": "Unwind40 with unwinding assertions; actual production fixed-prefix ELF and Mach-O parsing, no quantifier or contract flags.",
+      "production": "xtask/src/proof_tools/native_default.rs object, called by actual physical object capture"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "name": "native_default::native_default_required_roles_and_limits",
+      "covers": 4,
+      "contract": "All actual required roles must be present without duplicate role insertion; tool member count, per-object and aggregate lengths use checked bounded transitions under the explicitly revised tool-observation policy.",
+      "input_domain": "Every u32 role mask and member count, every role variant and every u64 previous total and candidate length. Actual checkpoint admission includes every valid numeric state; no assumed role presence or budget conclusion.",
+      "bound": "Loop-free actual role and numeric decisions with complete widths; count1024, object256MiB, aggregate1024MiB. Artifact, report and source-transfer policies remain separate.",
+      "production": "xtask/src/proof_tools/native_default.rs Roles and Budget, called by actual native role and support capture"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "name": "native_default::native_default_full_identity_recheck",
+      "covers": 2,
+      "contract": "Recheck compares every before and after path-digest and content-digest byte and all device, inode, byte-length, mode, owner and group fields.",
+      "input_domain": "Every byte in independent complete thirty-two-byte path and content digests, and full u64 and u32 native identity fields; no equality assumptions.",
+      "bound": "Unwind40 with unwinding assertions; independent element comparisons retain all bytes and fields. Hash authenticity and OS identity observation remain adapter trust boundaries.",
+      "production": "xtask/src/proof_tools/native_default.rs unchanged, called by actual file and directory snapshot rechecks"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "name": "native_default::native_default_builtin_configuration",
+      "covers": 2,
+      "contract": "Builtin configuration admits only Cadical, exactly sixteen object bits and an actually decoded explicit-null solver version; ordinary proof and named-counterexample admission remain required.",
+      "input_domain": "Every closed solver observation, every u32 object-bit value and both actual explicit-null projection outcomes. Missing required JSON fields are separately refused by the real strict decoder tests.",
+      "bound": "Loop-free actual production configuration selector; no external Cadical executable or guessed version.",
+      "production": "xtask/src/proof_tools/native_default.rs configuration, called by actual NativeDefault report metadata validation"
+    },
+    {
+      "source": null,
+      "name": "chat::ledger::parent_identity::proofs::canonical_parent_identity_generator_preserves_every_origin_byte",
+      "covers": 1,
+      "contract": "The unchanged fallible canonical factory succeeds and preserves every generated origin byte through actual UTF-8, Origin validation and EventId construction.",
+      "input_domain": "Every independent thirty-two-byte lowercase hexadecimal origin and every nonzero u64 sequence, through the actual full-domain identity() generator. Zero samples map to one without removing any admitted nonzero value.",
+      "bound": "Unwind34 with unwinding assertions; actual generator unwrap and all thirty-two origin bytes are checked without assumptions. The additional minimum-sequence cover establishes nonempty reachability and replaces no aggregate cover.",
+      "production": "crates/domyjob-core/src/chat/ledger/parent_identity.rs identity() calls actual String::from_utf8, Origin::try_from and EventId::new; the full factory and protected production projection remain bound by the mandatory parent_refinement identity contract. This additive component is not a completed aggregate theorem."
+    },
+    {
+      "source": null,
+      "name": "chat::ledger::parent_identity::proofs::present_parent_identity_matches_exact_origin_and_sequence",
+      "covers": 4,
+      "contract": "The actual Present identity decision is true exactly when the full actual origin bytes and nonzero sequence are both equal, retaining all four equality and mismatch classes.",
+      "input_domain": "Independent complete canonical 128-bit origins and every nonzero u64 sequence for parent and request through two real identity().unwrap calls, with no equality assumption or fixed identity.",
+      "bound": "Unwind34 with unwinding assertions; the exact original two-generator prefix and both byte-preservation assertions execute before the Present assertion. Actual UTF-8 and Origin errors remain assertion failures. No separately proved factory summary or heap-state noninterference is assumed.",
+      "production": "crates/domyjob-core/src/chat/ledger/parent_identity.rs matches(Some(&parent.identity), &request.identity) imports the actual complete EventId equality through the exact Parent/Event/id/macro refinement. This is an additive Present component rather than whole constructor or aggregate completion."
+    },
+    {
+      "source": null,
+      "name": "chat::ledger::parent_identity::proofs::absent_parent_identity_accepts_every_request",
+      "covers": 2,
+      "contract": "The actual Opaque and Missing identity checks both remain unbound for every request; this does not admit a missing dependency at a Ledger caller.",
+      "input_domain": "Independent complete canonical 128-bit origins and every nonzero u64 sequence for both parent and request, retaining the exact original two real identity().unwrap calls even though these classifications do not inspect the parent value.",
+      "bound": "Unwind34 with unwinding assertions; the exact original two-generator prefix and both byte-preservation assertions execute. Actual UTF-8 and Origin errors are not skipped or returned silently. Both classification assertions follow that prefix without a factory summary or heap-state assumption.",
+      "production": "crates/domyjob-core/src/chat/ledger/parent_identity.rs calls both Parent::Opaque.matches and Parent::Missing.matches through the exact actual projection refinement, retaining two separate success covers. No whole-parent admission, notice, receipt or aggregate theorem is claimed."
+    },
+    {
+      "source": "verification/proof-exit-policy.rs",
+      "name": "only_the_required_normal_code_admits_each_proof_phase",
+      "covers": 4,
+      "contract": "The actual proof controller admits normal zero only for a positive and normal one only for a named negative; absent, signal and other exit codes refuse before report decoding.",
+      "input_domain": "Every Option<i32> process exit code and both typed proof phases, with no assumptions.",
+      "bound": "Loop-free production match with four reachable normal-zero, normal-one, no-code and other-code classes. Native ExitStatus::code and kernel process completion are separate adapter boundaries.",
+      "production": "xtask/src/resource_proofs/exit_policy.rs admitted imported directly; resource_proofs::process::check_exit projects the actual child ExitStatus::code and consumes this decision before reading positive or negative JSON reports."
+    },
+    {
+      "source": null,
+      "name": "chat::ledger::parent_identity::proofs::projected_parent_identity_preserves_every_complete_identity_class",
+      "covers": 6,
+      "contract": "The actual complete EventId decision preserves exact identity and rejects either identity-field mismatch; Missing and Opaque retain their original classifications. Full Parent and lookup linkage requires the mandatory restricted AST refinement.",
+      "input_domain": "Every canonical thirty-two-byte lowercase hexadecimal origin and every nonzero u64 sequence for independent parent and request, and all three Parent identity classes. Zero sequence samples map to one without losing any admitted nonzero value.",
+      "bound": "Unwind34 with successful unwinding assertions; surjective full-domain generators execute actual UTF-8 and Origin validation. No assumed conclusion, identity equality, fixed Event body, or whole-constructor claim.",
+      "production": "crates/domyjob-core/src/chat/ledger/parent_identity.rs matches; Parent::matches, checked_parent, thread_parent, resolve, Event/EventId field projections, Origin validation macro, and views::stored are linked by xtask::parent_refinement in inventory and gates before proof selection with source binding after success or failure."
+    },
+    {
       "source": "verification/worker-handoff.rs",
       "name": "handoff_stops_at_the_first_failure_and_retains_its_cause",
       "covers": 5,
@@ -239,9 +338,273 @@
       "input_domain": "Every projection of the five recorded phases, all four durable states, and every action, including both request-equivalence values.",
       "bound": "No loops or assumptions; complete finite enum domain.",
       "production": "crates/domyjob-core/src/job_protocol.rs step; Store::reserve, Store::status, app::start_worker_using"
+    },
+    {
+      "name": "chat::notification_proofs::receipts_are_monotonic_and_convergent",
+      "covers": 4,
+      "contract": "Receipt observations are monotonic, commutative, associative, and idempotent; read completion admits only the original uncancelled response after successful output.",
+      "input_domain": "All receipt stages and every three-stage combination, both response-delivery variants, and both cancellation values.",
+      "bound": "No loops; complete finite enum domain via u8 remainder.",
+      "production": "crates/domyjob-core/src/chat/notification.rs Delivery::observe and reading_after_delivery; actual chat::model receipt projection joins each exact message and recipient; CLI and MCP complete reader-bound selections after successful response output"
+    },
+    {
+      "name": "chat::notification_proofs::urgent_stop_requires_acknowledgment",
+      "covers": 3,
+      "contract": "An urgent notification blocks stopping until explicitly acknowledged.",
+      "input_domain": "Both urgency values and every delivery stage.",
+      "bound": "No loops; complete finite domain.",
+      "production": "crates/domyjob-core/src/chat/notification.rs stop_decision"
+    },
+    {
+      "name": "chat::notification_proofs::escalation_respects_deadlines_and_terminal_states",
+      "covers": 4,
+      "contract": "Only an unanswered, un-escalated question becomes due after its deadline; future creation timestamps do not trigger escalation.",
+      "input_domain": "Every u64 creation time, duration, and observation time and every question state.",
+      "bound": "No loops or arithmetic assumptions.",
+      "production": "crates/domyjob-core/src/chat/notification.rs escalation_due"
+    },
+    {
+      "name": "chat::notification_proofs::presence_becomes_stalled_at_the_elapsed_bound",
+      "covers": 3,
+      "contract": "Presence becomes stalled exactly at the saturating elapsed-time threshold.",
+      "input_domain": "Every u64 timestamp and threshold and every activity state.",
+      "bound": "No loops or arithmetic assumptions.",
+      "production": "crates/domyjob-core/src/chat/notification.rs activity_state"
+    },
+    {
+      "name": "chat::notification_proofs::context_budget_rejects_overflow_and_excess",
+      "covers": 3,
+      "contract": "Context growth accepts only a sum that fits its budget without overflow.",
+      "input_domain": "Every usize used count, next count, and limit for the verified target.",
+      "bound": "No loops or arithmetic assumptions; target-sized integers.",
+      "production": "crates/domyjob-core/src/chat/notification.rs summary_fits"
+    },
+    {
+      "name": "hook_clients::proofs::hook_updates_preserve_foreign_groups_in_order",
+      "covers": 3,
+      "contract": "The production compaction retains exactly every foreign hook group in its original order before appending the replacement.",
+      "input_domain": "All owned/foreign labels and every list length from zero through four, with distinct original IDs.",
+      "bound": "Four original groups; unwind 6 with unwinding assertions; JSON classification, Vec truncation/append, and allocation are separate native and corpus evidence.",
+      "production": "hook_clients::codex_merge calls replace_owned, which directly calls compact_foreign for each lifecycle event"
+    },
+    {
+      "name": "capture_policy::proofs::complete_capture_rejects_every_omitted_suffix",
+      "covers": 4,
+      "contract": "Complete capture is admitted exactly when no suffix is omitted; prefix capture remains explicitly partial.",
+      "input_domain": "Every u64 omitted-byte count and both Complete/Prefix policies.",
+      "bound": "No loops or input assumptions; actual bounded reads, stream draining, process exit, and I/O errors remain native contracts.",
+      "production": "crates/domyjob-core/src/capture_policy.rs admit"
+    },
+    {
+      "name": "terminal_input::utf16::proofs::native_key_phase_preserves_alt_text_and_ordinary_releases",
+      "covers": 4,
+      "contract": "Nonzero Alt key-up text is a text Press, ordinary key-up remains Release, and only repeated physical key-down is Repeat.",
+      "input_domain": "Every i32 down fact, u16 repeat count, virtual key and Unicode unit, and u32 modifier mask.",
+      "bound": "No loops or assumptions; the actual SDK VK_MENU constant is compiler-bound to the production core constant. Native record production remains an OS contract.",
+      "production": "Utf16Decoder::windows_key calls WindowsKey::alt_text before choosing literal text or physical-key translation and WindowsKey::event_kind before publishing the actual KeyEvent."
+    },
+    {
+      "name": "terminal_input::utf16::proofs::every_alt_text_scalar_survives_interleaved_zero_unit_modifiers",
+      "covers": 3,
+      "contract": "Every nonzero Unicode scalar delivered on Alt release survives the actual decoder with interleaved zero-unit Alt presses, including control text without creating a Control shortcut.",
+      "input_domain": "Every valid nonzero Rust char encoded into one or two UTF-16 units, with the actual four-record ConPTY Alt-text schedule for supplementary scalars.",
+      "bound": "Unwind 6 with unwinding assertions; complete scalar range through the real production record decoder, without a general OS scheduling theorem.",
+      "production": "platform::terminal::windows passes checked native WindowsKey facts into the same Utf16Decoder::windows_key; the native ConPTY trace reproduced this Alt key-up surrogate schedule and retains the required emoji assertion."
+    },
+    {
+      "name": "terminal_input::unicode::proofs::only_canonical_utf8_sequences_admit_a_scalar",
+      "covers": 6,
+      "contract": "Every admitted complete multibyte sequence is exactly the canonical Rust encoding of its non-ASCII Unicode scalar; overlong forms, surrogate encodings and values above the scalar range refuse.",
+      "input_domain": "Every four-byte array and every complete sequence length two through four.",
+      "bound": "Unwind 6 with unwinding assertions; byte-level canonical admission combined with the independent all-scalar production decoder roundtrip. Rust char and encoder semantics remain language verifier contracts.",
+      "production": "terminal_input::Decoder::utf8 calls this same checked unicode::scalar on its actual bounded complete sequence content before publishing a KeyEvent."
+    },
+    {
+      "name": "terminal_input::sequence::proofs::every_sequence_append_preserves_its_buffer_invariant",
+      "covers": 3,
+      "contract": "The only production sequence mutators admit exactly one byte while capacity remains, preserve every other array slot, refuse full buffers unchanged, and clear to an empty bounded sequence.",
+      "input_domain": "Every 32-byte buffer, every admitted usize length zero through 32, every appended byte and every array coordinate zero through 31.",
+      "bound": "Unwind 34 with unwinding assertions; constructor and actual append/clear induction, with private fields preventing decoder counter assignment. This does not prove every arbitrary-length keyboard sequence has its intended semantic event.",
+      "production": "terminal_input::Decoder owns private Sequence, accesses only its checked content, and calls these actual push and clear methods for UTF-8 and CSI input."
+    },
+    {
+      "name": "terminal_input::proofs::console_modes_preserve_every_unselected_bit",
+      "covers": 3,
+      "contract": "Input modes remove exactly the selected cooked-input flags, enable window and extended flags, preserve existing mouse input and all unrelated flags, and output enables exactly the required ANSI flags.",
+      "input_domain": "Every u32 original input and output mode.",
+      "bound": "No loops or assumptions; SDK constants are bound by native compiler assertions, while console handle capture and restoration are native contracts.",
+      "production": "platform::terminal::windows captures real original modes and passes these actual transformations to SetConsoleMode through its checked SDK leaf."
+    },
+    {
+      "name": "terminal_input::proofs::console_viewports_are_checked_inclusive_rectangles",
+      "covers": 4,
+      "contract": "Only nonnegative noninverted inclusive console windows produce dimensions, and each dimension equals its inclusive coordinate difference.",
+      "input_domain": "Every i16 left, top, right and bottom viewport coordinate.",
+      "bound": "No loops or assumptions; actual srWindow ABI and physical resize remain native contracts.",
+      "production": "platform::terminal::windows::Display passes the actual GetConsoleScreenBufferInfo srWindow coordinates to console_viewport before allocating the separate bounded Grid."
+    },
+    {
+      "name": "terminal_input::proofs::native_poll_and_descriptor_admission_are_finite",
+      "covers": 4,
+      "contract": "Native polling admits at most 100 milliseconds without conversion overflow, and the Mac descriptor-set span contains exactly its admitted nonnegative bounded descriptor.",
+      "input_domain": "Every i32 descriptor and every u64 poll duration.",
+      "bound": "No loops or assumptions; at most 65536 descriptor bits and 100000000 nanoseconds. OS descriptor validity and timed waiting remain native boundaries.",
+      "production": "platform::terminal::unix calls poll_nanos for its actual remaining Deadline and its Mac select leaf calls descriptor_span on the BorrowedFd before sizing the FD set."
+    },
+    {
+      "name": "terminal_input::proofs::every_unicode_scalar_survives_utf16_input",
+      "covers": 3,
+      "contract": "Every Unicode scalar roundtrips through the actual incremental UTF-16 decoder, and a standalone low surrogate is refused after clear.",
+      "input_domain": "Every valid Rust char and every u16 low surrogate in the complete DC00 through DFFF range.",
+      "bound": "Unwind 5 with unwinding assertions; at most two code units per scalar, without a console ABI or arbitrary-stream semantic theorem.",
+      "production": "platform::terminal::windows passes actual admitted KEY_EVENT_RECORD facts into Utf16Decoder::windows_key, which calls this same incremental decode method."
+    },
+    {
+      "name": "terminal_input::proofs::every_unicode_scalar_survives_byte_fragmented_utf8",
+      "covers": 3,
+      "contract": "Every non-ASCII Unicode scalar roundtrips through the actual byte-at-a-time decoder and leaves no pending sequence or retained bytes.",
+      "input_domain": "Every valid non-ASCII Rust char encoded by the real Rust UTF-8 encoder.",
+      "bound": "Unwind 6 with unwinding assertions; at most four encoded bytes per scalar. Malformed streams and quiet boundaries also have actual native, Miri and preserved-corpus controls.",
+      "production": "platform::terminal::unix feeds the actual read bytes into this same Decoder::decode and retains partial UTF-8 and CSI across quiet polls."
+    },
+    {
+      "name": "terminal_input::proofs::console_key_records_preserve_press_repeat_and_release",
+      "covers": 3,
+      "contract": "Control-letter console records retain their character and Control modifier, and their exact native down and repeat facts select Release, Repeat or Press.",
+      "input_domain": "Every i32 down observation, every u16 repeat count, every u32 native modifier mask, and all 26 control-letter code units.",
+      "bound": "Unwind 6 with unwinding assertions; source-bound record classification, not Win32 ABI or a theorem over unsupported console records.",
+      "production": "platform::terminal::windows::kernel checks the actual INPUT_RECORD tag and received count before copying these native facts into WindowsKey for the actual decoder."
+    },
+    {
+      "name": "terminal_input::control::proofs::cursor_modifier_fields_require_the_complete_supported_domain",
+      "covers": 4,
+      "contract": "Cursor modifier fields admit exactly the supported decimal domain and empty default fields, preserve their exact Shift, Alt and Control bits, and refuse unsupported or malformed values.",
+      "input_domain": "Every u8 field byte in the actual four-byte cursor sequence, including both empty-field separator forms, nondigits and all decimal values zero through nine.",
+      "bound": "Unwind 6 with unwinding assertions; one complete cursor field. Longer CSI numeric overflow and multiple sequences have native and preserved-corpus evidence, without a complete arbitrary-stream parser theorem.",
+      "production": "terminal_input::Decoder passes the bounded actual CSI or SS3 sequence content to this same control::key implementation."
+    },
+    {
+      "name": "dashboard::geometry::proofs::frame_allocation_requires_bounded_terminal_dimensions",
+      "covers": 4,
+      "contract": "Owned frames admit exactly the declared terminal dimensions and allocate the exact bounded cell count, including empty extents.",
+      "input_domain": "Every u16 terminal width and height.",
+      "bound": "No loops or assumptions; the declared maximum is 512 columns by 256 rows. Native allocation failure and driver dimensions remain adapter boundaries.",
+      "production": "tui::frame::Grid::new directly obtains the admitted Extent and its cell count before constructing the owned buffer."
+    },
+    {
+      "name": "dashboard::geometry::proofs::clipped_layouts_remain_inside_the_admitted_frame",
+      "covers": 6,
+      "contract": "Clipped rectangles, row and column partitions, insets and admitted percentage-centered regions remain contained, preserve their partition sizes and cannot wrap coordinates.",
+      "input_domain": "Every u16 extent, rectangle coordinate, rectangle dimension and partition input, and both arbitrary u8 percentages; admitted extents use the production constructor.",
+      "bound": "No loops or assumptions; scalar geometry only, without a claim about terminal glyph metrics.",
+      "production": "tui::render uses these production Rect and share operations for its actual responsive layouts; Grid clips every panel, fill, paragraph and list region before drawing."
+    },
+    {
+      "name": "dashboard::geometry::proofs::glyph_placement_requires_a_complete_cell_inside_its_row",
+      "covers": 4,
+      "contract": "Only nonempty bounded one- or two-column glyphs enter a complete in-row cell range; accepted positions and next columns equal the admitted frame's exact indices.",
+      "input_domain": "Every usize glyph byte and display-column count, every u16 extent and cell coordinate; admitted Glyph and Extent use their production constructors.",
+      "bound": "No loops or assumptions; at most 128 bytes per stored grapheme. Unicode segmentation, measured display width and physical fonts remain native and dependency contracts.",
+      "production": "tui::frame::Grid::put derives actual DisplayText byte length and Unicode width, then calls Glyph::new and Extent::place before any cell mutation."
+    },
+    {
+      "name": "dashboard::geometry::proofs::redraws_follow_the_actual_frame_and_extent_equality",
+      "covers": 3,
+      "contract": "Only an equal frame with an equal extent skips drawing; a changed extent clears before painting, and same-extent changes repaint rows.",
+      "input_domain": "Every frame and extent equality Boolean, including the conservative inconsistent combination.",
+      "bound": "No loops or assumptions; real Grid equality, output completion and terminal effects remain native checked.",
+      "production": "tui::output::Renderer::draw passes actual previous Grid equality and actual extent equality to paint_plan, then commits the previous frame only after its output finish port succeeds."
+    },
+    {
+      "name": "dashboard::proofs::navigation_and_selection_are_bounded",
+      "covers": 6,
+      "contract": "Navigation never selects outside its actual row count, a vanished selected identity stays unselected until explicit navigation, full-identity retention requires equality, and viewing identity requires the local origin and current registration.",
+      "input_domain": "Every usize count and position, both optional-selection and prior-selection states, all four movements, both identity match values, and every registration flag.",
+      "bound": "No loops or assumptions; actual typed AgentId, Origin and Conversation equality and store authorization are separately native checked.",
+      "production": "tui::Model navigation and reconciliation call dashboard::navigate, retained_selection and selection_after_refresh with actual typed rows and sticky full-identity intent; chat::store::observer derives identity equality and registration from the actual local profiles before viewing_identity admits an actor."
+    },
+    {
+      "name": "dashboard::proofs::freshness_never_hides_clock_rollback",
+      "covers": 5,
+      "contract": "Missing observations and clock rollback stay unknown, and every reliable age is fresh exactly below the declared stale boundary.",
+      "input_domain": "Every Option<u64> observation and current-clock value, and every u64 threshold.",
+      "bound": "No loops or assumptions; the native wall clock and stored activity and link stamps remain external observations, not liveness guarantees.",
+      "production": "tui::render calls dashboard::freshness separately for the actual snapshot observation, machine Link and agent Activity timestamps."
+    },
+    {
+      "name": "dashboard::proofs::refresh_accepts_only_the_pending_generation",
+      "covers": 6,
+      "contract": "Refresh requests are serial and never wrap, completions require the exact pending newer generation, and a changed view scope never publishes its old result.",
+      "input_domain": "Every u64 accepted and completed generation, every Option<u64> pending generation and both full request-scope equality outcomes.",
+      "bound": "No loops or assumptions; native typed request equality, bounded channels, cancellation and filesystem completion remain adapter contracts.",
+      "production": "tui::Worker uses dashboard::Refresh::request and Model::accept calls complete_view with actual Request equality before changing the snapshot or selected full identity."
+    },
+    {
+      "name": "dashboard::proofs::every_attempted_terminal_mode_has_owned_cleanup",
+      "covers": 4,
+      "contract": "Every attempted raw, alternate-screen and cursor setup has its corresponding reverse cleanup even when setup fails after a partial effect.",
+      "input_domain": "All four production setup stages and every cleanup resource.",
+      "bound": "Complete finite enum domain; native terminal commands and I/O failures remain external effects.",
+      "production": "platform::terminal::session records the actual attempted stage before each setup effect and calls TerminalStage::owns for every cleanup, retaining the primary error and every cleanup failure."
+    },
+    {
+      "name": "dashboard::proofs::query_admission_preserves_utf8_and_control_boundaries",
+      "covers": 4,
+      "contract": "Search admits only visible Unicode scalar values whose exact UTF-8 length fits the byte budget without overflow; literal display characters cannot contain terminal or selected bidirectional controls.",
+      "input_domain": "Every Unicode scalar char and every usize used-byte count.",
+      "bound": "No loops or assumptions; complete scalar admission, not an arbitrary-length String allocation or third-party terminal rendering theorem.",
+      "production": "dashboard::query_push calls query_admits before modifying the actual String; tui input uses query_push and every dynamic rendered text field uses dashboard::display and display_char."
+    },
+    {
+      "name": "dashboard::proofs::viewport_policy_is_total_for_every_terminal_size",
+      "covers": 4,
+      "contract": "Every terminal dimension selects exactly the declared minimal, compact, split or sidebar viewport.",
+      "input_domain": "Every u16 width and height.",
+      "bound": "No loops or assumptions; glyph widths and the physical terminal remain native rendering boundaries; separate production geometry proofs check the owned region operations.",
+      "production": "tui::render directly uses dashboard::viewport for the actual owned Grid area before choosing responsive regions."
     }
   ],
   "negatives": [
+    {
+      "source": null,
+      "harness": "chat::ledger::parent_identity::proofs::rejects_a_changed_parent_hex_encoder_value",
+      "assertion": "NEGATIVE_PARENT_HEX_ENCODER"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "harness": "native_default::rejects_unfiltered_native_default_toolchain_loader",
+      "assertion": "NEGATIVE_DEFAULT_LOADER_TAIL"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "harness": "native_default::rejects_foreign_native_default_architecture",
+      "assertion": "NEGATIVE_DEFAULT_ARCHITECTURE"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "harness": "native_default::rejects_missing_native_default_required_role",
+      "assertion": "NEGATIVE_DEFAULT_REQUIRED_ROLE"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "harness": "native_default::rejects_changed_native_default_identity",
+      "assertion": "NEGATIVE_DEFAULT_IDENTITY_CHANGE"
+    },
+    {
+      "source": "verification/native-default-tool-binding.rs",
+      "harness": "native_default::rejects_foreign_native_default_configuration",
+      "assertion": "NEGATIVE_DEFAULT_CONFIGURATION"
+    },
+    {
+      "source": "verification/proof-exit-policy.rs",
+      "harness": "rejects_an_unrelated_exit_as_a_named_counterexample",
+      "assertion": "NEGATIVE_PROOF_EXIT_CODE"
+    },
+    {
+      "source": null,
+      "harness": "chat::ledger::parent_identity::proofs::rejects_a_present_parent_with_a_different_sequence",
+      "assertion": "NEGATIVE_PARENT_IDENTITY"
+    },
     {
       "source": "verification/worker-handoff.rs",
       "harness": "rejects_relabelled_request_read_failure",
@@ -311,6 +674,111 @@
       "source": null,
       "harness": "job_protocol::proofs::rejects_disconnect_loss",
       "assertion": "NEGATIVE_JOB_CONTROL"
+    },
+    {
+      "source": "verification/chat-negative.rs",
+      "harness": "rejects_unacknowledged_urgent_stop",
+      "assertion": "NEGATIVE_CHAT_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "hook_clients::proofs::rejects_foreign_hook_loss",
+      "assertion": "NEGATIVE_HOOK_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "capture_policy::proofs::rejects_truncated_complete_capture",
+      "assertion": "NEGATIVE_TOOL_CAPTURE_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::utf16::proofs::rejects_dropping_an_alt_text_release",
+      "assertion": "NEGATIVE_TERMINAL_ALT_TEXT_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::unicode::proofs::rejects_an_overlong_utf8_scalar",
+      "assertion": "NEGATIVE_TERMINAL_CANONICAL_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::proofs::rejects_disabling_existing_mouse_input",
+      "assertion": "NEGATIVE_TERMINAL_MODE_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::proofs::rejects_unbounded_native_poll",
+      "assertion": "NEGATIVE_TERMINAL_POLL_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::proofs::rejects_an_inverted_console_viewport",
+      "assertion": "NEGATIVE_TERMINAL_VIEWPORT_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::proofs::rejects_an_unpaired_utf16_low_surrogate",
+      "assertion": "NEGATIVE_TERMINAL_UTF16_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::decoder::proofs::rejects_emitting_a_truncated_utf8_sequence",
+      "assertion": "NEGATIVE_TERMINAL_UTF8_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "terminal_input::control::proofs::rejects_an_unsupported_cursor_modifier",
+      "assertion": "NEGATIVE_TERMINAL_CSI_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::geometry::proofs::rejects_oversized_frame_allocation",
+      "assertion": "NEGATIVE_DASHBOARD_FRAME_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::geometry::proofs::rejects_an_unclipped_foreign_region",
+      "assertion": "NEGATIVE_DASHBOARD_REGION_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::geometry::proofs::rejects_wide_glyphs_crossing_the_last_column",
+      "assertion": "NEGATIVE_DASHBOARD_CELL_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::geometry::proofs::rejects_skipping_a_changed_frame",
+      "assertion": "NEGATIVE_DASHBOARD_PAINT_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_foreign_selection_retention",
+      "assertion": "NEGATIVE_DASHBOARD_SELECTION_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_rollback_reported_as_fresh",
+      "assertion": "NEGATIVE_DASHBOARD_CLOCK_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_an_unrequested_refresh_completion",
+      "assertion": "NEGATIVE_DASHBOARD_REFRESH_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_skipping_partial_screen_cleanup",
+      "assertion": "NEGATIVE_DASHBOARD_CLEANUP_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_a_control_character_in_search",
+      "assertion": "NEGATIVE_DASHBOARD_QUERY_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "dashboard::proofs::rejects_sidebar_in_a_narrow_terminal",
+      "assertion": "NEGATIVE_DASHBOARD_VIEWPORT_CONTROL"
     }
   ],
   "boundaries": [
@@ -361,6 +829,18 @@
       "reason": "Kani does not establish concurrent Win32 kernel ownership or foreign-function behavior.",
       "evidence": "mise x -- cargo xtask windows-contracts; mise run test on Windows exercises capability, child ownership, failure cleanup, and process-tree termination.",
       "reconsider": "A verifier supports the actual Win32 boundary, SDK semantics change, or a native ownership contract fails."
+    },
+    {
+      "source": "crates/domyjob/src/chat/store/notifications.rs",
+      "reason": "Source-bound receipt, stop, deadline, activity and byte-admission proofs do not establish redb durability, peer origin authentication, native locking, clock synchronization or client consumption. The actual ledger projections and fallback link share a single redb transaction, while hook output and its delivered receipt are separate resources.",
+      "evidence": "Native chat store fixtures exercise recipient-scoped delivery/read/ack synchronization, distinct room recipients, exact deadlines, one-time fallback and previous-format identity/history preservation. Actual backend faults refuse receipt writes and check old-or-complete-new atomic state after sync errors, with idempotent retry; counter exhaustion rolls back escalation before replay. Hook and CLI fixtures retain bounded context, urgent stop, subsequent-action reading, status/presence and failed output leaving new delivery pending.",
+      "reconsider": "A receipt, deadline, output/commit, identity or native durability fixture fails, a supported client exposes a causal consumption receipt, or a verifier checks the actual database, client or stream boundary."
+    },
+    {
+      "source": "crates/domyjob/src/chat/setup.rs",
+      "reason": "The source-bound finite compaction and capture-policy proofs do not establish all JSON document shapes, filesystem writes, native client scheduling, hook trust or operating-system stream behavior. Setup requires complete structured readiness output and preserves foreign hooks; it never writes native trust hashes.",
+      "evidence": "Native setup fixtures preserve malformed prior hook bytes exactly, retain owner stop groups, check idempotent merge and read-only diagnosis, and refuse failed registration adds, mismatched post-add registration and nonzero credential queries. Provider fixtures bind all four phases, literal platform executable paths and --if-bound without a Codex trust bypass. Actual capture fixtures require exact-budget output, refuse drained overflow, retain read errors and preserve nonzero native outcomes.",
+      "reconsider": "The supported client schema, lifecycle or native trust semantics change, a configuration/capture/readiness fixture fails, or a verifier checks the actual client or native filesystem boundary."
     }
   ]
 }

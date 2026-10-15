@@ -10,6 +10,7 @@ pub mod exceptions;
 pub mod fixes;
 pub mod macos_package;
 pub mod ownership;
+pub mod parent_refinement;
 
 mod raw {
     #![expect(
@@ -21,7 +22,7 @@ mod raw {
     use std::path::Path;
     use std::process::Command;
 
-    pub(super) fn command(program: &str) -> Command {
+    pub(super) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         Command::new(program)
     }
 
@@ -38,6 +39,10 @@ mod raw {
         std::fs::create_dir_all(path)
     }
 
+    pub(super) fn create_new_file(path: &Path) -> io::Result<std::fs::File> {
+        std::fs::File::create_new(path)
+    }
+
     pub(super) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::write(path, bytes)
     }
@@ -49,6 +54,7 @@ mod raw {
         )
     }
 }
+mod proof_tools;
 pub mod pure_core;
 pub mod release;
 pub mod release_orchestration;
@@ -61,6 +67,8 @@ pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
+    #[error("parent implementation refinement: {0}")]
+    Refinement(String),
     #[error("reading {path}: {source}")]
     Read {
         path: PathBuf,
@@ -212,7 +220,9 @@ fn effect_module(path: &str) -> bool {
             | "crates/domyjob/tests/e2e/os.rs"
             | "xtask/src/ci.rs"
             | "xtask/src/macos_package.rs"
+            | "xtask/src/proof_tools.rs"
             | "xtask/src/release.rs"
+            | "xtask/src/resource_proofs/process.rs"
     ) || path.starts_with("crates/domyjob/src/platform/")
         || path.starts_with("crates/domyjob/src/process/")
         || path.starts_with("crates/domyjob/tests/e2e/os/")
@@ -363,7 +373,12 @@ fn comment_findings_with(
 }
 
 pub fn gates(root: &Path) -> Result<usize, GateError> {
-    gates_with(root, &directory_entries, &raw::read_to_string)
+    let findings = gates_with(root, &directory_entries, &raw::read_to_string)?;
+    if findings != 0 {
+        return Ok(findings);
+    }
+    verification::check_parent_refinement(root).map_err(GateError::Refinement)?;
+    Ok(findings)
 }
 
 fn gates_with(
@@ -508,7 +523,9 @@ mod tests {
             "crates/domyjob/src/platform/windows_acl.rs",
             "xtask/src/ci.rs",
             "xtask/src/macos_package.rs",
+            "xtask/src/proof_tools.rs",
             "xtask/src/release.rs",
+            "xtask/src/resource_proofs/process.rs",
             "crates/domyjob/src/process/windows.rs",
             "crates/domyjob/tests/e2e/os/windows.rs",
         ] {
@@ -518,6 +535,11 @@ mod tests {
             "crates/domyjob/src/store.rs",
             "crates/domyjob/src/platform_extra.rs",
             "crates/domyjob/tests/e2e/other.rs",
+            "xtask/src/resource_proofs.rs",
+            "xtask/src/resource_proofs/process_extra.rs",
+            "xtask/src/resource_proofs/process/other.rs",
+            "xtask/src/proof_tools/native_default.rs",
+            "xtask/src/proof_tools_extra.rs",
         ] {
             assert!(!effect_module(path), "{path}");
         }
@@ -553,6 +575,27 @@ mod tests {
                 "2: platform branches belong in the platform or process adapter",
             ]
         );
+    }
+
+    #[test]
+    fn verifier_process_adapter_accepts_no_adjacent_platform_scope() {
+        let source = syn::parse_file("#[cfg(unix)] fn native_status() {}").unwrap();
+        for (path, admitted) in [
+            ("xtask/src/resource_proofs/process.rs", true),
+            ("xtask/src/resource_proofs.rs", false),
+            ("xtask/src/resource_proofs/process_extra.rs", false),
+            ("xtask/src/resource_proofs/process/other.rs", false),
+            ("xtask/src/proof_tools.rs", true),
+            ("xtask/src/proof_tools/native_default.rs", false),
+            ("xtask/src/proof_tools_extra.rs", false),
+        ] {
+            let mut policy = SourcePolicy {
+                effect_module: effect_module(path),
+                ..SourcePolicy::default()
+            };
+            policy.visit_file(&source);
+            assert_eq!(policy.findings.is_empty(), admitted, "{path}");
+        }
     }
 
     #[test]
@@ -662,6 +705,24 @@ mod tests {
         )
         .unwrap();
         raw::write(&root.path().join("README.md"), b"# prose\n").unwrap();
+        assert!(matches!(
+            gates(root.path()),
+            Err(GateError::Refinement(reason))
+                if reason.contains("crates/domyjob-core/src/chat/ledger.rs")
+        ));
+        for (file, source) in crate::parent_refinement::FILES.iter().zip([
+            include_str!("../../crates/domyjob-core/src/chat/ledger.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/ledger/parent_identity.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/id.rs"),
+            include_str!("../../crates/domyjob-core/src/chat/event.rs"),
+            include_str!("../../crates/domyjob/src/chat/store/views.rs"),
+            include_str!("../../crates/domyjob-core/src/lib.rs"),
+            include_str!("../../crates/domyjob-core/src/chat.rs"),
+        ]) {
+            let path = root.path().join(file);
+            raw::create_dir_all(path.parent().unwrap()).unwrap();
+            raw::write(&path, source.as_bytes()).unwrap();
+        }
         assert_eq!(gates(root.path()).unwrap(), 0);
         raw::write(&root.path().join("settings.TOML"), b"# setting\n").unwrap();
         raw::write(

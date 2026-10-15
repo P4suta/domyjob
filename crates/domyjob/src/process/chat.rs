@@ -9,6 +9,7 @@ use super::{Group, ProcessError};
 
 pub(crate) const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTIC: usize = 4096;
+const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ChatProcessError {
@@ -54,7 +55,10 @@ fn json_text(value: &serde_json::Value) -> String {
 pub(crate) fn resumable(tool: Tool, session: &str) -> bool {
     let uuid = || {
         let groups: Vec<&str> = session.split('-').collect();
-        groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        groups
+            .iter()
+            .map(|group| group.len())
+            .eq(UUID_GROUP_LENGTHS)
             && groups
                 .iter()
                 .all(|group| group.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -67,6 +71,26 @@ pub(crate) fn resumable(tool: Tool, session: &str) -> bool {
 }
 
 const OPENCODE_READ_AGENT: &str = "domyjob-read";
+
+pub(crate) fn codex_hook_commands(program: &str) -> [domyjob_core::hook_clients::CodexCommand; 4] {
+    domyjob_core::hook_clients::EVENTS.map(|(_, phase)| {
+        let script = format!(
+            "$ErrorActionPreference='Stop'; & '{}' chat hook {phase} --client codex --if-bound; exit $LASTEXITCODE",
+            program.replace('\'', "''")
+        );
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        domyjob_core::hook_clients::CodexCommand {
+            command: format!(
+                "'{}' chat hook {phase} --client codex --if-bound",
+                program.replace('\'', "'\"'\"'")
+            ),
+            windows: format!(
+                "powershell.exe -NoProfile -EncodedCommand {}",
+                data_encoding::BASE64.encode(&utf16)
+            ),
+        }
+    })
+}
 
 fn arguments(invocation: &Invocation<'_>, domyjob: &str) -> Result<Vec<String>, ChatProcessError> {
     if invocation
@@ -89,6 +113,10 @@ fn arguments(invocation: &Invocation<'_>, domyjob: &str) -> Result<Vec<String>, 
             });
             let mut words = owned(&["-p", "--output-format", "json", "--strict-mcp-config"]);
             words.push(format!("--mcp-config={}", json_text(&config)));
+            words.push(format!(
+                "--settings={}",
+                domyjob_core::hook_clients::claude_settings(domyjob)
+            ));
             words.push("--allowedTools=mcp__domyjob".to_owned());
             words.extend(match invocation.access {
                 Access::Read => owned(&["--permission-mode", "dontAsk", "--tools=Read,Grep,Glob"]),
@@ -356,6 +384,64 @@ mod tests {
                 "/bin/domyjob",
             )
             .unwrap_err();
+        }
+    }
+
+    #[test]
+    fn lifecycle_hooks_bind_all_phases_without_bypassing_codex_hook_trust() {
+        let claude = invocation(Tool::Claude, Access::Read, None);
+        let settings = claude
+            .iter()
+            .find_map(|word| word.strip_prefix("--settings="))
+            .unwrap();
+        let value: serde_json::Value = domyjob_core::ingress::foreign_json(settings).unwrap();
+        for (event, phase) in domyjob_core::hook_clients::EVENTS {
+            let groups = value
+                .get("hooks")
+                .unwrap()
+                .get(event)
+                .unwrap()
+                .as_array()
+                .unwrap();
+            let hook = groups
+                .first()
+                .unwrap()
+                .get("hooks")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .first()
+                .unwrap();
+            assert_eq!(hook.get("command").unwrap(), "/bin/domyjob");
+            assert_eq!(
+                hook.get("args").unwrap(),
+                &serde_json::json!(["chat", "hook", phase, "--client", "claude", "--if-bound"])
+            );
+        }
+        let codex = invocation(Tool::Codex, Access::Read, None);
+        assert!(!codex.iter().any(|word| word.contains("bypass-hook-trust")));
+    }
+
+    #[test]
+    fn codex_windows_hook_paths_are_encoded_as_literal_powershell_arguments() {
+        let program = "C:\\Owner's tools\\100%real $name\\domyjob.exe";
+        let commands = super::codex_hook_commands(program);
+        for ((_, phase), command) in domyjob_core::hook_clients::EVENTS.into_iter().zip(commands) {
+            let encoded = command
+                .windows
+                .strip_prefix("powershell.exe -NoProfile -EncodedCommand ")
+                .unwrap();
+            let bytes = data_encoding::BASE64.decode(encoded.as_bytes()).unwrap();
+            let words: Vec<u16> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .collect();
+            let script = String::from_utf16(&words).unwrap();
+            assert!(script.contains("& 'C:\\Owner''s tools\\100%real $name\\domyjob.exe'"));
+            assert!(script.contains(&format!("chat hook {phase} --client codex --if-bound")));
+            assert!(script.ends_with("exit $LASTEXITCODE"));
         }
     }
 }

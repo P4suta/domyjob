@@ -1,6 +1,7 @@
 use domyjob_core::chat::card::{Card, Mode};
 use domyjob_core::chat::event::{Body, Event, Intent, Outcome};
 use domyjob_core::chat::id::{AgentId, EventId, Origin, Text};
+use domyjob_core::chat::notification::{Activity, ActivityState};
 use domyjob_core::chat::policy::Priority;
 use redb::ReadableTable;
 
@@ -37,6 +38,24 @@ fn ending(request: &Event, by: &AgentId, outcome: Outcome) -> Result<Body, Store
 }
 
 impl Tx<'_> {
+    fn worker_activity(&mut self, agent: &AgentId, state: ActivityState) -> Result<(), StoreError> {
+        let status = views::activity(self.transaction(), agent)?
+            .and_then(|activity| activity.status)
+            .or(views::profile(self.transaction(), agent)?.and_then(|card| card.status));
+        self.author(
+            Priority::Ending,
+            Body::Activity {
+                agent: agent.name().clone(),
+                activity: Activity {
+                    state,
+                    at: crate::platform::clock::stamp(),
+                    status,
+                },
+            },
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn end(
         &mut self,
         request: &Event,
@@ -127,6 +146,9 @@ impl Store {
                     .open_table(TURNS)?
                     .remove(event_key(request).as_str())?;
             }
+            if !claimed.is_empty() {
+                tx.worker_activity(agent, ActivityState::Waiting)?;
+            }
             Ok(claimed.len())
         })
     }
@@ -153,6 +175,7 @@ impl Store {
                     agent: agent.name().clone(),
                 },
             )?;
+            tx.worker_activity(agent, ActivityState::Working)?;
             tx.transaction()
                 .open_table(TURNS)?
                 .insert(event_key(request.id()).as_str(), agent.to_string().as_str())?;
@@ -185,6 +208,7 @@ impl Store {
                                 request: turn.request.id().clone(),
                             },
                             at: crate::platform::clock::stamp(),
+                            notice: None,
                         },
                     )?;
                     let config = LocalAgent {
@@ -200,6 +224,7 @@ impl Store {
             tx.transaction()
                 .open_table(TURNS)?
                 .remove(event_key(turn.request.id()).as_str())?;
+            tx.worker_activity(&turn.agent, ActivityState::Waiting)?;
             Ok(())
         })
     }

@@ -33,10 +33,11 @@ struct Net<'a> {
 
 impl Net<'_> {
     fn sync(&self, store: &Store) -> super::Report {
+        const SYNC_TIMEOUT_SECONDS: u64 = 30;
         sync_with(
             store,
             None,
-            Deadline::after_seconds(30),
+            Deadline::after_seconds(SYNC_TIMEOUT_SECONDS),
             &mut |alias: &str| {
                 let node = self
                     .stores
@@ -87,6 +88,7 @@ fn offline_peers_are_reported_and_catch_up_after_reconnecting() {
                 audience: audience([&alice, &bob]).unwrap(),
                 intent: Intent::Send {},
                 at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+                notice: None,
             },
         )
     })
@@ -134,6 +136,7 @@ fn room_ask(
                         chain: Chain::default(),
                     },
                     at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+                    notice: None,
                 },
             )
         })
@@ -155,6 +158,7 @@ fn answer(store: &Store, responder: &AgentId, question: &domyjob_core::chat::eve
                         request: question.id().clone(),
                     },
                     at: domyjob_core::chat::event::Stamp::from_unix_millis(0),
+                    notice: None,
                 },
             )
         })

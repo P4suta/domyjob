@@ -41,6 +41,7 @@ mod store;
 #[cfg(test)]
 mod testing;
 mod transport;
+mod tui;
 mod watch_event;
 mod workspace;
 
@@ -48,11 +49,16 @@ mod workspace;
 #[command(name = "domyjob", about = "Run persistent jobs over SSH")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Open the read-only human dashboard")]
+    Tui {
+        #[arg(long = "as", value_name = "LOCAL_AGENT")]
+        actor: Option<String>,
+    },
     #[command(about = "Conversations between AI agents on this and other machines")]
     Chat(chat::cli::ChatArgs),
     #[command(about = "Serve the chat tools to an AI client over the MCP stdio transport")]
@@ -163,12 +169,18 @@ enum MainError {
     #[error(transparent)]
     App(#[from] app::AppError),
     #[error(transparent)]
+    Dashboard(#[from] tui::TuiError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
     let output = raw::output();
     match command {
+        Command::Tui { actor } => {
+            tui::run(actor.as_deref(), output)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Chat(args) => Ok(chat::cli::run(args, &output)?),
         Command::Mcp { actor, turn } => {
             mcp::serve(output, actor.as_deref(), turn.as_deref())?;
@@ -258,6 +270,12 @@ fn internal() -> bool {
 
 fn main() -> ExitCode {
     let internal = internal();
+    let command = Cli::parse().command.unwrap_or(Command::Tui { actor: None });
+    let dashboard = matches!(command, Command::Tui { .. });
+    if dashboard && !platform::terminal::interactive(&raw::output().into_stream()) {
+        eprintln!("domyjob: {}", tui::TuiError::NotTerminal);
+        return ExitCode::FAILURE;
+    }
     let _build = match builds::hold_current() {
         Ok(held) => held,
         Err(error) => {
@@ -265,7 +283,7 @@ fn main() -> ExitCode {
             None
         }
     };
-    if !internal {
+    if !internal && !dashboard {
         match transport::refresh_local() {
             Ok(Some(code)) => return code,
             Ok(None) => {}
@@ -275,7 +293,7 @@ fn main() -> ExitCode {
             }
         }
     }
-    match run(Cli::parse().command) {
+    match run(command) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("domyjob: {error}");
@@ -291,12 +309,28 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
+    fn human_dashboard_is_the_default_and_has_an_explicit_command() {
+        let default = Cli::try_parse_from(["domyjob"]).unwrap();
+        assert!(default.command.is_none());
+        let explicit = Cli::try_parse_from(["domyjob", "tui"]).unwrap();
+        assert!(matches!(
+            explicit.command,
+            Some(Command::Tui { actor: None })
+        ));
+        let selected = Cli::try_parse_from(["domyjob", "tui", "--as", "alice"]).unwrap();
+        assert!(matches!(
+            selected.command,
+            Some(Command::Tui { actor: Some(actor) }) if actor == "alice"
+        ));
+    }
+
+    #[test]
     fn reaper_command_accepts_only_positive_groups() {
         let parsed = Cli::try_parse_from(["domyjob", "node", "--reap", "17"]);
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Command::Node { reap: Some(_), .. }
+                command: Some(Command::Node { reap: Some(_), .. })
             })
         ));
         for value in ["0", "-1", "2147483648", "invalid"] {

@@ -66,6 +66,7 @@ fn follow_up(request: &Event, by: &AgentId, outcome: Option<Outcome>) -> Result<
                 request: request.id().clone(),
             },
             at: Stamp::from_unix_millis(0),
+            notice: None,
         },
         Some(outcome) => Body::Resolved {
             request: request.id().clone(),
@@ -96,6 +97,8 @@ fn ends(event: &Event, ask: &Event) -> bool {
         | Body::RoomClosed { .. }
         | Body::Message { .. }
         | Body::TurnStarted { .. }
+        | Body::Receipt { .. }
+        | Body::Activity { .. }
         | Body::Omitted {} => false,
     }
 }
@@ -207,6 +210,7 @@ impl World {
                         chain: Chain::default(),
                     },
                     at: Stamp::from_unix_millis(0),
+                    notice: None,
                 };
                 self.ask = Some(self.write(0, body)?);
             }
