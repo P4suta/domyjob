@@ -38,6 +38,9 @@ jobs:
           shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Set up the pinned verifier bundle
+        if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
+        run: mise x cargo:kani-verifier@0.68.0 -- cargo kani setup
       - name: Install the pinned interpreter for finite core contracts
         if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
         run: rustup toolchain install nightly-2026-10-01 --component miri --component rust-src
