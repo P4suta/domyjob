@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::resource_proofs::{Harness, Negative};
 
+mod handoffs;
+
 const MANIFEST: &str = "verification/obligations.json";
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const QUINT_VERSION: &str = "0.32.0";
@@ -1111,6 +1113,7 @@ pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
         [] => run(root),
         ["models"] => replay_models(root),
         ["inventory"] => check_inventory(root),
+        ["handoffs"] => handoffs::run(root),
         ["native-default"] => native_default(root),
         ["parent-identity-encoder"] => parent_identity_encoder(root),
         ["parent-identity"] => parent_identity(root),
@@ -1118,7 +1121,7 @@ pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
             parent_identity_component(root, ParentComponent::parse(component)?)
         }
         ["fuzz"] => replay_fuzz(root),
-        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
+        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|handoffs|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
     }
 }
 
