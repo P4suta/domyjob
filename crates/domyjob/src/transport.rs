@@ -621,6 +621,11 @@ pub(crate) struct Submission {
     pub(crate) wait: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ResultRetention {
+    Preserve,
+}
+
 pub(crate) fn on(
     machine: &MachineName,
     submission: Submission,
@@ -641,8 +646,8 @@ fn finish_submission(
         return Ok(ExitCode::SUCCESS);
     }
     let reference = JobReference::new(machine.clone(), job);
-    let result = wait(&reference, output)?;
-    logs(&reference, output)?;
+    let result = wait(&reference, ResultRetention::Preserve, output)?;
+    logs(&reference, ResultRetention::Preserve, output)?;
     Ok(result)
 }
 
@@ -736,13 +741,21 @@ fn print_state(reference: &JobReference, state: &JobState, output: &Output) -> s
     ))
 }
 
-pub(crate) fn status(reference: &JobReference, output: &Output) -> Result<(), TransportError> {
+pub(crate) fn status(
+    reference: &JobReference,
+    ResultRetention::Preserve: ResultRetention,
+    output: &Output,
+) -> Result<(), TransportError> {
     let state = observe(reference, Observation::Current)?;
     print_state(reference, &state, output)?;
     Ok(())
 }
 
-pub(crate) fn wait(reference: &JobReference, output: &Output) -> Result<ExitCode, TransportError> {
+pub(crate) fn wait(
+    reference: &JobReference,
+    ResultRetention::Preserve: ResultRetention,
+    output: &Output,
+) -> Result<ExitCode, TransportError> {
     let state = observe(reference, Observation::Complete)?;
     print_state(reference, &state, output)?;
     match state.outcome() {
@@ -777,7 +790,11 @@ pub(crate) fn kill(reference: &JobReference, output: &Output) -> Result<ExitCode
     }
 }
 
-pub(crate) fn logs(reference: &JobReference, output: &Output) -> Result<(), TransportError> {
+pub(crate) fn logs(
+    reference: &JobReference,
+    ResultRetention::Preserve: ResultRetention,
+    output: &Output,
+) -> Result<(), TransportError> {
     let request = Request::Logs {
         job: reference.job().clone(),
     };

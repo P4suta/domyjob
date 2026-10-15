@@ -90,18 +90,12 @@ enum Command {
         #[arg(long)]
         job: Option<String>,
     },
-    Status {
-        job: String,
-    },
-    Wait {
-        job: String,
-    },
+    Status(ResultReadArgs),
+    Wait(ResultReadArgs),
     Kill {
         job: String,
     },
-    Logs {
-        job: String,
-    },
+    Logs(ResultReadArgs),
     #[command(hide = true)]
     Node {
         #[arg(long, hide = true)]
@@ -123,6 +117,19 @@ enum Command {
         #[arg(long, hide = true)]
         ready_event: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+struct ResultReadArgs {
+    job: String,
+    #[arg(
+        long = "keep",
+        hide = true,
+        num_args = 0,
+        default_value = "preserve",
+        default_missing_value = "preserve"
+    )]
+    retention: transport::ResultRetention,
 }
 
 #[derive(Debug, Args)]
@@ -212,14 +219,18 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
             transport::clean(&MachineName::try_from(machine)?, target, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Status { job } => {
-            transport::status(&JobReference::try_from(job)?, &output)?;
+        Command::Status(ResultReadArgs { job, retention }) => {
+            transport::status(&JobReference::try_from(job)?, retention, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait { job } => Ok(transport::wait(&JobReference::try_from(job)?, &output)?),
+        Command::Wait(ResultReadArgs { job, retention }) => Ok(transport::wait(
+            &JobReference::try_from(job)?,
+            retention,
+            &output,
+        )?),
         Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?, &output)?),
-        Command::Logs { job } => {
-            transport::logs(&JobReference::try_from(job)?, &output)?;
+        Command::Logs(ResultReadArgs { job, retention }) => {
+            transport::logs(&JobReference::try_from(job)?, retention, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Node { reap, reap_scope } => {
@@ -307,6 +318,46 @@ mod tests {
     use clap::Parser as _;
 
     use super::{Cli, Command};
+
+    #[test]
+    fn job_reads_accept_keep_as_the_preserving_compatibility_form() {
+        let job = "beta:00000000000000000000000000000001";
+        for command in ["status", "wait", "logs"] {
+            for arguments in [
+                vec!["domyjob", command, "--keep", job],
+                vec!["domyjob", command, job, "--keep"],
+                vec!["domyjob", command, job],
+            ] {
+                let parsed = Cli::try_parse_from(&arguments);
+                assert!(parsed.is_ok(), "{arguments:?}: {parsed:?}");
+                assert!(matches!(
+                    parsed.unwrap().command,
+                    Some(Command::Status(args) | Command::Wait(args) | Command::Logs(args))
+                        if args.job == job
+                            && args.retention == super::transport::ResultRetention::Preserve
+                ));
+            }
+            let help = Cli::try_parse_from(["domyjob", command, "--help"])
+                .unwrap_err()
+                .to_string();
+            assert!(!help.contains("--keep"), "{help}");
+        }
+    }
+
+    #[test]
+    fn keep_is_only_a_zero_argument_result_read_option() {
+        let job = "beta:00000000000000000000000000000001";
+        for arguments in [
+            vec!["domyjob", "status", "--keep=false", job],
+            vec!["domyjob", "wait", "--keep=preserve", job],
+            vec!["domyjob", "logs", "--keep", "false", job],
+            vec!["domyjob", "logs", "--unknown", job],
+            vec!["domyjob", "kill", "--keep", job],
+            vec!["domyjob", "tui", "--keep"],
+        ] {
+            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
 
     #[test]
     fn human_dashboard_is_the_default_and_has_an_explicit_command() {

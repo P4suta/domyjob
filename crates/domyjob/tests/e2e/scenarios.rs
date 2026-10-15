@@ -8,7 +8,7 @@ use crate::world::{
 };
 use crate::{Failure, Scenario};
 
-pub(crate) const ALL: [Scenario; 16] = [
+pub(crate) const ALL: [Scenario; 17] = [
     Scenario {
         name: "dashboard_and_help_respect_redirected_cli_boundaries",
         machines: &["alpha"],
@@ -83,6 +83,11 @@ pub(crate) const ALL: [Scenario; 16] = [
         name: "jobs_run_through_the_node_wrapper",
         machines: &["alpha", "beta"],
         run: jobs_run_through_the_node_wrapper,
+    },
+    Scenario {
+        name: "kept_job_reads_preserve_success_and_failure_results",
+        machines: &["alpha", "beta"],
+        run: kept_job_reads_preserve_success_and_failure_results,
     },
     Scenario {
         name: "resource_probe_recognizes_its_parent_scope",
@@ -1085,6 +1090,78 @@ fn arrives(alpha: &Machine<'_>, text: &str) -> Result<(), Failure> {
             Ok(thread.exited(0)?.stdout.contains(text).then_some(()))
         },
     )
+}
+
+fn kept_job_reads_preserve_success_and_failure_results(world: &World) -> Result<(), Failure> {
+    let alpha = world.machine("alpha");
+    crate::os::job_handoff(world, &alpha)?;
+    for (code, argument) in [(0, "0"), (7, "7")] {
+        let submitted = alpha.run(&["on", "beta", "--", "sleeper", "0", argument])?;
+        let job = submitted.exited(0)?.stdout.trim();
+        let waited = alpha.run(&["wait", "--keep", job])?;
+        waited.exited(code)?;
+        let listed = alpha.run(&["ls", "beta"])?;
+        listed.exited(0)?;
+        for arguments in [vec!["status", "--keep", job], vec!["status", job]] {
+            let status = alpha.run(&arguments)?;
+            ensure!(
+                status.exited(0)?.stdout == waited.stdout,
+                "unstable retained status: {status}"
+            );
+        }
+        let logs = alpha.run(&["logs", "--keep", job])?;
+        ensure!(
+            logs.exited(0)?.stdout == "sleeper slept 0ms\n",
+            "missing retained logs: {logs}"
+        );
+        let repeated_wait = alpha.run(&["wait", job, "--keep"])?;
+        ensure!(
+            repeated_wait.exited(code)?.stdout == waited.stdout,
+            "unstable retained wait: {repeated_wait}"
+        );
+        let default_wait = alpha.run(&["wait", job])?;
+        ensure!(
+            default_wait.exited(code)?.stdout == waited.stdout,
+            "unstable default wait: {default_wait}"
+        );
+        for arguments in [vec!["logs", job], vec!["logs", job, "--keep"]] {
+            let repeated = alpha.run(&arguments)?;
+            ensure!(
+                repeated.exited(0)?.stdout.as_bytes() == logs.stdout.as_bytes(),
+                "unstable retained log bytes: {repeated}"
+            );
+        }
+        let status = alpha.run(&["status", "--keep", job])?;
+        ensure!(
+            status.exited(0)?.stdout == waited.stdout,
+            "a read consumed the result: {status}"
+        );
+        let after = alpha.run(&["ls", "beta"])?;
+        ensure!(
+            after.exited(0)?.stdout == listed.stdout,
+            "reading changed the job inventory: {after}"
+        );
+        let cleaned = alpha.run(&[
+            "clean",
+            "beta",
+            "--job",
+            job.rsplit_once(':')
+                .ok_or_else(|| Failure::new("invalid retained job reference"))?
+                .1,
+        ])?;
+        ensure!(
+            cleaned.exited(0)?.stdout.contains("cleaned 1"),
+            "keep must permit explicit cleanup: {cleaned}"
+        );
+        let removed = alpha.run(&["status", "--keep", job])?;
+        ensure!(
+            removed.code == Some(1)
+                && removed.stdout.is_empty()
+                && !removed.stderr.contains("Usage:"),
+            "explicit cleanup must remove a retained result: {removed}"
+        );
+    }
+    Ok(())
 }
 
 fn jobs_run_through_the_node_wrapper(world: &World) -> Result<(), Failure> {

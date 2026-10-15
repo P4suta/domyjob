@@ -23,6 +23,9 @@ The node publishes a complete staged job record with one directory rename.
 A worker lock is the evidence of liveness; a dead worker produces the explicit `lost` outcome.
 Cancellation is persisted and delivered through a file change event before the process tree is terminated.
 Finished jobs may be removed; active jobs may not.
+`status`, `wait`, and `logs` preserve the result and logs after each read, including failed job outcomes.
+Their hidden `--keep` compatibility flag selects that same default policy.
+It does not pin a job against later admission cleanup or an explicit `clean`.
 Each admission removes the oldest finished jobs beyond the newest 32, so logs and workspaces never accumulate without bound.
 A job leaves the store with one rename into its trash, and its tree is then removed as far as it can be;
 a tree that cannot be removed yet, such as one holding files a container wrote as root, waits there and never stops an admission.
