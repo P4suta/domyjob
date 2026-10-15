@@ -4,6 +4,7 @@ pub mod exchange;
 #[cfg(test)]
 #[path = "../tests/support/chat_fixtures.rs"]
 pub(crate) mod fixtures;
+pub mod handoff;
 pub mod id;
 pub mod ledger;
 pub mod model;

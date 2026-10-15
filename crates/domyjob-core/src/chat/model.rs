@@ -25,6 +25,7 @@ pub struct Model {
     started: BTreeMap<EventId, AgentId>,
     deliveries: BTreeMap<(EventId, AgentId), Delivery>,
     activities: BTreeMap<AgentId, Activity>,
+    handoff_reads: BTreeSet<(EventId, AgentId)>,
 }
 
 impl Model {
@@ -44,11 +45,17 @@ impl Model {
             started: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             activities: BTreeMap::new(),
+            handoff_reads: BTreeSet::new(),
         }
     }
 
     pub fn write(&mut self, body: Body) -> Result<Event, Failure<Infallible>> {
         append(self, body)
+    }
+
+    #[must_use]
+    pub const fn handoff_reads(&self) -> &BTreeSet<(EventId, AgentId)> {
+        &self.handoff_reads
     }
 
     #[must_use]
@@ -162,6 +169,9 @@ impl Ledger for Model {
         self.events.insert(event.id().clone(), sealed.clone());
         match admitted.change {
             Change::Nothing => {}
+            Change::HandoffRead { request, agent } => {
+                self.handoff_reads.insert((request, agent));
+            }
             Change::Receipt {
                 request,
                 agent,

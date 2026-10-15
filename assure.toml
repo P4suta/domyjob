@@ -1,5 +1,20 @@
 [[owner]]
 shape = "parser"
+path = "crates/domyjob/src/chat/args/handoff.rs"
+by = "fuzz/fuzz_targets/handoff_metadata.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/chat/handoff.rs"
+by = "fuzz/fuzz_targets/handoff_metadata.rs"
+
+[[owner]]
+shape = "parser"
+path = "crates/domyjob-core/src/chat/handoff/metadata.rs"
+by = "fuzz/fuzz_targets/handoff_metadata.rs"
+
+[[owner]]
+shape = "parser"
 path = "crates/domyjob-core/src/hook_clients.rs"
 by = "fuzz/fuzz_targets/hook_clients.rs"
 

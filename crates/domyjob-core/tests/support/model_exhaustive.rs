@@ -99,6 +99,8 @@ fn ends(event: &Event, ask: &Event) -> bool {
         | Body::TurnStarted { .. }
         | Body::Receipt { .. }
         | Body::Activity { .. }
+        | Body::Handoff { .. }
+        | Body::HandoffRead { .. }
         | Body::Omitted {} => false,
     }
 }

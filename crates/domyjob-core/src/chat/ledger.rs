@@ -126,6 +126,10 @@ pub enum Change {
         agent: AgentId,
         activity: Activity,
     },
+    HandoffRead {
+        request: EventId,
+        agent: AgentId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,6 +387,8 @@ fn receipt_change(
         | Body::Resolved { .. }
         | Body::Receipt { .. }
         | Body::Activity { .. }
+        | Body::Handoff { .. }
+        | Body::HandoffRead { .. }
         | Body::Omitted {} => false,
     };
     if !addressed
@@ -404,9 +410,50 @@ fn receipt_change(
     })
 }
 
+fn handoff_read<L: Ledger + ?Sized>(
+    ledger: &L,
+    event: &Event,
+    observation: &super::handoff::Observation,
+    audience: &Audience,
+) -> Result<Change, Failure<L::Error>> {
+    let mismatch = || {
+        Failure::Rejected(Rejection::Mismatch {
+            event: event.id().clone(),
+        })
+    };
+    let author = event.author().ok_or_else(mismatch)?;
+    let parent = match checked_parent(ledger, event, observation.handoff())? {
+        Parent::Missing => {
+            return Err(Failure::Rejected(Rejection::MissingDependency {
+                event: event.id().clone(),
+                request: observation.handoff().clone(),
+            }));
+        }
+        Parent::Opaque => return Err(mismatch()),
+        Parent::Present(parent) => parent,
+    };
+    let Body::Handoff { metadata, text, .. } = parent.body() else {
+        return Err(mismatch());
+    };
+    let descriptor = super::handoff::Descriptor::new(parent.id().clone(), metadata.clone(), text)
+        .map_err(|_invalid| mismatch())?;
+    descriptor
+        .admit_observation(
+            observation,
+            (&author, audience),
+            (parent.clock(), event.clock()),
+        )
+        .map_err(|_refused| mismatch())?;
+    Ok(Change::HandoffRead {
+        request: observation.handoff().clone(),
+        agent: observation.reader().clone(),
+    })
+}
+
 fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failure<L::Error>> {
     Ok(match event.body() {
         Body::Omitted {}
+        | Body::Handoff { .. }
         | Body::Message {
             intent: Intent::Send {},
             ..
@@ -426,6 +473,10 @@ fn change<L: Ledger + ?Sized>(ledger: &L, event: &Event) -> Result<Change, Failu
         Body::Receipt {
             request, delivery, ..
         } => receipt(ledger, event, request, *delivery)?,
+        Body::HandoffRead {
+            observation,
+            audience,
+        } => handoff_read(ledger, event, observation, audience)?,
         Body::Machine { card } => Change::Machine { card: card.clone() },
         Body::Room {
             name,

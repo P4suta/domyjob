@@ -3,6 +3,9 @@ use domyjob_core::chat::card::{Access, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+mod handoff;
+pub(crate) use handoff::{HandoffCreateArgs, HandoffListArgs, HandoffReadArgs};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[schemars(description = "An AI command-line client.")]

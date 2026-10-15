@@ -3,6 +3,7 @@ use std::fmt::{self, Write as _};
 
 use domyjob_core::chat::card::{Access, Card, Mode, Os, Relevance, Tag};
 use domyjob_core::chat::event::{Body, Event, Intent, Stamp};
+use domyjob_core::chat::handoff::Descriptor;
 use domyjob_core::chat::id::{AgentId, Conversation, EventId};
 use domyjob_core::chat::ledger::{Ending, Resolution, Room};
 use domyjob_core::chat::notification::{ActivityState, Delivery};
@@ -12,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::address::Book;
 pub(crate) use super::store::Presence;
+use super::store::handoff::{PendingObservation, ReadBody};
 use super::store::{Directory, Link, LinkState};
 use crate::platform::clock;
 
@@ -107,6 +109,12 @@ pub(crate) enum Outcome {
     Directory(DirectoryView),
     Rooms(Vec<RoomView>),
     Posted(Event),
+    HandoffCreated(Descriptor),
+    HandoffMetadata {
+        reader: AgentId,
+        descriptors: Vec<Descriptor>,
+    },
+    HandoffBody(ReadBody),
     Asked(AskState),
     Events {
         events: Vec<MessageView>,
@@ -152,6 +160,8 @@ fn view(book: &Book, event: &Event) -> Option<MessageView> {
         | Body::RoomClosed { .. }
         | Body::Receipt { .. }
         | Body::Activity { .. }
+        | Body::Handoff { .. }
+        | Body::HandoffRead { .. }
         | Body::Omitted {} => return None,
     };
     Some(MessageView {
@@ -442,7 +452,18 @@ impl Outcome {
             | Self::Directory(_)
             | Self::Rooms(_)
             | Self::Posted(_)
+            | Self::HandoffCreated(_)
+            | Self::HandoffMetadata { .. }
+            | Self::HandoffBody(_)
             | Self::Asked(_) => None,
+        }
+    }
+
+    pub(crate) const fn pending_handoff(&self) -> Option<&PendingObservation> {
+        if let Self::HandoffBody(body) = self {
+            Some(body.pending())
+        } else {
+            None
         }
     }
 
@@ -458,6 +479,14 @@ impl Outcome {
             Self::Directory(directory) => json!(directory),
             Self::Rooms(rooms) => json!({"rooms": rooms}),
             Self::Posted(event) => json!({"message_id": event.id()}),
+            Self::HandoffCreated(descriptor) => json!({"handoff": descriptor}),
+            Self::HandoffMetadata {
+                reader,
+                descriptors,
+            } => {
+                json!({"reader": reader, "handoffs": descriptors})
+            }
+            Self::HandoffBody(body) => json!(body),
             Self::Asked(state) => json!(state),
             Self::Events { events, unread, .. } => json!({"events": events, "unread": unread}),
         }
@@ -498,6 +527,17 @@ impl Outcome {
             }
             Self::Rooms(rooms) => rooms.iter().map(room_line).collect::<Vec<_>>().join("\n"),
             Self::Posted(event) => event.id().to_string(),
+            Self::HandoffCreated(descriptor) => json!(descriptor).to_string(),
+            Self::HandoffMetadata {
+                reader,
+                descriptors,
+            } => json!({"reader": reader, "handoffs": descriptors}).to_string(),
+            Self::HandoffBody(body) => format!(
+                "{}\nreader: {}\n{}",
+                body.descriptor.id(),
+                body.reader,
+                safe(body.text.as_str())
+            ),
             Self::Asked(state) => match &state.answer {
                 Some(answer) => message_line(answer),
                 None => format!("{} {}", state.message_id, state.state),
@@ -521,6 +561,9 @@ impl Outcome {
             | Self::Directory(_)
             | Self::Rooms(_)
             | Self::Posted(_)
+            | Self::HandoffCreated(_)
+            | Self::HandoffMetadata { .. }
+            | Self::HandoffBody(_)
             | Self::Events { .. } => 0,
         }
     }

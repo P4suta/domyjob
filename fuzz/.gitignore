@@ -23,6 +23,13 @@ corpus/hook_clients/*
 !corpus/hook_clients/foreign
 !corpus/hook_clients/malformed
 artifacts
+!corpus/handoff_metadata/
+corpus/handoff_metadata/*
+!corpus/handoff_metadata/granted
+!corpus/handoff_metadata/team
+!corpus/handoff_metadata/malformed
+!corpus/handoff_metadata/agent-target
+!corpus/handoff_metadata/team-target
 !corpus/terminal_input/
 corpus/terminal_input/*
 !corpus/terminal_input/unicode

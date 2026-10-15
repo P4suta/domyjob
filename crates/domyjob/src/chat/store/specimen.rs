@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 
 use domyjob_core::chat::card::{Access, Card, MachineCard, Mode, Os, Skills, Tag, Tool};
 use domyjob_core::chat::event::{Body, Chain, Event, Intent, Members, Outcome, Sealed, Stamp};
+use domyjob_core::chat::handoff::{Descriptor, Metadata, Project, ReadLimit, Scope, Target};
 use domyjob_core::chat::id::{
     AgentId, AgentName, Conversation, EventId, Line, Origin, Paragraph, RoomId, RoomName, Text,
 };
@@ -35,10 +36,12 @@ const fn kind(body: &Body) -> &'static str {
         Body::Omitted {} => "omitted",
         Body::Receipt { .. } => "receipt",
         Body::Activity { .. } => "activity",
+        Body::Handoff { .. } => "handoff",
+        Body::HandoffRead { .. } => "handoff_read",
     }
 }
 
-const KINDS: [&str; 11] = [
+const KINDS: [&str; 13] = [
     "profile",
     "left",
     "machine",
@@ -50,6 +53,8 @@ const KINDS: [&str; 11] = [
     "omitted",
     "receipt",
     "activity",
+    "handoff",
+    "handoff_read",
 ];
 
 fn origin(digit: char) -> Origin {
@@ -270,9 +275,49 @@ fn events() -> Vec<Event> {
     directory_bodies()
         .into_iter()
         .chain(thread_bodies())
+        .chain(handoff_bodies())
         .zip(1_u64..)
         .map(|((digit, body), seq)| Event::new(id(digit, seq), seq, body).unwrap())
         .collect()
+}
+
+fn handoff_bodies() -> Vec<(char, Body)> {
+    let reader = agent("continuing", 'c');
+    let metadata = Metadata::new(
+        agent("asker", 'a'),
+        Target::Agent {
+            agent: agent("responder", 'b'),
+        },
+        (
+            Project::try_from("owner/project".to_owned()).unwrap(),
+            Scope::try_from("issue-47".to_owned()).unwrap(),
+        ),
+        Members::try_from(vec![agent("responder", 'b'), reader.clone()]).unwrap(),
+    )
+    .unwrap();
+    let text = Text::try_from("scoped handoff".to_owned()).unwrap();
+    let descriptor = Descriptor::new(id('a', 1), metadata.clone(), &text).unwrap();
+    let observation = descriptor
+        .authorize(&reader, &descriptor, ReadLimit::MAX)
+        .unwrap()
+        .observation();
+    vec![
+        (
+            'a',
+            Body::Handoff {
+                metadata: metadata.clone(),
+                text,
+                at: Stamp::from_unix_millis(SPECIMEN_MILLIS),
+            },
+        ),
+        (
+            'c',
+            Body::HandoffRead {
+                observation,
+                audience: metadata.audience().clone(),
+            },
+        ),
+    ]
 }
 
 fn specimen() -> String {

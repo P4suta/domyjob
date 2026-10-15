@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use domyjob_core::chat::card::Tool;
+use domyjob_core::chat::handoff::{DeliveryOutcome, observation_after_delivery};
 use domyjob_core::chat::notification::{ResponseDelivery, reading_after_delivery};
 use domyjob_core::ingress;
 
@@ -14,10 +15,12 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::chat::args::{
-    AskArgs, DirectoryArgs, EmptyArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs,
-    ProfileArgs, ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs,
+    AskArgs, DirectoryArgs, EmptyArgs, HandoffCreateArgs, HandoffListArgs, HandoffReadArgs,
+    InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs, ReplyArgs, RoomArgs,
+    SendArgs, StartArgs, ThreadArgs, TopicArgs,
 };
 use crate::chat::ops::{self, OpsError, RoomChange, Session};
+use crate::chat::store::handoff::PendingObservation;
 use crate::chat::view::Outcome;
 
 const VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -33,7 +36,8 @@ const INSTRUCTIONS: &str = "Chat with AI agents on this and other machines. \
 Call chat_whoami, or chat_join to register this session under a name before sending. \
 Use chat_directory to find the agent whose role and skills fit a task, then chat_ask it; \
 chat_ask waits for the answer and chat_wait resumes waiting. \
-Replies go to exact message IDs. Results report `unread`; read them with chat_inbox.";
+Replies go to exact message IDs. Results report `unread`; read them with chat_inbox. \
+For scoped continuation, use chat_handoff_list and chat_handoff_read under your own chat_join identity.";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum McpError {
@@ -317,6 +321,30 @@ tools!(
         |session, args, _client| ops::read_message(session, args)
     ),
     (
+        "chat_handoff_create",
+        "Create handoff",
+        "Create a project-scoped handoff under your identity with explicit named reader grants.",
+        HandoffCreateArgs,
+        Effect::Write,
+        |session, args, _client| ops::create_handoff(session, args)
+    ),
+    (
+        "chat_handoff_list",
+        "List handoffs",
+        "Discover bounded handoff metadata granted to your identity in one exact project and scope.",
+        HandoffListArgs,
+        Effect::Read,
+        |session, args, _client| ops::handoffs(session, args)
+    ),
+    (
+        "chat_handoff_read",
+        "Read handoff",
+        "Read one granted handoff using its exact descriptor and record your observation after delivery.",
+        HandoffReadArgs,
+        Effect::Write,
+        |session, args, _client| ops::read_handoff(session, args)
+    ),
+    (
         "chat_acknowledge",
         "Acknowledge",
         "Acknowledge an addressed message and release its urgent stop block.",
@@ -342,21 +370,48 @@ struct Server<W> {
     calls: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
 }
 
-struct ReadCompletion {
+enum PendingDelivery {
+    Messages(Box<ops::PendingRead>),
+    Handoff(Box<PendingObservation>),
+}
+
+impl PendingDelivery {
+    const fn admits(&self, delivered: ResponseDelivery, cancelled: bool) -> bool {
+        match self {
+            Self::Messages(_) => reading_after_delivery(delivered, cancelled),
+            Self::Handoff(_) => observation_after_delivery(
+                match delivered {
+                    ResponseDelivery::Original => DeliveryOutcome::OriginalBody,
+                    ResponseDelivery::Replaced => DeliveryOutcome::Replaced,
+                },
+                cancelled,
+            ),
+        }
+    }
+
+    fn complete(self, session: &Session) -> Result<(), OpsError> {
+        match self {
+            Self::Messages(pending) => ops::complete_read(session, &pending),
+            Self::Handoff(pending) => ops::observe_handoff(session, &pending),
+        }
+    }
+}
+
+struct DeliveryCompletion {
     session: Session,
-    pending: ops::PendingRead,
+    pending: PendingDelivery,
 }
 
 struct CallReply {
     value: Value,
-    reading: Option<ReadCompletion>,
+    completion: Option<DeliveryCompletion>,
 }
 
 impl From<Value> for CallReply {
     fn from(value: Value) -> Self {
         Self {
             value,
-            reading: None,
+            completion: None,
         }
     }
 }
@@ -376,6 +431,25 @@ fn client_tool(params: &Value) -> Option<Tool> {
     } else {
         None
     }
+}
+
+fn rendered_outcome_using(
+    outcome: &Outcome,
+    unread: impl FnOnce() -> Result<Option<usize>, OpsError>,
+) -> Value {
+    let mut value = outcome.json();
+    if outcome.pending_read().is_some()
+        || matches!(
+            outcome,
+            Outcome::HandoffCreated(_) | Outcome::HandoffMetadata { .. } | Outcome::HandoffBody(_)
+        )
+    {
+        return value;
+    }
+    if let (Value::Object(fields), Ok(Some(count))) = (&mut value, unread()) {
+        fields.insert("unread".to_owned(), json!(count));
+    }
+    value
 }
 
 impl<W: Write + Send> Server<W> {
@@ -443,14 +517,16 @@ impl<W: Write + Send> Server<W> {
         }
         let (value, pending) = match outcome {
             Ok(outcome) => {
-                let pending = outcome.pending_read().cloned();
-                let mut value = outcome.json();
-                if pending.is_none()
-                    && let (Value::Object(fields), Ok(Some(unread))) =
-                        (&mut value, ops::unread(&session))
-                {
-                    fields.insert("unread".to_owned(), json!(unread));
-                }
+                let pending = outcome.pending_read().cloned().map_or_else(
+                    || {
+                        outcome
+                            .pending_handoff()
+                            .cloned()
+                            .map(|pending| PendingDelivery::Handoff(Box::new(pending)))
+                    },
+                    |pending| Some(PendingDelivery::Messages(Box::new(pending))),
+                );
+                let value = rendered_outcome_using(&outcome, || ops::unread(&session));
                 (
                     result(
                         id,
@@ -474,7 +550,7 @@ impl<W: Write + Send> Server<W> {
         };
         Some(CallReply {
             value,
-            reading: pending.map(|pending| ReadCompletion { session, pending }),
+            completion: pending.map(|pending| DeliveryCompletion { session, pending }),
         })
     }
 
@@ -484,10 +560,12 @@ impl<W: Write + Send> Server<W> {
         }
         let delivered = self.send(&reply.value)?;
         let _calls = lock(&self.calls);
-        if reading_after_delivery(delivered, cancelled.load(Ordering::Acquire))
-            && let Some(reading) = reply.reading
+        if let Some(completion) = reply.completion
+            && completion
+                .pending
+                .admits(delivered, cancelled.load(Ordering::Acquire))
         {
-            ops::complete_read(&reading.session, &reading.pending)?;
+            completion.pending.complete(&completion.session)?;
         }
         Ok(())
     }

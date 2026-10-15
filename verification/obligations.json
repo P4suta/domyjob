@@ -5,6 +5,30 @@
   "apalache_version": "0.56.1",
   "harnesses": [
     {
+      "name": "chat::handoff::decision::proofs::only_a_delivered_uncancelled_body_records_an_observation",
+      "covers": 4,
+      "contract": "Only the original successfully delivered body of an uncancelled call authorizes a handoff reader observation.",
+      "input_domain": "Both production delivery dispositions and every cancellation boolean: all four combinations.",
+      "bound": "No loops or assumptions; native response write, newline, flush, oversized-reply replacement and cancellation ordering are separately injected through the actual MCP completion port.",
+      "production": "MCP completion calls chat::handoff::observation_after_delivery with the actual send disposition and cancellation state before ops::observe_handoff commits its private pending reader capability."
+    },
+    {
+      "name": "chat::handoff::decision::proofs::reads_require_the_exact_grant_scope_and_bound",
+      "covers": 9,
+      "contract": "The acting reader reaches a handoff body only for a matching project, scope and complete selected descriptor, an explicit named grant, and a nonzero body fitting a valid bounded read.",
+      "input_domain": "Every project/scope match boolean, both descriptor and reader-grant enums, and all usize body and read-limit values.",
+      "bound": "No loops or assumptions; native typed equality, validated identity/context ingress, immutable EventId lookup and metadata-only projection refinement are checked by native fixtures and metadata corpus replay, without an OS or cryptographic identity theorem.",
+      "production": "chat::handoff::Descriptor::authorize derives facts from actual stored metadata and Session::me before chat::store::handoff::load_using calls the exact body-fetch port; Permit::check_body checks the fetched EventId, metadata and UTF-8 byte length."
+    },
+    {
+      "name": "chat::handoff::decision::proofs::observations_require_the_actual_author_and_grant",
+      "covers": 6,
+      "contract": "An observation requires its exact parent, actual reader issuer, explicit named grant, unchanged source audience and a strictly later Lamport clock.",
+      "input_domain": "Every parent/issuer/audience match boolean, both grant enums, and all u64 parent and observation clocks.",
+      "bound": "No loops or assumptions; Session actor binding, origin-authenticated peer trust, output flush, redb atomic commit and process crashes remain native adapter contracts.",
+      "production": "chat::ledger::handoff_read builds the actual descriptor from the referenced parent event and calls Descriptor::admit_observation; native ops::observe_handoff checks Session::me and commits a private pending observation only after successful response output."
+    },
+    {
       "source": null,
       "name": "chat::ledger::parent_identity::proofs::canonical_parent_hex_encoder_preserves_the_exact_full_domain",
       "covers": 2,
@@ -567,6 +591,21 @@
   "negatives": [
     {
       "source": null,
+      "harness": "chat::handoff::decision::proofs::rejects_an_observation_for_a_replaced_body",
+      "assertion": "NEGATIVE_HANDOFF_DELIVERY_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "chat::handoff::decision::proofs::rejects_ungranted_handoff_body_access",
+      "assertion": "NEGATIVE_HANDOFF_READ_CONTROL"
+    },
+    {
+      "source": null,
+      "harness": "chat::handoff::decision::proofs::rejects_a_foreign_handoff_reader_observation",
+      "assertion": "NEGATIVE_HANDOFF_OBSERVATION_CONTROL"
+    },
+    {
+      "source": null,
       "harness": "chat::ledger::parent_identity::proofs::rejects_a_changed_parent_hex_encoder_value",
       "assertion": "NEGATIVE_PARENT_HEX_ENCODER"
     },
@@ -782,6 +821,12 @@
     }
   ],
   "boundaries": [
+    {
+      "source": "crates/domyjob/src/chat/store/handoff.rs",
+      "reason": "The source-bound scalar decisions do not establish redb durability, peer origin authentication, local actor binding, immutable event storage or output-stream completion. Dedicated metadata indexes are derived atomically from admitted actual handoff events and body lookup occurs only after the production descriptor admission.",
+      "evidence": "Native handoff fixtures cover body-corrupt metadata discovery, denied-reader body-port nonreachability, actual-reader observation and transaction rollback, foreign-peer omission, previous-inbox denial, own-identity scoped continuation, all three prior store formats and identity reset. Actual MCP serve_io and completion fixtures inject payload/newline/flush faults, before/during-flush cancellation, oversized-result substitution, global actor rebound and ungranted same-name identity; only the original successfully flushed uncancelled body commits its bound actual-reader observation.",
+      "reconsider": "Peer trust or local identity admission changes, a native metadata/body or output/commit ordering fixture fails, or a supported verifier models the actual database and external stream boundary."
+    },
     {
       "source": "crates/domyjob/tests/e2e/os/windows/input_reader.rs",
       "reason": "The source-bound decision and counted-port proofs do not establish PowerShell compilation time, filesystem publication, monotonic-clock scheduling, windows-spawn creation-time Job attachment, or Win32 accounting/termination. A retained fresh Job is attached during process creation before PowerShell can launch compiler children; the original native reader and binary channels are unchanged.",

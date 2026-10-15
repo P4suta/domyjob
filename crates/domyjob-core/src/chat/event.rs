@@ -6,6 +6,7 @@ use core::num::NonZeroU64;
 use serde::{Deserialize, Serialize};
 
 use super::card::{Card, MachineCard};
+use super::handoff::{Metadata as HandoffMetadata, Observation as HandoffObservation};
 use super::id::{
     AgentId, AgentName, Audience, Conversation, EventId, Invalid, Line, Origin, RoomName, Text,
 };
@@ -191,6 +192,15 @@ pub enum Body {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notice: Option<Notice>,
     },
+    Handoff {
+        metadata: HandoffMetadata,
+        text: Text,
+        at: Stamp,
+    },
+    HandoffRead {
+        observation: HandoffObservation,
+        audience: Audience,
+    },
     Receipt {
         request: EventId,
         conversation: Conversation,
@@ -248,13 +258,29 @@ impl Body {
             | Self::Room { .. }
             | Self::RoomClosed { .. }
             | Self::Activity { .. }
+            | Self::Handoff { .. }
+            | Self::HandoffRead { .. }
             | Self::Omitted {} => None,
         }
     }
 
     #[must_use]
     pub fn audience(&self) -> Option<&Audience> {
-        self.thread().map(|(_, audience)| audience)
+        match self {
+            Self::Handoff { metadata, .. } => Some(metadata.audience()),
+            Self::HandoffRead { audience, .. } => Some(audience),
+            Self::Profile { .. }
+            | Self::Left { .. }
+            | Self::Machine { .. }
+            | Self::Room { .. }
+            | Self::RoomClosed { .. }
+            | Self::Message { .. }
+            | Self::Receipt { .. }
+            | Self::Activity { .. }
+            | Self::TurnStarted { .. }
+            | Self::Resolved { .. }
+            | Self::Omitted {} => self.thread().map(|(_, audience)| audience),
+        }
     }
 
     #[must_use]
@@ -264,6 +290,9 @@ impl Body {
 
     #[must_use]
     pub const fn request(&self) -> Option<&EventId> {
+        if let Self::HandoffRead { observation, .. } = self {
+            return Some(observation.handoff());
+        }
         if let Self::Message {
             intent: Intent::Reply { request },
             ..
@@ -288,6 +317,8 @@ impl Body {
             | Self::Resolved { agent, .. }
             | Self::Receipt { agent, .. }
             | Self::Activity { agent, .. } => Some(agent),
+            Self::Handoff { metadata, .. } => Some(metadata.sender().name()),
+            Self::HandoffRead { observation, .. } => Some(observation.reader().name()),
             Self::Machine { .. }
             | Self::Room { .. }
             | Self::RoomClosed { .. }
@@ -382,6 +413,19 @@ impl Event {
     pub fn new(id: EventId, clock: u64, body: Body) -> Result<Self, Invalid> {
         if clock == 0 || clock == u64::MAX {
             return Err(Invalid("event clock"));
+        }
+        if let Body::Handoff { metadata, .. } = &body
+            && metadata.sender().origin() != id.origin()
+        {
+            return Err(Invalid("handoff sender origin"));
+        }
+        if let Body::HandoffRead {
+            observation,
+            audience,
+        } = &body
+            && (observation.reader().origin() != id.origin() || !audience.includes(id.origin()))
+        {
+            return Err(Invalid("handoff observation author or audience"));
         }
         if let Some((conversation, audience)) = body.thread() {
             let author = body

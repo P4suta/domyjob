@@ -26,6 +26,8 @@ use crate::platform::clock::{self, Deadline};
 
 pub(crate) mod reads;
 pub(crate) use reads::{PendingRead, complete_read};
+pub(crate) mod handoff;
+pub(crate) use handoff::{create_handoff, handoffs, observe_handoff, read_handoff};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpsError {

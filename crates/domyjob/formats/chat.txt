@@ -20,6 +20,9 @@ table delivery: &'static str => &'static str
 table activity: &'static str => &'static str
 table escalations: &'static str => &'static str
 table urgent: &'static str => &'static str
+table handoff_headers: &'static str => &'static str
+table handoff_readers: &'static str => &'static str
+table handoff_reads: &'static str => &'static str
 table peers: &'static str => &'static str
 table links: &'static str => &'static str
 key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000001
@@ -108,6 +111,12 @@ key order 0000000000000014:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000014
 key thread "dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u{1f}0000000000000014:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000014"
 key joined "asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 event {"origin":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":20,"clock":20,"body":{"kind":"resolved","request":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000007","conversation":"dm:asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"agent":"asker","outcome":"withdrawn"}}
+key event aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000015
+key order 0000000000000015:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000015
+event {"origin":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":21,"clock":21,"body":{"kind":"handoff","metadata":{"sender":"asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","intended_recipient":{"kind":"agent","agent":"responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"project":"owner/project","scope":"issue-47","permitted_readers":["responder@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","continuing@cccccccccccccccccccccccccccccccc"]},"text":"scoped handoff","at":1700000000000}}
+key event cccccccccccccccccccccccccccccccc:0000000000000016
+key order 0000000000000016:cccccccccccccccccccccccccccccccc:0000000000000016
+event {"origin":"cccccccccccccccccccccccccccccccc","seq":22,"clock":22,"body":{"kind":"handoff_read","observation":{"handoff":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0000000000000001","reader":"continuing@cccccccccccccccccccccccccccccccc"},"audience":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","cccccccccccccccccccccccccccccccc"]}}
 key room room:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:release
 record card {"display_name":"Reviewer","role":"reviewer","description":"Reviews Rust changes.","skills":["rust"],"project":"domyjob","status":"reviewing","tool":"codex","mode":"managed","access":"read"}
 record room {"topic":"the release","members":["asker@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}

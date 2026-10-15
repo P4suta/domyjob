@@ -11,6 +11,7 @@ use crate::lock::{LockError, OsLock};
 use crate::state_io::{self, StateError};
 
 mod admin;
+pub(crate) mod handoff;
 mod notifications;
 pub(crate) mod observer;
 mod tables;
@@ -30,6 +31,8 @@ pub(crate) use views::{
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StoreError {
+    #[error(transparent)]
+    Handoff(#[from] domyjob_core::chat::handoff::ReadRefusal),
     #[error(transparent)]
     State(#[from] StateError),
     #[error(transparent)]

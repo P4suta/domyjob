@@ -53,6 +53,7 @@ fn bump(write: &WriteTransaction, key: &str, amount: u64) -> Result<u64, StoreEr
 
 fn record(write: &WriteTransaction, sealed: &Sealed, cursor: Cursor) -> Result<(), StoreError> {
     let event = sealed.event();
+    super::handoff::record(write, event)?;
     let id = event_key(event.id());
     let order = order_key(event);
     write
@@ -173,6 +174,9 @@ fn project(write: &WriteTransaction, event: &Event, change: Change) -> Result<()
         }
         Change::Activity { agent, activity } => {
             upsert(write, ACTIVITY, &agent.to_string(), Some(&activity))?;
+        }
+        Change::HandoffRead { request, agent } => {
+            super::handoff::record_read(write, &agent, &request, event.id())?;
         }
     }
     Ok(())

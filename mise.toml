@@ -96,7 +96,7 @@ description = "Check protocol induction and replay 100 fixed-seed Quint traces"
 run = "cargo xtask verify models"
 
 [tasks."fuzz:replay"]
-description = "Replay twelve preserved wire, source, process-group, notification, and hook seeds"
+description = "Replay preserved production ingress corpora"
 run = "cargo xtask verify fuzz"
 
 [tasks.miri]

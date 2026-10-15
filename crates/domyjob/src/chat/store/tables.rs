@@ -51,6 +51,9 @@ tables! {
     ACTIVITY: &'static str => &'static str = "activity";
     ESCALATIONS: &'static str => &'static str = "escalations";
     URGENT: &'static str => &'static str = "urgent";
+    HANDOFF_HEADERS: &'static str => &'static str = "handoff_headers";
+    HANDOFF_READERS: &'static str => &'static str = "handoff_readers";
+    HANDOFF_READS: &'static str => &'static str = "handoff_reads";
     PEERS: &'static str => &'static str = "peers";
     LINKS: &'static str => &'static str = "links";
 }

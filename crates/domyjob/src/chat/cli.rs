@@ -7,8 +7,9 @@ use domyjob_core::chat::id::{Conversation, EventId};
 use serde_json::json;
 
 use super::args::{
-    AskArgs, DirectoryArgs, HookArgs, InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs,
-    ProfileArgs, ReplyArgs, RoomArgs, SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
+    AskArgs, DirectoryArgs, HandoffCreateArgs, HandoffListArgs, HandoffReadArgs, HookArgs,
+    InboxArgs, JoinArgs, MemberArgs, MessageArgs, NameArgs, ProfileArgs, ReplyArgs, RoomArgs,
+    SendArgs, StartArgs, ThreadArgs, TopicArgs, UpdateArgs,
 };
 use super::ops::{self, OpsError, RoomChange, Session};
 use super::pulse::{Pulse, PulseError};
@@ -38,6 +39,11 @@ pub(crate) struct ChatArgs {
 
 #[derive(Debug, Subcommand)]
 enum ChatCommand {
+    #[command(about = "Create or read a scoped handoff under the acting agent's own identity")]
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommand,
+    },
     #[command(
         about = "Pin peers, start the background service, and register the MCP server with AI clients"
     )]
@@ -124,6 +130,16 @@ struct SetupArgs {
     #[arg(long)]
     #[arg(help = "Do not register the MCP server with Claude Code, Codex, or OpenCode")]
     no_clients: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum HandoffCommand {
+    #[command(about = "Publish a handoff with explicit named reader grants")]
+    Create(HandoffCreateArgs),
+    #[command(about = "Discover bounded metadata without reading handoff bodies")]
+    List(HandoffListArgs),
+    #[command(about = "Read the selected body and record the acting reader after output succeeds")]
+    Read(HandoffReadArgs),
 }
 
 impl SetupArgs {
@@ -313,6 +329,7 @@ fn machine(
         ChatCommand::Reset { yes: true } => reset(out).map(Ok),
         ChatCommand::Clean { target } => clean(target, out).map(Ok),
         other @ (ChatCommand::Directory(_)
+        | ChatCommand::Handoff { .. }
         | ChatCommand::Whoami
         | ChatCommand::Profile(_)
         | ChatCommand::Status { .. }
@@ -449,6 +466,9 @@ const fn reads(command: &ChatCommand) -> bool {
     matches!(
         command,
         ChatCommand::Directory(_)
+            | ChatCommand::Handoff {
+                command: HandoffCommand::List(_) | HandoffCommand::Read(_)
+            }
             | ChatCommand::Whoami
             | ChatCommand::Inbox(_)
             | ChatCommand::Read(_)
@@ -465,6 +485,11 @@ const fn reads(command: &ChatCommand) -> bool {
 
 fn act(session: &mut Session, command: ChatCommand) -> Result<Outcome, OpsError> {
     Ok(match command {
+        ChatCommand::Handoff { command } => match command {
+            HandoffCommand::Create(args) => ops::create_handoff(session, &args)?,
+            HandoffCommand::List(args) => ops::handoffs(session, &args)?,
+            HandoffCommand::Read(args) => ops::read_handoff(session, &args)?,
+        },
         ChatCommand::Directory(args)
         | ChatCommand::Agent {
             command: AgentCommand::List(args),
@@ -595,8 +620,15 @@ fn deliver_outcome(
     if let Some(pending) = outcome.pending_read() {
         ops::complete_read(session, pending)?;
     }
+    if let Some(pending) = outcome.pending_handoff() {
+        ops::observe_handoff(session, pending)?;
+    }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cli/handoff_tests.rs"]
+mod handoff_tests;
 
 fn hook_using(
     session: &Session,
