@@ -47,7 +47,7 @@ fn shown(text: &str) -> String {
 fn age(observed: Option<u64>, now: Option<u64>, limit: u64) -> String {
     match dashboard::freshness(observed, now, limit) {
         Freshness::Unknown => "unknown · no reliable observation".to_owned(),
-        Freshness::Fresh(millis) => format!("fresh · {}s ago", millis / MILLIS_PER_SECOND),
+        Freshness::Fresh(_) => "fresh".to_owned(),
         Freshness::Stale(millis) => format!("stale · {}s ago", millis / MILLIS_PER_SECOND),
     }
 }
@@ -91,12 +91,15 @@ fn header_view(
     if viewport == Viewport::Sidebar {
         brand.push(Span::styled(" HUMAN DASHBOARD  ", emphasis(INK)));
     }
+    let chats = model.request.actor.as_ref().map_or_else(
+        || "chats: choose agent".to_owned(),
+        |_| format!("{} chats", model.snapshot.chats.len()),
+    );
     brand.push(Span::styled(
         format!(
-            " {} machines · {} agents · {} chats",
+            " {} machines · {} agents · {chats}",
             model.snapshot.machines.len(),
             model.snapshot.agents.len(),
-            model.snapshot.chats.len(),
         ),
         Style::default().fg(MINT),
     ));
@@ -140,14 +143,12 @@ fn footer_view(
     now: Option<u64>,
 ) {
     let hint = if viewport == Viewport::Sidebar {
-        " Tab sections  ↑↓/jk rows  Enter detail  / search  a identity  r refresh  ? help  q exit"
+        " Tab sections  ↑↓/jk rows  Enter detail  / search  a choose agent  r refresh  ? help  q exit"
     } else {
         " q exit · ? help · Tab sections · Enter detail"
     };
     let status = if let Some(error) = model.error.as_deref() {
         format!(" Refresh error · {} · prior data retained", shown(error))
-    } else if model.refresh.pending().is_some() {
-        " Refreshing local observations…".to_owned()
     } else {
         format!(
             " {} · passive local view",
@@ -304,9 +305,11 @@ fn rows(frame: &mut Grid, area: Rect, model: &Model, now: Option<u64>) {
 
 fn empty(model: &Model) -> &'static str {
     if model.section == Section::Chats && model.request.actor.is_none() {
-        "Choose a viewing identity with a.\nBrowsing keeps read status unchanged."
+        "Choose an agent with a to view chats.\nBrowsing keeps read status unchanged."
     } else if !model.query.is_empty() {
         "No rows match this search.\nEsc clears the search."
+    } else if model.section == Section::Chats {
+        "No conversations to show for this agent.\nOnly domyjob messages appear here.\na chooses another agent."
     } else {
         "No observations yet.\nExisting local state appears here.\nr refreshes the view."
     }
@@ -564,7 +567,7 @@ fn message_detail(messages: &[observer::Message]) -> Vec<Line> {
         lines.push(Line::from(""));
     }
     if lines.is_empty() {
-        lines.push(Line::from("No messages in the observed recent page."));
+        lines.push(Line::from("No messages to display."));
     }
     lines
 }
@@ -581,17 +584,17 @@ fn help(frame: &mut Grid, area: Rect) {
     let area = modal(area);
     let area = panel(frame, area, " Keyboard guide · any key closes ");
     frame.paragraph(area, &lines(
-        "Tab           Machines / Agents / Chats\n↑↓ or j/k     Move selection\nEnter         Open detail\nPgUp/PgDn     Scroll detail\n/             Search · Enter confirms\nEsc           Clear search / back\na             Choose viewing identity\nr             Refresh local observations\n?             Open help · any key closes\nq             Exit\n\nViewing keeps read and activity status unchanged.\nChoose an existing identity to inspect its conversations."
+        "Tab           Machines / Agents / Chats\n↑↓ or j/k     Move selection\nEnter         Open detail\nPgUp/PgDn     Scroll detail\n/             Search · Enter confirms\nEsc           Clear search / back\na             Choose agent for Chats\nr             Refresh local observations\n?             Open help · any key closes\nq             Exit\n\nViewing keeps read and activity status unchanged.\nIn Chats, choose a local agent and press Enter.\nSelect a conversation and press Enter to read it."
     ), Flow { style: Style::default().fg(INK).bg(PANEL), scroll: 0, wrap: Wrap::Fold });
 }
 
 fn picker(frame: &mut Grid, area: Rect, model: &Model, position: usize) {
     let area = modal(area);
     if model.snapshot.local_agents.is_empty() {
-        let area = panel(frame, area, " Viewing identity ");
+        let area = panel(frame, area, " Choose agent for chats ");
         frame.paragraph(
             area,
-            &lines("No registered local identities.\nEsc returns to the public directory."),
+            &lines("No local agents registered.\nOnly domyjob messages appear here.\nEsc closes this picker."),
             Flow {
                 style: Style::default().fg(INK).bg(PANEL),
                 scroll: 0,
@@ -611,7 +614,7 @@ fn picker(frame: &mut Grid, area: Rect, model: &Model, position: usize) {
             ]
         })
         .collect::<Vec<_>>();
-    let area = panel(frame, area, " Viewing identity · Enter select · Esc back ");
+    let area = panel(frame, area, " Choose agent · Enter select · Esc back ");
     frame.list(
         area,
         &items,

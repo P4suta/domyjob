@@ -4,7 +4,7 @@ use crate::tui::frame::{Cell, Grid as Buffer};
 use domyjob_core::chat::card::{Access, Card, MachineCard, Mode, Os, Skills, Tool};
 use domyjob_core::chat::event::Stamp;
 use domyjob_core::chat::id::{AgentId, AgentName, Conversation, EventId, Line, Origin};
-use domyjob_core::chat::notification::{Activity, ActivityState, Delivery};
+use domyjob_core::chat::notification::{Activity, ActivityState, Delivery, MILLIS_PER_SECOND};
 use domyjob_core::dashboard::{self, Section};
 
 use super::{CYAN, MINT, Model, NAVY, RowId, draw};
@@ -196,7 +196,38 @@ fn every_responsive_frame_keeps_navigation_freshness_and_viewing_identity_visibl
 }
 
 #[test]
-fn errors_stale_observations_clock_rollback_and_pending_refresh_have_distinct_labels() {
+fn unchanged_observations_keep_frames_stable_across_ticks_and_background_refreshes() {
+    for section in [Section::Machines, Section::Agents, Section::Chats] {
+        for size in [(128, 36), (48, 12)] {
+            for detail in [false, true] {
+                let mut model = populated();
+                model.section = section;
+                model.detail = detail;
+                model.selected = None;
+                model.reconcile();
+                let expected = screen(&model, size, OBSERVED);
+                for elapsed in [0, MILLIS_PER_SECOND - 1, MILLIS_PER_SECOND] {
+                    assert_eq!(screen(&model, size, OBSERVED + elapsed), expected);
+                }
+                let now = OBSERVED + MILLIS_PER_SECOND;
+                let generation = model.refresh.request().unwrap();
+                assert_eq!(screen(&model, size, now), expected);
+                let mut next = populated().snapshot;
+                next.observed = Some(now);
+                model.accept(generation, &model.request.clone(), Ok(next));
+                assert_eq!(screen(&model, size, now), expected);
+
+                model.snapshot.observed = None;
+                let unknown = screen_at(&model, size, None);
+                model.refresh.request().unwrap();
+                assert_eq!(screen_at(&model, size, None), unknown);
+            }
+        }
+    }
+}
+
+#[test]
+fn errors_stale_observations_and_clock_rollback_have_distinct_labels() {
     let mut model = populated();
     assert!(
         text(&screen(
@@ -208,7 +239,7 @@ fn errors_stale_observations_clock_rollback_and_pending_refresh_have_distinct_la
     );
     assert!(text(&screen(&model, (128, 36), OBSERVED - 1)).contains("unknown"));
     model.refresh.request().unwrap();
-    assert!(text(&screen(&model, (128, 36), OBSERVED)).contains("Refreshing"));
+    assert!(!text(&screen(&model, (128, 36), OBSERVED)).contains("Refreshing"));
     model.error = Some("connection\u{1b}[31m refused\u{202e}".to_owned());
     let failed = text(&screen(&model, (128, 36), OBSERVED));
     assert!(failed.contains("Refresh error"));
@@ -362,7 +393,7 @@ fn the_complete_compact_empty_frame_keeps_its_information_hierarchy() {
     const INNER: usize = WIDTH - 2;
     const TITLE_WIDTH: usize = 23;
     let expected = [
-        " DOMYJOB  0 machines · 0 agents · 0 chats".to_owned(),
+        " DOMYJOB  0 machines · 0 agents · chats: choose agent".to_owned(),
         " Viewing public directory · unknown · no reliable observation".to_owned(),
         "─".repeat(WIDTH),
         " Machines  ·  Agents  ·  Chats ".to_owned(),
@@ -421,8 +452,21 @@ fn empty_search_and_identity_restricted_views_explain_the_available_next_action(
     model.query.clear();
     model.section = Section::Chats;
     let public = text(&screen(&model, (128, 36), 0));
-    assert!(public.contains("Choose a viewing identity"));
+    assert!(public.contains("Choose an agent with a"));
+    assert!(public.contains("chats: choose agent"));
+    assert!(!public.contains("0 chats"));
     assert!(public.contains("read status unchanged"));
+    model.request.actor = populated().snapshot.actor;
+    let empty_chats = text(&screen(&model, (128, 36), 0));
+    for expected in [
+        "No conversations to show for this agent",
+        "domyjob messages",
+        "a chooses another agent",
+    ] {
+        assert!(empty_chats.contains(expected));
+    }
+    model.query = "unmatched".to_owned();
+    assert!(text(&screen(&model, (128, 36), 0)).contains("No rows match this search"));
 }
 
 #[test]
@@ -448,7 +492,7 @@ fn help_and_identity_picker_render_controls_without_changing_the_viewing_identit
         "Keyboard guide",
         "PgUp/PgDn",
         "Search",
-        "identity",
+        "Choose agent for Chats",
         "status unchanged",
     ] {
         assert!(help.contains(control), "missing {control}:\n{help}");
@@ -458,11 +502,16 @@ fn help_and_identity_picker_render_controls_without_changing_the_viewing_identit
     model.picker = Some(0);
     let identity = model.snapshot.local_agents.first().unwrap().to_string();
     let picker = text(&screen(&model, (128, 36), OBSERVED));
-    assert!(picker.contains("Viewing identity"));
+    assert!(picker.contains("Choose agent"));
     assert!(picker.contains(&identity));
     assert!(model.request.actor.is_none());
+    let narrow_picker = text(&screen(&model, (48, 12), OBSERVED));
+    assert!(narrow_picker.contains("Enter select"));
+    assert!(narrow_picker.contains("Esc back"));
     model.snapshot.local_agents.clear();
-    assert!(text(&screen(&model, (80, 24), OBSERVED)).contains("No registered local identities"));
+    let empty_picker = text(&screen(&model, (80, 24), OBSERVED));
+    assert!(empty_picker.contains("No local agents registered"));
+    assert!(empty_picker.contains("Esc closes this picker"));
 }
 
 #[test]
