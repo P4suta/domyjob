@@ -17,7 +17,7 @@ Source-after binding runs even after proof refusal and retains both failures whe
 Each proof captures the actual selected Kani proxies, mise and Cargo launchers, linked compiler and toolchain, required backend roles, runtime support files, and exact child version observations before execution.
 The independent after observation still runs after admission, compiler, process, or report refusal and retains both causes when they fail.
 Owned evidence directories retain the raw report and tool observations after the command returns.
-The current source epoch still requires actual native qualification and Parent proof results; implementing these checks does not supply those results.
+Implementing these checks does not supply actual native qualification or Parent proof results.
 This scoped calibration does not certify all registered proofs, other platforms, notice admission, receipt authorization, Question delay, or hook formatting.
 
 `cargo xtask verify parent-identity-component generator|present|absent` selects exactly one of three additive Parent components for native Linux calibration.
@@ -31,16 +31,16 @@ The one-call generator component provides additional diagnostic evidence rather 
 The existing exact normal-code policy, cover and assertion admission, default proof flags, resource bounds, and independent source-after check remain required.
 The physical native tool/configuration binding is enforced for each proof as in the aggregate calibration.
 The original aggregate harness and its six covers remain registered and required by `parent-identity` and full verification.
-Individual component success cannot complete that aggregate, and the prior aggregate timeout remains missing evidence.
+Individual component success cannot complete that aggregate.
 No checked composition or derived-obligation substitution is implemented.
 
 `cargo xtask verify parent-identity-encoder` selects one proof-only arithmetic hexadecimal encoder theorem and its independent `NEGATIVE_PARENT_HEX_ENCODER` control after the required exact exit-policy pair.
 It retains the full inventory, seven-file Parent refinement, actual tool binding, and independent source-after checks.
 The theorem quantifies every u8 input, proves exact equality to the original sixteen-byte lookup, proves the lowercase hexadecimal range, and supplies an inverse for every valid output byte without assumptions.
 Two covers require the zero digit and final lowercase letter to remain reachable.
-The factory maps all thirty-two independent u8 choices through the pointwise-equivalent arithmetic encoder, actual UTF-8 conversion, Origin validation, and EventId construction.
+The factory maps all thirty-two independent u8 choices through the pointwise-equivalent arithmetic encoder, a byte-preserving ASCII mask, checked typed ASCII construction, Origin validation, and EventId construction.
 The separate encoder theorem supplies no factory or aggregate completion by itself.
-The generator-only sixty-second timeout establishes missing evidence without identifying the responsible operation inside the factory.
+Factory and aggregate success each require their own complete report with every byte-preservation assertion and expected cover.
 
 `cargo xtask verify native-default` selects only the fixed tool-qualification inventory after the complete source inventory and Parent refinement checks.
 It requires five positive harnesses, five exact named counterexamples, and twelve covers for the actual imported native-default kernel.

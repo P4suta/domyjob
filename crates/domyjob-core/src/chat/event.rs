@@ -382,11 +382,20 @@ fn valid_ask(
 fn valid_thread(conversation: &Conversation, audience: &Audience, author: &AgentId) -> bool {
     match conversation {
         Conversation::Direct(pair) => {
-            let mut machines: Vec<&Origin> =
-                pair.agents().iter().map(|agent| agent.origin()).collect();
-            machines.sort();
-            machines.dedup();
-            pair.includes(author) && audience.members().iter().eq(machines)
+            let [first, second] = pair.agents();
+            let (first, second) = (first.origin(), second.origin());
+            pair.includes(author)
+                && match first.cmp(second) {
+                    core::cmp::Ordering::Equal => {
+                        matches!(audience.members(), [only] if only == first)
+                    }
+                    core::cmp::Ordering::Less => {
+                        matches!(audience.members(), [lower, upper] if lower == first && upper == second)
+                    }
+                    core::cmp::Ordering::Greater => {
+                        matches!(audience.members(), [lower, upper] if lower == second && upper == first)
+                    }
+                }
         }
         Conversation::Room(_) => true,
     }
@@ -746,6 +755,55 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn direct_threads_require_exact_origins_and_full_agent_identity() {
+        for (first_origin, second_origin) in [('a', 'b'), ('b', 'a'), ('a', 'a')] {
+            let first = agent("alice", first_origin);
+            let second = agent("bob", second_origin);
+            let conversation = Conversation::direct(&first, &second).unwrap();
+            assert_eq!(conversation, Conversation::direct(&second, &first).unwrap());
+            let exact = crate::chat::policy::audience([&first, &second]).unwrap();
+            let outsiders = [
+                agent("mallory", first_origin),
+                agent("mallory", second_origin),
+            ];
+            for author in [&first, &second] {
+                assert!(super::valid_thread(&conversation, &exact, author));
+            }
+            for author in &outsiders {
+                assert!(!super::valid_thread(&conversation, &exact, author));
+            }
+            let extra =
+                crate::chat::policy::audience([&first, &second, &agent("carol", 'c')]).unwrap();
+            let wrong = crate::chat::policy::audience([&agent("carol", 'c')]).unwrap();
+            for audience in [&extra, &wrong] {
+                assert!(!super::valid_thread(&conversation, audience, &first));
+            }
+            if first_origin != second_origin {
+                let missing = crate::chat::policy::audience([&first]).unwrap();
+                assert!(!super::valid_thread(&conversation, &missing, &first));
+                let substituted =
+                    crate::chat::policy::audience([&first, &agent("carol", 'c')]).unwrap();
+                assert!(!super::valid_thread(&conversation, &substituted, &first));
+            }
+        }
+    }
+
+    #[test]
+    fn room_thread_validation_leaves_author_and_audience_admission_to_the_caller() {
+        let owner = agent("alice", 'a');
+        let conversation = Conversation::Room(crate::chat::id::RoomId::new(
+            owner.origin().clone(),
+            crate::chat::id::RoomName::try_from(alloc::string::String::from("work")).unwrap(),
+        ));
+        let audience = crate::chat::policy::audience([&owner]).unwrap();
+        assert!(super::valid_thread(
+            &conversation,
+            &audience,
+            &agent("outsider", 'c')
+        ));
     }
 
     #[test]
