@@ -324,11 +324,43 @@ pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
     let mut leftovers = Vec::new();
     for entry in entries.take(EMPTY_LIMIT) {
         let path = entry.map_err(|error| io_at(trash, error))?.path();
-        if let Err(error) = raw::remove_dir_all(&path) {
-            leftovers.push(Leftover { path, error });
+        match raw::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(denied) if denied.kind() == ErrorKind::PermissionDenied => {
+                let retried = match writable(&path) {
+                    Ok(()) => raw::remove_dir_all(&path),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = retried {
+                    let error = io::Error::new(
+                        error.kind(),
+                        format!("{denied}, and after granting the owner write access: {error}"),
+                    );
+                    leftovers.push(Leftover { path, error });
+                }
+            }
+            Err(error) => leftovers.push(Leftover { path, error }),
         }
     }
     Ok(leftovers)
+}
+
+fn writable(root: &Path) -> io::Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let metadata = fs::symlink_metadata(&directory)?;
+        if !metadata.is_dir() || platform::reparse_point(&metadata) {
+            continue;
+        }
+        platform::grant_owner_write(&directory, &metadata)?;
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
@@ -339,6 +371,28 @@ pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
 #[cfg(test)]
 mod tests {
     use super::{open_read, read_bytes, remove_file, write_bytes};
+
+    #[test]
+    fn trash_with_read_only_directories_empties_in_one_pass() {
+        let root = tempfile::tempdir().expect("temporary state root");
+        let trash = root.path().join("trash");
+        super::private_dir(&trash).expect("trash directory");
+        let entry = trash.join("job");
+        let checkout = entry.join("workspace").join("checkout");
+        let nested = checkout.join("docs");
+        crate::testing::write(&nested.join("readme"), "text");
+        crate::testing::write(&checkout.join("tracked"), "text");
+        for directory in [&nested, &checkout] {
+            crate::testing::protect(directory);
+        }
+        assert!(super::empty(&trash).expect("emptied trash").is_empty());
+        assert_eq!(
+            std::fs::symlink_metadata(&entry)
+                .map_err(|error| error.kind())
+                .err(),
+            Some(std::io::ErrorKind::NotFound)
+        );
+    }
 
     #[test]
     fn state_readers_refuse_directories_with_their_paths() {

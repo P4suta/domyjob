@@ -76,6 +76,13 @@ impl System for Unix {
         raw::set_permissions(path, fs::Permissions::from_mode(PUBLIC_EXECUTABLE_MODE))
     }
 
+    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+        raw::set_permissions(
+            path,
+            fs::Permissions::from_mode(metadata.permissions().mode() | PRIVATE_DIRECTORY_MODE),
+        )
+    }
+
     fn file_mode(metadata: &fs::Metadata) -> u32 {
         if metadata.permissions().mode() & EXECUTE_BITS == 0 {
             PUBLIC_FILE_MODE

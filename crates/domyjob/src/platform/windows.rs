@@ -59,6 +59,10 @@ impl System for Windows {
         Ok(())
     }
 
+    fn grant_owner_write(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
+        Ok(())
+    }
+
     fn file_mode(_metadata: &fs::Metadata) -> u32 {
         const NON_EXECUTABLE_FILE_MODE: u32 = 0o644;
         NON_EXECUTABLE_FILE_MODE
