@@ -86,6 +86,28 @@ jobs:
           github-token: ${{ github.token }}
           merge-multiple: true
           path: dist
+      - name: Fetch notarize_macos credentials
+        id: doppler_notarize_macos_3
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_NOTARIZE_MACOS_IDENTITY_ID }}
+          doppler-project: domyjob
+          doppler-config: notarize_macos
+          inject-env-vars: false
+      - name: Reject missing or unresolved notarize_macos credentials
+        if: >-
+          ${{ steps.doppler_notarize_macos_3.outcome == 'success' && (
+          steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_ISSUER_ID == '' ||
+          startsWith(steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_ISSUER_ID, '${') ||
+          steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY == '' ||
+          startsWith(steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY, '${') ||
+          steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY_ID == '' ||
+          startsWith(steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY_ID, '${')
+          ) }}
+        shell: bash
+        run: exit 1
+
       - name: Verify provenance, check existing submissions, and finalize accepted bytes
         id: finalize
         env:
@@ -93,9 +115,9 @@ jobs:
           QUEUE_RUN_ID: ${{ matrix.run_id }}
           QUEUE_RUN_ATTEMPT: ${{ matrix.run_attempt }}
           QUEUE_ARTIFACT_ID: ${{ matrix.artifact_id }}
-          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY: ${{ steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ steps.doppler_notarize_macos_3.outputs.APPLE_NOTARY_ISSUER_ID }}
         run: cargo xtask release queue finalize
       - name: Attest the stapled packages and their derivation from the original build
         if: steps.finalize.outputs.accepted == 'true' && steps.finalize.outputs.modern == 'true' && steps.finalize.outputs.reused_ready != 'true'
@@ -112,6 +134,29 @@ jobs:
           path: ready/*
           if-no-files-found: error
           retention-days: 14
+      - name: Fetch notarize_macos credentials
+        id: doppler_notarize_macos_6
+        if: "steps.finalize.outputs.accepted == 'true' && steps.finalize.outputs.modern == 'true'"
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_NOTARIZE_MACOS_IDENTITY_ID }}
+          doppler-project: domyjob
+          doppler-config: notarize_macos
+          inject-env-vars: false
+      - name: Reject missing or unresolved notarize_macos credentials
+        if: >-
+          ${{ steps.doppler_notarize_macos_6.outcome == 'success' && (
+          steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_ISSUER_ID == '' ||
+          startsWith(steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_ISSUER_ID, '${') ||
+          steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY == '' ||
+          startsWith(steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY, '${') ||
+          steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY_ID == '' ||
+          startsWith(steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY_ID, '${')
+          ) }}
+        shell: bash
+        run: exit 1
+
       - name: Verify ready provenance and publish only the original protected tag
         if: steps.finalize.outputs.accepted == 'true' && steps.finalize.outputs.modern == 'true'
         env:
@@ -119,9 +164,9 @@ jobs:
           QUEUE_RUN_ID: ${{ matrix.run_id }}
           QUEUE_RUN_ATTEMPT: ${{ matrix.run_attempt }}
           QUEUE_ARTIFACT_ID: ${{ matrix.artifact_id }}
-          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY: ${{ steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ steps.doppler_notarize_macos_6.outputs.APPLE_NOTARY_ISSUER_ID }}
         run: cargo xtask release queue publish
       - name: Preserve the accepted original distribution
         if: steps.finalize.outputs.accepted == 'true'

@@ -54,6 +54,7 @@ jobs:
     timeout-minutes: 60
     environment: release
     permissions:
+      id-token: write
       contents: read
     strategy:
       fail-fast: false
@@ -82,31 +83,91 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo xtask release build
+      - name: Fetch sign_macos credentials
+        id: doppler_sign_macos_3
+        if: "runner.os == 'macOS'"
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_SIGN_MACOS_IDENTITY_ID }}
+          doppler-project: domyjob
+          doppler-config: sign_macos
+          inject-env-vars: false
+      - name: Reject missing or unresolved sign_macos credentials
+        if: >-
+          ${{ steps.doppler_sign_macos_3.outcome == 'success' && (
+          steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE_PASSWORD == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE_PASSWORD, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE_PASSWORD == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE_PASSWORD, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_IDENTITY == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_IDENTITY, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_ISSUER_ID == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_ISSUER_ID, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY_ID == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY_ID, '${') ||
+          steps.doppler_sign_macos_3.outputs.APPLE_SIGNING_IDENTITY == '' ||
+          startsWith(steps.doppler_sign_macos_3.outputs.APPLE_SIGNING_IDENTITY, '${')
+          ) }}
+        shell: bash
+        run: exit 1
+
       - name: Sign the macOS binary and installer, then submit the package for notarization
         if: runner.os == 'macOS'
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.check.outputs.version }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
-          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
-          APPLE_INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
-          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_CERTIFICATE: ${{ steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ steps.doppler_sign_macos_3.outputs.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ steps.doppler_sign_macos_3.outputs.APPLE_SIGNING_IDENTITY }}
+          APPLE_INSTALLER_CERTIFICATE: ${{ steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          APPLE_INSTALLER_IDENTITY: ${{ steps.doppler_sign_macos_3.outputs.APPLE_INSTALLER_IDENTITY }}
+          APPLE_NOTARY_KEY: ${{ steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ steps.doppler_sign_macos_3.outputs.APPLE_NOTARY_ISSUER_ID }}
         run: cargo xtask release sign-macos
+      - name: Fetch sign_windows credentials
+        id: doppler_sign_windows_4
+        if: "runner.os == 'Windows'"
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_SIGN_WINDOWS_IDENTITY_ID }}
+          doppler-project: domyjob
+          doppler-config: sign_windows
+          inject-env-vars: false
+      - name: Reject missing or unresolved sign_windows credentials
+        if: >-
+          ${{ steps.doppler_sign_windows_4.outcome == 'success' && (
+          steps.doppler_sign_windows_4.outputs.SSLDOTCOM_CREDENTIAL_ID == '' ||
+          startsWith(steps.doppler_sign_windows_4.outputs.SSLDOTCOM_CREDENTIAL_ID, '${') ||
+          steps.doppler_sign_windows_4.outputs.SSLDOTCOM_PASSWORD == '' ||
+          startsWith(steps.doppler_sign_windows_4.outputs.SSLDOTCOM_PASSWORD, '${') ||
+          steps.doppler_sign_windows_4.outputs.SSLDOTCOM_TOTP_SECRET == '' ||
+          startsWith(steps.doppler_sign_windows_4.outputs.SSLDOTCOM_TOTP_SECRET, '${') ||
+          steps.doppler_sign_windows_4.outputs.SSLDOTCOM_USERNAME == '' ||
+          startsWith(steps.doppler_sign_windows_4.outputs.SSLDOTCOM_USERNAME, '${')
+          ) }}
+        shell: bash
+        run: exit 1
+
       - name: Sign the Windows binary
         if: runner.os == 'Windows'
         uses: SSLcom/esigner-codesign@cf5f6c1d38ad10f47e3ed9aca873f429b1a8d85b # v1.3.2
         with:
           command: sign
           signing_method: v2
-          username: ${{ secrets.SSLDOTCOM_USERNAME }}
-          password: ${{ secrets.SSLDOTCOM_PASSWORD }}
-          credential_id: ${{ secrets.SSLDOTCOM_CREDENTIAL_ID }}
-          totp_secret: ${{ secrets.SSLDOTCOM_TOTP_SECRET }}
+          username: ${{ steps.doppler_sign_windows_4.outputs.SSLDOTCOM_USERNAME }}
+          password: ${{ steps.doppler_sign_windows_4.outputs.SSLDOTCOM_PASSWORD }}
+          credential_id: ${{ steps.doppler_sign_windows_4.outputs.SSLDOTCOM_CREDENTIAL_ID }}
+          totp_secret: ${{ steps.doppler_sign_windows_4.outputs.SSLDOTCOM_TOTP_SECRET }}
           file_path: ${{ github.workspace }}/target/${{ matrix.target }}/release/domyjob.exe
           override: true
           environment_name: PROD
