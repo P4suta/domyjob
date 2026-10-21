@@ -26,7 +26,6 @@ struct PreparedReader {
     fault: Option<PortFailure>,
     cleanup_error: bool,
     ready_after_begin: Option<Ready>,
-    regress_after_begin: bool,
 }
 
 impl PreparedReader {
@@ -43,7 +42,6 @@ impl PreparedReader {
             fault: None,
             cleanup_error: false,
             ready_after_begin: None,
-            regress_after_begin: false,
         }
     }
 }
@@ -58,9 +56,6 @@ impl Reader for PreparedReader {
 
     fn ready(&mut self) -> Result<Ready, Self::Error> {
         Ok(self.ready)
-    }
-    fn elapsed_millis(&mut self) -> u64 {
-        self.elapsed
     }
     fn begin(&mut self) -> Result<(), Self::Error> {
         self.released = self.released.saturating_add(1);
@@ -79,11 +74,7 @@ impl Reader for PreparedReader {
         }
     }
     fn pause(&mut self) {
-        if self.regress_after_begin && self.released != 0 {
-            self.elapsed = self.elapsed.saturating_sub(1);
-        } else {
-            self.elapsed = self.elapsed.saturating_add(1_000);
-        }
+        self.elapsed = self.elapsed.saturating_add(1_000);
         if self.released != 0
             && let Some(ready) = self.ready_after_begin
         {
@@ -113,7 +104,7 @@ impl Reader for PreparedReader {
 }
 
 fn observe(reader: &mut PreparedReader) -> input_controller::Outcome<i32, &'static str> {
-    input_controller::wait(reader, Controller::new(IDENTITY, CASE_MILLIS))
+    input_controller::wait(reader, Controller::new(IDENTITY))
 }
 
 fn assert_cleanup(reader: &PreparedReader) {
@@ -121,7 +112,7 @@ fn assert_cleanup(reader: &PreparedReader) {
 }
 
 #[test]
-fn completed_preparation_does_not_spend_the_input_operation_budget() {
+fn readiness_releases_input_once_and_completion_preserves_the_exit() {
     let mut reader = PreparedReader::new(PREPARED_MILLIS, COMPLETE_MILLIS);
     let outcome = observe(&mut reader);
     assert_eq!(outcome.primary, Ok(EXIT_CODE));
@@ -131,25 +122,38 @@ fn completed_preparation_does_not_spend_the_input_operation_budget() {
 }
 
 #[test]
-fn completion_at_the_operation_boundary_refuses_without_progress_resets() {
-    let mut reader = PreparedReader::new(0, input_controller::OPERATION_MILLIS);
+fn a_live_peer_can_finish_after_the_former_case_deadline() {
+    let mut reader = PreparedReader::new(CASE_MILLIS, CASE_MILLIS + COMPLETE_MILLIS);
     let outcome = observe(&mut reader);
-    assert_eq!(
-        outcome.primary,
-        Err(Problem::Refused(Refusal::OperationDeadline))
-    );
-    assert_eq!(reader.released, 1);
-    assert_eq!(reader.progress, 4);
+    assert_eq!(outcome.primary, Ok(EXIT_CODE));
     assert_cleanup(&reader);
 }
 
 #[test]
-fn missing_ready_refuses_at_the_original_command_boundary() {
-    let mut reader = PreparedReader::new(CASE_MILLIS, u64::MAX);
+fn a_live_peer_can_finish_after_the_former_operation_deadline() {
+    let mut reader = PreparedReader::new(0, COMPLETE_MILLIS);
+    let outcome = observe(&mut reader);
+    assert_eq!(outcome.primary, Ok(EXIT_CODE));
+    assert_cleanup(&reader);
+}
+
+#[test]
+fn progress_keeps_waiting_until_the_child_exits() {
+    let mut reader = PreparedReader::new(0, COMPLETE_MILLIS);
+    let outcome = observe(&mut reader);
+    assert_eq!(outcome.primary, Ok(EXIT_CODE));
+    assert_eq!(reader.released, 1);
+    assert!(reader.progress > 0);
+    assert_cleanup(&reader);
+}
+
+#[test]
+fn missing_ready_waits_until_the_child_exits_without_releasing_input() {
+    let mut reader = PreparedReader::new(CASE_MILLIS, CASE_MILLIS + COMPLETE_MILLIS);
     reader.ready = Ready::Missing;
     assert_eq!(
         observe(&mut reader).primary,
-        Err(Problem::Refused(Refusal::CaseDeadline))
+        Err(Problem::Refused(Refusal::ExitedBeforeReady))
     );
     assert_eq!(reader.released, 0);
     assert_cleanup(&reader);
@@ -227,7 +231,7 @@ fn native_ready_identity_bytes_preserve_every_case_and_process_field() {
 }
 
 #[test]
-fn vanished_ready_and_regressed_operation_clock_do_not_read_input() {
+fn vanished_ready_does_not_read_input() {
     let mut vanished = PreparedReader::new(0, COMPLETE_MILLIS);
     vanished.ready_after_begin = Some(Ready::Missing);
     assert_eq!(
@@ -236,14 +240,6 @@ fn vanished_ready_and_regressed_operation_clock_do_not_read_input() {
     );
     assert_eq!(vanished.progress, 0);
     assert_cleanup(&vanished);
-    let mut regressed = PreparedReader::new(PREPARED_MILLIS, COMPLETE_MILLIS);
-    regressed.regress_after_begin = true;
-    assert_eq!(
-        observe(&mut regressed).primary,
-        Err(Problem::Refused(Refusal::ClockRegressed))
-    );
-    assert_eq!(regressed.progress, 0);
-    assert_cleanup(&regressed);
 }
 
 #[test]
@@ -257,14 +253,11 @@ fn actual_progress_failure_stops_and_reaps_the_same_owned_reader() {
 }
 
 #[test]
-fn preparation_near_the_case_limit_cannot_extend_total_lifetime() {
-    let mut reader = PreparedReader::new(CASE_MILLIS - 1_000, u64::MAX);
+fn delayed_preparation_and_progress_do_not_change_the_exit_contract() {
+    let mut reader = PreparedReader::new(CASE_MILLIS - 1_000, CASE_MILLIS + COMPLETE_MILLIS);
     let outcome = observe(&mut reader);
-    assert_eq!(
-        outcome.primary,
-        Err(Problem::Refused(Refusal::CaseDeadline))
-    );
+    assert_eq!(outcome.primary, Ok(EXIT_CODE));
     assert_eq!(reader.released, 1);
-    assert_eq!(reader.progress, 0);
+    assert!(reader.progress > 0);
     assert_cleanup(&reader);
 }

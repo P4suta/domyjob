@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::provider::CODEX_SESSION;
-use crate::world::{
-    Machine, Run, World, calls, files_containing, same_directory, wait_for, wait_within,
-};
+use crate::world::{Machine, Run, World, calls, files_containing, same_directory, wait_for};
 use crate::{Failure, Scenario};
 
 pub(crate) const ALL: [Scenario; 17] = [
@@ -569,6 +567,10 @@ fn mcp_serves_an_interactive_agent(world: &World) -> Result<(), Failure> {
             message.get("jsonrpc") == Some(&json!("2.0")),
             "stdout held a line that is not JSON-RPC: {line}"
         );
+        ensure!(
+            message.get("id") != Some(&json!(8)),
+            "a cancelled call must not be answered: {message}"
+        );
     }
     ensure!(
         !crate::present(&alpha.work().join("calls.jsonl"))?,
@@ -619,7 +621,7 @@ fn mcp_cancels(mcp: &mut crate::world::Mcp) -> Result<(), Failure> {
         "ping should answer during a long ask: {pinged}"
     );
     ensure!(
-        mcp.response(8, 500)?.is_none(),
+        mcp.take_response(8)?.is_none(),
         "the ask should still be waiting"
     );
     mcp.notify(
@@ -627,7 +629,7 @@ fn mcp_cancels(mcp: &mut crate::world::Mcp) -> Result<(), Failure> {
         &json!({"requestId": 8, "reason": "the scenario stops waiting"}),
     )?;
     mcp.request(10, "ping", &json!({}))?;
-    let late = mcp.response(8, 3000)?;
+    let late = mcp.take_response(8)?;
     ensure!(
         late.is_none(),
         "a cancelled call must not be answered: {late:?}"
@@ -1064,7 +1066,7 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
     alpha
         .chat_as("ann", &["send", "ben@beta", "pushed by the service"])?
         .exited(0)?;
-    wait_within("the doorbell to make the service push", 300, || {
+    wait_for("the doorbell to make the service push", || {
         let thread = beta.chat_as("ben", &["thread", "ann@alpha"])?;
         Ok(thread
             .stdout
@@ -1082,14 +1084,10 @@ fn background_service_delivers_without_commands(world: &World) -> Result<(), Fai
 }
 
 fn arrives(alpha: &Machine<'_>, text: &str) -> Result<(), Failure> {
-    wait_within(
-        "the service to deliver the message",
-        crate::world::POLLS,
-        || {
-            let thread = alpha.chat_as("ann", &["thread", "ben@beta"])?;
-            Ok(thread.exited(0)?.stdout.contains(text).then_some(()))
-        },
-    )
+    wait_for("the service to deliver the message", || {
+        let thread = alpha.chat_as("ann", &["thread", "ben@beta"])?;
+        Ok(thread.exited(0)?.stdout.contains(text).then_some(()))
+    })
 }
 
 fn kept_job_reads_preserve_success_and_failure_results(world: &World) -> Result<(), Failure> {

@@ -2,7 +2,7 @@
     clippy::disallowed_methods,
     clippy::disallowed_types,
     clippy::disallowed_macros,
-    reason = "the harness drives real processes and files, bounds every wait, and reports on its output"
+    reason = "the harness drives real processes and files, reports pending waits, and leaves hang diagnosis to the outer runner"
 )]
 
 use std::ffi::{OsStr, OsString};
@@ -28,6 +28,8 @@ macro_rules! ensure {
 mod bootstrap;
 #[path = "e2e/os.rs"]
 mod os;
+#[path = "e2e/peer.rs"]
+mod peer;
 #[path = "e2e/provider.rs"]
 mod provider;
 #[path = "e2e/scenarios.rs"]

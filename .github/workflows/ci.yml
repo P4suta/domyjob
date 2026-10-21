@@ -109,6 +109,12 @@ jobs:
       - run: cargo xtask ci test
         env:
           PLAN_JSON: ${{ needs.changes.outputs.plan }}
+      - name: Repeat reply-wait scenarios ten times on Windows
+        if: runner.os == 'Windows' && needs.changes.outputs.product == 'true'
+        run: >-
+          mise x -- cargo nextest run --locked -p domyjob --test e2e
+          --stress-count 10 --fail-fast --no-tests=fail
+          -E 'test(=mcp_serves_an_interactive_agent) | test(=bootstrap_preserves_first_request_and_cleans_its_owned_work) | test(=jobs_run_through_the_node_wrapper)'
 
   fuzz:
     needs: [changes]

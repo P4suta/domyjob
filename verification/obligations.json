@@ -143,7 +143,7 @@
       "contract": "Read, decode, validation, and launch run in order, stop at the first refusal, and preserve its exact phase and owned error; launch occurs once only after valid request admission.",
       "input_domain": "Every four Boolean port-failure choices and every u8 cause, with identity byte/request ports and independent scalar call counters; no assumptions.",
       "bound": "Unwind eight with unwinding assertions; four loop-free production port calls. Actual bounded JSON parsing, validation, Unix socket timeouts and native launch are separate adapter contracts.",
-      "production": "crates/domyjob-core/src/worker_handoff.rs start imported directly by the harness; process/login.rs receive_request supplies actual bounded::read, ingress::json, Handoff::validate and native launch"
+      "production": "crates/domyjob-core/src/worker_handoff.rs start imported directly by the harness; process/login.rs receive_request supplies bounded control-frame reads, ingress::json, Handoff::validate and native launch"
     },
     {
       "source": "verification/input-controller.rs",
@@ -158,17 +158,17 @@
       "source": "verification/input-controller.rs",
       "name": "preparation_admits_only_live_matching_ready",
       "covers": 4,
-      "contract": "Preparation releases Begin only for a live matching case below the existing total deadline.",
-      "input_domain": "Every u64 elapsed time and total budget, all Ready variants, all case/process identities, and both observed child states.",
+      "contract": "Preparation releases Begin only for a live matching case; missing readiness keeps waiting until the peer publishes Ready or exits.",
+      "input_domain": "All Ready variants, all case/process identities, and both observed child states; scheduling time is not an input.",
       "bound": "Unwind24 with unwinding assertions; no input assumptions.",
       "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/prepare; actual Reader::begin writes the same twenty-byte identity after actual Add-Type/count controls publish Ready"
     },
     {
       "source": "verification/input-controller.rs",
-      "name": "operation_progress_never_resets_either_budget",
-      "covers": 4,
-      "contract": "An admitted progress observation cannot reset the operation start or the whole-case bound, and equality or regressed time refuses completion.",
-      "input_domain": "Every u64 preparation/progress/completion time and case budget with every fixed-size identity; conditional checks follow actual admitted Begin and Progress transitions.",
+      "name": "operation_progress_waits_for_the_peer_to_exit",
+      "covers": 2,
+      "contract": "An admitted operation keeps progressing while its matching peer is alive and completes exactly when that peer exits.",
+      "input_domain": "Every fixed-size identity and both peer exit observations after an actual Begin and Progress; scheduling time is not an input.",
       "bound": "Unwind24 with unwinding assertions; three actual transitions and no assumed conclusion.",
       "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate; Reader sampling and all pending/zero/completion schedules use the same controller"
     },
@@ -177,7 +177,7 @@
       "name": "begun_operations_refuse_missing_or_foreign_identity",
       "covers": 3,
       "contract": "An admitted operation refuses disappeared, malformed, or foreign Ready and cannot admit a second Begin.",
-      "input_domain": "Every u64 start/next time and total budget, all Ready variants, and all expected/actual identity fields after a checked Begin.",
+      "input_domain": "All Ready variants and all expected/actual identity fields after a checked Begin.",
       "bound": "Unwind24 with unwinding assertions; two actual transitions and no assumed conclusion.",
       "production": "crates/domyjob/tests/e2e/input_controller.rs Controller::observe/operate used by the real Windows polling loop"
     },
@@ -186,7 +186,7 @@
       "name": "every_outcome_retains_all_owned_cleanup_results",
       "covers": 3,
       "contract": "The actual controller attempts input closure, owned subtree stop, and reap exactly once and retains each cleanup result without replacing the primary observation/refusal.",
-      "input_domain": "Every seven port-failure Boolean choices, all three u64 observation times, every u64 total bound, and every fixed identity in the stated three-observation port.",
+      "input_domain": "Every seven port-failure Boolean choices and every fixed identity in the stated three-observation port; the peer exits on the third observation unless an earlier port refuses.",
       "bound": "Unwind24 with unwinding assertions; at most three observations. Native kernel cleanup is a separate boundary.",
       "production": "crates/domyjob/tests/e2e/input_controller.rs wait/run; the real Reader implements close_input/stop_tree/reap with retained Windows Job and Child"
     },
@@ -670,8 +670,8 @@
     },
     {
       "source": "verification/input-controller.rs",
-      "harness": "rejects_completion_at_the_input_deadline",
-      "assertion": "NEGATIVE_INPUT_DEADLINE_CONTROL"
+      "harness": "rejects_completion_before_the_peer_exits",
+      "assertion": "NEGATIVE_INPUT_EXIT_CONTROL"
     },
     {
       "source": "verification/input-controller.rs",
@@ -836,6 +836,12 @@
   ],
   "boundaries": [
     {
+      "source": "crates/domyjob/tests/e2e/peer.rs",
+      "reason": "Owned child exit, concurrent output files and native scheduling are operating-system boundaries outside Kani's executable model. The adapter uses no response deadline; time controls only diagnostic reporting and polling cadence.",
+      "evidence": "The e2e_peer target drives a real gated child, captures partial output before its response, retains process/request/output-tail diagnostics on missing replies, and explicitly stops a known held child. The complete native e2e suite and ten fixed repeats of the three affected scenarios exercise the shared adapter; the existing nextest watchdog is the external hang guard. The ownership gate rejects timed reply APIs and scenario clocks in current and future e2e leaves.",
+      "reconsider": "Process ownership, output capture, response framing or watchdog reporting changes or fails, or a verifier supports these native effects."
+    },
+    {
       "source": "crates/domyjob/src/state_io.rs",
       "reason": "Filesystem metadata, permission changes, reparse-point identity, Windows sharing observations and timed waits are native operating-system boundaries outside Kani's modeled environment.",
       "evidence": "Native state_io tests count zero writable calls for removable trash and cover read-only files and directories, no-follow directory links and Windows handles that deny deletion. Fault injection checks grant ordering, grant failure, later deletion failure, paired error messages and bounded busy retries before and after the single grant; the source-bound proof checks every admitted result sequence and the negative rejects granting without a denial. Native execution remains specific to the tested host; cross-target Clippy checks the Linux and Windows adapters.",
@@ -849,9 +855,9 @@
     },
     {
       "source": "crates/domyjob/tests/e2e/os/windows/input_reader.rs",
-      "reason": "The source-bound decision and counted-port proofs do not establish PowerShell compilation time, filesystem publication, monotonic-clock scheduling, windows-spawn creation-time Job attachment, or Win32 accounting/termination. A retained fresh Job is attached during process creation before PowerShell can launch compiler children; the original native reader and binary channels are unchanged.",
-      "evidence": "The dedicated input_controller target controls preparation6s then live Ready/completion7s, exact operation5s and whole-case180s boundaries, foreign/malformed/disappeared readiness, regressed clocks, and primary-plus-cleanup faults through the actual controller. The Windows bootstrap scenario preserves all eight actual input schedules and adds a known held Rust descendant observed inside its creation-time Job, exact operation refusal, retained root reap, and zero active processes before capture. No original hosted failure cause is inferred from successful reruns.",
-      "reconsider": "A phase/channel, Job attachment, accounting, ownership, cleanup, or native deadline contract changes or fails, or a verifier supports the actual Win32/CLR boundary."
+      "reason": "The source-bound decision and counted-port proofs do not establish PowerShell compilation, filesystem publication, windows-spawn creation-time Job attachment, or Win32 accounting/termination. A retained fresh Job is attached during process creation before PowerShell can launch compiler children.",
+      "evidence": "The input_controller target covers arbitrary delays beyond the former case and operation deadlines, foreign/malformed/disappeared readiness, peer exit and primary-plus-cleanup faults. Windows preserves all eight binary input schedules; the held descendant triggers explicit cancellation after observed containment, followed by retained root reap and zero active processes. Waiting diagnostics include the root PID, request and stderr tail; the outer nextest watchdog diagnoses hangs.",
+      "reconsider": "A phase/channel, Job attachment, accounting, ownership or cleanup contract changes or fails, or a verifier supports the actual Win32/CLR boundary."
     },
     {
       "source": "crates/domyjob/src/builds.rs",
@@ -873,8 +879,8 @@
     },
     {
       "source": "crates/domyjob/src/process/login.rs",
-      "reason": "The source-bound ordered request-port and bounded Write-port proofs do not establish actual JSON decoding, native Unix socket EOF or timeout causes, launchd, descriptor inheritance, concurrency, or every possible port implementation.",
-      "evidence": "The mandatory Mac workspace tests exercise actual bounded ingress decoding and Handoff validation, tagged Read/Decode/Validate/Launch refusals, an actual partial-request timeout with zero launches, injected partial-read WouldBlock retaining native error kind/code/cause, and complete readiness/refusal through UnixStream with a held receiver clone. The core handoff Miri lane interprets the same ordered request function; the cross-platform login_reply target and its Miri lane import the production write/shutdown adapter. Passing reruns do not identify the original intermittent refusal's cause.",
+      "reason": "The source-bound ordered request-port and bounded Write-port proofs do not establish actual frame/JSON decoding, native Unix socket behavior, launchd, descriptor inheritance, concurrency, or every possible port implementation.",
+      "evidence": "Mac workspace tests exercise bounded control-frame decoding and Handoff validation, Read/Decode/Validate/Launch refusals, partial-frame EOF with zero launches, injected WouldBlock retaining native kind/code/cause, absent socket deadlines, complete frames without transport EOF, and readiness/refusal with a held receiver clone. The core handoff Miri lane and cross-platform login_reply target still import the unchanged ordered port and write/shutdown adapters. A repeated native scenario captured the node and agent both blocked in socket receive; framing removes the request-EOF dependency without claiming the cause of the absent native EOF.",
       "reconsider": "Reply framing or socket semantics change, a native integration fails, or a verifier supports the actual concurrent operating-system boundary."
     },
     {

@@ -12,6 +12,13 @@ Product code, dependencies, toolchains, build configuration, and unrecognized pa
 Full lint and scoped validation call that same owner, so a different outgoing push range cannot omit a mandatory static check.
 A failure stops scoped tests and subsequent remote checks.
 
+End-to-end reply waits observe the owned process until its response or exit.
+The shared peer adapter captures output in files so a descendant retaining an output handle cannot hide the root's exit.
+Pending waits report the process, request, and output tail every ten seconds, including incomplete lines.
+The nextest slow-test watchdog remains the outer hang guard; its termination is a diagnostic limit, not a reply deadline.
+Run these scenarios through `mise run test` to retain that guard.
+Windows CI repeats the MCP, bootstrap, and node-wrapper scenarios ten times with nextest's fixed stress count.
+
 The planner compares exact Git objects with a NUL-delimited diff and disabled rename detection, so deleted paths and both sides of a rename participate in the decision.
 The pre-push hook unions every ref range received on stdin and includes local staged, unstaged, and untracked changes.
 A new branch uses the exact merge base with an existing local `main`, or a validated remote's tracking `main` when explicitly supplied to `cargo xtask ci hook REMOTE`.

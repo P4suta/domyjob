@@ -14,10 +14,12 @@ mod raw {
         reason = "file-lock release has no waitable notification; retries only recheck the OS predicate and never declare readiness"
     )]
 
+    const CAPACITY_RECHECK_MILLIS: u64 = 250;
+
     pub(super) fn receive<T>(
         receiver: &std::sync::mpsc::Receiver<T>,
     ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
-        receiver.recv_timeout(std::time::Duration::from_millis(250))
+        receiver.recv_timeout(std::time::Duration::from_millis(CAPACITY_RECHECK_MILLIS))
     }
 }
 

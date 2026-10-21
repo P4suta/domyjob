@@ -164,13 +164,14 @@ pub(crate) fn login_directory() -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
 
     const HOME_HASH_HEX_CHARS: usize = 16;
+    const LOGIN_PROTOCOL_VERSION: u8 = 2;
 
     let directory = home()?;
     let hash = blake3::hash(directory.as_os_str().as_bytes());
     let tag: String = hash.to_hex().chars().take(HOME_HASH_HEX_CHARS).collect();
     let user = user_id().ok_or_else(|| io::Error::other("user UID unavailable"))?;
     Ok(PathBuf::from(format!(
-        "/private/tmp/domyjob-login-{user}-{tag}"
+        "/private/tmp/domyjob-login-{user}-{tag}-v{LOGIN_PROTOCOL_VERSION}"
     )))
 }
 
