@@ -77,10 +77,19 @@ impl System for Unix {
     }
 
     fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+        let owner = if metadata.is_dir() {
+            PRIVATE_DIRECTORY_MODE
+        } else {
+            PRIVATE_FILE_MODE
+        };
         raw::set_permissions(
             path,
-            fs::Permissions::from_mode(metadata.permissions().mode() | PRIVATE_DIRECTORY_MODE),
+            fs::Permissions::from_mode(metadata.permissions().mode() | owner),
         )
+    }
+
+    fn removal_busy(_error: &io::Error) -> bool {
+        false
     }
 
     fn file_mode(metadata: &fs::Metadata) -> u32 {

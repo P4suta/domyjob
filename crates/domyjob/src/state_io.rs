@@ -6,6 +6,8 @@ use thiserror::Error;
 
 use crate::platform::{self, Ownership};
 
+mod removal;
+
 mod raw {
     #![expect(
         clippy::disallowed_methods,
@@ -84,13 +86,18 @@ fn check_owner(path: &Path, file: &File) -> Result<(), StateError> {
     }
 }
 
-fn check_file(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
+fn file_metadata(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
     let metadata = file.metadata().map_err(|error| io_at(path, error))?;
     if !metadata.is_file() || platform::reparse_point(&metadata) {
         return Err(StateError::NotFile {
             path: path.to_path_buf(),
         });
     }
+    Ok(metadata)
+}
+
+fn check_file(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
+    let metadata = file_metadata(path, file)?;
     check_owner(path, file)?;
     Ok(metadata)
 }
@@ -272,12 +279,7 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(classify_open(path, error)),
     };
-    let metadata = file.metadata().map_err(|error| io_at(path, error))?;
-    if !metadata.is_file() || platform::reparse_point(&metadata) {
-        return Err(StateError::NotFile {
-            path: path.to_path_buf(),
-        });
-    }
+    file_metadata(path, &file)?;
     match platform::ownership(&file).map_err(|error| io_at(path, error))? {
         Ownership::Private | Ownership::Exposed(_) => drop(file),
         Ownership::Foreign => {
@@ -314,8 +316,16 @@ pub(crate) struct Leftover {
 }
 
 const EMPTY_LIMIT: usize = 64;
+const REMOVAL_RETRY_MILLIS: u64 = 20;
 
 pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
+    empty_with(trash, writable)
+}
+
+fn empty_with(
+    trash: &Path,
+    mut grant: impl FnMut(&Path) -> io::Result<()>,
+) -> Result<Vec<Leftover>, StateError> {
     let entries = match fs::read_dir(trash) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -324,39 +334,46 @@ pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
     let mut leftovers = Vec::new();
     for entry in entries.take(EMPTY_LIMIT) {
         let path = entry.map_err(|error| io_at(trash, error))?.path();
-        match raw::remove_dir_all(&path) {
-            Ok(()) => {}
-            Err(denied) if denied.kind() == ErrorKind::PermissionDenied => {
-                let retried = match writable(&path) {
-                    Ok(()) => raw::remove_dir_all(&path),
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = retried {
-                    let error = io::Error::new(
-                        error.kind(),
-                        format!("{denied}, and after granting the owner write access: {error}"),
-                    );
-                    leftovers.push(Leftover { path, error });
-                }
-            }
-            Err(error) => leftovers.push(Leftover { path, error }),
+        if let Err(error) = removal::after_denial(
+            || {
+                removal::retry(
+                    || raw::remove_dir_all(&path),
+                    platform::removal_busy,
+                    || platform::clock::pause_millis(REMOVAL_RETRY_MILLIS),
+                )
+            },
+            || grant(&path),
+            |error| error.kind() == ErrorKind::PermissionDenied,
+        )
+        .map_err(removal_error)
+        {
+            leftovers.push(Leftover { path, error });
         }
     }
     Ok(leftovers)
 }
 
+fn removal_error(failure: removal::Failure<io::Error>) -> io::Error {
+    match failure {
+        removal::Failure::Removal(error) => error,
+        removal::Failure::AfterGrant { denied, error } => io::Error::new(
+            error.kind(),
+            format!("{denied}, and after granting the owner write access: {error}"),
+        ),
+    }
+}
+
 fn writable(root: &Path) -> io::Result<()> {
     let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() || platform::reparse_point(&metadata) {
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if platform::reparse_point(&metadata) || !(metadata.is_dir() || metadata.is_file()) {
             continue;
         }
-        platform::grant_owner_write(&directory, &metadata)?;
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                pending.push(entry.path());
+        platform::grant_owner_write(&path, &metadata)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
             }
         }
     }
@@ -373,6 +390,81 @@ mod tests {
     use super::{open_read, read_bytes, remove_file, write_bytes};
 
     #[test]
+    fn removable_trash_does_not_grant_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let trash = root.path().join("trash");
+        let entry = trash.join("job");
+        crate::testing::write(&entry.join("nested").join("tracked"), "remove");
+        let mut grants = 0_usize;
+        let leftovers = super::empty_with(&trash, |path| {
+            grants = grants.saturating_add(1);
+            super::writable(path)
+        })
+        .unwrap();
+        assert!(leftovers.is_empty());
+        assert!(!entry.try_exists().unwrap());
+        assert_eq!(grants, 0, "removable trash must not need a permission walk");
+    }
+
+    #[test]
+    fn recovery_errors_report_the_initial_denial_and_the_later_failure() {
+        use std::io::{self, ErrorKind};
+
+        for grant_fails in [false, true] {
+            let mut errors = [
+                io::Error::new(ErrorKind::PermissionDenied, "initial denial"),
+                io::Error::new(ErrorKind::NotFound, "later removal failure"),
+            ]
+            .into_iter();
+            let failure = super::removal::after_denial(
+                || Err(errors.next().unwrap()),
+                || {
+                    if grant_fails {
+                        Err(io::Error::new(
+                            ErrorKind::Interrupted,
+                            "permission walk failure",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |error| error.kind() == ErrorKind::PermissionDenied,
+            )
+            .unwrap_err();
+            let error = super::removal_error(failure);
+            let (kind, later) = if grant_fails {
+                (ErrorKind::Interrupted, "permission walk failure")
+            } else {
+                (ErrorKind::NotFound, "later removal failure")
+            };
+            assert_eq!(error.kind(), kind);
+            let message = error.to_string();
+            assert!(message.contains("initial denial"));
+            assert!(message.contains(later));
+        }
+    }
+
+    #[test]
+    fn trash_permissions_include_files_without_following_directory_links() {
+        let root = tempfile::tempdir().unwrap();
+        let trash = root.path().join("trash");
+        let file = trash.join("nested").join("tracked");
+        crate::testing::write(&file, "remove");
+        crate::testing::protect(&file);
+        let outside = root.path().join("outside");
+        let kept = outside.join("tracked");
+        crate::testing::write(&kept, "keep");
+        let original = crate::testing::protect(&kept);
+        crate::file_kind::directory_link(&outside, &trash.join("link")).unwrap();
+        super::writable(&trash).unwrap();
+        let cleared = !std::fs::metadata(&file).unwrap().permissions().readonly();
+        let preserved = std::fs::metadata(&kept).unwrap().permissions().readonly();
+        crate::testing::restore(&kept, original);
+        assert!(cleared, "trash files must be writable before removal");
+        assert!(preserved, "a link must not change files outside the trash");
+    }
+
+    #[test]
     fn trash_with_read_only_directories_empties_in_one_pass() {
         let root = tempfile::tempdir().expect("temporary state root");
         let trash = root.path().join("trash");
@@ -382,8 +474,13 @@ mod tests {
         let nested = checkout.join("docs");
         crate::testing::write(&nested.join("readme"), "text");
         crate::testing::write(&checkout.join("tracked"), "text");
-        for directory in [&nested, &checkout] {
-            crate::testing::protect(directory);
+        for path in [
+            nested.join("readme"),
+            checkout.join("tracked"),
+            nested,
+            checkout,
+        ] {
+            crate::testing::protect(&path);
         }
         assert!(super::empty(&trash).expect("emptied trash").is_empty());
         assert_eq!(

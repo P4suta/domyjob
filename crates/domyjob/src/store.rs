@@ -993,6 +993,7 @@ mod tests {
         let mut admitted = Vec::new();
         for index in 0..=super::KEEP_WORKSPACES.saturating_add(2) {
             let job = admit_finished(&store, format!("{index:032x}"));
+            state_file::write_bytes(&store.log_path(&job), b"kept log\n").unwrap();
             let workspace = store.paths(&job).workspace();
             state_file::private_dir(&workspace).unwrap();
             crate::testing::write(&workspace.join("target").join("output"), "build");
@@ -1007,6 +1008,7 @@ mod tests {
                 index >= shed,
                 "job {index}"
             );
+            assert_eq!(store.log_tail(job).unwrap().0.for_terminal(), "kept log\n");
             assert_eq!(
                 store.status(job).unwrap().kind(),
                 super::PhaseKind::Finished

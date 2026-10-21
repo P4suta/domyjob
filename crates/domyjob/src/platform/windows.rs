@@ -4,7 +4,7 @@ use std::path::Path;
 
 use domyjob_core::chat::card::Os;
 
-use super::{Ownership, System, variable, windows_acl};
+use super::{Ownership, System, raw, variable, windows_acl};
 
 #[derive(Debug)]
 pub(super) struct Windows;
@@ -59,8 +59,23 @@ impl System for Windows {
         Ok(())
     }
 
-    fn grant_owner_write(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
-        Ok(())
+    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            raw::set_readonly(&mut permissions, false);
+            raw::set_permissions(path, permissions)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn removal_busy(error: &io::Error) -> bool {
+        const SHARING_VIOLATION: i32 = 32;
+        const LOCK_VIOLATION: i32 = 33;
+        matches!(
+            error.raw_os_error(),
+            Some(SHARING_VIOLATION | LOCK_VIOLATION)
+        )
     }
 
     fn file_mode(_metadata: &fs::Metadata) -> u32 {
@@ -91,5 +106,30 @@ impl System for Windows {
 
     fn no_follow(options: &mut fs::OpenOptions) {
         windows_acl::no_follow(options);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn trash_sharing_failures_remain_reported_until_the_handle_closes() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let trash = root.path().join("trash");
+        let file = trash.join("job").join("tracked");
+        crate::testing::write(&file, "remove");
+        let held = crate::platform::private_options()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let leftovers = crate::state_io::empty(&trash).unwrap();
+        assert_eq!(leftovers.len(), 1);
+        assert!(crate::platform::removal_busy(
+            &leftovers.first().unwrap().error
+        ));
+        drop(held);
+        assert!(crate::state_io::empty(&trash).unwrap().is_empty());
     }
 }
