@@ -29,7 +29,7 @@ run = [
   "rustfmt --edition 2024 verification/resource-negative.rs verification/source-negative.rs verification/chat-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 verification/login-reply.rs",
   "rustfmt --edition 2024 verification/worker-handoff.rs",
-  "rustfmt --edition 2024 verification/proof-exit-policy.rs",
+  "rustfmt --edition 2024 verification/proof-exit-policy.rs verification/trash-removal.rs",
   "taplo fmt",
 ]
 env = { RUST_LOG = "warn" }
@@ -42,7 +42,7 @@ run = [
   "rustfmt --edition 2024 --check verification/resource-negative.rs verification/source-negative.rs verification/chat-negative.rs verification/outbound-proof.rs verification/source-metadata-directories.rs verification/input-controller.rs",
   "rustfmt --edition 2024 --check verification/login-reply.rs",
   "rustfmt --edition 2024 --check verification/worker-handoff.rs",
-  "rustfmt --edition 2024 --check verification/proof-exit-policy.rs",
+  "rustfmt --edition 2024 --check verification/proof-exit-policy.rs verification/trash-removal.rs",
   "taplo fmt --check",
   "taplo lint",
 ]
