@@ -10,6 +10,64 @@ const GIT_SHA1_HEX_LENGTH: usize = 40;
 const GIT_SHA256_HEX_LENGTH: usize = 64;
 const SINGLE_PARENT_FIELDS: usize = 2;
 const CHILD_TARGETS: [&str; 2] = ["target/ci-build", "target/ci-build-alt"];
+const VERIFICATION_IMAGE_ENV: &str = "DOMYJOB_VERIFICATION_IMAGE";
+const VERIFICATION_MACHINE_ENV: &str = "DOMYJOB_VERIFICATION_MACHINE";
+const VERIFICATION_CACHE: &str = "target/verification-container";
+const FUZZ_ARTIFACTS: &str = "fuzz/artifacts";
+const ARTIFACT_CACHE: &str = "fuzz-artifacts";
+const ARTIFACT_MOUNT_SUFFIX: &str = ":/work/fuzz/artifacts:rw";
+const CONTAINER_ROOT: &str = "/work";
+#[cfg(unix)]
+const CONTAINER_TARGET: &str = "/work/target";
+const SOURCE_MOUNT_SUFFIX: &str = ":/work:ro";
+const CACHE_MOUNT_SUFFIX: &str = ":/work/target:rw";
+const VERIFICATION_TIMEOUT: &str = "/usr/bin/timeout";
+const REMOTE_SHELL: &str = "/bin/bash";
+#[cfg(unix)]
+const OWNERSHIP_TOOL: &str = "/usr/bin/chown";
+const REMOTE_VERIFICATION: &str = r#"set -eu
+export MISE_TRUSTED_CONFIG_PATHS="$PWD"
+export MISE_AUTO_INSTALL=false MISE_TASK_RUN_AUTO_INSTALL=false MISE_INSTALL_MISSING_TOOLS=false
+export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$PWD/target/verification-driver"
+export DOMYJOB_VERIFICATION_IMAGE="$1"
+exec mise x -- cargo xtask ci bounded "$2""#;
+const VERIFICATION_OPTIONS: &[&str] = &[
+    "run",
+    "--rm",
+    "--init",
+    "--pull=never",
+    "--memory",
+    "4g",
+    "--memory-swap",
+    "4g",
+    "--cpus",
+    "2",
+    "--pids-limit",
+    "256",
+    "--log-driver",
+    "local",
+    "--log-opt",
+    "max-size=1m",
+    "--log-opt",
+    "max-file=1",
+    "--log-opt",
+    "compress=false",
+    "--workdir",
+    CONTAINER_ROOT,
+    "--env",
+    "MISE_TRUSTED_CONFIG_PATHS=/work",
+    "--env",
+    "MISE_AUTO_INSTALL=false",
+    "--env",
+    "MISE_TASK_RUN_AUTO_INSTALL=false",
+    "--env",
+    "CARGO_BUILD_JOBS=2",
+    "--env",
+    "CARGO_INCREMENTAL=0",
+    "--env",
+    "CARGO_TARGET_DIR=/tmp/domyjob-verification-target",
+    "--volume",
+];
 const XTASK_CLIPPY: [&str; 8] = [
     "clippy",
     "--locked",
@@ -627,7 +685,96 @@ fn output(plan: &Plan) -> Result<(), CiError> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum HeavyCheck {
+    Proofs,
+    Miri,
+}
+
+impl HeavyCheck {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "resource-proofs" => Some(Self::Proofs),
+            "miri" => Some(Self::Miri),
+            _ => None,
+        }
+    }
+
+    fn from_command(program: &str, arguments: &[&str]) -> Option<Self> {
+        match (program, arguments) {
+            ("cargo", ["xtask", "resource-proofs"]) => Some(Self::Proofs),
+            ("mise", ["run", "miri"]) => Some(Self::Miri),
+            _ => None,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Proofs => "resource-proofs",
+            Self::Miri => "miri",
+        }
+    }
+
+    const fn command(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Proofs => ("cargo", &["xtask", "resource-proofs"]),
+            Self::Miri => ("mise", &["run", "miri"]),
+        }
+    }
+}
+
+fn verification_remote_arguments(
+    machine: &domyjob_core::domain::MachineName,
+    image: &str,
+    check: HeavyCheck,
+) -> Vec<String> {
+    [
+        "run",
+        "--quiet",
+        "--locked",
+        "-p",
+        "domyjob",
+        "--",
+        "run",
+        machine.as_str(),
+        "--wait",
+        "--",
+        REMOTE_SHELL,
+        "-lc",
+        REMOTE_VERIFICATION,
+        "domyjob-verification",
+        image,
+        check.name(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 fn execute(root: &Path, program: &str, arguments: &[&str]) -> Result<(), CiError> {
+    if let Some(check) = HeavyCheck::from_command(program, arguments) {
+        match std::env::var(VERIFICATION_MACHINE_ENV) {
+            Ok(machine) if !machine.is_empty() => {
+                let machine =
+                    domyjob_core::domain::MachineName::try_from(machine).map_err(|_error| {
+                        CiError::Invalid("verification machine is not a valid SSH destination")
+                    })?;
+                let image = environment(VERIFICATION_IMAGE_ENV)?;
+                let remote = verification_remote_arguments(&machine, &image, check);
+                let remote = remote.iter().map(String::as_str).collect::<Vec<_>>();
+                return ChildBuildDirectory::current(root)?.execute("cargo", &remote);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(CiError::Invalid(
+                    "verification machine must be nonempty UTF-8",
+                ));
+            }
+        }
+        if let Some(container) = VerificationContainer::configured(root)? {
+            return container.execute(check);
+        }
+    }
     if matches!(program, "cargo" | "mise") {
         return ChildBuildDirectory::current(root)?.execute(program, arguments);
     }
@@ -636,6 +783,166 @@ fn execute(root: &Path, program: &str, arguments: &[&str]) -> Result<(), CiError
         .args(arguments)
         .status()?;
     require_success(program, status)
+}
+
+fn verification_command(
+    container: &VerificationContainer,
+    program: &str,
+    arguments: &[&str],
+    limit: &str,
+) -> Command {
+    let mut source = container.root.as_os_str().to_owned();
+    source.push(SOURCE_MOUNT_SUFFIX);
+    let mut output = container.cache.as_os_str().to_owned();
+    output.push(CACHE_MOUNT_SUFFIX);
+    let mut artifacts = container.artifacts.as_os_str().to_owned();
+    artifacts.push(ARTIFACT_MOUNT_SUFFIX);
+    let mut command = command("docker");
+    command
+        .args(VERIFICATION_OPTIONS)
+        .arg(source)
+        .arg("--volume")
+        .arg(output)
+        .arg("--volume")
+        .arg(artifacts)
+        .args([
+            "--entrypoint",
+            VERIFICATION_TIMEOUT,
+            &container.image,
+            "--kill-after=1s",
+            limit,
+            "mise",
+            "x",
+            "rust@1.99.0",
+            "--",
+            program,
+        ])
+        .args(arguments);
+    command
+}
+
+struct VerificationContainer {
+    root: PathBuf,
+    cache: PathBuf,
+    artifacts: PathBuf,
+    image: String,
+}
+
+impl VerificationContainer {
+    fn configured(root: &Path) -> Result<Option<Self>, CiError> {
+        let selected = match std::env::var(VERIFICATION_IMAGE_ENV) {
+            Ok(selected) => selected,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(CiError::Invalid("verification image must be UTF-8"));
+            }
+        };
+        let inspected = capture(
+            command("docker")
+                .args(["image", "inspect", "--format", "{{.Id}}", "--", &selected])
+                .stdin(Stdio::null()),
+        )?;
+        require_success("docker image inspect", inspected.status)?;
+        let image = String::from_utf8(inspected.stdout)
+            .map_err(|_error| CiError::Invalid("Docker returned a non-UTF-8 image identity"))?
+            .trim()
+            .to_owned();
+        if !image.starts_with("sha256:") {
+            return Err(CiError::Invalid(
+                "Docker did not return an immutable image identity",
+            ));
+        }
+        let root = raw::canonicalize(root)?;
+        let cache = Self::cache(&root)?;
+        Self::owned_directory(&root, FUZZ_ARTIFACTS)?;
+        let artifacts = Self::owned_directory(&cache, ARTIFACT_CACHE)?;
+        Ok(Some(Self {
+            root,
+            cache,
+            artifacts,
+            image,
+        }))
+    }
+
+    fn owned_directory(root: &Path, relative: &str) -> Result<PathBuf, CiError> {
+        let directory = root.join(relative);
+        if resolved_directory(&directory)? != directory {
+            return Err(CiError::Invalid(
+                "verification directory must not traverse links",
+            ));
+        }
+        crate::raw::create_dir_all(&directory)?;
+        if raw::canonicalize(&directory)? != directory {
+            return Err(CiError::Invalid(
+                "verification directory changed canonical identity",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn cache(root: &Path) -> Result<PathBuf, CiError> {
+        let cache_root = resolved_directory(&root.join("target"))?;
+        let cache = resolved_directory(&root.join(VERIFICATION_CACHE))?;
+        if !cache_root.starts_with(root)
+            || cache_root == root
+            || !cache.starts_with(&cache_root)
+            || cache == cache_root
+        {
+            return Err(CiError::Invalid(
+                "verification cache must remain inside the checkout's target cache",
+            ));
+        }
+        crate::raw::create_dir_all(&cache)?;
+        if raw::canonicalize(&cache)? != cache {
+            return Err(CiError::Invalid(
+                "verification cache changed canonical identity",
+            ));
+        }
+        Ok(cache)
+    }
+
+    fn execute(&self, check: HeavyCheck) -> Result<(), CiError> {
+        let (program, arguments) = check.command();
+        eprintln!(
+            "bounded verification: {program} {arguments:?}; image {}; 2 CPU, 4 GiB, 256 processes, 3600 seconds",
+            self.image
+        );
+        let primary = verification_command(self, program, arguments, "3600s")
+            .status()
+            .map_err(CiError::Io)
+            .and_then(|status| {
+                require_success(
+                    "bounded verification (resource-limit exits leave the check incomplete)",
+                    status,
+                )
+            });
+        #[cfg(unix)]
+        {
+            let cleanup = self.restore_owner();
+            if let Err(error) = &cleanup {
+                eprintln!("verification cache ownership: {error}");
+            }
+            primary.and(cleanup)
+        }
+        #[cfg(not(unix))]
+        primary
+    }
+
+    #[cfg(unix)]
+    fn restore_owner(&self) -> Result<(), CiError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = raw::metadata(&self.root)?;
+        let owner = format!("{}:{}", metadata.uid(), metadata.gid());
+        let status = verification_command(
+            self,
+            OWNERSHIP_TOOL,
+            &["-R", &owner, CONTAINER_TARGET],
+            "30s",
+        )
+        .status()?;
+        require_success("verification cache ownership", status)
+    }
 }
 
 fn require_success(program: &str, status: ExitStatus) -> Result<(), CiError> {
@@ -918,6 +1225,15 @@ fn verify_gate(workflow: &str, plan_text: &str, needs_text: &str) -> Result<(), 
 
 pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
     match words {
+        ["bounded", name] => {
+            let check = HeavyCheck::from_name(name)
+                .ok_or(CiError::Invalid("unsupported bounded verification check"))?;
+            VerificationContainer::configured(root)?
+                .ok_or(CiError::Invalid(
+                    "bounded verification requires a configured image",
+                ))?
+                .execute(check)
+        }
         ["static"] => static_checks(&mut |program, arguments| execute(root, program, arguments)),
         ["plan"] => output(&conservative(ci_plan(root))),
         ["check"] => check(root, &Plan::decode(&environment("PLAN_JSON")?)?),
@@ -930,7 +1246,7 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
             &environment("NEEDS_JSON")?,
         ),
         _ => Err(CiError::Invalid(
-            "usage: cargo xtask ci static|plan|check|test|hook [REMOTE]|gate WORKFLOW",
+            "usage: cargo xtask ci static|plan|check|test|hook [REMOTE]|gate WORKFLOW|bounded CHECK",
         )),
     }
 }
@@ -939,6 +1255,52 @@ pub fn run(root: &Path, words: &[&str]) -> Result<(), CiError> {
 mod tests {
     use std::io::Read as _;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn remote_verification_preserves_opaque_arguments_and_both_checks() {
+        let image = "image with spaces; $(refuse shell expansion)";
+        for name in ["resource-proofs", "miri"] {
+            let check = super::HeavyCheck::from_name(name).unwrap();
+            let machine = domyjob_core::domain::MachineName::try_from("linux".to_owned()).unwrap();
+            let arguments = super::verification_remote_arguments(&machine, image, check);
+            assert!(arguments.windows(2).any(|pair| pair == ["run", "linux"]));
+            assert!(arguments.windows(2).any(|pair| pair == ["--", "/bin/bash"]));
+            assert!(arguments.ends_with(&[image.to_owned(), name.to_owned()]));
+            assert_eq!(arguments.iter().filter(|word| *word == image).count(), 1);
+        }
+        assert!(super::HeavyCheck::from_name("arbitrary-command").is_none());
+        assert!(super::HeavyCheck::from_command("cargo", &["xtask", "verify"]).is_none());
+    }
+
+    #[test]
+    fn generated_verification_directories_are_owned_and_unknown_checks_refuse() {
+        let root = tempfile::tempdir().unwrap();
+        let root = raw::canonicalize(root.path()).unwrap();
+        let directory =
+            super::VerificationContainer::owned_directory(&root, super::FUZZ_ARTIFACTS).unwrap();
+        assert_eq!(directory, root.join(super::FUZZ_ARTIFACTS));
+        assert!(raw::metadata(&directory).unwrap().is_dir());
+        let error = super::run(&root, &["bounded", "arbitrary-command"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported bounded verification check")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_verification_directories_refuse_linked_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let root = raw::canonicalize(root.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.join(super::FUZZ_ARTIFACTS);
+        crate::raw::create_dir_all(link.parent().unwrap()).unwrap();
+        raw::link_directory(outside.path(), &link).unwrap();
+        let error = super::VerificationContainer::owned_directory(&root, super::FUZZ_ARTIFACTS)
+            .unwrap_err();
+        assert!(error.to_string().contains("must not traverse links"));
+    }
 
     use serde_json::{Map, Value};
 
@@ -955,6 +1317,83 @@ mod tests {
                 .map(|path| (*path).to_owned())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[test]
+    fn verification_container_keeps_the_command_source_and_resource_bounds() {
+        let root = Path::new("/checkout");
+        let cache = Path::new("/cache");
+        for (program, arguments) in [
+            ("cargo", &["xtask", "resource-proofs"][..]),
+            ("mise", &["run", "miri"][..]),
+        ] {
+            let container = super::VerificationContainer {
+                root: root.to_path_buf(),
+                cache: cache.to_path_buf(),
+                artifacts: cache.join(super::ARTIFACT_CACHE),
+                image: "sha256:verified".to_owned(),
+            };
+            let command = super::verification_command(&container, program, arguments, "3600s");
+            assert_eq!(command.get_program(), "docker");
+            let words = command.get_args().collect::<Vec<_>>();
+            for pair in [
+                ["--memory", "4g"],
+                ["--memory-swap", "4g"],
+                ["--cpus", "2"],
+                ["--pids-limit", "256"],
+                ["--log-driver", "local"],
+                ["--log-opt", "max-size=1m"],
+                ["--entrypoint", "/usr/bin/timeout"],
+                ["--volume", "/checkout:/work:ro"],
+                ["--volume", "/cache:/work/target:rw"],
+            ] {
+                assert!(words.windows(pair.len()).any(|actual| actual == pair));
+            }
+            let mut artifacts = cache.join(super::ARTIFACT_CACHE).into_os_string();
+            artifacts.push(":/work/fuzz/artifacts:rw");
+            assert!(
+                words
+                    .windows(2)
+                    .any(|pair| pair == [std::ffi::OsStr::new("--volume"), artifacts.as_os_str(),])
+            );
+            assert!(words.contains(&std::ffi::OsStr::new("3600s")));
+            assert!(
+                words.ends_with(
+                    &std::iter::once(program)
+                        .chain(arguments.iter().copied())
+                        .map(std::ffi::OsStr::new)
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn verification_cache_owns_an_existing_directory_below_target() {
+        let root = tempfile::tempdir().unwrap();
+        let root = raw::canonicalize(root.path()).unwrap();
+        let cache = super::VerificationContainer::cache(&root).unwrap();
+        assert_eq!(cache, root.join(super::VERIFICATION_CACHE));
+        assert!(raw::metadata(&cache).unwrap().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_cache_refuses_links_that_escape_the_checkout() {
+        for relative in ["target", super::VERIFICATION_CACHE] {
+            let root = tempfile::tempdir().unwrap();
+            let root = raw::canonicalize(root.path()).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let link = root.join(relative);
+            crate::raw::create_dir_all(link.parent().unwrap()).unwrap();
+            raw::link_directory(outside.path(), &link).unwrap();
+            let error = super::VerificationContainer::cache(&root).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("verification cache must remain inside")
+            );
+        }
     }
 
     #[test]

@@ -836,6 +836,12 @@
   ],
   "boundaries": [
     {
+      "source": "xtask/src/ci.rs",
+      "reason": "The optional verification container uses domyjob source snapshots, Docker image resolution, native path identity, bind mounts, ownership restoration and process exit status. These operating-system and engine contracts are outside Kani's executable model; the existing source-bound proofs and interpreter checks still execute unchanged inside the selected environment.",
+      "evidence": "CI adapter tests preserve both exact heavy commands, opaque remote arguments, read-only source and writable generated-output mounts, fixed memory/CPU/process bounds and the outer diagnostic limit. Native filesystem tests require owned output directories and reject escaping directory links. An unknown configured image fails before heavy execution, and native Docker runs retain the existing proof inventory, source/tool bindings and Miri lanes.",
+      "reconsider": "Container arguments, image resolution, mount ownership, command selection or result admission changes or fails, or a verifier supports the actual Docker and filesystem boundary."
+    },
+    {
       "source": "crates/domyjob/tests/e2e/peer.rs",
       "reason": "Owned child exit, concurrent output files and native scheduling are operating-system boundaries outside Kani's executable model. The adapter uses no response deadline; time controls only diagnostic reporting and polling cadence.",
       "evidence": "The e2e_peer target drives a real gated child, captures partial output before its response, retains process/request/output-tail diagnostics on missing replies, and explicitly stops a known held child. The complete native e2e suite and ten fixed repeats of the three affected scenarios exercise the shared adapter; the existing nextest watchdog is the external hang guard. The ownership gate rejects timed reply APIs and scenario clocks in current and future e2e leaves.",
