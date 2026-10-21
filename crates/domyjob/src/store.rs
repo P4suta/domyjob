@@ -124,6 +124,7 @@ impl JobPaths {
 }
 
 const KEEP_FINISHED: usize = 32;
+const KEEP_WORKSPACES: usize = 2;
 const MAX_JOB_RECORDS: usize = 1024;
 const ARCHIVE_COPY_BUFFER_BYTES: usize = 16_384;
 const MAX_LOG_TAIL_BYTES: u64 = 16_384;
@@ -321,16 +322,45 @@ impl Store {
         }
         finished.sort();
         let excess = finished.len().saturating_sub(KEEP_FINISHED);
-        for (_, job) in finished.into_iter().take(excess) {
-            if let Err(error) = self.clean_one(&job) {
+        let shed = finished.len().saturating_sub(KEEP_WORKSPACES);
+        for (index, (_, job)) in finished.into_iter().enumerate().take(shed) {
+            if index < excess {
+                if let Err(error) = self.clean_one(&job) {
+                    eprintln!(
+                        "domyjob node: keeping finished job {} for now: {error}",
+                        job.as_str()
+                    );
+                }
+            } else if let Err(error) = self.shed_workspace(&job) {
                 eprintln!(
-                    "domyjob node: keeping finished job {} for now: {error}",
+                    "domyjob node: keeping the workspace of finished job {} for now: {error}",
                     job.as_str()
                 );
             }
         }
         self.empty_trash();
         Ok(())
+    }
+
+    fn shed_workspace(&self, job: &JobId) -> Result<bool, StoreError> {
+        self.set_aside_finished(job, JobPaths::workspace)
+    }
+
+    fn set_aside_finished(
+        &self,
+        job: &JobId,
+        part: impl FnOnce(&JobPaths) -> PathBuf,
+    ) -> Result<bool, StoreError> {
+        let launch = self.launch_lock(job)?;
+        if self.status(job)?.kind() != PhaseKind::Finished {
+            return Ok(false);
+        }
+        let paths = self.verify_job(job)?;
+        let alive = OsLock::exclusive(&paths.alive_lock())?;
+        drop(alive);
+        drop(launch);
+        state_file::set_aside(&part(&paths), &self.trash_dir())?;
+        Ok(true)
     }
 
     fn staged(&self, job: &JobId) -> JobPaths {
@@ -726,16 +756,7 @@ impl Store {
     }
 
     fn clean_one(&self, job: &JobId) -> Result<bool, StoreError> {
-        let launch = self.launch_lock(job)?;
-        if self.status(job)?.kind() != PhaseKind::Finished {
-            return Ok(false);
-        }
-        let paths = self.verify_job(job)?;
-        let alive = OsLock::exclusive(&paths.alive_lock())?;
-        drop(alive);
-        drop(launch);
-        state_file::set_aside(&paths.dir, &self.trash_dir())?;
-        Ok(true)
+        self.set_aside_finished(job, |paths| paths.dir.clone())
     }
 
     pub(crate) fn clean(&self, target: &CleanTarget) -> Result<u16, StoreError> {
@@ -963,6 +984,38 @@ mod tests {
             kept.into_iter().collect::<std::collections::BTreeSet<_>>(),
             newest
         );
+    }
+
+    #[test]
+    fn admissions_keep_workspaces_of_only_the_newest_finished_jobs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = store(&temporary);
+        let mut admitted = Vec::new();
+        for index in 0..=super::KEEP_WORKSPACES.saturating_add(2) {
+            let job = admit_finished(&store, format!("{index:032x}"));
+            state_file::write_bytes(&store.log_path(&job), b"kept log\n").unwrap();
+            let workspace = store.paths(&job).workspace();
+            state_file::private_dir(&workspace).unwrap();
+            crate::testing::write(&workspace.join("target").join("output"), "build");
+            admitted.push(job);
+        }
+        let shed = admitted
+            .len()
+            .saturating_sub(super::KEEP_WORKSPACES.saturating_add(1));
+        for (index, job) in admitted.iter().enumerate() {
+            assert_eq!(
+                std::fs::symlink_metadata(store.paths(job).workspace()).is_ok(),
+                index >= shed,
+                "job {index}"
+            );
+            assert_eq!(store.log_tail(job).unwrap().0.for_terminal(), "kept log\n");
+            assert_eq!(
+                store.status(job).unwrap().kind(),
+                super::PhaseKind::Finished
+            );
+        }
+        assert_eq!(store.list().unwrap().len(), admitted.len());
+        assert!(state_file::empty(&store.trash_dir()).unwrap().is_empty());
     }
 
     #[test]

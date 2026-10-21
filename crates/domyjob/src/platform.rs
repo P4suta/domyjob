@@ -43,12 +43,16 @@ mod raw {
         OpenOptions::new()
     }
 
-    #[cfg(unix)]
     pub(super) fn set_permissions(
         path: &Path,
         permissions: std::fs::Permissions,
     ) -> io::Result<()> {
         std::fs::set_permissions(path, permissions)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn set_readonly(permissions: &mut std::fs::Permissions, readonly: bool) {
+        permissions.set_readonly(readonly);
     }
 
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
@@ -72,6 +76,8 @@ trait System {
     fn user_id() -> Option<u32>;
     fn executable(metadata: &fs::Metadata) -> bool;
     fn make_executable(path: &Path) -> io::Result<()>;
+    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()>;
+    fn removal_busy(error: &io::Error) -> bool;
     fn file_mode(metadata: &fs::Metadata) -> u32;
     fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool);
     fn ownership(file: &fs::File) -> io::Result<Ownership>;
@@ -143,6 +149,14 @@ pub(crate) fn stable_program(build: &str) -> io::Result<PathBuf> {
 
 pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
     Native::make_executable(path)
+}
+
+pub(crate) fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    Native::grant_owner_write(path, metadata)
+}
+
+pub(crate) fn removal_busy(error: &io::Error) -> bool {
+    Native::removal_busy(error)
 }
 
 #[cfg(target_os = "macos")]

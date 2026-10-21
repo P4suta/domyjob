@@ -6,6 +6,8 @@ const LICENSE: &str = "// SPDX-";
 
 const GENERATED: [&str; 2] = ["supply-chain/audits.toml", "supply-chain/config.toml"];
 
+const COMMIT_DIGEST_LENGTH: usize = 40;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Code,
@@ -187,8 +189,10 @@ pub fn in_rust(source: &str) -> Vec<usize> {
 
 fn pinned_action(line: &str) -> bool {
     line.split_once('@').is_some_and(|(_, reference)| {
-        let (digest, note) = reference.split_at_checked(40).unwrap_or_default();
-        digest.len() == 40
+        let (digest, note) = reference
+            .split_at_checked(COMMIT_DIGEST_LENGTH)
+            .unwrap_or_default();
+        digest.len() == COMMIT_DIGEST_LENGTH
             && digest
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
