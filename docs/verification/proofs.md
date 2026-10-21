@@ -49,7 +49,9 @@ Unknown names, source substitutions, missing or duplicated obligations, altered 
 The ordinary proof command uses the pinned native-default backend and command-local loader isolation; standalone sources receive the same Rust 2024 edition as the workspace.
 The report must agree with its actual target and observed tools, exactly one builtin Cadical solver with an explicit null version, sixteen object bits, complete unique harness observations, full property counts, and the required clean or PanicsOnly assertion-failure phase.
 Tool snapshots cap each member at 256 MiB, all member bytes at 1024 MiB, and member count at 1024; the 16 MiB report and existing source-transfer bounds remain separate.
-Version probes retain the ten-second deadline and one-MiB diagnostic bound, and actual proofs retain the sixty-second per-harness budget and one solver job.
+Version probes retain the ten-second observation limit and one-MiB diagnostic bound.
+Actual proofs retain one solver job and every declared input and unwinding bound, without a per-harness wall-clock deadline.
+The bounded container policy controls resource exhaustion; reaching its outer limit leaves the attempt inconclusive and blocks publication.
 Native paths, filesystem identity, SHA-256 implementation, process execution, and the operating system remain adapter trust boundaries, with specific replacement, alias, loader, identity, and failure controls.
 Current-source native execution is required before this qualification can be reported as passed.
 

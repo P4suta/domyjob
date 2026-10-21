@@ -836,6 +836,12 @@
   ],
   "boundaries": [
     {
+      "source": "xtask/src/ci.rs",
+      "reason": "The optional verification container uses domyjob source snapshots, Docker image resolution, native path identity, bind mounts, ownership restoration and process exit status. These operating-system and engine contracts are outside Kani's executable model; the existing source-bound proofs and interpreter checks still execute unchanged inside the selected environment.",
+      "evidence": "CI adapter tests preserve both exact heavy commands, opaque remote arguments, read-only source and writable generated-output mounts, fixed memory/CPU/process bounds and the outer diagnostic limit. Native filesystem tests require owned output directories and reject escaping directory links. An unknown configured image fails before heavy execution, and native Docker runs retain the existing proof inventory, source/tool bindings and Miri lanes.",
+      "reconsider": "Container arguments, image resolution, mount ownership, command selection or result admission changes or fails, or a verifier supports the actual Docker and filesystem boundary."
+    },
+    {
       "source": "crates/domyjob/src/state_io.rs",
       "reason": "Filesystem metadata, permission changes, reparse-point identity, Windows sharing observations and timed waits are native operating-system boundaries outside Kani's modeled environment.",
       "evidence": "Native state_io tests count zero writable calls for removable trash and cover read-only files and directories, no-follow directory links and Windows handles that deny deletion. Fault injection checks grant ordering, grant failure, later deletion failure, paired error messages and bounded busy retries before and after the single grant; the source-bound proof checks every admitted result sequence and the negative rejects granting without a denial. Native execution remains specific to the tested host; cross-target Clippy checks the Linux and Windows adapters.",

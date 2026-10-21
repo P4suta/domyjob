@@ -12,6 +12,17 @@ Product code, dependencies, toolchains, build configuration, and unrecognized pa
 Full lint and scoped validation call that same owner, so a different outgoing push range cannot omit a mandatory static check.
 A failure stops scoped tests and subsequent remote checks.
 
+Set `DOMYJOB_VERIFICATION_IMAGE` to a prepared Linux amd64 Docker image to run the existing proof and Miri checks in containers.
+The image must contain this repository's pinned mise tools, Kani 0.68.0, cargo-fuzz 0.13.2, and nightly-2026-10-01 with Miri and rust-src.
+The CI adapter resolves the selected image to its immutable identity before execution.
+Each command keeps the source read-only, writes evidence below `target/verification-container`, and receives two CPUs, 4 GiB without swap, 256 processes, and a 3600-second diagnostic limit.
+Generated fuzz artifacts use a separate writable cache mount, and a bounded cleanup restores cache ownership to the checkout owner.
+A resource-limit exit leaves the check incomplete and blocks publication.
+Kani waits for each solver result without a local wall-clock cutoff; every input bound, cover, named negative control, and report admission check remains required.
+The selected check inventory and native platform checks are unchanged.
+Set `DOMYJOB_VERIFICATION_MACHINE` as well to send these two checks through domyjob's verified source snapshot to a configured owner-side Linux machine.
+The prepared image must exist on that machine; its availability is optional and is never required by hosted CI.
+
 The planner compares exact Git objects with a NUL-delimited diff and disabled rename detection, so deleted paths and both sides of a rename participate in the decision.
 The pre-push hook unions every ref range received on stdin and includes local staged, unstaged, and untracked changes.
 A new branch uses the exact merge base with an existing local `main`, or a validated remote's tracking `main` when explicitly supplied to `cargo xtask ci hook REMOTE`.
