@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use windows_spawn::{Child, Command, Job, SpawnOptions};
 
@@ -80,6 +79,7 @@ impl Control {
 pub(super) struct Execution {
     child: Child,
     job: Job,
+    diagnostics: File,
 }
 
 impl Execution {
@@ -97,7 +97,11 @@ impl Execution {
             .stdout(capture.output.as_file().try_clone()?)
             .stderr(capture.errors.as_file().try_clone()?)
             .spawn_with(SpawnOptions::new().job(&job))?;
-        Ok(Self { child, job })
+        Ok(Self {
+            child,
+            job,
+            diagnostics: capture.errors.reopen()?,
+        })
     }
 }
 
@@ -105,8 +109,6 @@ pub(super) struct Context<'a> {
     pub(super) control: &'a Control,
     pub(super) marker: &'a Path,
     pub(super) schedule: InputSchedule,
-    pub(super) started: Instant,
-    pub(super) case_millis: u64,
     pub(super) descendant: Option<&'a Path>,
 }
 
@@ -123,16 +125,28 @@ pub(super) struct Reader<'a> {
     context: Context<'a>,
     transfer: Transfer,
     contained: bool,
+    waiting: crate::peer::Wait,
 }
 
 impl<'a> Reader<'a> {
-    pub(super) const fn new(execution: Execution, input: File, context: Context<'a>) -> Self {
+    pub(super) fn new(execution: Execution, input: File, context: Context<'a>) -> Self {
+        let waiting = crate::peer::Wait::new(
+            format!(
+                "PowerShell bootstrap input reader (pid {})",
+                execution.child.id()
+            ),
+            format!(
+                "binary source prefix and inherited remainder ({:?})",
+                context.schedule
+            ),
+        );
         Self {
             execution,
             input: Some(input),
             context,
             transfer: Transfer::Initial,
             contained: false,
+            waiting,
         }
     }
 
@@ -144,7 +158,7 @@ impl<'a> Reader<'a> {
     }
 
     pub(super) fn run(mut self) -> (Outcome<std::process::ExitStatus, io::Error>, bool) {
-        let controller = Controller::new(self.identity(), self.context.case_millis);
+        let controller = Controller::new(self.identity());
         let outcome = input_controller::wait(&mut self, controller);
         (outcome, self.contained)
     }
@@ -220,15 +234,6 @@ impl input_controller::Reader for Reader<'_> {
         })
     }
 
-    fn elapsed_millis(&mut self) -> u64 {
-        self.context
-            .started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX)
-    }
-
     fn begin(&mut self) -> io::Result<()> {
         publish_begin(self.context.control.directory.path(), self.identity())
     }
@@ -250,11 +255,17 @@ impl input_controller::Reader for Reader<'_> {
                 ));
             }
             self.contained = true;
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "controlled cancellation after owned descendant readiness",
+            ));
         }
         self.transfer(self.pending()?)
     }
     fn pause(&mut self) {
-        crate::pause(INPUT_POLL_MILLIS);
+        let received = super::diagnostic_prefix(&self.execution.diagnostics)
+            .unwrap_or_else(|error| format!("stderr capture: {error}"));
+        self.waiting.pause(received);
     }
     fn close_input(&mut self) -> io::Result<()> {
         drop(self.input.take());
@@ -265,6 +276,13 @@ impl input_controller::Reader for Reader<'_> {
     }
 
     fn reap(&mut self) -> io::Result<()> {
+        let mut waiting = crate::peer::Wait::new(
+            format!(
+                "owned bootstrap Job (root pid {})",
+                self.execution.child.id()
+            ),
+            "root exit and zero active descendants after termination",
+        );
         loop {
             let exited = self.execution.child.try_wait()?.is_some();
             let active = super::owned_job::active(&self.execution.job)?;
@@ -272,15 +290,7 @@ impl input_controller::Reader for Reader<'_> {
                 self.execution.child.wait()?;
                 return Ok(());
             }
-            if self.elapsed_millis() >= self.context.case_millis {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "owned input cleanup did not establish quiescence: root exited {exited}; active {active}"
-                    ),
-                ));
-            }
-            self.pause();
+            waiting.pause(format!("root exited {exited}; active {active}"));
         }
     }
 }
@@ -288,7 +298,6 @@ impl input_controller::Reader for Reader<'_> {
 pub(super) fn descendant_contract(root: &Path) -> Result<(), crate::Failure> {
     use crate::Context as _;
 
-    let started = Instant::now();
     let control = Control::new(root).context("owning the descendant control")?;
     let marker = control.directory.path().join("descendant.bin");
     let pending = control.directory.path().join("pending.txt");
@@ -313,9 +322,6 @@ pub(super) fn descendant_contract(root: &Path) -> Result<(), crate::Failure> {
         control: &control,
         marker: &pending,
         schedule: InputSchedule::Buffered,
-        started,
-        case_millis: u64::try_from(crate::world::COMMAND_LIMIT.as_millis())
-            .map_err(|error| crate::Failure::new(error.to_string()))?,
         descendant: Some(&marker),
     };
     let execution = Execution::spawn("powershell.exe", &script, input, &capture)
@@ -328,17 +334,15 @@ pub(super) fn descendant_contract(root: &Path) -> Result<(), crate::Failure> {
     ensure!(
         matches!(
             outcome.primary,
-            Err(input_controller::Problem::Refused(
-                input_controller::Refusal::OperationDeadline
-            ))
+            Err(input_controller::Problem::Port(ref error)) if error.kind() == io::ErrorKind::Interrupted
         ),
-        "the held child lost its exact operation deadline: {outcome:?}"
+        "the held child lost its controlled cancellation: {outcome:?}"
     );
     ensure!(
         outcome.cleanup.iter().all(Result::is_ok),
         "owned descendant cleanup did not establish quiescence: {outcome:?}"
     );
-    println!("bootstrap owned descendant: contained; operation deadline; quiescent");
+    println!("bootstrap owned descendant: contained; controlled cancellation; quiescent");
     Ok(())
 }
 

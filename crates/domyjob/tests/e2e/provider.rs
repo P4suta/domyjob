@@ -259,13 +259,9 @@ fn rendezvous(cwd: &Path) -> Result<bool, Failure> {
         .ok_or_else(|| Failure::new("the working directory has no parent"))?
         .join("rendezvous.jsonl");
     crate::append_line(&place, &json!(std::process::id())).context("joining the rendezvous")?;
-    for _ in 0..crate::world::POLLS {
-        if crate::read_lines(&place)?.len() >= 2 {
-            return Ok(true);
-        }
-        crate::pause(50);
-    }
-    Ok(false)
+    crate::world::wait_for("both fake peers to join the rendezvous", || {
+        Ok((crate::read_lines(&place)?.len() >= 2).then_some(true))
+    })
 }
 
 fn hang(cwd: &Path) -> Result<(), Failure> {

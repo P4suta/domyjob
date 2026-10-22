@@ -1,4 +1,3 @@
-pub(crate) const OPERATION_MILLIS: u64 = 5_000;
 pub(crate) const CASE_BYTES: usize = 16;
 pub(crate) const IDENTITY_BYTES: usize = CASE_BYTES + size_of::<u32>();
 
@@ -37,9 +36,6 @@ pub(crate) enum Ready {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
-    ClockRegressed,
-    CaseDeadline,
-    OperationDeadline,
     ExitedBeforeReady,
     InvalidReady,
     ForeignReady,
@@ -58,39 +54,28 @@ pub(crate) enum Decision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Preparing,
-    Operating { started: u64 },
+    Operating,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Controller {
     expected: Identity,
     phase: Phase,
-    case_millis: u64,
-    previous: u64,
 }
 
 impl Controller {
-    pub(crate) const fn new(expected: Identity, case_millis: u64) -> Self {
+    pub(crate) const fn new(expected: Identity) -> Self {
         Self {
             expected,
             phase: Phase::Preparing,
-            case_millis,
-            previous: 0,
         }
     }
 
-    pub(crate) fn observe(&mut self, elapsed: u64, exited: bool, ready: Ready) -> Decision {
-        if elapsed < self.previous {
-            return Decision::Refuse(Refusal::ClockRegressed);
-        }
-        self.previous = elapsed;
-        if elapsed >= self.case_millis {
-            return Decision::Refuse(Refusal::CaseDeadline);
-        }
+    pub(crate) fn observe(&mut self, exited: bool, ready: Ready) -> Decision {
         match self.phase {
-            Phase::Preparing => self.prepare(elapsed, exited, ready),
-            Phase::Operating { started } => {
-                let decision = self.operate(elapsed, started, ready);
+            Phase::Preparing => self.prepare(exited, ready),
+            Phase::Operating => {
+                let decision = self.operate(ready);
                 if exited && decision == Decision::Progress {
                     Decision::Complete
                 } else {
@@ -100,7 +85,7 @@ impl Controller {
         }
     }
 
-    fn prepare(&mut self, elapsed: u64, exited: bool, ready: Ready) -> Decision {
+    fn prepare(&mut self, exited: bool, ready: Ready) -> Decision {
         if exited {
             return Decision::Refuse(Refusal::ExitedBeforeReady);
         }
@@ -111,19 +96,13 @@ impl Controller {
                 Decision::Refuse(Refusal::ForeignReady)
             }
             Ready::Published(_) => {
-                self.phase = Phase::Operating { started: elapsed };
+                self.phase = Phase::Operating;
                 Decision::Begin
             }
         }
     }
 
-    fn operate(&self, elapsed: u64, started: u64, ready: Ready) -> Decision {
-        let Some(spent) = elapsed.checked_sub(started) else {
-            return Decision::Refuse(Refusal::ClockRegressed);
-        };
-        if spent >= OPERATION_MILLIS {
-            return Decision::Refuse(Refusal::OperationDeadline);
-        }
+    fn operate(&self, ready: Ready) -> Decision {
         match ready {
             Ready::Missing => Decision::Refuse(Refusal::ReadyDisappeared),
             Ready::Invalid => Decision::Refuse(Refusal::InvalidReady),
@@ -141,7 +120,6 @@ pub(crate) trait Reader {
 
     fn try_wait(&mut self) -> Result<Option<Self::Exit>, Self::Error>;
     fn ready(&mut self) -> Result<Ready, Self::Error>;
-    fn elapsed_millis(&mut self) -> u64;
     fn begin(&mut self) -> Result<(), Self::Error>;
     fn progress(&mut self) -> Result<(), Self::Error>;
     fn pause(&mut self);
@@ -178,7 +156,7 @@ fn run<R: Reader>(
     loop {
         let status = reader.try_wait().map_err(Problem::Port)?;
         let ready = reader.ready().map_err(Problem::Port)?;
-        match controller.observe(reader.elapsed_millis(), status.is_some(), ready) {
+        match controller.observe(status.is_some(), ready) {
             Decision::Wait => {}
             Decision::Begin => reader.begin().map_err(Problem::Port)?,
             Decision::Progress => reader.progress().map_err(Problem::Port)?,

@@ -49,7 +49,9 @@ Unknown names, source substitutions, missing or duplicated obligations, altered 
 The ordinary proof command uses the pinned native-default backend and command-local loader isolation; standalone sources receive the same Rust 2024 edition as the workspace.
 The report must agree with its actual target and observed tools, exactly one builtin Cadical solver with an explicit null version, sixteen object bits, complete unique harness observations, full property counts, and the required clean or PanicsOnly assertion-failure phase.
 Tool snapshots cap each member at 256 MiB, all member bytes at 1024 MiB, and member count at 1024; the 16 MiB report and existing source-transfer bounds remain separate.
-Version probes retain the ten-second deadline and one-MiB diagnostic bound, and actual proofs retain the sixty-second per-harness budget and one solver job.
+Version probes retain the ten-second observation limit and one-MiB diagnostic bound.
+Actual proofs retain one solver job and every declared input and unwinding bound, without a per-harness wall-clock deadline.
+The bounded container policy controls resource exhaustion; reaching its outer limit leaves the attempt inconclusive and blocks publication.
 Native paths, filesystem identity, SHA-256 implementation, process execution, and the operating system remain adapter trust boundaries, with specific replacement, alias, loader, identity, and failure controls.
 Current-source native execution is required before this qualification can be reported as passed.
 
@@ -61,13 +63,16 @@ It checks the exact accepted prefix, first-error refusal, and final-flush result
 Native helper fixtures separately exercise interrupted retries, zero writes, empty segments, and flush failures.
 
 The standalone input-controller proofs import the actual Windows fixture controller.
-They quantify every fixed-size case/process token, every scalar clock/budget value, typed Ready and child observations, and all failure choices in the stated three-observation port.
-Seventeen covers require representation boundaries, actual readiness admission/refusals, fixed operation and case deadlines, clock regression, and retained primary/cleanup outcomes.
-Three exact false controls reject completion at the operation deadline, foreign Ready admission, and discarded owned cleanup errors.
-The actual parent records the operation start before publishing Begin; PowerShell publishes Ready only after actual Add-Type and its zero/invalid-count checks.
-Every pending, zero-byte, and completion observation shares the unchanged five-second operation start, and the existing whole-case command budget remains authoritative.
+They quantify every fixed-size case/process token, typed Ready and child observations, and all failure choices in the stated three-observation port.
+Fifteen covers require representation boundaries, readiness admission/refusals, progress while the peer lives, completion after exit, and retained primary/cleanup outcomes.
+Three exact false controls reject completion before peer exit, foreign Ready admission, and discarded owned cleanup errors.
+PowerShell publishes Ready only after actual Add-Type and its zero/invalid-count checks; the parent publishes Begin only for that exact live case/process identity.
+Preparation and operation have no clock input or local deadline.
+`cargo xtask verify e2e-input` selects this complete positive and negative inventory, validates all registered source inventories, and binds source and physical tools before and after execution.
+Run it in a bounded Linux container on the Mac; it selects no mutation, fuzz, model, or unrelated proof campaign.
 These source-bound contracts do not establish PowerShell compilation time or Win32 Job behavior.
-Native controls retain all eight binary input schedules and exercise a held descendant in the exact creation-time Job, followed by owned termination, root reap, and zero-active-process observation.
+Native controls retain all eight binary input schedules and exercise a held descendant in the exact creation-time Job.
+Observed containment triggers explicit test cancellation, followed by owned termination, root reap, and zero-active-process observation.
 The original hosted failure's phase remains unestablished; a successful rerun alone is not a causal fix.
 The actual reaper CLI uses the typed process-group constructor, whose proof quantifies every `i32`, preserves every admitted positive value, and covers positive, zero, and negative inputs.
 Its false ownership control must fail `NEGATIVE_PROCESS_GROUP_CONTROL`.
@@ -88,8 +93,10 @@ It quantifies all four Boolean refusal choices and every eight-bit owned cause w
 Five covers require success and the first failure at Read, Decode, Validate, and Launch.
 The exact negatives reject relabelled request-read failure and discarded error payloads.
 The actual Mac adapter supplies bounded reads, JSON ingress, path and environment validation, and native launch; those parser and operating-system semantics are not replaced by the port proof.
-Native controls retain injected error kind, operating-system code, and cause, require zero launches before valid admission, and exercise an actual partial-request timeout with the unchanged thirty-second production bound.
-The observed intermittent timeout's underlying EOF or scheduling cause remains unestablished.
+Native controls retain injected error kind, operating-system code, and cause, require zero launches before valid admission, and exercise actual partial-request EOF.
+The login-session exchange reads the bounded request frame and waits for reply completion without socket deadlines.
+The complete-frame regression refuses any read beyond the declared payload, so native transport EOF is unnecessary for launch.
+Native socket observers require both read and write deadlines to remain absent on the sender and receiver.
 
 The login reply harness imports the production generic write-and-shutdown adapter.
 It checks every byte in payloads of length zero through four, every stable one-byte write cutoff within that payload, and both shutdown outcomes with unwind eight.
