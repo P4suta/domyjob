@@ -66,13 +66,17 @@ Suspended process creation remains part of the existing launch factory's reviewe
 | Release resource and publication ownership | Storage preflight before side effects; receipt retained on cleanup failure; owned credential and extraction cleanup; private capabilities without fabrication or cloning; manual origins never publish; exact draft assets before immutable publication |
 | Installer and distribution lineage | Active signer matches selected certificate; exact script-free payload and package reference; both architectures; unchanged original build manifest; authenticated original and final digests; exact saved ready artifact identity on retry |
 | Publication dependency and publisher policy | Fresh advisory fetch and native lockfile parsing; failed or changed snapshots and failed cleanup cannot issue audit authority; exact Windows publisher required by the bundle factory; failed verification cannot reach release writes |
-| Scoped verification | Full and scoped Rust checks share formatting, architecture, spelling, workflow and duplication checks; a static failure stops subsequent work; documentation alone retains spelling checks without product or remote tests |
+| Scoped verification | Full and scoped Rust checks share formatting, architecture, inventory consistency, spelling, workflow and duplication checks; a static failure stops subsequent work; hooks and PRs never start heavy or remote campaigns |
 
 Compiler checks cover prohibited capability combinations and ownership lifetimes without executing invalid SDK operations.
 An operating-system capability proves the requested resource kind and granted access at construction, rather than promising that later operations cannot fail.
 The small FFI constructors and their ABI assumptions remain a reviewed boundary backed by native contract tests.
 
 ## Completion boundary
+
+Implementation changes pass the [fast gate](../ci.md#fast-gate) before push and on their PR.
+The following full assurance boundary applies at the release gate or during an optional bounded investigation.
+It does not require a proof, mutation, or cross-OS campaign before a commit, push, PR, or merge.
 
 1. Implement the common ownership boundaries and the mandatory static gates.
 2. Pass the finite shared contracts, negative compiler checks with passing controls, project lint, and the existing macOS, Linux, and Windows suites.

@@ -109,12 +109,14 @@ The wire protocol has no format of its own, because a client only ever talks to 
   A mutation rejected by a required compiler or Clippy gate is a static rejection, not a native test detection.
   Native failures, timeouts, failed restored controls, and missing evidence remain inconclusive or unaudited.
   [Effect contracts](verification/effect-contracts.md) define the shared verification categories and the finite completion boundary.
-- `mise run check:fleet` runs the checks on Linux and Windows through domyjob.
+- `mise run check:scope` runs the fast pre-push gate on the current host.
+- `mise run check:fleet` optionally runs native checks on Linux and Windows through domyjob, outside required push and PR validation.
 
-Either mutation task accepts a dedicated engine through `DOMYJOB_MUTATION_TOOL`, so the default installation can stay unchanged.
-Create a separate temporary directory for that engine before running the task to keep incompatible build caches apart:
+The [CI policy](ci.md) separates the fast gate from release verification.
+Proofs, models, Miri, fuzz exploration, stress repeats, and the native OS matrix run at the release gate.
+On owner machines, proof, interpreter, fuzz, and mutation commands require `DOMYJOB_VERIFICATION_IMAGE` and execute inside its bounded container.
+Either mutation task accepts `DOMYJOB_MUTATION_TOOL` as the dedicated engine's path inside that image:
 
 ```sh
-mkdir -p /path/to/mutation-tmp
-DOMYJOB_MUTATION_TOOL=/path/to/dedicated/rust-mutants TMPDIR=/path/to/mutation-tmp mise run mutants:source
+DOMYJOB_VERIFICATION_IMAGE=verification@sha256:DIGEST mise run mutants:source
 ```

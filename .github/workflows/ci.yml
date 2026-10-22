@@ -1,10 +1,9 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -32,18 +31,12 @@ jobs:
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
         with:
           version: 2026.10.7
-          install_args: ${{ (needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true') && 'rust node java actionlint taplo typos npm:jscpd npm:@informalsystems/quint cargo:kani-verifier@0.68.0 cargo:cargo-fuzz@0.13.2 aqua:nextest-rs/nextest/cargo-nextest' || needs.changes.outputs.workflows == 'true' && 'rust actionlint typos' || 'rust typos' }}
+          install_args: ${{ (needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true') && 'rust node actionlint taplo typos npm:jscpd' || 'rust typos' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Set up the pinned verifier bundle
-        if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
-        run: mise x cargo:kani-verifier@0.68.0 -- cargo kani setup
-      - name: Install the pinned interpreter for finite core contracts
-        if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
-        run: rustup toolchain install nightly-2026-10-01 --component miri --component rust-src
       - run: cargo xtask ci check
         env:
           PLAN_JSON: ${{ needs.changes.outputs.plan }}
@@ -82,11 +75,7 @@ jobs:
   test:
     needs: [changes]
     if: needs.changes.outputs.product == 'true' || needs.changes.outputs.xtask == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.changes.outputs.test_os) }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -101,42 +90,14 @@ jobs:
           shared-key: domyjob-ci-v2
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Prepare the Linux user manager for isolated resource contracts
-        if: runner.os == 'Linux' && needs.changes.outputs.product == 'true'
-        run: |
-          sudo loginctl enable-linger "$(id -un)"
-          sudo systemctl start "user@$(id -u).service"
       - run: cargo xtask ci test
         env:
           PLAN_JSON: ${{ needs.changes.outputs.plan }}
-      - name: Repeat reply-wait scenarios ten times on Windows
-        if: runner.os == 'Windows' && needs.changes.outputs.product == 'true'
-        run: >-
-          mise x -- cargo nextest run --locked -p domyjob --test e2e
-          --stress-count 10 --fail-fast --no-tests=fail
-          -E 'test(=mcp_serves_an_interactive_agent) | test(=bootstrap_preserves_first_request_and_cleans_its_owned_work) | test(=jobs_run_through_the_node_wrapper)'
-
-  fuzz:
-    needs: [changes]
-    if: needs.changes.outputs.fuzz == 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
-        with:
-          version: 2026.10.7
-          install_args: rust
-      - run: rustup toolchain install nightly-2026-10-01 --component rust-src
-      - run: cargo install --locked cargo-fuzz --version 0.13.2
-      - run: mise run fuzz
 
   ci-success:
     name: ci-success
     if: always()
-    needs: [changes, lint, deny, vet, test, fuzz]
+    needs: [changes, lint, deny, vet, test]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

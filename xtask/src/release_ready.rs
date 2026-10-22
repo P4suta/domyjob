@@ -9,6 +9,7 @@ use crate::release_queue::{Handoff, MAC_TARGETS, Source, SourceClaims, sha256_fi
 pub(crate) const RECEIPT: &str = "release-derivation.json";
 pub(crate) const BUILD_MANIFEST: &str = "build-manifest.json";
 const LIMIT: u64 = 64 * 1024 * 1024;
+const CHECKSUM_FILE_LIMIT: u64 = 512;
 
 fn invalid(reason: &str) -> OrchestrationError {
     OrchestrationError::Invalid(reason.to_owned())
@@ -156,8 +157,10 @@ impl ReadyDistribution {
         }
         for asset in &derivation.assets {
             if sha256_file_bounded(&directory.join(&asset.name))? != asset.sha256
-                || read(&directory.join(format!("{}.sha256", asset.name)), 512)?
-                    != format!("{}  {}\n", asset.sha256, asset.name).as_bytes()
+                || read(
+                    &directory.join(format!("{}.sha256", asset.name)),
+                    CHECKSUM_FILE_LIMIT,
+                )? != format!("{}  {}\n", asset.sha256, asset.name).as_bytes()
             {
                 return Err(invalid("ready asset or checksum changed after stapling"));
             }

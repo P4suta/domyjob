@@ -1,18 +1,24 @@
 # Source-bound verification
 
 `mise run verify` owns the [proof inventory](../../verification/obligations.json).
+The [release gate](../ci.md#release-gate) runs the complete inventory, models, preserved corpora, Miri, fuzz exploration, and supported native OS tests on one candidate SHA.
+Pushes and pull requests run `cargo xtask verify inventory`, which checks source consistency without starting a verifier.
+Harnesses, models, and corpora remain required with their implementation changes.
+On owner machines, every heavy selector uses the [bounded container adapter](../ci.md#on-demand-verification).
+An unrun heavy check supplies no verification result.
+
 The inventory defines the required positive Kani harnesses, named negative controls, and cover counts.
 Every obligation records its contract, admitted inputs, bound, and production entry point.
 Discovery must equal the exact registered harness set in the core and standalone sources.
 An absent source, unregistered proof, duplicate identity, empty phase, stale inventory, skipped cover, solver error, or unrelated negative failure refuses the gate.
 An optional standalone source selects that maintained source explicitly; omission selects the core Cargo lane and never makes execution optional.
 
-`cargo xtask verify parent-identity` is a closed native Linux calibration.
+`cargo xtask verify parent-identity` is a closed Linux calibration, hosted or containerized.
 It validates the full inventory and the actual Parent source refinement, then runs the imported proof-controller exit policy before the complete Parent identity pair.
 The exit policy quantifies both proof phases and every optional i32 code with four covers and `NEGATIVE_PROOF_EXIT_CODE` as the false admission claim.
 The Parent proof quantifies every canonical 128-bit origin and nonzero u64 sequence independently for parent and request, with six identity and classification covers and `NEGATIVE_PARENT_IDENTITY` as its false claim.
 The actual runner requires normal zero for positive proofs and normal one for named counterexamples before it reads the unchanged strict report decoder.
-Its native-default arguments use one proof job, two build jobs, the unchanged sixty-second harness budget, and positive-only fail-fast.
+Its native-default arguments use one proof job, two build jobs, and positive-only fail-fast within the outer diagnostic limit.
 Source-after binding runs even after proof refusal and retains both failures when needed.
 Each proof captures the actual selected Kani proxies, mise and Cargo launchers, linked compiler and toolchain, required backend roles, runtime support files, and exact child version observations before execution.
 The independent after observation still runs after admission, compiler, process, or report refusal and retains both causes when they fail.
@@ -126,10 +132,13 @@ It also copies the checked-in source seeds `tracked`, `metadata` and `malformed`
 Missing or empty required corpus files fail before libFuzzer starts.
 The checked-in process-group seeds `positive`, `nonpositive`, and `overflow` add a third isolated replay directory.
 The checked-in `chat_ledger/notifications` seed and `hook_clients/foreign` and `hook_clients/malformed` seeds add three nonempty receipt/activity and hook-document inputs.
-The maintained cargo-fuzz 0.13.2 targets replay those twelve inputs through five production ingress and model targets with zero mutation runs and seed one.
+The maintained cargo-fuzz 0.13.2 targets replay the registered ingress and model corpora with zero mutation runs and seed one.
+The current inventory also includes terminal-input and handoff metadata seeds.
+`mise run fuzz` explores those seven targets and the state target for 20000 runs each with seed one, using isolated writable corpora.
 Exploratory corpus output cannot change the required replay set.
 
 `mise run miri` interprets fourteen finite production state, protocol, refusing generic-serialization, source-ingress, process-group, segmented-writer, worker handoff, login reply, input-controller, notification, hook-merge, and capture-policy lanes through nightly-2026-10-01.
+The public task selects the bounded local adapter or the hosted native implementation; `miri:native` requires one of those execution environments.
 Every named lane requires nonempty test execution.
 The serializer fixture exercises the public generic `frame` function with a valid custom serializer that returns its own error and requires that exact error without a panic.
 The login reply target imports the production adapter and checks partial writes, both failure outcomes, interrupted progress, write zero, and empty replies in four finite tests.
@@ -183,7 +192,8 @@ The gate fingerprints production source, locked dependencies, proof sources, con
 It includes the entire verifier package, including its manifest and any Cargo automatic build inputs.
 Only an unchanged source may produce its success receipt.
 Results from a larger feature set or a different checkout do not certify this baseline.
-Linux and Mac own the complete verifier and interpreter lanes.
+The release workflow runs the complete verifier and interpreter lanes on hosted Linux.
+Owner-machine on-demand runs use the prepared bounded Linux image.
 Windows requires the same nonempty exact inventory, native SDK contracts, and native workspace tests; inventory consistency alone is not a proof result.
 Native obligations and their reconsideration conditions are recorded beside the proof inventory.
 The arithmetic, transition, and protocol proofs do not establish SSH reliability, native process ownership, operating-system infallibility, or behavior of unreviewed dependencies.

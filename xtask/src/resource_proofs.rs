@@ -595,7 +595,7 @@ fn command(
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
-    crate::verification::run(root)
+    crate::verification::dispatch(root, &[])
 }
 
 pub fn run_inventory(
