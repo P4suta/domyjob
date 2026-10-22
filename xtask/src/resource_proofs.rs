@@ -581,7 +581,6 @@ fn command(
             "--jobs=1",
             "-Z",
             "unstable-options",
-            "--harness-timeout=60s",
         ])
         .arg("--target-dir")
         .arg(target)
@@ -596,7 +595,7 @@ fn command(
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
-    crate::verification::run(root)
+    crate::verification::dispatch(root, &[])
 }
 
 pub fn run_inventory(
@@ -772,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_proof_command_limits_jobs_and_applies_fail_fast_only_to_positives() {
+    fn actual_proof_command_limits_jobs_without_a_machine_speed_deadline() {
         let root = std::path::Path::new("root");
         for phase in [super::Phase::Positive, super::Phase::NamedNegative] {
             let command = super::command(
@@ -797,9 +796,9 @@ mod tests {
                 phase == super::Phase::Positive
             );
             assert!(
-                arguments
+                !arguments
                     .iter()
-                    .any(|value| value == "--harness-timeout=60s")
+                    .any(|value| value.starts_with("--harness-timeout"))
             );
             assert!(!arguments.iter().any(|value| value.starts_with("--solver")));
         }

@@ -7,16 +7,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 use domyjob_core::domain::JobId;
-use domyjob_core::wire::MAX_CONTROL_BYTES;
+use domyjob_core::wire::{self, MAX_CONTROL_BYTES};
 use domyjob_core::worker_handoff::{HandoffFailure, HandoffPhase};
 use serde::{Deserialize, Serialize};
 
 use super::{ProcessError, Tool, run_tool};
 use crate::layout::State;
 use crate::lock::OsLock;
-use crate::platform::{self, clock, user_files};
+use crate::platform::{self, user_files};
 
-const IO_TIMEOUT_MILLIS: u64 = 30_000;
 const MAX_REPLY_BYTES: usize = 16_385;
 const MAX_ERROR_CHARS: usize = 4096;
 
@@ -95,12 +94,15 @@ struct PreparedHandoff(Vec<u8>);
 
 impl PreparedHandoff {
     fn new(request: &Handoff) -> Result<Self, ProcessError> {
-        let bytes = serde_json::to_vec(request).map_err(refused)?;
-        if bytes.len() > MAX_CONTROL_BYTES {
-            return Err(refused(
-                "the login-session hand-off exceeds the 1 MiB limit",
-            ));
-        }
+        let bytes = wire::frame(request).map_err(|error| match error {
+            wire::WireError::TooLarge => {
+                refused("the login-session hand-off exceeds the 1 MiB limit")
+            }
+            error @ (wire::WireError::Incomplete
+            | wire::WireError::Trailing
+            | wire::WireError::Snapshot
+            | wire::WireError::Json(_)) => refused(error),
+        })?;
         Ok(Self(bytes))
     }
 }
@@ -111,7 +113,6 @@ fn exchange(
 ) -> Result<(), ProcessError> {
     let prepared = PreparedHandoff::new(request)?;
     let mut stream = connect()?;
-    clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS).map_err(refused)?;
     exchange_using(&mut stream, &prepared, |socket| {
         socket.shutdown(Shutdown::Write)
     })
@@ -179,7 +180,6 @@ fn receive(
     mut stream: UnixStream,
     launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
 ) -> io::Result<()> {
-    clock::socket_timeout(&stream, IO_TIMEOUT_MILLIS)?;
     let mut reader = RequestReader {
         inner: &mut stream,
         bytes: 0,
@@ -237,15 +237,20 @@ fn receive_request(
     launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
 ) -> Result<(), HandoffFailure<io::Error>> {
     domyjob_core::worker_handoff::start(
-        || {
-            crate::bounded::read(reader, MAX_CONTROL_BYTES)?.ok_or_else(|| {
-                io::Error::other("the login-session hand-off exceeds the 1 MiB limit")
-            })
-        },
+        || read_request_frame(reader),
         |bytes| domyjob_core::ingress::json(&bytes, MAX_CONTROL_BYTES).map_err(io::Error::other),
         Handoff::validate,
         |request| launch(request).map_err(io::Error::other),
     )
+}
+
+fn read_request_frame(mut reader: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut header = [0; wire::CONTROL_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let length = wire::ControlLength::try_from(header).map_err(io::Error::other)?;
+    let mut bytes = vec![0; length.bytes()];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn bind(directory: &Path) -> io::Result<(UnixListener, OsLock)> {
@@ -301,6 +306,7 @@ mod tests {
     use super::{Handoff, bind, exchange, hand_off, receive};
     use crate::process::ProcessError;
     use domyjob_core::domain::{IDENTIFIER_HEX_BYTES, JobId};
+    use domyjob_core::wire;
     use std::os::unix::net::UnixStream;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,7 +371,7 @@ mod tests {
             (TransportFault::Read, "reply read"),
         ] {
             let packet = request();
-            let bytes = serde_json::to_vec(&packet).unwrap();
+            let bytes = wire::frame(&packet).unwrap();
             let mut stream = FaultyTransport {
                 fault,
                 sent: Vec::new(),
@@ -416,7 +422,8 @@ mod tests {
         }
 
         let mut launches = 0_u8;
-        let error = super::receive_request((&b"{\"program\":"[..]).chain(WouldBlock), |_| {
+        let header = 1_u32.to_be_bytes();
+        let error = super::receive_request(header.as_slice().chain(WouldBlock), |_| {
             launches += 1;
             Ok(())
         })
@@ -452,10 +459,9 @@ mod tests {
     #[test]
     fn an_oversized_request_is_refused_before_connecting() {
         let mut packet = request();
-        packet.environment.push((
-            "PATH".to_owned(),
-            vec![b'x'; domyjob_core::wire::MAX_CONTROL_BYTES],
-        ));
+        packet
+            .environment
+            .push(("PATH".to_owned(), vec![b'x'; wire::MAX_CONTROL_BYTES]));
         let connected = std::cell::Cell::new(false);
         let error = exchange(&packet, || {
             connected.set(true);
@@ -504,9 +510,10 @@ mod tests {
 
     #[test]
     fn actual_decode_and_validation_refuse_before_launch() {
-        let malformed =
-            super::receive_request(&b"{"[..], |_| panic!("malformed JSON cannot reach launch"))
-                .unwrap_err();
+        let malformed = super::receive_request(wire::frame(&"{").unwrap().as_slice(), |_| {
+            panic!("malformed JSON cannot reach launch")
+        })
+        .unwrap_err();
         assert_eq!(malformed.phase, super::HandoffPhase::Decode);
         assert!(super::refusal_detail(&malformed).starts_with("request decode: "));
         for invalid_path in [false, true] {
@@ -520,7 +527,7 @@ mod tests {
                     .push(("GH_TOKEN".to_owned(), b"private".to_vec()));
                 "allowlist"
             };
-            let bytes = serde_json::to_vec(&packet).unwrap();
+            let bytes = wire::frame(&packet).unwrap();
             let error = super::receive_request(bytes.as_slice(), |_| {
                 panic!("invalid request cannot reach launch")
             })
@@ -535,7 +542,7 @@ mod tests {
     #[test]
     fn launch_refusal_retains_its_owned_process_error() {
         const MACOS_WOULD_BLOCK: i32 = 35;
-        let bytes = serde_json::to_vec(&request()).unwrap();
+        let bytes = wire::frame(&request()).unwrap();
         let mut launches = 0_u8;
         let error = super::receive_request(bytes.as_slice(), |_| {
             launches += 1;
@@ -575,7 +582,7 @@ mod tests {
             })
         });
         let packet = request();
-        let sent = serde_json::to_vec(&packet).unwrap().len();
+        let sent = wire::frame(&packet).unwrap().len();
         let observed = exchange(&packet, || Ok(client));
         let completed = receiver.join();
         completed.unwrap().unwrap();
@@ -588,12 +595,8 @@ mod tests {
     }
 
     #[test]
-    fn partial_request_timeout_is_named_as_request_read_and_never_launches() {
-        const OBSERVATION_GRACE_MILLIS: u64 = 2_000;
-        const MACOS_WOULD_BLOCK: i32 = 35;
+    fn partial_request_eof_is_named_as_read_failure_and_never_launches() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        super::clock::socket_timeout(&client, super::IO_TIMEOUT_MILLIS + OBSERVATION_GRACE_MILLIS)
-            .unwrap();
         let receiver = std::thread::spawn(move || {
             let mut launches = 0_u8;
             let completed = receive(server, |_| {
@@ -602,8 +605,9 @@ mod tests {
             });
             (completed, launches)
         });
-        let partial = b"{\"program\":";
-        let sent = std::io::Write::write_all(&mut client, partial);
+        let partial = 1_u32.to_be_bytes();
+        let sent = std::io::Write::write_all(&mut client, &partial);
+        client.shutdown(std::net::Shutdown::Write).unwrap();
         let observed = crate::bounded::read(&mut client, super::MAX_REPLY_BYTES);
         drop(client);
         let joined = receiver.join();
@@ -612,14 +616,11 @@ mod tests {
         completed.unwrap();
         assert_eq!(launches, 0);
         let detail = String::from_utf8(observed.unwrap().unwrap()).unwrap();
-        let cause = std::io::Error::from_raw_os_error(MACOS_WOULD_BLOCK).to_string();
-        assert_eq!(
-            detail,
-            format!(
-                "request read: {cause}; receiver bytes={}; request_eof=false",
-                partial.len()
-            )
-        );
+        assert!(detail.starts_with("request read: "));
+        assert!(detail.contains(&format!(
+            "receiver bytes={}; request_eof=true",
+            partial.len()
+        )));
     }
 
     #[test]
@@ -652,15 +653,75 @@ mod tests {
         receiver.join().unwrap();
     }
 
+    #[test]
+    fn handoff_waits_for_the_peer_without_socket_deadlines() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let client_observer = client.try_clone().unwrap();
+        let server_observer = server.try_clone().unwrap();
+        let receiver = std::thread::spawn(move || receive(server, |_| Ok(())));
+        exchange(&request(), || Ok(client)).unwrap();
+        receiver.join().unwrap().unwrap();
+        for socket in [client_observer, server_observer] {
+            assert_eq!(socket.read_timeout().unwrap(), None);
+            assert_eq!(socket.write_timeout().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_complete_request_frame_does_not_wait_for_transport_eof() {
+        use std::io::Read as _;
+
+        struct NoEof;
+
+        impl std::io::Read for NoEof {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(transport_fault())
+            }
+        }
+
+        let frame = wire::frame(&request()).unwrap();
+        let mut launched = false;
+        super::receive_request(frame.as_slice().chain(NoEof), |_| {
+            launched = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(launched);
+    }
+
+    #[test]
+    fn readiness_can_answer_before_the_sender_closes_its_write_side() {
+        use std::io::Write as _;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let receiver = std::thread::spawn(move || receive(server, |_| Ok(())));
+        client.write_all(&wire::frame(&request()).unwrap()).unwrap();
+        let reply = crate::bounded::read(&mut client, super::MAX_REPLY_BYTES).unwrap();
+        drop(client);
+        receiver.join().unwrap().unwrap();
+        assert_eq!(reply, Some(b"R".to_vec()));
+    }
+
+    #[test]
+    fn oversized_and_truncated_request_frames_cannot_launch() {
+        let oversized = u32::try_from(super::MAX_CONTROL_BYTES + 1)
+            .unwrap()
+            .to_be_bytes();
+        let truncated = 1_u32.to_be_bytes();
+        for bytes in [oversized.as_slice(), truncated.as_slice(), &[]] {
+            let error = super::receive_request(bytes, |_| panic!("invalid frame cannot launch"))
+                .unwrap_err();
+            assert_eq!(error.phase, super::HandoffPhase::Read);
+        }
+    }
+
     fn reply_with_held_receiver(
         launch: impl FnOnce(Handoff) -> Result<(), ProcessError> + Send + 'static,
     ) -> std::io::Result<Option<Vec<u8>>> {
-        const OBSERVATION_TIMEOUT_MILLIS: u64 = 100;
         let (mut client, server) = UnixStream::pair()?;
-        super::clock::socket_timeout(&client, OBSERVATION_TIMEOUT_MILLIS)?;
         let held = server.try_clone()?;
         let receiver = std::thread::spawn(move || receive(server, launch));
-        let bytes = serde_json::to_vec(&request()).map_err(std::io::Error::other)?;
+        let bytes = wire::frame(&request()).map_err(std::io::Error::other)?;
         std::io::Write::write_all(&mut client, &bytes)?;
         client.shutdown(std::net::Shutdown::Write)?;
         receiver
@@ -706,7 +767,7 @@ mod tests {
                     .environment
                     .push(("GH_TOKEN".to_owned(), b"never-forward".to_vec()));
             }
-            let bytes = serde_json::to_vec(&packet).unwrap().len();
+            let bytes = wire::frame(&packet).unwrap().len();
             let error = exchange(&packet, || Ok(client)).unwrap_err();
             let cause = if unapproved {
                 "allowlist"
@@ -715,7 +776,7 @@ mod tests {
             };
             let detail = error.to_string();
             assert!(detail.contains(cause));
-            assert!(detail.contains(&format!("receiver bytes={bytes}; request_eof=true")));
+            assert!(detail.contains(&format!("receiver bytes={bytes}; request_eof=false")));
             assert!(detail.contains(&format!(
                 "sender bytes={bytes}; write_complete=true; write_half_closed=true"
             )));
@@ -761,10 +822,9 @@ mod tests {
         }
         let (client, _server) = UnixStream::pair().unwrap();
         let mut packet = request();
-        packet.environment.push((
-            "PATH".to_owned(),
-            vec![b'x'; domyjob_core::wire::MAX_CONTROL_BYTES],
-        ));
+        packet
+            .environment
+            .push(("PATH".to_owned(), vec![b'x'; wire::MAX_CONTROL_BYTES]));
         assert!(
             exchange(&packet, || Ok(client))
                 .unwrap_err()

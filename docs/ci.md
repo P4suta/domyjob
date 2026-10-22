@@ -1,32 +1,77 @@
-# Change-scoped validation
+# Fast validation and release verification
 
-`cargo xtask ci plan` owns the scope policy used by CI and the pre-push hook.
+Pushes and pull requests run the fast gate.
+Releases require the full verification inventory on the exact candidate commit.
+The [decision record](adr/run-heavy-verification-at-the-release-gate.md) defines this boundary.
+
+## Fast gate
+
+`mise run check:scope` is the pre-push entry point, backed by `cargo xtask ci hook`.
+`mise run check` runs the complete fast gate on the current host without scope selection.
+The gate checks formatting, native and cross-target Clippy, architecture and structure, Windows compiler contracts, fuzz-target types, spelling, workflow syntax, duplication, and ordinary tests.
+Dependency changes also run deny, audit, and vet in CI; `mise run check` includes those checks locally.
+`cargo xtask verify inventory` checks every registered source, proof name, negative control, and Parent refinement without starting a verifier.
+
 Documentation changes run spelling checks.
-Workflow changes also run actionlint, repository-task checks and tests, Actions CodeQL, dependency review, and Scorecard.
-Rust changes confined to `xtask` run the shared static checks, its Clippy and package tests, and Rust CodeQL.
-Changes to platform-sensitive task entry points also test that package on all three native operating systems.
-Changes to the Windows compiler-contract task or its CLI entry points also run its actual SDK acceptance and rejection checks on Windows.
-Product code, dependencies, toolchains, build configuration, and unrecognized paths retain full validation and native fleet checks.
+Workflow and task changes run the shared static checks, cross-target Clippy, and the task package's native tests.
+Product code, dependencies, toolchains, build configuration, and unknown paths select the complete fast gate.
+No scope starts Kani, Quint, Miri, fuzz exploration or replay, mutation testing, stress repeats, or another host.
+`check:fleet` and its owner-machine adapters remain optional commands outside hooks and required CI.
 
-`cargo xtask ci static` owns formatting, architecture gates, spelling, workflow validation, and duplication checking for every Rust or workflow scope.
-Full lint and scoped validation call that same owner, so a different outgoing push range cannot omit a mandatory static check.
-A failure stops scoped tests and subsequent remote checks.
+[CI](../.github/workflows/ci.yml) runs on pull requests and merge groups, on the pinned `ubuntu-26.04` runner.
+It provisions no verifier and has no macOS, Windows, fuzz, or stress job.
+The required summary keeps the name `ci-success` and depends only on `changes`, `lint`, `deny`, `vet`, and `test`.
+`cargo xtask ci gate` rejects failed or cancelled jobs and accepts skipped jobs only when the validated plan did not select them.
+Actions CodeQL, dependency review, and Scorecard keep their existing separate summaries.
 
-The planner compares exact Git objects with a NUL-delimited diff and disabled rename detection, so deleted paths and both sides of a rename participate in the decision.
-The pre-push hook unions every ref range received on stdin and includes local staged, unstaged, and untracked changes.
-A new branch uses the exact merge base with an existing local `main`, or a validated remote's tracking `main` when explicitly supplied to `cargo xtask ci hook REMOTE`.
-Missing history, an initial repository without a trusted base, merges, fork pull requests, and malformed inputs select full validation.
-Scheduled and manual security scans also select full validation.
+The planner compares exact Git objects using a NUL-delimited diff with rename detection disabled.
+The pre-push hook unions every outgoing ref range and includes staged, unstaged, and untracked changes.
+A new branch uses the merge base with local `main`, or the validated remote's tracking `main` when passed to `cargo xtask ci hook REMOTE`.
+Missing history, merges, forks, and malformed inputs select the complete fast gate.
+They never select a heavy campaign.
 
-Workflows always produce their final required checks.
-`cargo xtask ci gate` requires the changes job to succeed and accepts skipped jobs only when its complete, validated plan did not select them.
-CI jobs share cached Rust dependencies, separated by operating system, CPU architecture, toolchain, and dependency configuration.
-Only `main` saves these caches; pull requests restore them without saving, and release jobs use their independent builds.
-The CI workflow and command adapters disable mise's automatic tool installation, so checks use the tools explicitly provisioned by their workflow instead of introducing unrelated installation work during execution.
-The ownership gate reserves raw CI command construction for the private policy factory and the registered override test, rejecting alternate imports, function references, and literal macro paths.
-CI adapters run child Cargo and mise commands with a validated `CARGO_TARGET_DIR` inside `target/ci-build`, using `target/ci-build-alt` when the running task occupies the first directory.
-The child directory remains disjoint from the live task executable, including custom parent target directories and directory links, so Windows can rebuild `xtask` without replacing a running executable.
-Windows commands receive standard drive or UNC paths only after they resolve to the same validated canonical directories, avoiding MSVC incompatibility with verbatim path syntax.
-Directory links that escape the checkout's target cache and invalid directory layouts fail before a child starts.
-Both child directories remain in the shared dependency cache; documentation-only spelling checks do not create them.
-Release rehearsals and tagged releases remain independent of this policy and build, sign, and verify all five distribution targets.
+End-to-end reply waits observe their owned peer until its response or exit.
+The shared peer adapter captures output independently of inherited handles and reports pending process, request, and output details.
+The nextest watchdog supplies the outer diagnostic limit.
+Fixed stress repeats run at the release gate.
+
+## Release gate
+
+[Release check](../.github/workflows/release-check.yml) supports `workflow_dispatch` and `workflow_call` and publishes nothing.
+Select the candidate branch or tag with `gh workflow run release-check.yml --ref <candidate>`.
+Every job checks out the immutable `github.sha` from that event, without accepting a separate source input in another ref's cache context.
+It runs the full Kani inventory and named negative controls, Quint induction and fixed-seed trace replay, preserved fuzz corpora, and every Miri lane.
+Every fuzz target receives 20000 exploration runs with seed one in an isolated writable corpus.
+The native matrix runs Clippy, architecture checks, inventory consistency, and the full test suite on Linux, macOS, and Windows.
+Linux also checks native resource ownership; Windows checks actual SDK contracts and repeats the three reply-wait scenarios ten times.
+Fixed counts define exploration; a runner timeout leaves evidence incomplete.
+
+[The tag-triggered release workflow](../.github/workflows/release.yml) calls this gate with the caller's `github.sha` context.
+Its version, policy, and dependency checks wait for the entire gate, so signing and distribution cannot start after a failed or incomplete verification.
+Release-plz keeps opening version PRs and creating tags; ordinary release PR CI still runs only the fast gate.
+Manual release checks do not grant permission to sign or publish.
+
+## On-demand verification
+
+On owner machines, set `DOMYJOB_VERIFICATION_IMAGE` to a prepared Linux amd64 Docker image before running `mise run verify`, `miri`, `fuzz`, or either mutation task.
+The image needs the pinned mise tools, Kani 0.68.0, cargo-fuzz 0.13.2, nightly-2026-10-01 with Miri and rust-src, and the selected mutation engine when needed.
+Direct `cargo xtask verify` selectors use the same adapter; inventory inspection needs no container.
+Native task implementations refuse execution outside Actions or the verification container.
+GitHub Actions executes the checks natively on its hosted runners.
+
+The adapter resolves the image to its immutable Docker identity and refuses a missing image.
+Source is read-only, while evidence and fuzz artifacts use separate writable mounts below `target/verification-container`.
+Each command receives two CPUs, 2 GiB without swap, 256 processes, and a 900-second diagnostic limit.
+A bounded cleanup restores cache ownership.
+Limit termination is incomplete evidence and cannot pass a release check.
+Set `DOMYJOB_VERIFICATION_MACHINE` as well to run the bounded adapter through a verified domyjob source snapshot on a configured Linux owner machine.
+No hook, pull request, or hosted release requires that machine or its image cache.
+
+## Build isolation
+
+The CI adapters disable mise's automatic tool installation.
+Workflows provision their selected tools explicitly.
+Cargo and mise children use validated directories under `target/ci-build` or `target/ci-build-alt`, separate from the running task executable.
+Directory links that escape the checkout and invalid directory layouts fail before a child starts.
+Windows receives ordinary drive or UNC paths after canonical identity checks.
+Dependency caches remain separate by OS, architecture, toolchain, and lockfile.

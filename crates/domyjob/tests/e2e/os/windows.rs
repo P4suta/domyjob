@@ -7,7 +7,6 @@ use std::io;
 use std::io::Write as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
-use std::time::Instant;
 
 #[path = "../input_controller.rs"]
 mod input_controller;
@@ -173,7 +172,6 @@ exit $p.ExitCode
 }
 
 fn input_case(root: &Path, shell: &str, schedule: InputSchedule) -> Result<(), crate::Failure> {
-    let started = Instant::now();
     let case = InputCase {
         root,
         shell,
@@ -209,9 +207,6 @@ fn input_case(root: &Path, shell: &str, schedule: InputSchedule) -> Result<(), c
         control: &control,
         marker: &marker,
         schedule,
-        started,
-        case_millis: u64::try_from(crate::world::COMMAND_LIMIT.as_millis())
-            .map_err(|error| crate::Failure::new(error.to_string()))?,
         descendant: None,
     };
     let execution = input_reader::Execution::spawn(shell, &script, input, &capture)
@@ -337,7 +332,9 @@ fn quote(path: &Path) -> String {
 
 fn diagnostic_prefix(mut source: impl io::Read + io::Seek) -> io::Result<String> {
     let length = source.seek(io::SeekFrom::End(0))?;
-    source.seek(io::SeekFrom::Start(0))?;
+    source.seek(io::SeekFrom::Start(
+        length.saturating_sub(MAX_INPUT_DIAGNOSTIC_BYTES),
+    ))?;
     let count =
         usize::try_from(length.min(MAX_INPUT_DIAGNOSTIC_BYTES)).map_err(io::Error::other)?;
     let mut bytes = vec![0; count];
@@ -347,7 +344,7 @@ fn diagnostic_prefix(mut source: impl io::Read + io::Seek) -> io::Result<String>
     Ok(if omitted == 0 {
         text.into_owned()
     } else {
-        format!("{text}\n[{omitted} later input diagnostic bytes omitted]")
+        format!("[{omitted} earlier input diagnostic bytes omitted]\n{text}")
     })
 }
 

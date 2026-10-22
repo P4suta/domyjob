@@ -1,19 +1,16 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::fs;
-use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
-use std::sync::{Mutex, PoisonError, mpsc};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
+use crate::peer::{Peer, Wait};
 use crate::{Context as _, FAKES, Failure};
-
-pub(crate) const COMMAND_LIMIT: Duration = Duration::from_secs(180);
-const POLL_MILLISECONDS: u64 = 50;
-pub(crate) const POLLS: u32 = 2400;
 
 const PREFIX: &str = "domyjob-e2e-";
 pub(crate) const FAILURE_LOG_BYTES: usize = 4096;
@@ -480,59 +477,25 @@ impl Machine<'_> {
         let mut full = vec!["mcp"];
         full.extend_from_slice(arguments);
         let label = self.label(&full);
-        let log = self.world.root().join(format!("{}-mcp.log", self.name));
-        let errors = fs::File::create(&log).context(&format!("creating {}", log.display()))?;
-        let mut child = self
-            .command(&full)?
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(errors))
-            .spawn()
-            .context(&format!("starting {label}"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Failure::new("the MCP server has no standard output"))?;
-        let (sender, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else {
-                    return;
-                };
-                if sender.send(line).is_err() {
-                    return;
-                }
-            }
-        });
+        let mut command = self.command(&full)?;
+        command.stdin(Stdio::piped());
+        let mut peer = Peer::spawn(command, label.clone()).context(&format!("starting {label}"))?;
         Ok(Mcp {
-            input: child.stdin.take(),
-            child,
-            lines,
+            input: peer.input(),
+            peer,
+            offset: 0,
             seen: Vec::new(),
             unclaimed: Vec::new(),
+            requests: BTreeMap::new(),
             label,
         })
     }
 }
 
-fn execute(mut command: Command, label: String) -> Result<Run, Failure> {
-    let child = command.spawn().context(&format!("starting {label}"))?;
-    let pid = child.id();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _delivered = sender.send(child.wait_with_output());
-    });
-    match receiver.recv_timeout(COMMAND_LIMIT) {
-        Ok(Ok(output)) => Ok(Run::new(label, &output)),
-        Ok(Err(error)) => Err(Failure::new(format!("waiting for {label}: {error}"))),
-        Err(_expired) => {
-            let _killed = crate::kill_process(pid);
-            Err(Failure::new(format!(
-                "`{label}` did not finish within {} seconds; it or a process it started kept its output open",
-                COMMAND_LIMIT.as_secs()
-            )))
-        }
-    }
+fn execute(command: Command, label: String) -> Result<Run, Failure> {
+    let mut peer = Peer::spawn(command, label.clone()).context(&format!("starting {label}"))?;
+    let output = peer.wait(&label).context(&format!("waiting for {label}"))?;
+    Ok(Run::new(label, &output))
 }
 
 #[derive(Debug)]
@@ -581,11 +544,12 @@ impl fmt::Display for Run {
 
 #[derive(Debug)]
 pub(crate) struct Mcp {
-    child: Child,
+    peer: Peer,
     input: Option<ChildStdin>,
-    lines: mpsc::Receiver<String>,
+    offset: usize,
     seen: Vec<String>,
     unclaimed: Vec<Value>,
+    requests: BTreeMap<u64, Value>,
     label: String,
 }
 
@@ -605,14 +569,31 @@ impl Mcp {
     }
 
     pub(crate) fn start(&mut self, id: u64, method: &str, params: &Value) -> Result<(), Failure> {
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.send(&request)?;
+        self.requests.insert(id, request);
+        Ok(())
     }
 
-    pub(crate) fn response(
-        &mut self,
-        id: u64,
-        milliseconds: u64,
-    ) -> Result<Option<Value>, Failure> {
+    fn read_messages(&mut self) -> Result<(), Failure> {
+        self.peer.read().context("reading MCP output")?;
+        while let Some(line) = self
+            .peer
+            .read_line(&mut self.offset)
+            .context("reading MCP output")?
+        {
+            let message = serde_json::from_str(&line).context(&format!(
+                "{} printed a line that is not JSON: {line:?}",
+                self.label
+            ))?;
+            self.seen.push(line);
+            self.unclaimed.push(message);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_response(&mut self, id: u64) -> Result<Option<Value>, Failure> {
+        self.read_messages()?;
         let wanted = json!(id);
         if let Some(position) = self
             .unclaimed
@@ -621,30 +602,26 @@ impl Mcp {
         {
             return Ok(Some(self.unclaimed.remove(position)));
         }
-        let deadline = Instant::now()
-            .checked_add(Duration::from_millis(milliseconds))
-            .ok_or_else(|| Failure::new("the MCP wait overflows the clock"))?;
+        Ok(None)
+    }
+
+    pub(crate) fn response(&mut self, id: u64) -> Result<Value, Failure> {
+        let request = format!("{id}: {}", self.requests.get(&id).unwrap_or(&Value::Null));
+        let mut pending = self.peer.waiting(&request);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let line = match self.lines.recv_timeout(left) {
-                Ok(line) => line,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Failure::new(format!(
-                        "{} closed its output while waiting for response {id}",
-                        self.label
-                    )));
-                }
-            };
-            self.seen.push(line.clone());
-            let message: Value = serde_json::from_str(&line).context(&format!(
-                "{} printed a line that is not JSON: {line:?}",
-                self.label
-            ))?;
-            if message.get("id") == Some(&wanted) {
-                return Ok(Some(message));
+            let exited = self.peer.poll().context("observing the MCP process")?;
+            let response = self
+                .take_response(id)
+                .map_err(|error| Failure::new(self.peer.failure(&request, error).to_string()))?;
+            if let Some(message) = response {
+                return Ok(message);
             }
-            self.unclaimed.push(message);
+            if let Some(status) = exited {
+                return Err(Failure::new(
+                    self.peer.failure(&request, status).to_string(),
+                ));
+            }
+            pending.pause(self.peer.diagnostic(&request));
         }
     }
 
@@ -655,8 +632,7 @@ impl Mcp {
         params: &Value,
     ) -> Result<Value, Failure> {
         self.start(id, method, params)?;
-        self.response(id, 10_000)?
-            .ok_or_else(|| Failure::new(format!("{} did not answer request {id}", self.label)))
+        self.response(id)
     }
 
     pub(crate) fn call(
@@ -678,27 +654,21 @@ impl Mcp {
 
     pub(crate) fn finish(mut self) -> Result<Vec<String>, Failure> {
         drop(self.input.take());
-        let mut exited = None;
-        for _ in 0..POLLS {
-            exited = self
-                .child
-                .try_wait()
-                .context(&format!("waiting for {}", self.label))?;
-            if exited.is_some() {
-                break;
+        let mut pending = self.peer.waiting("exit after MCP input EOF");
+        let status = loop {
+            let exited = self.peer.poll().context("observing MCP shutdown")?;
+            self.read_messages()?;
+            if let Some(status) = exited {
+                break status;
             }
-            crate::pause(POLL_MILLISECONDS);
-        }
-        let Some(status) = exited else {
-            let _killed = self.child.kill();
-            let _reaped = self.child.wait();
-            return Err(Failure::new(format!(
-                "{} did not exit after its input closed",
-                self.label
-            )));
+            pending.pause(self.peer.diagnostic("exit after MCP input EOF"));
         };
         ensure!(status.success(), "{} exited with {status}", self.label);
-        self.seen.extend(self.lines.try_iter());
+        ensure!(
+            self.offset == self.peer.stdout().len(),
+            "MCP exited with an incomplete frame: {}",
+            self.peer.diagnostic("output EOF")
+        );
         Ok(self.seen)
     }
 }
@@ -765,25 +735,15 @@ fn sweep() -> Result<(), Failure> {
 
 pub(crate) fn wait_for<T>(
     what: &str,
-    probe: impl FnMut() -> Result<Option<T>, Failure>,
-) -> Result<T, Failure> {
-    wait_within(what, POLLS, probe)
-}
-
-pub(crate) fn wait_within<T>(
-    what: &str,
-    polls: u32,
     mut probe: impl FnMut() -> Result<Option<T>, Failure>,
 ) -> Result<T, Failure> {
-    for _ in 0..polls {
+    let mut pending = Wait::new(format!("e2e (pid {})", std::process::id()), what);
+    loop {
         if let Some(value) = probe()? {
             return Ok(value);
         }
-        crate::pause(POLL_MILLISECONDS);
+        pending.pause("the requested state has not been published");
     }
-    Err(Failure::new(format!(
-        "gave up waiting for {what} after {polls} polls {POLL_MILLISECONDS} ms apart"
-    )))
 }
 
 pub(crate) fn calls(directory: &Path) -> Result<Vec<Value>, Failure> {

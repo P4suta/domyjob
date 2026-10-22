@@ -183,6 +183,8 @@ impl<'ast> Visit<'ast> for RawResource {
 }
 
 const RAW_OWNERS: &[&str] = &[
+    "crates/domyjob/tests/e2e/peer.rs",
+    "crates/domyjob/tests/e2e_peer.rs",
     "crates/domyjob-core/src/ingress.rs",
     "crates/domyjob/build.rs",
     "crates/domyjob/src/bounded.rs",
@@ -323,7 +325,24 @@ impl Ownership<'_> {
     }
 
     fn operation(&mut self, name: &str, span: proc_macro2::Span) {
+        let e2e = self.owner == "crates/domyjob/tests/e2e.rs"
+            || self.owner.starts_with("crates/domyjob/tests/e2e/");
         let reserved = match name {
+            "recv_timeout" | "wait_timeout" | "set_read_timeout" | "set_write_timeout"
+            | "wait_within"
+                if e2e =>
+            {
+                Some("e2e replies wait for their peer; only the outer runner diagnoses hangs")
+            }
+            "now" | "elapsed" | "expired" | "left_millis" | "after_millis" | "after_seconds"
+                if e2e
+                    && !matches!(
+                        self.owner,
+                        "crates/domyjob/tests/e2e.rs" | "crates/domyjob/tests/e2e/peer.rs"
+                    ) =>
+            {
+                Some("e2e wait clocks belong only to diagnostic reporting in peer.rs")
+            }
             "persist" | "persist_noclobber" => Some("use StagedFile for replacement"),
             "keep" if self.owner != "crates/domyjob/tests/e2e/world.rs" => {
                 Some("staged cleanup is owned by StagedFile")
@@ -568,8 +587,8 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
     }
 
     fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
-        if expression.path.segments.len() > 1
-            && let Some(last) = expression.path.segments.last()
+        if let Some(last) = expression.path.segments.last()
+            && (expression.path.segments.len() > 1 || last.ident == "wait_within")
         {
             self.operation(&identifier_name(&last.ident), last.ident.span());
         }
@@ -725,6 +744,40 @@ mod tests {
         RELEASE_ORCHESTRATION, RELEASE_QUEUE, RELEASE_READY, REPLACEMENT, RESOURCES, SOURCE_FILE,
         check,
     };
+
+    #[test]
+    fn e2e_replies_cannot_reintroduce_deadlines_outside_the_outer_runner() {
+        for owner in [
+            "crates/domyjob/tests/e2e.rs",
+            "crates/domyjob/tests/e2e/world.rs",
+            "crates/domyjob/tests/e2e/peer.rs",
+            "crates/domyjob/tests/e2e/os/windows/input_reader.rs",
+            "crates/domyjob/tests/e2e/future.rs",
+        ] {
+            for source in [
+                "fn f() { receiver.recv_timeout(limit); }",
+                "fn f() { stream.set_read_timeout(Some(limit)); }",
+                "fn f() { stream.set_write_timeout(Some(limit)); }",
+                "fn f() { Child::wait_timeout(child, limit); }",
+                "fn f() { wait_within(label, polls, probe); }",
+            ] {
+                rejected(owner, source);
+            }
+        }
+        for source in [
+            "fn f() { Instant::now(); }",
+            "fn f() { started.elapsed(); }",
+            "fn f() { Deadline::after_seconds(10); }",
+        ] {
+            rejected("crates/domyjob/tests/e2e/future.rs", source);
+        }
+        let diagnostic =
+            syn::parse_file(include_str!("../../crates/domyjob/tests/e2e/peer.rs")).unwrap();
+        assert_eq!(
+            check("crates/domyjob/tests/e2e/peer.rs", &diagnostic),
+            Vec::<String>::new()
+        );
+    }
 
     #[test]
     fn terminal_sdk_effects_have_only_their_exact_native_leaves() {

@@ -44,22 +44,18 @@ fn identity_tokens_preserve_every_case_and_process_bit() {
 fn preparation_admits_only_live_matching_ready() {
     let expected = identity();
     let ready = readiness(identity());
-    let elapsed: u64 = kani::any();
-    let case_millis: u64 = kani::any();
     let exited: bool = kani::any();
-    let mut controller = Controller::new(expected, case_millis);
-    let decision = controller.observe(elapsed, exited, ready);
+    let mut controller = Controller::new(expected);
+    let decision = controller.observe(exited, ready);
     assert_eq!(
         decision == Decision::Begin,
-        elapsed < case_millis && !exited && ready == Ready::Published(expected)
+        !exited && ready == Ready::Published(expected)
     );
     assert_eq!(
         decision == Decision::Wait,
-        elapsed < case_millis && !exited && ready == Ready::Missing
+        !exited && ready == Ready::Missing
     );
-    if elapsed >= case_millis {
-        assert_eq!(decision, Decision::Refuse(Refusal::CaseDeadline));
-    } else if exited {
+    if exited {
         assert_eq!(decision, Decision::Refuse(Refusal::ExitedBeforeReady));
     } else if ready == Ready::Invalid {
         assert_eq!(decision, Decision::Refuse(Refusal::InvalidReady));
@@ -74,34 +70,23 @@ fn preparation_admits_only_live_matching_ready() {
 
 #[kani::proof]
 #[kani::unwind(24)]
-fn operation_progress_never_resets_either_budget() {
+fn operation_progress_waits_for_the_peer_to_exit() {
     let expected = identity();
-    let case_millis: u64 = kani::any();
-    let started: u64 = kani::any();
-    let middle: u64 = kani::any();
-    let finished: u64 = kani::any();
-    let mut controller = Controller::new(expected, case_millis);
-    if controller.observe(started, false, Ready::Published(expected)) == Decision::Begin {
-        let progress = controller.observe(middle, false, Ready::Published(expected));
-        if progress == Decision::Progress {
-            let result = controller.observe(finished, true, Ready::Published(expected));
-            let accepted = finished >= middle
-                && finished < case_millis
-                && finished - started < input_controller::OPERATION_MILLIS;
-            assert_eq!(result == Decision::Complete, accepted);
-            if finished < middle {
-                assert_eq!(result, Decision::Refuse(Refusal::ClockRegressed));
-            } else if finished >= case_millis {
-                assert_eq!(result, Decision::Refuse(Refusal::CaseDeadline));
-            } else if finished - started >= input_controller::OPERATION_MILLIS {
-                assert_eq!(result, Decision::Refuse(Refusal::OperationDeadline));
-            }
-            kani::cover!(result == Decision::Complete);
-            kani::cover!(result == Decision::Refuse(Refusal::OperationDeadline));
-            kani::cover!(result == Decision::Refuse(Refusal::ClockRegressed));
-            kani::cover!(result == Decision::Refuse(Refusal::CaseDeadline));
-        }
-    }
+    let mut controller = Controller::new(expected);
+    assert_eq!(
+        controller.observe(false, Ready::Published(expected)),
+        Decision::Begin
+    );
+    assert_eq!(
+        controller.observe(false, Ready::Published(expected)),
+        Decision::Progress
+    );
+    let exited: bool = kani::any();
+    let result = controller.observe(exited, Ready::Published(expected));
+    assert_eq!(result == Decision::Complete, exited);
+    assert_eq!(result == Decision::Progress, !exited);
+    kani::cover!(result == Decision::Complete);
+    kani::cover!(result == Decision::Progress);
 }
 
 #[kani::proof]
@@ -109,28 +94,20 @@ fn operation_progress_never_resets_either_budget() {
 fn begun_operations_refuse_missing_or_foreign_identity() {
     let expected = identity();
     let ready = readiness(identity());
-    let started: u64 = kani::any();
-    let elapsed: u64 = kani::any();
-    let case_millis: u64 = kani::any();
-    let mut controller = Controller::new(expected, case_millis);
-    if controller.observe(started, false, Ready::Published(expected)) == Decision::Begin {
-        let result = controller.observe(elapsed, true, ready);
-        let within = elapsed >= started
-            && elapsed < case_millis
-            && elapsed - started < input_controller::OPERATION_MILLIS;
+    let mut controller = Controller::new(expected);
+    if controller.observe(false, Ready::Published(expected)) == Decision::Begin {
+        let result = controller.observe(true, ready);
         assert_eq!(
             result == Decision::Complete,
-            within && ready == Ready::Published(expected)
+            ready == Ready::Published(expected)
         );
-        if within {
-            match ready {
-                Ready::Missing => assert_eq!(result, Decision::Refuse(Refusal::ReadyDisappeared)),
-                Ready::Invalid => assert_eq!(result, Decision::Refuse(Refusal::InvalidReady)),
-                Ready::Published(actual) if actual != expected => {
-                    assert_eq!(result, Decision::Refuse(Refusal::ForeignReady))
-                }
-                Ready::Published(_) => assert_eq!(result, Decision::Complete),
+        match ready {
+            Ready::Missing => assert_eq!(result, Decision::Refuse(Refusal::ReadyDisappeared)),
+            Ready::Invalid => assert_eq!(result, Decision::Refuse(Refusal::InvalidReady)),
+            Ready::Published(actual) if actual != expected => {
+                assert_eq!(result, Decision::Refuse(Refusal::ForeignReady))
             }
+            Ready::Published(_) => assert_eq!(result, Decision::Complete),
         }
         assert_ne!(result, Decision::Begin);
         kani::cover!(result == Decision::Refuse(Refusal::ReadyDisappeared));
@@ -152,7 +129,6 @@ enum Fault {
 
 struct CountedReader {
     expected: Identity,
-    clock: [u64; 3],
     index: usize,
     fail: [bool; 7],
     counts: [usize; 3],
@@ -165,7 +141,7 @@ impl Reader for CountedReader {
         if self.fail[0] {
             Err(Fault::Observation)
         } else {
-            Ok((self.index == self.clock.len() - 1).then_some(COMPLETED_EXIT))
+            Ok((self.index == REAP_COUNT_INDEX).then_some(COMPLETED_EXIT))
         }
     }
     fn ready(&mut self) -> Result<Ready, Fault> {
@@ -174,9 +150,6 @@ impl Reader for CountedReader {
         } else {
             Ok(Ready::Published(self.expected))
         }
-    }
-    fn elapsed_millis(&mut self) -> u64 {
-        self.clock[self.index]
     }
     fn begin(&mut self) -> Result<(), Fault> {
         if self.fail[BEGIN_FAULT_INDEX] {
@@ -227,12 +200,11 @@ fn every_outcome_retains_all_owned_cleanup_results() {
     let fail: [bool; 7] = kani::any();
     let mut reader = CountedReader {
         expected: identity(),
-        clock: kani::any(),
         index: 0,
         fail,
         counts: [0; 3],
     };
-    let controller = Controller::new(reader.expected, kani::any());
+    let controller = Controller::new(reader.expected);
     let outcome = input_controller::wait(&mut reader, controller);
     assert_eq!(reader.counts[0], 1);
     assert_eq!(reader.counts[1], 1);
@@ -272,28 +244,24 @@ fn every_outcome_retains_all_owned_cleanup_results() {
             && fail[STOP_FAULT_INDEX]
             && fail[REAP_FAULT_INDEX]
     );
-    kani::cover!(matches!(outcome.primary, Err(Problem::Refused(_))) && fail[CLOSE_FAULT_INDEX]);
+    kani::cover!(outcome.primary == Err(Problem::Port(Fault::Progress)) && fail[CLOSE_FAULT_INDEX]);
 }
 
 #[kani::proof]
 #[kani::unwind(24)]
-fn rejects_completion_at_the_input_deadline() {
+fn rejects_completion_before_the_peer_exits() {
     let expected = Identity {
         case: [0; input_controller::CASE_BYTES],
         process: 1,
     };
-    let mut controller = Controller::new(expected, u64::MAX);
+    let mut controller = Controller::new(expected);
     assert_eq!(
-        controller.observe(0, false, Ready::Published(expected)),
+        controller.observe(false, Ready::Published(expected)),
         Decision::Begin
     );
     kani::assert(
-        controller.observe(
-            input_controller::OPERATION_MILLIS,
-            true,
-            Ready::Published(expected),
-        ) == Decision::Complete,
-        "NEGATIVE_INPUT_DEADLINE_CONTROL",
+        controller.observe(false, Ready::Published(expected)) == Decision::Complete,
+        "NEGATIVE_INPUT_EXIT_CONTROL",
     );
 }
 
@@ -308,9 +276,9 @@ fn rejects_foreign_ready_admission() {
         process: 2,
         ..expected
     };
-    let mut controller = Controller::new(expected, u64::MAX);
+    let mut controller = Controller::new(expected);
     kani::assert(
-        controller.observe(0, false, Ready::Published(foreign)) == Decision::Begin,
+        controller.observe(false, Ready::Published(foreign)) == Decision::Begin,
         "NEGATIVE_INPUT_IDENTITY_CONTROL",
     );
 }
@@ -324,12 +292,11 @@ fn rejects_discarded_owned_cleanup_errors() {
     };
     let mut reader = CountedReader {
         expected,
-        clock: [0, 1, 2],
         index: 0,
         fail: [false, false, true, false, false, true, true],
         counts: [0; 3],
     };
-    let outcome = input_controller::wait(&mut reader, Controller::new(expected, u64::MAX));
+    let outcome = input_controller::wait(&mut reader, Controller::new(expected));
     assert_eq!(outcome.primary, Err(Problem::Port(Fault::Begin)));
     kani::assert(
         outcome.cleanup.iter().all(Result::is_ok),

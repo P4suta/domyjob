@@ -52,9 +52,8 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn parent_calibration_refuses_non_linux_before_invoking_a_verifier() {
-        let root = tempfile::tempdir().unwrap();
         assert!(
-            crate::verification::dispatch(root.path(), &["parent-identity"])
+            super::require_native_linux()
                 .unwrap_err()
                 .contains("requires native Linux")
         );

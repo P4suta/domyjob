@@ -35,24 +35,6 @@ mod raw {
     pub(super) fn sleep(millis: u64) {
         std::thread::sleep(Duration::from_millis(millis));
     }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn socket_timeout(
-        stream: &std::os::unix::net::UnixStream,
-        millis: u64,
-    ) -> std::io::Result<()> {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(millis)))
-            .and_then(|()| stream.set_write_timeout(Some(Duration::from_millis(millis))))
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn socket_timeout(
-    stream: &std::os::unix::net::UnixStream,
-    millis: u64,
-) -> std::io::Result<()> {
-    raw::socket_timeout(stream, millis)
 }
 
 fn saturate(millis: u128) -> u64 {
