@@ -22,7 +22,7 @@ It checks formatting, Clippy including cross-target checks, architecture, invent
 `ci-success` keeps its required name and depends only on fast jobs.
 Changes still include their harnesses, models, and fuzz targets.
 
-The [release check](../../.github/workflows/release-check.yml) resolves one candidate SHA and verifies every proof, model, preserved corpus, Miri lane, and supported native OS.
+The [release check](../../.github/workflows/release-check.yml) uses the triggering commit SHA and verifies every proof, model, preserved corpus, Miri lane, and supported native OS.
 Fuzz exploration and stress repeats use fixed counts and seeds.
 The [release path](../../.github/workflows/release.yml) requires this gate before version checks, signing, or distribution.
 The workflow can also verify a candidate on demand without publishing.

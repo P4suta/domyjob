@@ -16,8 +16,6 @@ jobs:
     uses: ./.github/workflows/release-check.yml
     permissions:
       contents: read
-    with:
-      candidate_ref: ${{ github.sha }}
 
   check:
     name: check

@@ -37,15 +37,16 @@ Fixed stress repeats run at the release gate.
 
 ## Release gate
 
-[Release check](../.github/workflows/release-check.yml) accepts `candidate_ref` through `workflow_dispatch` or `workflow_call` and publishes nothing.
-It resolves that ref once, and every job checks out the resulting immutable commit.
+[Release check](../.github/workflows/release-check.yml) supports `workflow_dispatch` and `workflow_call` and publishes nothing.
+Select the candidate branch or tag with `gh workflow run release-check.yml --ref <candidate>`.
+Every job checks out the immutable `github.sha` from that event, without accepting a separate source input in another ref's cache context.
 It runs the full Kani inventory and named negative controls, Quint induction and fixed-seed trace replay, preserved fuzz corpora, and every Miri lane.
 Every fuzz target receives 20000 exploration runs with seed one in an isolated writable corpus.
 The native matrix runs Clippy, architecture checks, inventory consistency, and the full test suite on Linux, macOS, and Windows.
 Linux also checks native resource ownership; Windows checks actual SDK contracts and repeats the three reply-wait scenarios ten times.
 Fixed counts define exploration; a runner timeout leaves evidence incomplete.
 
-[The tag-triggered release workflow](../.github/workflows/release.yml) calls this gate with `github.sha`.
+[The tag-triggered release workflow](../.github/workflows/release.yml) calls this gate with the caller's `github.sha` context.
 Its version, policy, and dependency checks wait for the entire gate, so signing and distribution cannot start after a failed or incomplete verification.
 Release-plz keeps opening version PRs and creating tags; ordinary release PR CI still runs only the fast gate.
 Manual release checks do not grant permission to sign or publish.
