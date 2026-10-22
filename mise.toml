@@ -18,6 +18,9 @@ java = "temurin-25.0.4+101.0.LTS"
 [settings]
 cargo.binstall = false
 
+[task_config]
+shell = "{% if os() == 'windows' %}pwsh -NoProfile -Command{% else %}sh -c{% endif %}"
+
 [tasks.bootstrap]
 description = "Fetch the locked dependencies and install the git hooks"
 run = ["cargo fetch --locked", "lefthook install"]
