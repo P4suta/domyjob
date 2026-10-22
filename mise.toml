@@ -1,5 +1,6 @@
 [tools]
 rust = { version = "1.99.0", components = ["clippy", "rustfmt"] }
+"aqua:PowerShell/PowerShell" = { version = "7.6.7", os = ["windows"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
 typos = "1.50.3"
@@ -16,6 +17,9 @@ java = "temurin-25.0.4+101.0.LTS"
 
 [settings]
 cargo.binstall = false
+
+[task_config]
+shell = "{% if os() == 'windows' %}pwsh -NoProfile -Command{% else %}sh -c{% endif %}"
 
 [tasks.bootstrap]
 description = "Fetch the locked dependencies and install the git hooks"
