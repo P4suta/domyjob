@@ -52,6 +52,7 @@ const EXIT_SOURCE: &str = "verification/proof-exit-policy.rs";
 const EXIT_POSITIVE: &str = "only_the_required_normal_code_admits_each_proof_phase";
 const EXIT_NEGATIVE: &str = "rejects_an_unrelated_exit_as_a_named_counterexample";
 const EXIT_COVERS: u64 = 4;
+const INPUT_CONTROLLER_SOURCE: &str = "verification/input-controller.rs";
 const PARENT_COVERS: u64 = 6;
 const GENERATOR_COVERS: u64 = 1;
 const PRESENT_COVERS: u64 = 4;
@@ -1119,6 +1120,7 @@ pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
         ["models"] => replay_models(root),
         ["inventory"] => check_inventory(root),
         ["handoffs"] => handoffs::run(root),
+        ["e2e-input"] => input_controller(root),
         ["native-default"] => native_default(root),
         ["parent-identity-encoder"] => parent_identity_encoder(root),
         ["parent-identity"] => parent_identity(root),
@@ -1127,7 +1129,7 @@ pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
         }
         ["fuzz"] => replay_fuzz(root),
         ["explore"] => explore_fuzz(root),
-        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|explore|handoffs|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
+        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|explore|handoffs|e2e-input|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
     }
 }
 
@@ -1138,6 +1140,7 @@ pub(crate) fn heavy_selector(words: &[&str]) -> bool {
             | "fuzz"
             | "explore"
             | "handoffs"
+            | "e2e-input"
             | "native-default"
             | "parent-identity-encoder"
             | "parent-identity"]
@@ -1146,6 +1149,33 @@ pub(crate) fn heavy_selector(words: &[&str]) -> bool {
                 "generator" | "present" | "absent"
             ]
     )
+}
+
+fn input_controller(root: &Path) -> Result<(), String> {
+    crate::resource_proofs::process::require_native_linux()?;
+    let before = fingerprint(root)?;
+    bound_attempt(
+        || {
+            check_inventory(root)?;
+            let inventory = inventory(root)?;
+            let harnesses = inventory
+                .harnesses
+                .into_iter()
+                .filter(|harness| harness.source.as_deref() == Some(INPUT_CONTROLLER_SOURCE))
+                .collect::<Vec<_>>();
+            let negatives = inventory
+                .negatives
+                .into_iter()
+                .filter(|negative| negative.source.as_deref() == Some(INPUT_CONTROLLER_SOURCE))
+                .collect::<Vec<_>>();
+            crate::resource_proofs::run_inventory(root, &harnesses, &negatives)
+        },
+        || unchanged_source(root, before),
+    )?;
+    eprintln!(
+        "verification: source={before}; complete e2e input-controller proof inventory; source and physical tools bound before and after"
+    );
+    Ok(())
 }
 
 pub fn check_inventory(root: &Path) -> Result<(), String> {

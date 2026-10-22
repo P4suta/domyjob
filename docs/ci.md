@@ -30,6 +30,11 @@ A new branch uses the merge base with local `main`, or the validated remote's tr
 Missing history, merges, forks, and malformed inputs select the complete fast gate.
 They never select a heavy campaign.
 
+End-to-end reply waits observe their owned peer until its response or exit.
+The shared peer adapter captures output independently of inherited handles and reports pending process, request, and output details.
+The nextest watchdog supplies the outer diagnostic limit.
+Fixed stress repeats run at the release gate.
+
 ## Release gate
 
 [Release check](../.github/workflows/release-check.yml) accepts `candidate_ref` through `workflow_dispatch` or `workflow_call` and publishes nothing.
