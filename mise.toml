@@ -91,6 +91,10 @@ run = "cargo xtask verify"
 description = "Verify the complete source-bound proof inventory and model traces"
 run = "cargo xtask verify"
 
+[tasks."verify:inventory"]
+description = "Check source and proof inventory consistency without running a verifier"
+run = "cargo xtask verify inventory"
+
 [tasks."verify:models"]
 description = "Check protocol induction and replay 100 fixed-seed Quint traces"
 run = "cargo xtask verify models"
@@ -100,7 +104,16 @@ description = "Replay preserved production ingress corpora"
 run = "cargo xtask verify fuzz"
 
 [tasks.miri]
+description = "Interpret finite contracts in Actions or a bounded local container"
+run = "cargo xtask ci heavy miri"
+
+[tasks."verification:environment"]
+description = "Require Actions or the bounded verification container for native heavy tasks"
+run = "cargo xtask ci native-verification"
+
+[tasks."miri:native"]
 description = "Interpret finite production state, protocol, serialization, and source-ingress contracts"
+depends = ["verification:environment"]
 run = [
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(worker_handoff::tests)' --no-tests=fail --test-threads=1",
   "cargo +nightly-2026-10-01 miri nextest run --locked -p domyjob-core --lib -E 'test(state::tests)' --no-tests=fail --test-threads=1",
@@ -127,26 +140,26 @@ description = "Type-check every fuzz target against the current core API"
 run = "cargo check --locked --manifest-path fuzz/Cargo.toml --bins"
 
 [tasks.fuzz]
-description = "Fuzz wire and source ingress, job state transitions, and chat ledger convergence"
+description = "Replay preserved corpora and explore every fuzz target with fixed bounds"
 depends = ["fuzz:check"]
-dir = "fuzz"
-run = [
-  "mkdir -p corpus/wire",
-  "cp seeds/wire/* corpus/wire/",
-  "cargo +nightly-2026-10-01 fuzz run wire -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-10-01 fuzz run state -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-10-01 fuzz run chat_ledger -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-10-01 fuzz run source_paths corpus/source_paths -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-10-01 fuzz run process_group corpus/process_group -- -runs=20000 -seed=1 -verbosity=0",
-  "cargo +nightly-2026-10-01 fuzz run hook_clients corpus/hook_clients -- -runs=20000 -seed=1 -verbosity=0",
-]
+run = "cargo xtask ci heavy fuzz"
 
 [tasks.mutants]
+description = "Measure core and task mutations in a bounded local container"
+run = "cargo xtask ci heavy mutants"
+
+[tasks."mutants:native"]
 description = "Measure mutations in the core and repository gates"
+depends = ["verification:environment"]
 run = '"${DOMYJOB_MUTATION_TOOL:-rust-mutants}" run --package domyjob-core --package xtask --jobs auto --locked --trace'
 
 [tasks."mutants:source"]
+description = "Measure binary mutations in a bounded local container"
+run = "cargo xtask ci heavy mutants:source"
+
+[tasks."mutants:source:native"]
 description = "Measure ordinary binary tests with isolated source mutations"
+depends = ["verification:environment"]
 run = '"${DOMYJOB_MUTATION_TOOL:-rust-mutants}" run --config .rust-mutants-source.toml --package domyjob --execution-mode source --jobs auto --locked --trace'
 
 [tasks.deny]
@@ -162,18 +175,11 @@ description = "Check pinned dependency audit evidence"
 run = "cargo xtask dependencies vet"
 
 [tasks.check]
-description = "Run local lint, tests, and dependency checks"
-run = [
-  "mise run lint",
-  "mise run test",
-  "cargo xtask resource-contracts",
-  "mise run deny",
-  "mise run audit",
-  "mise run vet",
-]
+description = "Run the fast current-host gate without verifier or fleet campaigns"
+run = ["mise run lint", "mise run test", "mise run deny", "mise run audit", "mise run vet"]
 
 [tasks."check:scope"]
-description = "Validate the exact push ranges with the shared CI scope policy"
+description = "Run the fast gate for the exact push ranges on the current host"
 run = "cargo xtask ci hook"
 
 [tasks."check:linux"]

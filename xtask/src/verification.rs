@@ -19,6 +19,7 @@ const TRACE_STEPS: usize = 20;
 const TRACE_SEED: &str = "1";
 const SCHEMA_VERSION: u32 = 1;
 const FUZZ_TOOL: &str = "cargo:cargo-fuzz@0.13.2";
+const FUZZ_EXPLORATION_RUNS: &str = "-runs=20000";
 const FUZZ_TARGETS: [(&str, &[&str]); 7] = [
     ("wire", &["hello", "chat-exchange", "chat-unknown-field"]),
     ("source_paths", &["tracked", "metadata", "malformed"]),
@@ -1107,6 +1108,10 @@ pub fn replay_models(root: &Path) -> Result<(), String> {
 }
 
 pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
+    if heavy_selector(words) && !crate::ci::native_verification() {
+        let arguments = [&["heavy", "verify"][..], words].concat();
+        return crate::ci::run(root, &arguments).map_err(|error| error.to_string());
+    }
     match words {
         ["__native-default-context"] => crate::proof_tools::emit_default_selection(),
         ["__native-default-versions"] => crate::proof_tools::emit_default_versions(root),
@@ -1121,8 +1126,26 @@ pub fn dispatch(root: &Path, words: &[&str]) -> Result<(), String> {
             parent_identity_component(root, ParentComponent::parse(component)?)
         }
         ["fuzz"] => replay_fuzz(root),
-        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|handoffs|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
+        ["explore"] => explore_fuzz(root),
+        _ => Err("usage: cargo xtask verify [models|inventory|fuzz|explore|handoffs|native-default|parent-identity|parent-identity-encoder|parent-identity-component generator|present|absent]".to_owned()),
     }
+}
+
+pub(crate) fn heavy_selector(words: &[&str]) -> bool {
+    matches!(
+        words,
+        [] | ["models"
+            | "fuzz"
+            | "explore"
+            | "handoffs"
+            | "native-default"
+            | "parent-identity-encoder"
+            | "parent-identity"]
+            | [
+                "parent-identity-component",
+                "generator" | "present" | "absent"
+            ]
+    )
 }
 
 pub fn check_inventory(root: &Path) -> Result<(), String> {
@@ -1151,6 +1174,17 @@ fn replay_target(root: &Path, target: &str, seeds: &[&str]) -> Result<(), String
     if seeds.is_empty() {
         return Err("source ingress requires a nonempty replay corpus".to_owned());
     }
+    fuzz_target(root, target, seeds, "-runs=0")
+}
+
+fn explore_fuzz(root: &Path) -> Result<(), String> {
+    for (target, seeds) in FUZZ_TARGETS {
+        fuzz_target(root, target, seeds, FUZZ_EXPLORATION_RUNS)?;
+    }
+    fuzz_target(root, "state", &[], FUZZ_EXPLORATION_RUNS)
+}
+
+fn fuzz_target(root: &Path, target: &str, seeds: &[&str], runs: &str) -> Result<(), String> {
     let corpus = tempfile::tempdir().map_err(|error| error.to_string())?;
     for seed in seeds {
         let relative = format!("fuzz/corpus/{target}/{seed}");
@@ -1184,20 +1218,13 @@ fn replay_target(root: &Path, target: &str, seeds: &[&str]) -> Result<(), String
             target,
         ])
         .arg(corpus.path())
-        .args([
-            "--target",
-            native,
-            "--",
-            "-runs=0",
-            "-seed=1",
-            "-verbosity=0",
-        ])
+        .args(["--target", native, "--", runs, "-seed=1", "-verbosity=0"])
         .status()
         .map_err(|error| error.to_string())?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("ingress corpus replay failed: {target}"))
+        Err(format!("fuzz target failed: {target}; {runs}"))
     }
 }
 

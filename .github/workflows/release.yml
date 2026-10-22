@@ -12,8 +12,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verification:
+    uses: ./.github/workflows/release-check.yml
+    permissions:
+      contents: read
+    with:
+      candidate_ref: ${{ github.sha }}
+
   check:
     name: check
+    needs: [verification]
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:

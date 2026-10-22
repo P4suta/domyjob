@@ -837,8 +837,8 @@
   "boundaries": [
     {
       "source": "xtask/src/ci.rs",
-      "reason": "The optional verification container uses domyjob source snapshots, Docker image resolution, native path identity, bind mounts, ownership restoration and process exit status. These operating-system and engine contracts are outside Kani's executable model; the existing source-bound proofs and interpreter checks still execute unchanged inside the selected environment.",
-      "evidence": "CI adapter tests preserve both exact heavy commands, opaque remote arguments, read-only source and writable generated-output mounts, fixed memory/CPU/process bounds and the outer diagnostic limit. Native filesystem tests require owned output directories and reject escaping directory links. An unknown configured image fails before heavy execution, and native Docker runs retain the existing proof inventory, source/tool bindings and Miri lanes.",
+      "reason": "The fast and release gate adapters depend on Actions job ordering, domyjob source snapshots, Docker image resolution, native paths, bind mounts, ownership restoration, and process exit status. These operating-system and engine contracts are outside Kani's executable model. Heavy commands run natively in Actions or in the required bounded local container.",
+      "evidence": "CI adapter tests require verifier-free inventory checks in the fast gate and exclude fuzz campaigns from ci-success. They preserve heavy selectors, opaque remote arguments, read-only source, writable output mounts, fixed resource bounds, and refusal of escaping directory links. Workflow validation checks the candidate and release job dependencies; hosted campaign results remain required before release publication.",
       "reconsider": "Container arguments, image resolution, mount ownership, command selection or result admission changes or fails, or a verifier supports the actual Docker and filesystem boundary."
     },
     {
@@ -891,8 +891,8 @@
     },
     {
       "source": "xtask/src/verification.rs",
-      "reason": "The supported native Kani, Quint/Apalache, Miri, and libFuzzer owner lane runs on Linux and Mac; native Windows verifier capability is not claimed.",
-      "evidence": "Linux or Mac: mise run verify and mise run miri on the exact source digest; Windows: cargo xtask verify inventory, cargo xtask windows-contracts, and mise run test for native SDK, process ownership, and filesystem contracts.",
+      "reason": "Kani, Quint/Apalache, Miri, and libFuzzer execute on hosted Linux at the release gate, or in a bounded Linux container on demand. Native Windows verifier capability is not claimed.",
+      "evidence": "Release check runs mise run verify, mise run miri, and mise run fuzz on the resolved candidate SHA. Its three-OS matrix runs native workspace tests, inventory consistency, Windows SDK contracts, and fixed Windows e2e repeats. These campaigns are outside the fast push and PR gate.",
       "reconsider": "A pinned native verifier supports Windows, the implementation adds target-specific core decisions, or any native Windows contract fails."
     },
     {
