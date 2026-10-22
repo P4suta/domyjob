@@ -48,7 +48,7 @@ jobs:
         with:
           ref: ${{ needs.candidate.outputs.sha }}
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           version: 2026.10.7
           install_args: rust node java npm:@informalsystems/quint cargo:kani-verifier@0.68.0 cargo:cargo-fuzz@0.13.2 aqua:nextest-rs/nextest/cargo-nextest
@@ -72,7 +72,7 @@ jobs:
         with:
           ref: ${{ needs.candidate.outputs.sha }}
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           version: 2026.10.7
           install_args: rust cargo:cargo-fuzz@0.13.2
@@ -84,7 +84,7 @@ jobs:
       - run: rustup toolchain install nightly-2026-10-01 --component rust-src
       - name: Explore every fuzz target with 20000 runs and seed one
         run: mise run fuzz
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: release-fuzz-crashes
@@ -106,7 +106,7 @@ jobs:
         with:
           ref: ${{ needs.candidate.outputs.sha }}
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           version: 2026.10.7
           install_args: rust actionlint aqua:nextest-rs/nextest/cargo-nextest
