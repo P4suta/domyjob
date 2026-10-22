@@ -1,5 +1,6 @@
 [tools]
 rust = { version = "1.99.0", components = ["clippy", "rustfmt"] }
+"aqua:PowerShell/PowerShell" = { version = "7.6.6", os = ["windows"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
 typos = "1.50.3"
