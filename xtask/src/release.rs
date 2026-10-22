@@ -7,6 +7,7 @@ use std::process::Stdio;
 use tempfile::{NamedTempFile, TempDir};
 
 const SECURITY: &str = "/usr/bin/security";
+const CODESIGN: &str = "/usr/bin/codesign";
 pub(crate) const SECRET_ENVIRONMENT: [&str; 13] = [
     "APPLE_CERTIFICATE",
     "APPLE_CERTIFICATE_PASSWORD",
@@ -574,7 +575,7 @@ impl<'a, D: Driver> SigningKeychain<'a, D> {
             "-P",
             configuration.certificate_password.text()?,
             "-T",
-            "/usr/bin/codesign",
+            CODESIGN,
         ])?;
         let partition = security_input(&[
             "set-key-partition-list",
@@ -807,7 +808,7 @@ fn sign_binary<D: Driver>(
     let binary = path_text(&binary)?;
     driver.run(
         "sign binary",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&[
             "--force",
             "--keychain",
@@ -822,12 +823,12 @@ fn sign_binary<D: Driver>(
     )?;
     driver.run(
         "verify signed binary",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&["--verify", "--strict", "--verbose=2", binary]),
     )?;
     let metadata = driver.run(
         "inspect signed binary",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&["--display", "--verbose=4", binary]),
     )?;
     let cdhash = native_cdhash(&metadata)?;
@@ -1404,7 +1405,7 @@ fn verify_existing_binary<D: Driver>(
     }
     driver.run(
         "verify signed binary",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&[
             "--verify",
             "--strict",
@@ -1415,7 +1416,7 @@ fn verify_existing_binary<D: Driver>(
     )?;
     let metadata = driver.run(
         "inspect signed binary",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&["--display", "--verbose=4", path_text(binary)?]),
     )?;
     verified_metadata(&metadata, receipt.cdhash())?;
@@ -1425,7 +1426,7 @@ fn verify_existing_binary<D: Driver>(
     require_ticket(&ticket, receipt.submission_id(), receipt.cdhash())?;
     driver.run(
         "verify online notarization",
-        "/usr/bin/codesign",
+        CODESIGN,
         &arguments(&[
             "--verify",
             "--strict",
