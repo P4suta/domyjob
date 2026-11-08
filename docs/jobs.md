@@ -17,7 +17,7 @@ Use `--submission ID` with the same command and snapshot to retry an uncertain s
 The node refuses a conflicting request with the same submission identity.
 
 `status MACHINE:JOB_ID` prints the recorded state.
-`wait MACHINE:JOB_ID` waits for completion and prints the outcome and logs.
+`wait MACHINE:JOB_ID` waits for completion and prints the outcome.
 `logs MACHINE:JOB_ID` prints the available log.
 `kill MACHINE:JOB_ID` requests termination of the owned process tree.
 `ls MACHINE` lists retained jobs.

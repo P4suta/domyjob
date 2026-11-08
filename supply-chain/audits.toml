@@ -107,6 +107,16 @@ Exact crate archive SHA256 values, independently matched to the official Cargo r
 Evidence: reports/dependencies/20261002-notarization-queue/crate-delta-evidence.json, baseline-trust-paths.json, automated-delta-review.json, and miniz_oxide-0.8.9-to-0.9.1.diff.txt.
 """
 
+[[audits.rustix]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.1.5 -> 1.1.6"
+notes = """
+Reviewed the delta from the existing exempted 1.1.5 baseline, including manifests and unchanged MSRV.
+Opaque MaybeUninit padding preserves C layout without reading unspecified bytes.
+Xattr size queries avoid assuming absent buffer contents are initialized, and ancillary messages clamp lengths to available storage and complete descriptors.
+Reviewed full Apple allocation, platform flag values and cfg changes, zero ioctl arguments, and 32-bit UID/GID syscall selection in the packaged sources."""
+
 [[audits.simd-adler32]]
 who = "Codex (automated source review)"
 criteria = "safe-to-deploy"
