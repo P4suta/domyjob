@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use domyjob_core::service as render;
 
 use crate::platform::user_files::{self, UserFileError};
-use crate::process::{Tool, ToolError, run_tool};
+use crate::process::{Tool, ToolError, ToolOutput, run_tool};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ServiceError {
@@ -35,17 +35,63 @@ fn text(path: &Path) -> Result<&str, ServiceError> {
     path.to_str().ok_or(ServiceError::Path)
 }
 
-fn step(program: &str, arguments: &[String], tolerated: bool) -> Result<String, ServiceError> {
+fn step(program: &str, arguments: &[String]) -> Result<String, ServiceError> {
     let output = run_tool(
         &Tool::new(program, arguments)
             .output(domyjob_core::capture_policy::CapturePolicy::Complete),
     )?;
-    if output.success || tolerated {
+    if output.success {
         return Ok(output.stdout);
     }
     Err(ServiceError::Failed {
         command: format!("{program} {}", arguments.join(" ")),
         detail: output.stderr.trim().to_owned(),
+    })
+}
+
+fn bootout_using(
+    domain: &str,
+    path: &str,
+    mut run: impl FnMut(&[String]) -> Result<ToolOutput, ServiceError>,
+) -> Result<(), ServiceError> {
+    let arguments = [String::from("bootout"), domain.to_owned(), path.to_owned()];
+    let stopped = run(&arguments)?;
+    if stopped.success {
+        return Ok(());
+    }
+    let observed = run(&[String::from("print"), format!("{domain}/{LABEL}")]);
+    let missing = format!("Could not find service \"{LABEL}\" in domain");
+    match observed {
+        Ok(state)
+            if !state.success
+                && state
+                    .stderr
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&missing)) =>
+        {
+            Ok(())
+        }
+        result => {
+            let mut detail = stopped.stderr.trim().to_owned();
+            if let Err(error) = result {
+                use std::fmt::Write as _;
+                let _format = write!(detail, "; checking service state failed: {error}");
+            }
+            Err(ServiceError::Failed {
+                command: format!("launchctl {}", arguments.join(" ")),
+                detail,
+            })
+        }
+    }
+}
+
+fn bootout(domain: &str, path: &str) -> Result<(), ServiceError> {
+    bootout_using(domain, path, |arguments| {
+        run_tool(
+            &Tool::new("launchctl", arguments)
+                .output(domyjob_core::capture_policy::CapturePolicy::Complete),
+        )
+        .map_err(ServiceError::from)
     })
 }
 
@@ -111,15 +157,10 @@ pub(crate) fn install(
     let plist_path = text(&path)?.to_owned();
     let plist = render::launchd_plist(LABEL, text(program)?, &["service", "serve"], text(log)?)?;
     user_files::write(&path, plist.as_bytes())?;
-    step(
-        "launchctl",
-        &[String::from("bootout"), domain.clone(), plist_path.clone()],
-        true,
-    )?;
+    bootout(&domain, &plist_path)?;
     step(
         "launchctl",
         &[String::from("bootstrap"), domain, plist_path],
-        false,
     )?;
     Ok(path)
 }
@@ -129,15 +170,7 @@ fn launchd_uninstall(program: Option<&Path>, log: &Path) -> Result<bool, Service
     if !launchd_owned(&path, program, log)? {
         return Ok(false);
     }
-    step(
-        "launchctl",
-        &[
-            String::from("bootout"),
-            launchd_domain()?,
-            text(&path)?.to_owned(),
-        ],
-        true,
-    )?;
+    bootout(&launchd_domain()?, text(&path)?)?;
     Ok(user_files::remove(&path)?)
 }
 
@@ -211,7 +244,6 @@ Unregister-ScheduledTask -InputObject $task -Confirm:$false; Write-Output 'remov
             String::from("-EncodedCommand"),
             data_encoding::BASE64.encode(&utf16),
         ],
-        false,
     )?;
     Ok(output.trim() == "removed")
 }
@@ -234,6 +266,103 @@ mod tests {
     use crate::platform::user_files;
     use domyjob_core::service::launchd_plist;
     use std::path::Path;
+
+    #[test]
+    fn a_failed_launchd_stop_cannot_report_success_while_the_service_is_loaded() {
+        let mut operations = Vec::new();
+        let failure = super::bootout_using("gui/501", "/owned/service.plist", |arguments| {
+            operations.push(arguments.first().unwrap().clone());
+            Ok(crate::process::ToolOutput {
+                success: arguments
+                    .first()
+                    .is_some_and(|operation| operation == "print"),
+                stdout: String::from("the service is still loaded"),
+                stderr: String::from("stop refused by the service manager"),
+            })
+        })
+        .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("stop refused by the service manager")
+        );
+        assert_eq!(operations, ["bootout", "print"]);
+    }
+
+    #[test]
+    fn launchd_removal_requires_an_exact_absence_observation_after_a_failed_stop() {
+        let absent = format!("Could not find service \"{LABEL}\" in domain for user gui: 501");
+        for (message, success, admitted) in [
+            (absent.as_str(), false, true),
+            (absent.as_str(), true, false),
+            (
+                "Could not find service \"foreign\" in domain for user gui: 501",
+                false,
+                false,
+            ),
+            ("service state inspection was denied", false, false),
+        ] {
+            let mut calls = 0_u8;
+            let result = super::bootout_using("gui/501", "/owned/service.plist", |arguments| {
+                calls = calls.saturating_add(1);
+                let query = arguments
+                    .first()
+                    .is_some_and(|operation| operation == "print");
+                if query {
+                    assert_eq!(arguments.get(1).unwrap(), &format!("gui/501/{LABEL}"));
+                }
+                Ok(crate::process::ToolOutput {
+                    success: query && success,
+                    stdout: String::new(),
+                    stderr: if query { message } else { "stop refused" }.to_owned(),
+                })
+            });
+            assert_eq!(result.is_ok(), admitted);
+            assert_eq!(calls, 2);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("stop refused"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_successful_launchd_stop_needs_no_fallback_probe() {
+        let mut calls = 0_u8;
+        super::bootout_using("gui/501", "/owned/service.plist", |arguments| {
+            calls = calls.saturating_add(1);
+            assert_eq!(arguments.first().unwrap(), "bootout");
+            Ok(crate::process::ToolOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_failed_service_probe_preserves_the_stop_error_and_its_secondary_cause() {
+        let failure = super::bootout_using("gui/501", "/owned/service.plist", |arguments| {
+            if arguments
+                .first()
+                .is_some_and(|operation| operation == "print")
+            {
+                return Err(super::ServiceError::Tool(
+                    crate::process::ToolError::Missing(String::from("launchctl probe")),
+                ));
+            }
+            Ok(crate::process::ToolOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: String::from("stop refused"),
+            })
+        })
+        .unwrap_err();
+        let detail = failure.to_string();
+        assert!(detail.contains("stop refused"));
+        assert!(detail.contains("launchctl probe"));
+    }
 
     #[test]
     fn migration_recognizes_the_previous_service_and_refuses_foreign_definitions() {
