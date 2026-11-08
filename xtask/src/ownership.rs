@@ -6,8 +6,6 @@ const MAIN: &str = "crates/domyjob/src/main.rs";
 const KERNEL: &str = "crates/domyjob/src/process/windows/kernel.rs";
 const DESCRIPTOR: &str = "crates/domyjob/src/platform/windows_acl/descriptor.rs";
 const SOURCE_FILE: &str = "crates/domyjob/src/platform/source_file/windows.rs";
-const TERMINAL_KERNEL: &str = "crates/domyjob/src/platform/terminal/windows/kernel.rs";
-const TERMINAL_FIXTURE: &str = "crates/domyjob/src/platform/terminal/windows/fixture.rs";
 const RELEASE: &str = "xtask/src/release.rs";
 const DISTRIBUTION: &str = "xtask/src/distribution.rs";
 const CI: &str = "xtask/src/ci.rs";
@@ -381,18 +379,6 @@ impl Ownership<'_> {
         }
     }
 
-    fn terminal_sdk_alias(&mut self, tree: &syn::UseTree) {
-        if matches!(self.owner, TERMINAL_KERNEL | TERMINAL_FIXTURE)
-            && let syn::UseTree::Rename(rename) = tree
-            && identifier_name(&rename.ident) == "windows_sys"
-        {
-            self.findings.push(format!(
-                "{}: terminal leaves import the Windows SDK crate without an alias",
-                rename.ident.span().start().line
-            ));
-        }
-    }
-
     fn sdk(&mut self, name: &str, span: proc_macro2::Span) {
         if name == "windows_sys"
             && !matches!(
@@ -400,8 +386,6 @@ impl Ownership<'_> {
                 KERNEL
                     | DESCRIPTOR
                     | SOURCE_FILE
-                    | TERMINAL_KERNEL
-                    | TERMINAL_FIXTURE
                     | INPUT_ACCOUNTING
                     | "crates/domyjob/tests/e2e/os/windows.rs"
             )
@@ -640,7 +624,6 @@ impl<'ast> Visit<'ast> for Ownership<'_> {
     }
 
     fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
-        self.terminal_sdk_alias(tree);
         let accounting_root = match tree {
             syn::UseTree::Path(part) => identifier_name(&part.ident) == "windows_sys",
             syn::UseTree::Name(part) => identifier_name(&part.ident) == "windows_sys",
@@ -777,31 +760,6 @@ mod tests {
             check("crates/domyjob/tests/e2e/peer.rs", &diagnostic),
             Vec::<String>::new()
         );
-    }
-
-    #[test]
-    fn terminal_sdk_effects_have_only_their_exact_native_leaves() {
-        for (owner, source) in [
-            (
-                super::TERMINAL_KERNEL,
-                include_str!("../../crates/domyjob/src/platform/terminal/windows/kernel.rs"),
-            ),
-            (
-                super::TERMINAL_FIXTURE,
-                include_str!("../../crates/domyjob/src/platform/terminal/windows/fixture.rs"),
-            ),
-        ] {
-            let file = syn::parse_file(source).unwrap();
-            assert_eq!(check(owner, &file), Vec::<String>::new());
-            rejected(owner, "use windows_sys as sdk;");
-            for other in [
-                "crates/domyjob/src/platform/terminal/windows.rs",
-                "crates/domyjob/src/platform/terminal/windows/other.rs",
-                "crates/domyjob/src/tui/runtime.rs",
-            ] {
-                assert_ne!(check(other, &file), Vec::<String>::new());
-            }
-        }
     }
 
     #[test]

@@ -10,16 +10,19 @@ use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateEventW, EVENT_MODIFY_STATE,
     GetExitCodeProcess, INFINITE, OpenEventW, OpenProcess, OpenThread,
@@ -165,8 +168,11 @@ impl<A: CanWait> EventRef<'_, A> {
     }
 
     pub(super) fn wait_for_start(&self, process: &Process<Watch>) -> io::Result<StartWake> {
+        const READY_AND_PROCESS_HANDLES: u32 = 2;
         let handles = [self.handle.as_raw_handle(), process.handle.as_raw_handle()];
-        let woke = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        let woke = unsafe {
+            WaitForMultipleObjects(READY_AND_PROCESS_HANDLES, handles.as_ptr(), 0, INFINITE)
+        };
         if woke == WAIT_OBJECT_0 {
             Ok(StartWake::Ready)
         } else if woke == WAIT_OBJECT_0.saturating_add(1) {
@@ -240,6 +246,20 @@ pub(super) struct Job<S: sealed::JobState> {
 }
 
 impl Job<New> {
+    pub(super) fn named(name: &str) -> io::Result<Self> {
+        let name = wide(name)?;
+        let handle = owned_handle(unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) })?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the job object already exists",
+            ));
+        }
+        Ok(Self {
+            handle,
+            state: PhantomData,
+        })
+    }
     pub(super) fn create() -> io::Result<Self> {
         let handle = owned_handle(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
         Ok(Self {
@@ -306,7 +326,7 @@ impl<'child> AssignedJob<'child> {
 #[derive(Debug)]
 pub(super) struct RunningJob {
     job: Job<Configured>,
-    process: Process<Watch>,
+    process: std::sync::Mutex<Option<Process<Watch>>>,
 }
 
 impl WatchedJob<'_> {
@@ -314,18 +334,72 @@ impl WatchedJob<'_> {
         ThreadSnapshot::create()?.resume_process(self.assigned.child.id())?;
         Ok(RunningJob {
             job: self.assigned.job,
-            process: self.process,
+            process: std::sync::Mutex::new(Some(self.process)),
         })
     }
 }
 
 impl RunningJob {
     pub(super) fn await_leader(&self) -> io::Result<Success> {
-        self.process.as_wait().await_exit()
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_poisoned| io::Error::other("the job watch lock was poisoned"))?;
+        let completed = process
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the job leader was already reaped"))?
+            .as_wait()
+            .await_exit()?;
+        drop(process.take());
+        drop(process);
+        Ok(completed)
     }
 
     pub(super) fn terminate(&self) -> io::Result<Success> {
         checked_bool(unsafe { TerminateJobObject(self.job.handle.as_raw_handle(), 1) })
+    }
+
+    pub(super) fn quiescent(&self) -> io::Result<bool> {
+        active_processes(&self.job.handle).map(|count| count == 0)
+    }
+}
+
+fn active_processes(job: &OwnedHandle) -> io::Result<u32> {
+    let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    let size = u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+        .map_err(io::Error::other)?;
+    checked_bool(unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicAccountingInformation,
+            (&raw mut information).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(information.ActiveProcesses)
+}
+
+#[derive(Debug)]
+pub(super) struct JobObserver(OwnedHandle);
+
+impl JobObserver {
+    pub(super) fn open(name: &str) -> io::Result<Option<Self>> {
+        let name = wide(name)?;
+        let handle =
+            unsafe { OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, 0, name.as_ptr()) };
+        if handle.is_null() && unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        owned_handle(handle).map(|handle| Some(Self(handle)))
+    }
+
+    pub(super) fn terminate(&self) -> io::Result<Success> {
+        checked_bool(unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) })
+    }
+
+    pub(super) fn quiescent(&self) -> io::Result<bool> {
+        active_processes(&self.0).map(|count| count == 0)
     }
 }
 
@@ -398,6 +472,10 @@ pub(super) fn isolate(command: &mut Command) {
     command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
 
+pub(super) fn isolate_reaper(command: &mut Command) {
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::windows::ffi::OsStrExt as _;
@@ -416,8 +494,8 @@ mod tests {
     };
 
     use super::{
-        Event, Job, Process, WaitState, checked_bool, configure_job, exit_code, owned_handle,
-        wait_one, wide,
+        Event, Job, JobObserver, Process, WaitState, active_processes, checked_bool, configure_job,
+        exit_code, owned_handle, wait_one, wide,
     };
 
     fn named_resource() -> (tempfile::TempDir, String) {
@@ -429,6 +507,37 @@ mod tests {
             .to_string_lossy();
         let name = format!("Local\\domyjob-kernel-{}-{filename}", std::process::id());
         (root, name)
+    }
+
+    #[test]
+    fn named_jobs_refuse_reuse_and_observers_require_query_access() {
+        let (_root, name) = named_resource();
+        assert!(JobObserver::open(&name).unwrap().is_none());
+        let job = Job::named(&name).unwrap().configure().unwrap();
+        assert_eq!(
+            Job::named(&name).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let observer = JobObserver::open(&name).unwrap().unwrap();
+        assert!(observer.quiescent().unwrap());
+        observer.terminate().unwrap();
+        let encoded = wide(&name).unwrap();
+        let terminate_only = owned_handle(unsafe {
+            OpenJobObjectW(super::JOB_OBJECT_TERMINATE, 0, encoded.as_ptr())
+        })
+        .unwrap();
+        assert_eq!(
+            active_processes(&terminate_only).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(terminate_only);
+        drop(observer);
+        drop(job);
+        assert!(JobObserver::open(&name).unwrap().is_none());
+        assert_eq!(
+            JobObserver::open("invalid\0name").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

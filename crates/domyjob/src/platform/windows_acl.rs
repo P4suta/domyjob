@@ -60,9 +60,22 @@ pub(super) fn no_follow(options: &mut fs::OpenOptions) {
     descriptor::no_follow(options);
 }
 
+pub(super) fn no_follow_relative(options: &mut cap_std::fs::OpenOptions) {
+    descriptor::no_follow_relative(options);
+}
+
 pub(super) fn open_private_dir(path: &Path) -> io::Result<fs::File> {
     descriptor::open_private_dir(path, &mut super::raw::options())
 }
+
+pub(super) fn open_cleanup_root(path: &Path) -> io::Result<fs::File> {
+    descriptor::open_cleanup_root(path, &mut super::raw::options())
+}
+
+pub(super) use descriptor::{cleanup_child_options, cleanup_link, remove_cleanup_link};
+
+#[cfg(test)]
+pub(super) use descriptor::cleanup_link_refusal;
 
 pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
     create_private_dir_using(

@@ -3,14 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use domyjob_core::chat::card::{MachineCard, Os};
-use domyjob_core::chat::id::{Invalid, Line};
-
 pub(crate) use crate::file_kind::reparse_point;
 pub(crate) mod clock;
 pub(crate) mod replacement;
 pub(crate) mod service;
-pub(crate) mod terminal;
 pub(crate) mod user_files;
 
 #[cfg(unix)]
@@ -29,6 +25,8 @@ pub(crate) use windows::Acl as Exposure;
 #[cfg(windows)]
 use windows::Windows as Native;
 
+pub(crate) mod cleanup;
+
 mod raw {
     #![expect(
         clippy::disallowed_methods,
@@ -43,16 +41,12 @@ mod raw {
         OpenOptions::new()
     }
 
+    #[cfg(unix)]
     pub(super) fn set_permissions(
         path: &Path,
         permissions: std::fs::Permissions,
     ) -> io::Result<()> {
         std::fs::set_permissions(path, permissions)
-    }
-
-    #[cfg(windows)]
-    pub(super) fn set_readonly(permissions: &mut std::fs::Permissions, readonly: bool) {
-        permissions.set_readonly(readonly);
     }
 
     pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
@@ -69,36 +63,27 @@ mod raw {
 }
 
 trait System {
-    const OS: Os;
     const JOB_ENVIRONMENT: &'static [&'static str];
 
-    fn host_name() -> String;
     fn user_id() -> Option<u32>;
     fn executable(metadata: &fs::Metadata) -> bool;
     fn make_executable(path: &Path) -> io::Result<()>;
-    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()>;
-    fn removal_busy(error: &io::Error) -> bool;
     fn file_mode(metadata: &fs::Metadata) -> u32;
     fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: bool);
+    fn private_creation_mode(options: &mut cap_std::fs::OpenOptions);
     fn ownership(file: &fs::File) -> io::Result<Ownership>;
     fn open_private_dir(path: &Path) -> io::Result<fs::File>;
     fn create_private_dir(path: &Path) -> io::Result<()>;
     #[cfg(test)]
     fn create_exposed_build_parent(path: &Path) -> io::Result<()>;
-    #[cfg(test)]
-    fn non_unicode_string() -> OsString;
     fn owner_only(options: &mut fs::OpenOptions);
     fn no_follow(options: &mut fs::OpenOptions);
+    fn no_follow_relative(options: &mut cap_std::fs::OpenOptions);
 }
 
 #[cfg(test)]
 pub(crate) fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
     Native::create_exposed_build_parent(path)
-}
-
-#[cfg(test)]
-pub(crate) fn non_unicode_environment_value() -> std::env::VarError {
-    std::env::VarError::NotUnicode(Native::non_unicode_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,14 +136,6 @@ pub(crate) fn make_executable(path: &Path) -> io::Result<()> {
     Native::make_executable(path)
 }
 
-pub(crate) fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    Native::grant_owner_write(path, metadata)
-}
-
-pub(crate) fn removal_busy(error: &io::Error) -> bool {
-    Native::removal_busy(error)
-}
-
 #[cfg(target_os = "macos")]
 pub(crate) fn login_directory() -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -177,20 +154,6 @@ pub(crate) fn login_directory() -> io::Result<PathBuf> {
 
 pub(crate) fn user_id() -> Option<u32> {
     Native::user_id()
-}
-
-pub(crate) fn machine_card() -> Result<MachineCard, Invalid> {
-    const MAX_MACHINE_LABEL_CHARS: usize = 64;
-    let name = Native::host_name();
-    let label = name.split('.').next().unwrap_or_default().trim().to_owned();
-    Ok(MachineCard {
-        label: Line::try_from(if label.is_empty() {
-            "machine".to_owned()
-        } else {
-            label.chars().take(MAX_MACHINE_LABEL_CHARS).collect()
-        })?,
-        os: Native::OS,
-    })
 }
 
 pub(crate) fn user_runtime_dir() -> Option<String> {
@@ -293,6 +256,13 @@ pub(crate) fn creation_mode(options: &mut cap_std::fs::OpenOptions, executable: 
     Native::creation_mode(options, executable);
 }
 
+pub(crate) fn private_relative_options() -> cap_std::fs::OpenOptions {
+    let mut options = cap_std::fs::OpenOptions::new();
+    Native::private_creation_mode(&mut options);
+    Native::no_follow_relative(&mut options);
+    options
+}
+
 pub(crate) fn ownership(file: &fs::File) -> io::Result<Ownership> {
     Native::ownership(file)
 }
@@ -317,6 +287,17 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     fs::File::open(path)?.sync_all()
+}
+
+pub(crate) fn private_creation_mode(options: &mut cap_std::fs::OpenOptions) {
+    Native::private_creation_mode(options);
+}
+
+pub(crate) fn sync_open_dir(file: &fs::File) -> io::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    file.sync_all()
 }
 
 #[cfg(test)]

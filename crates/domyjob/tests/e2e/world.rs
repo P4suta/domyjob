@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, PoisonError};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::NamedTempFile;
 
 use crate::peer::{Peer, Wait};
@@ -16,7 +15,6 @@ const PREFIX: &str = "domyjob-e2e-";
 pub(crate) const FAILURE_LOG_BYTES: usize = 4096;
 const FAILURE_LOG_FILES: usize = 8;
 const FAILURE_SCAN_ENTRIES: usize = 128;
-const FAILURE_SCAN_DEPTH: u8 = 4;
 
 pub(crate) fn prepare_binaries() -> Result<tempfile::TempDir, Failure> {
     let binaries = tempfile::Builder::new()
@@ -39,6 +37,17 @@ pub(crate) struct World {
     lock: NamedTempFile,
     machines: Vec<String>,
     background: Mutex<Vec<(String, Child)>>,
+}
+
+pub(crate) struct ServiceDiagnostics {
+    pub(crate) text: String,
+    observations: Vec<ServiceObservation>,
+}
+
+struct ServiceObservation {
+    pid: u32,
+    outcome: crate::diagnostics::Sampling,
+    artifact: Option<PathBuf>,
 }
 
 impl World {
@@ -80,47 +89,72 @@ impl World {
     }
 
     pub(crate) fn failure_diagnostics(&self) -> Result<String, Failure> {
-        let mut remaining = FAILURE_SCAN_ENTRIES;
-        let mut files = Vec::new();
-        failure_logs(self.root(), 0, &mut remaining, &mut files)?;
+        let mut logs = Vec::new();
+        let mut budget = FAILURE_SCAN_ENTRIES;
+        let mut limited = false;
+        diagnostic_logs(self.root(), 0, &mut logs, (&mut budget, &mut limited))?;
         for name in &self.machines {
-            failure_logs(
+            diagnostic_logs(
                 &self.machine(name).state(),
-                FAILURE_SCAN_DEPTH,
-                &mut remaining,
-                &mut files,
+                1,
+                &mut logs,
+                (&mut budget, &mut limited),
             )?;
         }
-        let mut output = String::new();
-        let read_limit = u64::try_from(FAILURE_LOG_BYTES.saturating_add(1))
-            .context("representing the diagnostic byte limit")?;
-        for path in &files {
-            let mut bytes = Vec::new();
-            fs::File::open(path)
-                .context(&format!("opening diagnostic {}", path.display()))?
-                .take(read_limit)
-                .read_to_end(&mut bytes)
-                .context(&format!("reading diagnostic {}", path.display()))?;
-            let truncated = bytes.len() > FAILURE_LOG_BYTES;
-            bytes.truncate(FAILURE_LOG_BYTES);
-            let relative = path
-                .strip_prefix(self.root())
-                .context("diagnostic escaped its owned world")?;
-            writeln!(
-                output,
-                "--- {} ---\n{}",
-                relative.display(),
-                String::from_utf8_lossy(&bytes)
-            )
-            .context("formatting owned failure diagnostics")?;
-            if truncated {
-                output.push_str("[log truncated]\n");
+        let mut notes = vec![format!("fixture artifacts: {}", self.root().display())];
+        for path in logs {
+            if let Some(tail) =
+                crate::diagnostics::worker_log(&path).context("reading an owned failure log")?
+            {
+                notes.push(format!("--- {}\n{tail}", path.display()));
             }
         }
-        if remaining == 0 || files.len() == FAILURE_LOG_FILES {
-            output.push_str("[diagnostic scan limit reached]\n");
+        if limited {
+            notes.push("[diagnostic scan limit reached]".to_owned());
         }
-        Ok(output)
+        Ok(notes.join("\n"))
+    }
+
+    pub(crate) fn capture_service_diagnostics(&self) -> ServiceDiagnostics {
+        let mut owned = self
+            .background
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut notes = Vec::new();
+        let mut observations = Vec::new();
+        for (index, (label, child)) in owned.iter_mut().enumerate() {
+            let pid = child.id();
+            let observed = crate::diagnostics::sample_service(
+                child,
+                self.root(),
+                crate::os::service_sampler,
+                crate::peer::wait_sampler,
+            );
+            let evidence = match observed {
+                Ok(evidence) => evidence,
+                Err(error) => crate::diagnostics::SampleEvidence::collecting_failed(&error),
+            };
+            let saved = retain_sample(self.root(), index, pid, &evidence.text);
+            notes.push(format!(
+                "owned service {label} ({pid}): {:?}\n{}\nretaining sample: {saved:?}",
+                evidence.outcome,
+                evidence
+                    .text
+                    .chars()
+                    .take(FAILURE_LOG_BYTES)
+                    .collect::<String>(),
+            ));
+            observations.push(ServiceObservation {
+                pid,
+                outcome: evidence.outcome,
+                artifact: saved.ok(),
+            });
+        }
+        drop(owned);
+        ServiceDiagnostics {
+            text: notes.join("\n"),
+            observations,
+        }
     }
 
     fn bin(&self) -> PathBuf {
@@ -142,10 +176,6 @@ impl World {
             name: name.to_owned(),
             dir: self.root().join("machines").join(name),
         }
-    }
-
-    pub(crate) fn remove_fake(&self, name: &str) -> Result<(), Failure> {
-        fs::remove_file(self.program(name)).context(&format!("removing the fake {name}"))
     }
 
     pub(crate) fn ssh_log(&self) -> Result<Vec<Value>, Failure> {
@@ -312,44 +342,158 @@ impl World {
     }
 }
 
-fn failure_logs(
+fn diagnostic_logs(
     directory: &Path,
     depth: u8,
-    remaining: &mut usize,
-    files: &mut Vec<PathBuf>,
+    logs: &mut Vec<PathBuf>,
+    limits: (&mut usize, &mut bool),
 ) -> Result<(), Failure> {
+    let (budget, limited) = limits;
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(Failure::new(format!(
-                "listing diagnostics in {}: {error}",
-                directory.display()
-            )));
-        }
+        Err(error) => return Err(Failure::new(format!("listing diagnostics: {error}"))),
     };
     for entry in entries {
-        if *remaining == 0 || files.len() == FAILURE_LOG_FILES {
+        if *budget == 0 {
+            *limited = true;
             break;
         }
-        *remaining = remaining.saturating_sub(1);
-        let entry = entry.context("listing an owned diagnostic entry")?;
-        let path = entry.path();
-        let kind = entry
-            .file_type()
-            .context("inspecting an owned diagnostic")?;
-        if kind.is_dir() && depth != 0 && entry.file_name() != "workspace" {
-            failure_logs(&path, depth.saturating_sub(1), remaining, files)?;
-        } else if kind.is_file()
-            && path.file_name().is_some_and(|name| {
-                name == "supervisor.log"
-                    || name == "worker.log"
-                    || name.to_string_lossy().ends_with("-serve.log")
-            })
+        *budget = budget.saturating_sub(1);
+        let entry = entry.context("reading diagnostic entries")?;
+        let kind = entry.file_type().context("inspecting diagnostic entries")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let wanted = kind.is_file()
+            && ((depth == 0 && name.ends_with("-service-serve.log"))
+                || (depth == 4 && name == "supervisor.log"));
+        if wanted {
+            if logs.len() < FAILURE_LOG_FILES {
+                logs.push(entry.path());
+            } else {
+                *limited = true;
+            }
+        } else if kind.is_dir()
+            && ((depth == 1 && name.starts_with("runner-"))
+                || (depth == 2 && name == "jobs")
+                || depth == 3)
         {
-            files.push(path);
+            diagnostic_logs(
+                &entry.path(),
+                depth.saturating_add(1),
+                logs,
+                (budget, limited),
+            )?;
         }
     }
+    Ok(())
+}
+
+fn retain_sample(directory: &Path, index: usize, pid: u32, text: &str) -> io::Result<PathBuf> {
+    let mut artifact = tempfile::Builder::new()
+        .prefix(&format!("service-{index}-{pid}-"))
+        .suffix(".sample.txt")
+        .tempfile_in(directory)?;
+    artifact.as_file_mut().write_all(text.as_bytes())?;
+    artifact.as_file().sync_all()?;
+    let (closed, path) = artifact.keep().map_err(|error| error.error)?;
+    drop(closed);
+    Ok(path)
+}
+
+fn start_diagnostic_fixture(world: &World, machine: &Machine<'_>) -> Result<u32, Failure> {
+    let child = Command::new(world.program("sleeper"))
+        .arg("120000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting the owned diagnostic fixture")?;
+    let pid = child.id();
+    world
+        .background
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((format!("diagnostic sleeper on {}", machine.name), child));
+    Ok(pid)
+}
+
+pub(crate) fn service_diagnostic_fixture(world: &World) -> Result<(), Failure> {
+    let machine = world.machine("alpha");
+    let pid = start_diagnostic_fixture(world, &machine)?;
+    let diagnostics = world.capture_service_diagnostics();
+    let evidence = &diagnostics.text;
+    let mut owned = world
+        .background
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let service = owned
+        .iter_mut()
+        .find(|(_, child)| child.id() == pid)
+        .ok_or_else(|| Failure::new("the owned service child was removed before sampling"))?;
+    let ended = service
+        .1
+        .try_wait()
+        .context("checking the owned sampled service")?;
+    drop(owned);
+    ensure!(
+        ended.is_none(),
+        "sampling terminated the owned service: {evidence}"
+    );
+    let [observation] = diagnostics.observations.as_slice() else {
+        return Err(Failure::new(format!(
+            "expected one owned service sample: {evidence}"
+        )));
+    };
+    ensure!(
+        observation.pid == pid,
+        "the sample belongs to another process: {evidence}"
+    );
+    let artifact = observation
+        .artifact
+        .as_ref()
+        .ok_or_else(|| Failure::new(format!("the sample was not retained: {evidence}")))?;
+    let retained = crate::diagnostics::worker_log(artifact)
+        .context("reading the retained service sample")?
+        .ok_or_else(|| Failure::new("the service sample artifact was not retained"))?;
+    ensure!(!retained.is_empty(), "the retained sample is empty");
+    let another = retain_sample(world.root(), 0, pid, "second capture control")
+        .context("retaining another diagnostic generation")?;
+    ensure!(
+        another != *artifact,
+        "a later capture replaced the first artifact"
+    );
+    ensure!(
+        crate::diagnostics::worker_log(artifact).context("rechecking the first sample")?
+            == Some(retained),
+        "a later capture changed the first diagnostic artifact"
+    );
+    match observation.outcome {
+        crate::diagnostics::Sampling::Unsupported => {
+            eprintln!(
+                "native stack sampling is unsupported on this platform; owned-service diagnostic refusal and retention verified"
+            );
+            return Ok(());
+        }
+        crate::diagnostics::Sampling::Refused(cause) => {
+            eprintln!(
+                "native stack sampling was refused ({cause:?}); bounded failure evidence retained: {}",
+                artifact.display()
+            );
+            return Ok(());
+        }
+        crate::diagnostics::Sampling::ServiceExited => {
+            return Err(Failure::new(format!(
+                "the service exited before sampling: {evidence}"
+            )));
+        }
+        crate::diagnostics::Sampling::Captured => {}
+    }
+    ensure!(
+        evidence.contains("Call graph:")
+            && evidence.contains(&format!("Process:         sleeper [{pid}]")),
+        "the native sampler did not capture the exact owned service: {evidence}"
+    );
     Ok(())
 }
 
@@ -371,16 +515,6 @@ impl Machine<'_> {
 
     pub(crate) fn work(&self) -> PathBuf {
         self.dir.join("work")
-    }
-
-    pub(crate) fn worker_log(&self) -> PathBuf {
-        self.state().join("chat").join("worker.log")
-    }
-
-    pub(crate) fn workdir(&self, name: &str) -> Result<PathBuf, Failure> {
-        let directory = self.work().join(name);
-        fs::create_dir_all(&directory).context(&format!("creating {}", directory.display()))?;
-        Ok(directory)
     }
 
     pub(crate) fn set_offline(&self, offline: bool) -> Result<(), Failure> {
@@ -415,9 +549,7 @@ impl Machine<'_> {
             .env("PATH", crate::search_path(&world.bin())?)
             .env("E2E_ROOT", world.root())
             .env("E2E_DOMYJOB", world.domyjob())
-            .env("DOMYJOB_REFRESH", "never")
-            .env_remove("DOMYJOB_CHAT_AGENT")
-            .env_remove("DOMYJOB_CHAT_TURN");
+            .env("DOMYJOB_REFRESH", "never");
         if cfg!(windows) {
             command.env("USERPROFILE", self.home());
         }
@@ -434,19 +566,15 @@ impl Machine<'_> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        execute(command, self.label(arguments))
+        execute(command, self.label(arguments), None)
     }
 
-    pub(crate) fn chat(&self, arguments: &[&str]) -> Result<Run, Failure> {
-        let mut full = vec!["chat", "--json"];
-        full.extend_from_slice(arguments);
-        self.run(&full)
-    }
-
-    pub(crate) fn chat_as(&self, agent: &str, arguments: &[&str]) -> Result<Run, Failure> {
-        let mut full = vec!["chat", "--json", "--as", agent];
-        full.extend_from_slice(arguments);
-        self.run(&full)
+    pub(crate) fn run_without_output_reader(&self, arguments: &[&str]) -> Result<Run, Failure> {
+        let (reader, writer) = io::pipe().context("creating the closed output fixture")?;
+        drop(reader);
+        let mut command = self.command(arguments)?;
+        command.stdin(Stdio::null()).stderr(Stdio::piped());
+        execute(command, self.label(arguments), Some(Stdio::from(writer)))
     }
 
     pub(crate) fn start_background(&self, arguments: &[&str]) -> Result<u32, Failure> {
@@ -472,28 +600,11 @@ impl Machine<'_> {
             .push((label, child));
         Ok(pid)
     }
-
-    pub(crate) fn mcp(&self, arguments: &[&str]) -> Result<Mcp, Failure> {
-        let mut full = vec!["mcp"];
-        full.extend_from_slice(arguments);
-        let label = self.label(&full);
-        let mut command = self.command(&full)?;
-        command.stdin(Stdio::piped());
-        let mut peer = Peer::spawn(command, label.clone()).context(&format!("starting {label}"))?;
-        Ok(Mcp {
-            input: peer.input(),
-            peer,
-            offset: 0,
-            seen: Vec::new(),
-            unclaimed: Vec::new(),
-            requests: BTreeMap::new(),
-            label,
-        })
-    }
 }
 
-fn execute(command: Command, label: String) -> Result<Run, Failure> {
-    let mut peer = Peer::spawn(command, label.clone()).context(&format!("starting {label}"))?;
+fn execute(command: Command, label: String, destination: Option<Stdio>) -> Result<Run, Failure> {
+    let mut peer =
+        Peer::spawn(command, label.clone(), destination).context(&format!("starting {label}"))?;
     let output = peer.wait(&label).context(&format!("waiting for {label}"))?;
     Ok(Run::new(label, &output))
 }
@@ -520,11 +631,6 @@ impl Run {
         ensure!(self.code == Some(code), "expected exit code {code}: {self}");
         Ok(self)
     }
-
-    pub(crate) fn json(&self) -> Result<Value, Failure> {
-        serde_json::from_str(self.stdout.trim())
-            .map_err(|error| Failure::new(format!("standard output is not JSON ({error}): {self}")))
-    }
 }
 
 impl fmt::Display for Run {
@@ -539,137 +645,6 @@ impl fmt::Display for Run {
             self.stdout.trim_end(),
             self.stderr.trim_end()
         )
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct Mcp {
-    peer: Peer,
-    input: Option<ChildStdin>,
-    offset: usize,
-    seen: Vec<String>,
-    unclaimed: Vec<Value>,
-    requests: BTreeMap<u64, Value>,
-    label: String,
-}
-
-impl Mcp {
-    pub(crate) fn send(&mut self, message: &Value) -> Result<(), Failure> {
-        let input = self
-            .input
-            .as_mut()
-            .ok_or_else(|| Failure::new("the MCP input is closed"))?;
-        writeln!(input, "{message}")
-            .and_then(|()| input.flush())
-            .context(&format!("writing to {}", self.label))
-    }
-
-    pub(crate) fn notify(&mut self, method: &str, params: &Value) -> Result<(), Failure> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
-    }
-
-    pub(crate) fn start(&mut self, id: u64, method: &str, params: &Value) -> Result<(), Failure> {
-        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.send(&request)?;
-        self.requests.insert(id, request);
-        Ok(())
-    }
-
-    fn read_messages(&mut self) -> Result<(), Failure> {
-        self.peer.read().context("reading MCP output")?;
-        while let Some(line) = self
-            .peer
-            .read_line(&mut self.offset)
-            .context("reading MCP output")?
-        {
-            let message = serde_json::from_str(&line).context(&format!(
-                "{} printed a line that is not JSON: {line:?}",
-                self.label
-            ))?;
-            self.seen.push(line);
-            self.unclaimed.push(message);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn take_response(&mut self, id: u64) -> Result<Option<Value>, Failure> {
-        self.read_messages()?;
-        let wanted = json!(id);
-        if let Some(position) = self
-            .unclaimed
-            .iter()
-            .position(|message| message.get("id") == Some(&wanted))
-        {
-            return Ok(Some(self.unclaimed.remove(position)));
-        }
-        Ok(None)
-    }
-
-    pub(crate) fn response(&mut self, id: u64) -> Result<Value, Failure> {
-        let request = format!("{id}: {}", self.requests.get(&id).unwrap_or(&Value::Null));
-        let mut pending = self.peer.waiting(&request);
-        loop {
-            let exited = self.peer.poll().context("observing the MCP process")?;
-            let response = self
-                .take_response(id)
-                .map_err(|error| Failure::new(self.peer.failure(&request, error).to_string()))?;
-            if let Some(message) = response {
-                return Ok(message);
-            }
-            if let Some(status) = exited {
-                return Err(Failure::new(
-                    self.peer.failure(&request, status).to_string(),
-                ));
-            }
-            pending.pause(self.peer.diagnostic(&request));
-        }
-    }
-
-    pub(crate) fn request(
-        &mut self,
-        id: u64,
-        method: &str,
-        params: &Value,
-    ) -> Result<Value, Failure> {
-        self.start(id, method, params)?;
-        self.response(id)
-    }
-
-    pub(crate) fn call(
-        &mut self,
-        id: u64,
-        tool: &str,
-        arguments: &Value,
-    ) -> Result<Value, Failure> {
-        let response = self.request(
-            id,
-            "tools/call",
-            &json!({"name": tool, "arguments": arguments}),
-        )?;
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| Failure::new(format!("{tool} returned no result: {response}")))
-    }
-
-    pub(crate) fn finish(mut self) -> Result<Vec<String>, Failure> {
-        drop(self.input.take());
-        let mut pending = self.peer.waiting("exit after MCP input EOF");
-        let status = loop {
-            let exited = self.peer.poll().context("observing MCP shutdown")?;
-            self.read_messages()?;
-            if let Some(status) = exited {
-                break status;
-            }
-            pending.pause(self.peer.diagnostic("exit after MCP input EOF"));
-        };
-        ensure!(status.success(), "{} exited with {status}", self.label);
-        ensure!(
-            self.offset == self.peer.stdout().len(),
-            "MCP exited with an incomplete frame: {}",
-            self.peer.diagnostic("output EOF")
-        );
-        Ok(self.seen)
     }
 }
 
@@ -744,40 +719,6 @@ pub(crate) fn wait_for<T>(
         }
         pending.pause("the requested state has not been published");
     }
-}
-
-pub(crate) fn calls(directory: &Path) -> Result<Vec<Value>, Failure> {
-    crate::read_lines(&directory.join("calls.jsonl"))
-}
-
-pub(crate) fn same_directory(left: &Path, right: &Path) -> Result<bool, Failure> {
-    let left = fs::canonicalize(left).context(&format!("resolving {}", left.display()))?;
-    let right = fs::canonicalize(right).context(&format!("resolving {}", right.display()))?;
-    Ok(left == right)
-}
-
-pub(crate) fn files_containing(directory: &Path, needle: &str) -> Result<Vec<PathBuf>, Failure> {
-    let mut files = Vec::new();
-    files_under(
-        directory,
-        &|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()),
-        &mut files,
-    )?;
-    let needle = needle.as_bytes();
-    let mut found = Vec::new();
-    for file in files {
-        let bytes = match fs::read(&file) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(Failure::new(format!("reading {}: {error}", file.display())));
-            }
-        };
-        if bytes.windows(needle.len()).any(|window| window == needle) {
-            found.push(file);
-        }
-    }
-    Ok(found)
 }
 
 fn files_under(

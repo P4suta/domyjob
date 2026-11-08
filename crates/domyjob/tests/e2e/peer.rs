@@ -6,12 +6,13 @@ use tempfile::NamedTempFile;
 
 const REPORT_INTERVAL_MILLIS: u128 = 10_000;
 const DIAGNOSTIC_BYTES: usize = 4096;
+const SAMPLE_LIMIT_MILLIS: u128 = 3000;
 
 mod raw {
     #![expect(
         clippy::disallowed_methods,
         clippy::disallowed_types,
-        reason = "peer clocks only pace diagnostics; output reads observe the owned capture files"
+        reason = "peer clocks pace response diagnostics and bound optional sampling; output reads observe owned files"
     )]
 
     use std::io::Seek as _;
@@ -41,6 +42,22 @@ mod raw {
             .metadata()?
             .len()
             .saturating_sub(input.stream_position()?))
+    }
+}
+
+pub(crate) fn wait_sampler(child: &mut Child) -> io::Result<ExitStatus> {
+    let started = raw::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if raw::now().saturating_sub(started) >= SAMPLE_LIMIT_MILLIS {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the optional sampler exceeded three seconds",
+            ));
+        }
+        raw::pause();
     }
 }
 
@@ -83,11 +100,19 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
-    pub(crate) fn spawn(mut command: Command, label: String) -> io::Result<Self> {
+    pub(crate) fn spawn(
+        mut command: Command,
+        label: String,
+        destination: Option<Stdio>,
+    ) -> io::Result<Self> {
         let output = NamedTempFile::new()?;
         let errors = NamedTempFile::new()?;
+        let destination = match destination {
+            Some(destination) => destination,
+            None => Stdio::from(output.reopen()?),
+        };
         let child = command
-            .stdout(Stdio::from(output.reopen()?))
+            .stdout(destination)
             .stderr(Stdio::from(errors.reopen()?))
             .spawn()?;
         Ok(Self {
@@ -126,28 +151,6 @@ impl Peer {
         &self.stdout
     }
 
-    pub(crate) fn read_line(&self, offset: &mut usize) -> io::Result<Option<String>> {
-        let bytes = self.stdout.get(*offset..).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output offset exceeds the captured bytes",
-            )
-        })?;
-        let Some(end) = bytes.iter().position(|byte| *byte == b'\n') else {
-            return Ok(None);
-        };
-        let line = std::str::from_utf8(bytes.get(..end).unwrap_or_default())
-            .map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    self.failure("output line", error),
-                )
-            })?
-            .to_owned();
-        *offset = offset.saturating_add(end).saturating_add(1);
-        Ok(Some(line))
-    }
-
     pub(crate) fn poll(&mut self) -> io::Result<Option<ExitStatus>> {
         self.read()?;
         let exited = self.child.try_wait()?;
@@ -162,7 +165,7 @@ impl Peer {
             "{} (pid {}), request {request}; stdout tail: {:?}; stderr tail: {:?}",
             self.label,
             self.child.id(),
-            tail(&self.stdout),
+            tail(self.stdout()),
             tail(&self.stderr)
         )
     }
@@ -172,9 +175,10 @@ impl Peer {
     }
 
     pub(crate) fn wait(&mut self, request: &str) -> io::Result<Output> {
+        drop(self.input());
         let mut pending = self.waiting(request);
         loop {
-            if let Some(status) = self.poll()? {
+            if let Some(status) = self.poll().map_err(|error| self.failure(request, error))? {
                 return Ok(Output {
                     status,
                     stdout: std::mem::take(&mut self.stdout),

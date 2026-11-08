@@ -5,8 +5,6 @@ use std::os::unix::fs::{
 };
 use std::path::Path;
 
-use domyjob_core::chat::card::Os;
-
 use super::{Ownership, System, raw};
 
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -30,19 +28,6 @@ impl std::fmt::Display for Mode {
 }
 
 impl System for Unix {
-    #[cfg(test)]
-    fn non_unicode_string() -> std::ffi::OsString {
-        use std::os::unix::ffi::OsStringExt as _;
-        std::ffi::OsString::from_vec(vec![0xff])
-    }
-
-    const OS: Os = if cfg!(target_os = "macos") {
-        Os::Macos
-    } else if cfg!(target_os = "linux") {
-        Os::Linux
-    } else {
-        Os::Other
-    };
     const JOB_ENVIRONMENT: &'static [&'static str] = &[
         "USER",
         "LOGNAME",
@@ -57,13 +42,6 @@ impl System for Unix {
         "XDG_STATE_HOME",
     ];
 
-    fn host_name() -> String {
-        rustix::system::uname()
-            .nodename()
-            .to_string_lossy()
-            .into_owned()
-    }
-
     fn user_id() -> Option<u32> {
         Some(rustix::process::getuid().as_raw())
     }
@@ -74,22 +52,6 @@ impl System for Unix {
 
     fn make_executable(path: &Path) -> io::Result<()> {
         raw::set_permissions(path, fs::Permissions::from_mode(PUBLIC_EXECUTABLE_MODE))
-    }
-
-    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-        let owner = if metadata.is_dir() {
-            PRIVATE_DIRECTORY_MODE
-        } else {
-            PRIVATE_FILE_MODE
-        };
-        raw::set_permissions(
-            path,
-            fs::Permissions::from_mode(metadata.permissions().mode() | owner),
-        )
-    }
-
-    fn removal_busy(_error: &io::Error) -> bool {
-        false
     }
 
     fn file_mode(metadata: &fs::Metadata) -> u32 {
@@ -108,6 +70,12 @@ impl System for Unix {
         } else {
             PUBLIC_FILE_MODE
         });
+    }
+
+    fn private_creation_mode(options: &mut cap_std::fs::OpenOptions) {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        options.mode(PRIVATE_FILE_MODE);
     }
 
     fn ownership(file: &fs::File) -> io::Result<Ownership> {
@@ -137,10 +105,6 @@ impl System for Unix {
             .create(path)
     }
 
-    fn owner_only(options: &mut fs::OpenOptions) {
-        options.mode(PRIVATE_FILE_MODE);
-    }
-
     #[cfg(test)]
     fn create_exposed_build_parent(path: &Path) -> io::Result<()> {
         const PUBLIC_BUILD_PARENT_MODE: u32 = 0o755;
@@ -150,8 +114,43 @@ impl System for Unix {
         raw::set_permissions(path, fs::Permissions::from_mode(PUBLIC_BUILD_PARENT_MODE))
     }
 
+    fn owner_only(options: &mut fs::OpenOptions) {
+        options.mode(PRIVATE_FILE_MODE);
+    }
+
     fn no_follow(options: &mut fs::OpenOptions) {
         let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
         options.custom_flags(flags.bits().cast_signed());
+    }
+
+    fn no_follow_relative(options: &mut cap_std::fs::OpenOptions) {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        options.custom_flags(flags.bits().cast_signed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_relative_job_lock_cannot_follow_a_file_link() {
+        use crate::state_io;
+
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        state_io::private_dir(&job).unwrap();
+        let target = job.join("target");
+        state_io::write_bytes(&target, b"unchanged").unwrap();
+        let link = job.join("state.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            state_io::open_lock_in_existing_directory(&link),
+            Err(state_io::StateError::NotFile { path }) if path == link
+        ));
+        assert_eq!(
+            state_io::read_bytes(&target).unwrap(),
+            Some(b"unchanged".to_vec())
+        );
     }
 }

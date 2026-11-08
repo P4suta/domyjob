@@ -6,6 +6,8 @@ path runner/incoming.lock
 path runner/admission.lock
 path runner/sequence
 path runner/opened
+path runner/receipts
+path runner/receipts/00000000000000000000000000000000
 path runner/jobs/00000000000000000000000000000000/request.json
 path runner/jobs/00000000000000000000000000000000/state.json
 path runner/jobs/00000000000000000000000000000000/state.lock
@@ -16,6 +18,9 @@ path runner/jobs/00000000000000000000000000000000/output.log
 path runner/jobs/00000000000000000000000000000000/supervisor.log
 path runner/jobs/00000000000000000000000000000000/workspace
 path runner/jobs/00000000000000000000000000000000/order
+path runner/jobs/00000000000000000000000000000000/quiesced
+path runner/jobs/00000000000000000000000000000000/scope
+path runner/jobs/00000000000000000000000000000000/consumed
 path runner/staging/00000000000000000000000000000000/request.json
 path runner/staging/00000000000000000000000000000000/state.json
 path runner/staging/00000000000000000000000000000000/state.lock
@@ -26,6 +31,9 @@ path runner/staging/00000000000000000000000000000000/output.log
 path runner/staging/00000000000000000000000000000000/supervisor.log
 path runner/staging/00000000000000000000000000000000/workspace
 path runner/staging/00000000000000000000000000000000/order
+path runner/staging/00000000000000000000000000000000/quiesced
+path runner/staging/00000000000000000000000000000000/scope
+path runner/staging/00000000000000000000000000000000/consumed
 request {"request":"run","body":{"submission":"11111111111111111111111111111111","command":["cargo","test"],"input":{"source":"home"}}}
 request {"request":"run","body":{"submission":"11111111111111111111111111111111","command":["cargo","test"],"input":{"source":"snapshot","detail":{"bytes":1,"digest":"0000000000000000000000000000000000000000000000000000000000000000"}}}}
 state {"phase":{"phase":"accepted"}}
@@ -38,3 +46,5 @@ state {"phase":{"phase":"finished","outcome":{"outcome":"failed","code":3}}}
 state {"phase":{"phase":"finished","outcome":{"outcome":"lost"}}}
 state {"phase":{"phase":"finished","outcome":{"outcome":"killed"}}}
 state {"phase":{"phase":"finished","outcome":{"outcome":"memory_limit_exceeded"}}}
+receipt {"namespace":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"job":"11111111111111111111111111111111","request":[158,235,0,63,208,64,77,242,85,239,217,160,100,2,88,245,217,73,80,154,6,119,39,202,52,47,229,93,162,51,240,205],"state":{"phase":{"phase":"finished","outcome":{"outcome":"killed"}}}}
+scope {"namespace":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"job":"00000000000000000000000000000000","build":42,"scope":"domyjob-job-6974636a4d685c83c5b2d43459d6b9f8.scope"}

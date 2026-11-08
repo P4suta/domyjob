@@ -8,11 +8,9 @@ const EFFECT_LINTS: &[&str] = &[
 ];
 
 const ACCOUNTING_OWNER: &str = "crates/domyjob/tests/e2e/os/windows/owned_job.rs";
-const TERMINAL_SELECT: &str = "crates/domyjob/src/platform/terminal/unix/select.rs";
 
 fn native_leaf(owner: &str, function: &syn::ItemFn) -> bool {
-    ((owner == ACCOUNTING_OWNER && function.sig.ident == "active")
-        || (owner == TERMINAL_SELECT && function.sig.ident == "ready"))
+    (owner == ACCOUNTING_OWNER && function.sig.ident == "active")
         && match &function.vis {
             syn::Visibility::Inherited => true,
             syn::Visibility::Restricted(scope) => scope.path.is_ident("super"),
@@ -39,14 +37,6 @@ fn unsafe_expect(attribute: &syn::Attribute) -> bool {
 }
 
 const FILE_EXCEPTIONS: &[(&str, &[&str])] = &[
-    (
-        "crates/domyjob/src/platform/terminal/windows/kernel.rs",
-        &["unsafe_code"],
-    ),
-    (
-        "crates/domyjob/src/platform/terminal/windows/fixture.rs",
-        &["unsafe_code", "clippy::disallowed_methods"],
-    ),
     (
         "crates/domyjob/src/platform/source_file/windows.rs",
         &["unsafe_code"],
@@ -263,59 +253,6 @@ pub fn check(path: &str, file: &syn::File) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::check;
-
-    #[test]
-    fn terminal_exceptions_have_only_their_exact_native_owners() {
-        const SELECT: &str = "crates/domyjob/src/platform/terminal/unix/select.rs";
-        const KERNEL: &str = "crates/domyjob/src/platform/terminal/windows/kernel.rs";
-        const FIXTURE: &str = "crates/domyjob/src/platform/terminal/windows/fixture.rs";
-        for (owner, source) in [
-            (
-                SELECT,
-                include_str!("../../crates/domyjob/src/platform/terminal/unix/select.rs"),
-            ),
-            (
-                KERNEL,
-                include_str!("../../crates/domyjob/src/platform/terminal/windows/kernel.rs"),
-            ),
-            (
-                FIXTURE,
-                include_str!("../../crates/domyjob/src/platform/terminal/windows/fixture.rs"),
-            ),
-        ] {
-            let file = syn::parse_file(source).unwrap();
-            assert_eq!(check(owner, &file), Vec::<String>::new());
-            assert_ne!(
-                check("crates/domyjob/src/platform/terminal/other.rs", &file),
-                Vec::<String>::new()
-            );
-        }
-        for source in [
-            "#[expect(unsafe_code, reason = \"live FD\")] pub fn ready() {}",
-            "#[expect(unsafe_code, reason = \"live FD\")] fn sibling() {}",
-            "#[expect(unsafe_code, reason = \"\")] fn ready() {}",
-            "#[expect(unsafe_code)] fn ready() {}",
-            "#[expect(unsafe_code, dead_code, reason = \"live FD\")] fn ready() {}",
-            "mod nested { #[expect(unsafe_code, reason = \"live FD\")] fn ready() {} }",
-            "fn ready() { #[expect(unsafe_code, reason = \"live FD\")] fn sibling() {} }",
-            "#[cfg_attr(unix, expect(unsafe_code, reason = \"live FD\"))] fn ready() {}",
-        ] {
-            assert!(
-                !check(SELECT, &syn::parse_file(source).unwrap()).is_empty(),
-                "{source}"
-            );
-        }
-        for (owner, lint) in [
-            (KERNEL, "clippy::disallowed_methods"),
-            (FIXTURE, "dead_code"),
-        ] {
-            let source = format!("#![expect({lint}, reason = \"foreign effect\")] fn ready() {{}}");
-            assert_ne!(
-                check(owner, &syn::parse_file(&source).unwrap()),
-                Vec::<String>::new()
-            );
-        }
-    }
 
     #[test]
     fn accounting_leaf_has_only_its_exact_reasoned_unsafe_exception() {

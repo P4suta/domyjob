@@ -1,27 +1,23 @@
 # Security model
 
-OpenSSH authentication controls who may request work on a machine.
-The remote node executes commands as the SSH account and has no separate network listener.
-A user who can run `domyjob on` on a host can execute arbitrary commands as that account.
+OpenSSH authenticates the host and account.
+A job runs with that account's authority and can execute arbitrary commands.
+Trust source snapshots, job commands, and the remote build environment only within the account owner's authority.
+The build fingerprint identifies deployed source.
+It doesn't authenticate a publisher or dependency.
 
-The node treats control frames, snapshots, stored records, and remote output as untrusted data.
-Ingress validates bounded wire messages before dispatch.
-A source snapshot is checked for size, digest, portable paths, case collisions, and regular file types before confined extraction.
-State files are private and checked for owner and access permissions before use.
-Log replies read at most the final 16 KiB of the output file and terminal text is neutralized.
-The output file stores at most the first 256 MiB of a job's output, and one final line counts any later bytes that were discarded.
-Jobs receive an explicit environment allowlist, so SSH agent and connection variables are not passed to the command.
+The storage adapter requires private ownership and Unix permissions or Windows ACLs.
+Snapshot extraction uses confined directory capabilities and rejects links, nonregular files, nonportable paths, and collisions.
+State records, control messages, and retained job output have explicit byte limits.
+The output adapter neutralizes remote text before terminal display.
 
-The client builds and installs remote code from its embedded build source over an authenticated SSH connection.
-Every build runs from its own fingerprint-named path, so a request always reaches the node of its own build.
-The fingerprint detects changes; it does not certify the source or dependencies.
-The remote account and build environment are trusted to compile and execute that checkout.
+Jobs receive an explicit environment allowlist.
+The launcher excludes SSH authentication and connection variables.
+On macOS, a private Unix socket hands the worker to the desktop login session for native keychain access.
+A missing session or login service causes refusal without an SSH fallback.
 
-Chat runs within the same trust boundary.
-A machine pins each peer's chat identity and refuses an exchange meant for another identity.
-Any account that can reach a machine over SSH can read the chat events addressed to that machine's agents and can ask its managed agents to run turns with their configured access.
-Managed agents default to read-only access, and each client's own sandbox or permission mode enforces it.
-The MCP server writes only as an agent that joined or was bound to the connection, and it does not expose job operations.
-Setup changes the user's AI client configuration only through each client's registration command or a comment-preserving edit of the domyjob entry.
-
-The first release does not provide a network service, signed release installation, file pullback, or migration from the former state format.
+`domyjob` no longer supplies agent chat, managed agents, synchronization, MCP tools, or a dashboard.
+`domyjob service install` and `uninstall` remove recognized domyjob client registrations and lifecycle handlers.
+The migration keeps foreign entries, shared hook handlers, comments outside edited members, and chat history.
+Malformed configuration stops migration without replacing the affected file.
+Migration leaves chat databases unopened and preserves their files.

@@ -11,6 +11,12 @@ use super::{AdmissionPermit, Launch, Scope};
 use crate::process::{Tool, ToolOutput};
 
 const POLICY_LIMIT: usize = 16_384;
+const GROUP_AND_OTHER_WRITE_BITS: u32 = 0o022;
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+const SELF_CGROUP: &str = "/proc/self/cgroup";
+const CHOOM: &str = "/usr/bin/choom";
+const MAX_LAUNCH_ERROR_CHARS: usize = 4096;
 
 pub(super) fn load(path: &Path) -> io::Result<Option<Policy>> {
     let file = match crate::platform::private_options().read(true).open(path) {
@@ -25,10 +31,10 @@ pub(super) fn load(path: &Path) -> io::Result<Option<Policy>> {
     let directory = fs::symlink_metadata(parent)?;
     if !metadata.is_file()
         || metadata.uid() != 0
-        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & GROUP_AND_OTHER_WRITE_BITS != 0
         || !directory.is_dir()
         || directory.uid() != 0
-        || directory.mode() & 0o022 != 0
+        || directory.mode() & GROUP_AND_OTHER_WRITE_BITS != 0
     {
         return Err(io::Error::other(
             "resource policy and its directory must be root-owned and not writable by group or others",
@@ -55,11 +61,16 @@ pub(super) fn load(path: &Path) -> io::Result<Option<Policy>> {
     }
 }
 
-fn systemctl(arguments: &[String]) -> io::Result<ToolOutput> {
+fn systemctl(
+    arguments: &[String],
+    policy: domyjob_core::capture_policy::CapturePolicy,
+) -> io::Result<ToolOutput> {
     let runtime = crate::platform::user_runtime_dir()
         .ok_or_else(|| io::Error::other("user systemd runtime directory is unavailable"))?;
     crate::process::run_tool(
-        &Tool::new("/usr/bin/systemctl", arguments).env("XDG_RUNTIME_DIR", runtime),
+        &Tool::new(SYSTEMCTL, arguments)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .output(policy),
     )
     .map_err(io::Error::other)
 }
@@ -71,7 +82,7 @@ fn properties(scope: &str) -> io::Result<ToolOutput> {
         scope.into(),
         "--property=LoadState,ActiveState,Result,ControlGroup,MemoryHigh,MemoryMax,MemorySwapMax"
             .into(),
-    ])
+    ], domyjob_core::capture_policy::CapturePolicy::Complete)
 }
 
 fn value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
@@ -87,7 +98,10 @@ pub(super) fn prepare(
     job: &JobId,
     original: &std::process::Command,
 ) -> io::Result<Launch> {
-    let started = systemctl(&["--user".into(), "start".into(), "domyjob.slice".into()])?;
+    let started = systemctl(
+        &["--user".into(), "start".into(), "domyjob.slice".into()],
+        domyjob_core::capture_policy::CapturePolicy::Prefix,
+    )?;
     if !started.success {
         return Err(io::Error::other(started.stderr));
     }
@@ -106,18 +120,13 @@ pub(super) fn prepare(
             )));
         }
     }
-    let identity = format!("{}:{}", crate::identity::tag(), job.as_str());
-    let name: String = blake3::hash(identity.as_bytes())
-        .to_hex()
-        .chars()
-        .take(32)
-        .collect();
-    let scope = Scope::parse(format!("domyjob-job-{name}.scope"))?;
-    if let Some(record) = &permit.record {
-        crate::state_io::write_bytes(record, scope.name().as_bytes()).map_err(io::Error::other)?;
-    }
+    let build = crate::identity::current();
+    let namespace = permit
+        .namespace
+        .ok_or_else(|| io::Error::other("job scope has no store namespace"))?;
+    let scope = Scope::for_job((namespace, job), build);
     crate::state_io::remove_file(&scope.marker()?).map_err(io::Error::other)?;
-    let mut command = crate::process::command("/usr/bin/systemd-run");
+    let mut command = crate::process::command(SYSTEMD_RUN);
     crate::platform::prepare_job_environment(&mut command);
     command.args([
         "--user",
@@ -151,11 +160,12 @@ pub(super) fn prepare(
         command,
         scope: Some(scope),
         permit,
+        quiescence: None,
     })
 }
 
 pub(super) fn exec(scope: &Scope, original: &Command) -> io::Result<()> {
-    let membership = crate::bounded::read(fs::File::open("/proc/self/cgroup")?, POLICY_LIMIT)?
+    let membership = crate::bounded::read(fs::File::open(SELF_CGROUP)?, POLICY_LIMIT)?
         .ok_or_else(|| io::Error::other("cgroup membership is too large"))?;
     let suffix = format!("/{}", scope.name());
     if !String::from_utf8(membership)
@@ -168,7 +178,7 @@ pub(super) fn exec(scope: &Scope, original: &Command) -> io::Result<()> {
         ));
     }
     let adjusted = crate::process::run_tool(&Tool::new(
-        "/usr/bin/choom",
+        CHOOM,
         &[
             "--pid".into(),
             std::process::id().to_string(),
@@ -190,7 +200,11 @@ pub(super) fn exec(scope: &Scope, original: &Command) -> io::Result<()> {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let detail: String = error.to_string().chars().take(4096).collect();
+            let detail: String = error
+                .to_string()
+                .chars()
+                .take(MAX_LAUNCH_ERROR_CHARS)
+                .collect();
             let reason = RemoteText::try_from(detail).map_err(io::Error::other)?;
             execution
                 .advance(&Event::LaunchFailed { reason })
@@ -300,14 +314,20 @@ pub(super) fn stop(scope: &Scope) -> io::Result<()> {
     if !populated(scope, &state)? {
         return Ok(());
     }
-    let killed = systemctl(&[
-        "--user".into(),
-        "kill".into(),
-        "--signal=KILL".into(),
-        "--kill-whom=all".into(),
-        scope.name().into(),
-    ])?;
-    let stopped = systemctl(&["--user".into(), "stop".into(), scope.name().into()])?;
+    let killed = systemctl(
+        &[
+            "--user".into(),
+            "kill".into(),
+            "--signal=KILL".into(),
+            "--kill-whom=all".into(),
+            scope.name().into(),
+        ],
+        domyjob_core::capture_policy::CapturePolicy::Prefix,
+    )?;
+    let stopped = systemctl(
+        &["--user".into(), "stop".into(), scope.name().into()],
+        domyjob_core::capture_policy::CapturePolicy::Prefix,
+    )?;
     let final_state = properties(scope.name())?;
     if final_state.success && !populated(scope, &final_state)? {
         Ok(())
@@ -317,6 +337,14 @@ pub(super) fn stop(scope: &Scope) -> io::Result<()> {
             killed.stderr, stopped.stderr
         )))
     }
+}
+
+pub(super) fn obsolete(scope: &Scope) -> io::Result<bool> {
+    let state = properties(scope.name())?;
+    if !state.success {
+        return Err(io::Error::other(state.stderr));
+    }
+    Ok(value(&state.stdout, "LoadState") == Some("not-found"))
 }
 
 pub(super) fn completion(scope: &Scope, event: &Event) -> io::Result<Event> {
@@ -345,7 +373,10 @@ pub(super) fn cleanup(scope: &Scope) -> io::Result<()> {
     if value(&state.stdout, "LoadState") == Some("not-found") {
         return Ok(());
     }
-    let reset = systemctl(&["--user".into(), "reset-failed".into(), scope.name().into()])?;
+    let reset = systemctl(
+        &["--user".into(), "reset-failed".into(), scope.name().into()],
+        domyjob_core::capture_policy::CapturePolicy::Prefix,
+    )?;
     if reset.success {
         Ok(())
     } else {
@@ -394,21 +425,38 @@ mod tests {
         );
     }
 
-    fn native_scope() -> (tempfile::TempDir, Scope) {
-        let directory = tempfile::tempdir().unwrap();
+    fn native_job(directory: &tempfile::TempDir) -> domyjob_core::domain::JobId {
+        const JOB_ID_HEX_CHARS: usize = 32;
         let unique = blake3::hash(directory.path().to_string_lossy().as_bytes())
             .to_hex()
             .to_string();
-        let name: String = unique.chars().take(32).collect();
-        (
-            directory,
-            Scope::parse(format!("domyjob-job-{name}.scope")).unwrap(),
-        )
+        let name: String = unique.chars().take(JOB_ID_HEX_CHARS).collect();
+        domyjob_core::domain::JobId::try_from(name).unwrap()
+    }
+
+    fn native_scope() -> (tempfile::TempDir, Scope) {
+        let directory = tempfile::tempdir().unwrap();
+        let namespace = native_namespace(&directory);
+        let scope = Scope::for_job(
+            (namespace, &native_job(&directory)),
+            crate::identity::current(),
+        );
+        (directory, scope)
+    }
+
+    fn native_namespace(directory: &tempfile::TempDir) -> super::super::ScopeNamespace {
+        let state = directory.path().join("state");
+        crate::state_io::private_dir(&state).unwrap();
+        super::super::ScopeNamespace::for_store(&state).unwrap()
     }
 
     fn native_command(scope: &Scope) -> std::process::Command {
         let mut command = crate::process::command("/usr/bin/systemd-run");
         command
+            .env(
+                "XDG_RUNTIME_DIR",
+                crate::platform::user_runtime_dir().unwrap(),
+            )
             .args([
                 "--user",
                 "--scope",
@@ -422,6 +470,46 @@ mod tests {
             ])
             .arg(format!("--unit={}", scope.name()));
         command
+    }
+
+    fn native_ready(reader: &mut std::io::PipeReader, group: &Group, errors: &mut std::fs::File) {
+        use std::io::Seek as _;
+
+        const READY_BYTES: usize = 5;
+        const STDERR_PREFIX_BYTES: usize = 4096;
+        let mut ready = [0; READY_BYTES];
+        if let Err(error) = reader.read_exact(&mut ready) {
+            let status = group.wait();
+            errors.rewind().unwrap();
+            let detail = crate::bounded::prefix(errors, STDERR_PREFIX_BYTES).unwrap();
+            panic!(
+                "scope readiness failed: {error}; command {status:?}; stderr: {}",
+                String::from_utf8_lossy(&detail)
+            );
+        }
+        assert_eq!(&ready, b"ready");
+    }
+
+    fn escaped_descendant(scope: &Scope, account_scope: bool) -> Group {
+        let mut command = native_command(scope);
+        command.args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "setsid sleep 600 & printf ready; wait",
+        ]);
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let mut launch = Launch::fixture(command);
+        launch.scope = account_scope.then(|| scope.clone());
+        let mut errors = tempfile::tempfile().unwrap();
+        let group = Group::spawn_job_stdio(
+            launch,
+            Stdio::from(writer),
+            Stdio::from(errors.try_clone().unwrap()),
+        )
+        .unwrap();
+        native_ready(&mut reader, &group, &mut errors);
+        group
     }
 
     #[test]
@@ -541,20 +629,7 @@ mod tests {
     #[ignore = "requires a native Linux user systemd manager; run mise run resource-contracts"]
     fn native_resource_cancel_stops_session_escaped_descendants() {
         let (_directory, scope) = native_scope();
-        let mut command = native_command(&scope);
-        command.args([
-            "--",
-            "/bin/sh",
-            "-c",
-            "setsid sleep 600 & printf ready; wait",
-        ]);
-        let (mut reader, writer) = std::io::pipe().unwrap();
-        let mut launch = Launch::fixture(command);
-        launch.scope = Some(scope.clone());
-        let group = Group::spawn_job_stdio(launch, Stdio::from(writer), Stdio::null()).unwrap();
-        let mut ready = [0; 5];
-        reader.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready");
+        let group = escaped_descendant(&scope, true);
         group.kill().unwrap();
         group.wait().unwrap();
         assert_eq!(group.completion(Event::Killed).unwrap(), Event::Killed);
@@ -573,24 +648,13 @@ mod tests {
             r#"{"version":1,"max_concurrent_jobs":2,"slice":"domyjob.slice","memory_high_bytes":67108864,"memory_max_bytes":100663296,"memory_swap_max_bytes":0}"#,
         ).unwrap();
         let limits =
-            super::super::Limits::fixture(Some(policy), directory.path().join("admission"));
-        let permit = limits.try_admit().unwrap().unwrap();
-        crate::state_io::write_bytes(permit.record.as_ref().unwrap(), scope.name().as_bytes())
+            super::super::Limits::fixture(Some(policy), directory.path().join("admission"))
+                .with_namespace(native_namespace(&directory));
+        let mut permit = limits.try_admit().unwrap().unwrap();
+        permit
+            .record_scope(&native_job(&directory), crate::identity::current(), &scope)
             .unwrap();
-        let mut command = native_command(&scope);
-        command.args([
-            "--",
-            "/bin/sh",
-            "-c",
-            "setsid sleep 600 & printf ready; wait",
-        ]);
-        let (mut reader, writer) = std::io::pipe().unwrap();
-        let group =
-            Group::spawn_job_stdio(Launch::fixture(command), Stdio::from(writer), Stdio::null())
-                .unwrap();
-        let mut ready = [0; 5];
-        reader.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready");
+        let group = escaped_descendant(&scope, false);
         drop(permit);
         group.wait().unwrap();
         assert_eq!(

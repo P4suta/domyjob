@@ -1338,7 +1338,7 @@ mod tests {
             let (_program, arguments) = check.command();
             assert_eq!(arguments.join(" "), expected);
         }
-        let words = ["parent-identity-component", "present"];
+        let words = ["arbitrary-selector", "opaque-argument"];
         let check = super::HeavyCheck::Verify(&words);
         let (_program, arguments) = check.command();
         assert!(arguments.ends_with(&words));

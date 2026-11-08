@@ -68,10 +68,7 @@ pub fn stored_request(bytes: &[u8]) -> Result<Request, WireError> {
 }
 
 pub fn stored_job(bytes: &[u8]) -> Result<JobState, WireError> {
-    if bytes.len() > wire::MAX_CONTROL_BYTES {
-        return Err(WireError::TooLarge);
-    }
-    Ok(raw::from_slice(bytes)?)
+    decode_payload(bytes)
 }
 
 pub fn foreign_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {

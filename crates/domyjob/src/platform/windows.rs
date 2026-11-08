@@ -2,9 +2,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use domyjob_core::chat::card::Os;
-
-use super::{Ownership, System, raw, variable, windows_acl};
+use super::{Ownership, System, windows_acl};
 
 #[derive(Debug)]
 pub(super) struct Windows;
@@ -19,13 +17,6 @@ impl std::fmt::Display for Acl {
 }
 
 impl System for Windows {
-    #[cfg(test)]
-    fn non_unicode_string() -> std::ffi::OsString {
-        use std::os::windows::ffi::OsStringExt as _;
-        std::ffi::OsString::from_wide(&[0xd800])
-    }
-
-    const OS: Os = Os::Windows;
     const JOB_ENVIRONMENT: &'static [&'static str] = &[
         "PATHEXT",
         "SystemRoot",
@@ -41,12 +32,6 @@ impl System for Windows {
         "PROCESSOR_ARCHITECTURE",
     ];
 
-    fn host_name() -> String {
-        variable("COMPUTERNAME")
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
-
     fn user_id() -> Option<u32> {
         None
     }
@@ -59,31 +44,14 @@ impl System for Windows {
         Ok(())
     }
 
-    fn grant_owner_write(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-        let mut permissions = metadata.permissions();
-        if permissions.readonly() {
-            raw::set_readonly(&mut permissions, false);
-            raw::set_permissions(path, permissions)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn removal_busy(error: &io::Error) -> bool {
-        const SHARING_VIOLATION: i32 = 32;
-        const LOCK_VIOLATION: i32 = 33;
-        matches!(
-            error.raw_os_error(),
-            Some(SHARING_VIOLATION | LOCK_VIOLATION)
-        )
-    }
-
     fn file_mode(_metadata: &fs::Metadata) -> u32 {
         const NON_EXECUTABLE_FILE_MODE: u32 = 0o644;
         NON_EXECUTABLE_FILE_MODE
     }
 
     fn creation_mode(_options: &mut cap_std::fs::OpenOptions, _executable: bool) {}
+
+    fn private_creation_mode(_options: &mut cap_std::fs::OpenOptions) {}
 
     fn ownership(file: &fs::File) -> io::Result<Ownership> {
         windows_acl::ownership(file)
@@ -107,12 +75,18 @@ impl System for Windows {
     fn no_follow(options: &mut fs::OpenOptions) {
         windows_acl::no_follow(options);
     }
+
+    fn no_follow_relative(options: &mut cap_std::fs::OpenOptions) {
+        windows_acl::no_follow_relative(options);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn trash_sharing_failures_remain_reported_until_the_handle_closes() {
+        const SHARING_VIOLATION: i32 = 32;
+        const LOCK_VIOLATION: i32 = 33;
         use std::os::windows::fs::OpenOptionsExt as _;
 
         let root = tempfile::tempdir().unwrap();
@@ -126,8 +100,9 @@ mod tests {
             .unwrap();
         let leftovers = crate::state_io::empty(&trash).unwrap();
         assert_eq!(leftovers.len(), 1);
-        assert!(crate::platform::removal_busy(
-            &leftovers.first().unwrap().error
+        assert!(matches!(
+            leftovers.first().unwrap().error.raw_os_error(),
+            Some(SHARING_VIOLATION | LOCK_VIOLATION)
         ));
         drop(held);
         assert!(crate::state_io::empty(&trash).unwrap().is_empty());

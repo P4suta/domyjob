@@ -30,7 +30,7 @@ fn spawn_fixture(mode: &str) -> std::io::Result<Peer> {
         .args(["--exact", "peer_fixture", "--ignored", "--nocapture"])
         .env(FIXTURE, mode)
         .stdin(Stdio::piped());
-    Peer::spawn(command, "controlled reply peer".to_owned())
+    Peer::spawn(command, "controlled reply peer".to_owned(), None)
 }
 
 #[test]
@@ -44,14 +44,6 @@ fn a_live_peer_keeps_partial_bytes_until_the_requested_reply() {
         pending.pause(peer.diagnostic(request));
     }
     assert!(peer.poll().unwrap().is_none());
-    let mut offset = peer
-        .stdout()
-        .windows(PARTIAL_REPLY.len())
-        .position(|bytes| bytes == PARTIAL_REPLY.as_bytes())
-        .unwrap();
-    let original = offset;
-    assert_eq!(peer.read_line(&mut offset).unwrap(), None);
-    assert_eq!(offset, original);
     let diagnostic = peer
         .failure(request, "waiting for a complete frame")
         .to_string();
@@ -63,14 +55,25 @@ fn a_live_peer_keeps_partial_bytes_until_the_requested_reply() {
     while peer.poll().unwrap().is_none() {
         pending.pause(peer.diagnostic(request));
     }
-    assert_eq!(
-        peer.read_line(&mut offset).unwrap().as_deref(),
-        Some("reply without a newline completed")
-    );
     let output = peer.wait(request).unwrap();
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("reply without a newline completed"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("peer stderr"));
+}
+
+#[test]
+fn optional_sampling_waits_for_its_owned_child_completion() {
+    let mut child = raw::command(std::env::current_exe().unwrap())
+        .args(["--exact", "peer_fixture", "--ignored", "--nocapture"])
+        .env(FIXTURE, "exit")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = peer::wait_sampler(&mut child).unwrap();
+    assert!(status.success());
+    assert_eq!(child.try_wait().unwrap(), Some(status));
 }
 
 #[test]
@@ -118,28 +121,15 @@ fn a_hung_peer_is_diagnosable_before_the_outer_runner_stops_it() {
 }
 
 #[test]
-fn invalid_frame_encoding_is_refused_without_consuming_or_replacing_bytes() {
+fn diagnostics_escape_invalid_output_without_replacing_raw_bytes() {
     let mut peer = spawn_fixture("invalid-utf8").unwrap();
     drop(peer.input());
-    let mut pending = peer.waiting("request 10: decode the reply");
+    let mut pending = peer.waiting("binary output");
     while peer.poll().unwrap().is_none() {
-        pending.pause(peer.diagnostic("request 10: decode the reply"));
+        pending.pause(peer.diagnostic("binary output"));
     }
-    let mut offset = peer
-        .stdout()
-        .windows(PARTIAL_REPLY.len())
-        .position(|bytes| bytes == PARTIAL_REPLY.as_bytes())
-        .unwrap();
-    let original = offset;
-    let error = peer.read_line(&mut offset).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    assert_eq!(offset, original);
-    assert!(error.to_string().contains(r"\xff"));
-    let mut invalid_offset = usize::MAX;
-    assert_eq!(
-        peer.read_line(&mut invalid_offset).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidInput
-    );
+    assert!(peer.stdout().windows(2).any(|bytes| bytes == b"\xff\n"));
+    assert!(peer.diagnostic("binary output").contains(r"\xff"));
 }
 
 #[test]

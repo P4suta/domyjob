@@ -7,6 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
 use domyjob_core::domain::JobId;
+use domyjob_core::login_diagnostic::{Failure, ReplyPhase, RequestPhase, select_failure};
 use domyjob_core::wire::{self, MAX_CONTROL_BYTES};
 use domyjob_core::worker_handoff::{HandoffFailure, HandoffPhase};
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,6 @@ use crate::lock::OsLock;
 use crate::platform::{self, user_files};
 
 const MAX_REPLY_BYTES: usize = 16_385;
-const MAX_ERROR_CHARS: usize = 4096;
 
 mod reply;
 
@@ -85,7 +85,7 @@ fn hand_off(path: &Path, logged_in: bool) -> Result<UnixStream, ProcessError> {
     UnixStream::connect(path).map_err(|error| {
         refused(format!(
             "the login-session agent is missing or unavailable ({error}); \
-             run `domyjob chat service install` inside the user's login session"
+             run `domyjob service install` inside the user's login session"
         ))
     })
 }
@@ -176,12 +176,163 @@ fn launch(request: Handoff) -> Result<(), ProcessError> {
     super::unix::launch_worker_command(command, None)
 }
 
+#[derive(Debug)]
+struct RequestFailure {
+    phase: RequestPhase,
+    source: io::Error,
+}
+
+#[derive(Debug)]
+struct ReplyFailure {
+    phase: ReplyPhase,
+    source: io::Error,
+}
+
+#[derive(Debug)]
+struct ReceiveFailure {
+    request: Option<RequestFailure>,
+    reply: Option<ReplyFailure>,
+}
+
+impl ReceiveFailure {
+    const fn request(phase: RequestPhase, source: io::Error) -> Self {
+        Self {
+            request: Some(RequestFailure { phase, source }),
+            reply: None,
+        }
+    }
+
+    const fn reply(reply: ReplyFailure) -> Self {
+        Self {
+            request: None,
+            reply: Some(reply),
+        }
+    }
+
+    fn selection(&self) -> Option<Failure> {
+        select_failure(
+            self.request.as_ref().map(|failure| failure.phase),
+            self.reply.as_ref().map(|failure| failure.phase),
+        )
+    }
+}
+
+const fn request_label(phase: RequestPhase) -> &'static str {
+    match phase {
+        RequestPhase::Read => "request read",
+        RequestPhase::Decode => "request decode",
+        RequestPhase::Validate => "request validation",
+        RequestPhase::Launch => "worker launch",
+    }
+}
+
+const fn reply_label(phase: ReplyPhase) -> &'static str {
+    match phase {
+        ReplyPhase::Write => "reply write",
+        ReplyPhase::ShutdownWrite => "reply finish",
+    }
+}
+
+struct IoContext<'a>(&'a io::Error);
+
+impl std::fmt::Display for IoContext<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self
+            .0
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<ProcessError>())
+        {
+            Some(
+                ProcessError::Spawn { source, .. }
+                | ProcessError::Wait(source)
+                | ProcessError::Signal(source)
+                | ProcessError::Ready(source),
+            ) => source,
+            _ => self.0,
+        };
+        write!(formatter, "{:?}", source.kind())?;
+        if let Some(errno) = source.raw_os_error() {
+            write!(formatter, ", errno {errno}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {}",
+            request_label(self.phase),
+            IoContext(&self.source)
+        )
+    }
+}
+
+impl std::fmt::Display for ReceiveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.selection(), &self.request, &self.reply) {
+            (Some(Failure::Request { phase, reply }), Some(request), secondary) => {
+                write!(
+                    formatter,
+                    "{}: {}",
+                    request_label(phase),
+                    IoContext(&request.source)
+                )?;
+                if let (Some(reply_phase), Some(failure)) = (reply, secondary) {
+                    write!(
+                        formatter,
+                        "; additionally {}: {}",
+                        reply_label(reply_phase),
+                        IoContext(&failure.source)
+                    )?;
+                }
+                Ok(())
+            }
+            (Some(Failure::Reply(phase)), _, Some(failure)) => write!(
+                formatter,
+                "{}: {}",
+                reply_label(phase),
+                IoContext(&failure.source)
+            ),
+            _ => formatter.write_str("the login handoff diagnostic has no failure"),
+        }
+    }
+}
+
+impl std::error::Error for ReceiveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.selection() {
+            Some(Failure::Request { .. }) => self
+                .request
+                .as_ref()
+                .map(|failure| -> &(dyn std::error::Error + 'static) { &failure.source }),
+            Some(Failure::Reply(_)) => self
+                .reply
+                .as_ref()
+                .map(|failure| -> &(dyn std::error::Error + 'static) { &failure.source }),
+            None => None,
+        }
+    }
+}
+
 fn receive(
     mut stream: UnixStream,
     launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
 ) -> io::Result<()> {
+    receive_using(&mut stream, launch, |socket| {
+        socket.shutdown(Shutdown::Write)
+    })
+    .map_err(io::Error::other)
+}
+
+fn receive_using<S: io::Read + io::Write>(
+    stream: &mut S,
+    launch: impl FnOnce(Handoff) -> Result<(), ProcessError>,
+    finish: impl FnOnce(&mut S) -> io::Result<()>,
+) -> Result<(), ReceiveFailure> {
     let mut reader = RequestReader {
-        inner: &mut stream,
+        inner: &mut *stream,
         bytes: 0,
         eof: false,
     };
@@ -189,16 +340,40 @@ fn receive(
     let bytes = reader.bytes;
     let eof = reader.eof;
     match started {
-        Ok(()) => reply::complete(&mut stream, b"R", |socket| socket.shutdown(Shutdown::Write)),
+        Ok(()) => complete_reply(stream, b"R", finish).map_err(ReceiveFailure::reply),
         Err(error) => {
             let detail = format!(
                 "{}; receiver bytes={bytes}; request_eof={eof}",
                 refusal_detail(&error)
             );
-            reply::complete(&mut stream, detail.as_bytes(), |socket| {
-                socket.shutdown(Shutdown::Write)
+            complete_reply(stream, detail.as_bytes(), finish).map_err(|reply| {
+                let mut failure = ReceiveFailure::request(request_phase(error.phase), error.cause);
+                failure.reply = Some(reply);
+                failure
             })
         }
+    }
+}
+
+fn complete_reply<S: io::Write>(
+    stream: &mut S,
+    bytes: &[u8],
+    finish: impl FnOnce(&mut S) -> io::Result<()>,
+) -> Result<(), ReplyFailure> {
+    let mut phase = ReplyPhase::Write;
+    reply::complete(stream, bytes, |stream| {
+        phase = ReplyPhase::ShutdownWrite;
+        finish(stream)
+    })
+    .map_err(|source| ReplyFailure { phase, source })
+}
+
+const fn request_phase(phase: HandoffPhase) -> RequestPhase {
+    match phase {
+        HandoffPhase::Read => RequestPhase::Read,
+        HandoffPhase::Decode => RequestPhase::Decode,
+        HandoffPhase::Validate => RequestPhase::Validate,
+        HandoffPhase::Launch => RequestPhase::Launch,
     }
 }
 
@@ -220,16 +395,11 @@ impl<R: io::Read> io::Read for RequestReader<R> {
 }
 
 fn refusal_detail(error: &HandoffFailure<io::Error>) -> String {
-    let phase = match error.phase {
-        HandoffPhase::Read => "request read",
-        HandoffPhase::Decode => "request decode",
-        HandoffPhase::Validate => "request validation",
-        HandoffPhase::Launch => "worker launch",
-    };
-    format!("{phase}: {}", error.cause)
-        .chars()
-        .take(MAX_ERROR_CHARS)
-        .collect()
+    format!(
+        "{}: {}",
+        request_label(request_phase(error.phase)),
+        IoContext(&error.cause)
+    )
 }
 
 fn receive_request(
@@ -278,7 +448,10 @@ pub(crate) fn start() -> io::Result<()> {
     let arguments = ["managername".to_owned()];
     let manager = run_tool(&Tool::new("launchctl", &arguments)).map_err(io::Error::other)?;
     if !manager.success || manager.stdout.trim() != "Aqua" {
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the login service requires a macOS Aqua session",
+        ));
     }
     let (listener, guard) = bind(&platform::login_directory()?)?;
     std::thread::spawn(move || {
@@ -408,6 +581,70 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reply_keeps_the_request_cause_and_redacts_packet_content() {
+        struct Transport {
+            input: std::io::Cursor<Vec<u8>>,
+            fail_write: bool,
+        }
+        impl std::io::Read for Transport {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.input, buffer)
+            }
+        }
+        impl std::io::Write for Transport {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_write {
+                    Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for fail_write in [true, false] {
+            let packet =
+                wire::frame(&serde_json::json!({"private-canary": "never disclose"})).unwrap();
+            let mut stream = Transport {
+                input: std::io::Cursor::new(packet),
+                fail_write,
+            };
+            let error = super::receive_using(
+                &mut stream,
+                |_| panic!("invalid input cannot launch"),
+                |_| Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+            )
+            .unwrap_err();
+            let expected = if fail_write {
+                super::ReplyPhase::Write
+            } else {
+                super::ReplyPhase::ShutdownWrite
+            };
+            assert_eq!(
+                error.selection(),
+                Some(super::Failure::Request {
+                    phase: super::RequestPhase::Decode,
+                    reply: Some(expected)
+                })
+            );
+            let detail = error.to_string();
+            assert!(detail.contains("request decode"));
+            assert!(!detail.contains("private-canary"));
+            assert!(!detail.contains("never disclose"));
+            assert!(
+                error
+                    .request
+                    .unwrap()
+                    .source
+                    .get_ref()
+                    .unwrap()
+                    .is::<domyjob_core::ingress::JsonError>()
+            );
+        }
+    }
+
+    #[test]
     fn request_read_fault_keeps_phase_cause_and_never_launches() {
         use std::io::Read as _;
 
@@ -432,9 +669,11 @@ mod tests {
         assert_eq!(error.phase, super::HandoffPhase::Read);
         assert_eq!(error.cause.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(error.cause.raw_os_error(), Some(MACOS_WOULD_BLOCK));
-        let original = error.cause.to_string();
         let detail = super::refusal_detail(&error);
-        assert_eq!(detail, format!("request read: {original}"));
+        assert_eq!(
+            detail,
+            format!("request read: WouldBlock, errno {MACOS_WOULD_BLOCK}")
+        );
         let mut output = Vec::new();
         let mut shutdowns = 0_u8;
         super::reply::complete(&mut output, detail.as_bytes(), |bytes| {
@@ -535,7 +774,8 @@ mod tests {
             assert_eq!(error.phase, super::HandoffPhase::Validate);
             let detail = super::refusal_detail(&error);
             assert!(detail.starts_with("request validation: "));
-            assert!(detail.contains(expected));
+            assert!(error.cause.to_string().contains(expected));
+            assert!(detail.contains("Other"));
         }
     }
 
@@ -567,7 +807,8 @@ mod tests {
         } else {
             panic!("the original spawn error must survive");
         }
-        assert!(super::refusal_detail(&error).starts_with("worker launch: starting the worker: "));
+        assert!(super::refusal_detail(&error).starts_with("worker launch: WouldBlock"));
+        assert!(super::refusal_detail(&error).contains("errno 35"));
     }
 
     #[test]
@@ -747,7 +988,11 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert!(String::from_utf8(reply).unwrap().contains("worker refused"));
+        assert!(
+            String::from_utf8(reply)
+                .unwrap()
+                .contains("worker launch: Other")
+        );
     }
 
     #[test]
@@ -770,9 +1015,9 @@ mod tests {
             let bytes = wire::frame(&packet).unwrap().len();
             let error = exchange(&packet, || Ok(client)).unwrap_err();
             let cause = if unapproved {
-                "allowlist"
+                "request validation"
             } else {
-                "worker refused"
+                "worker launch"
             };
             let detail = error.to_string();
             assert!(detail.contains(cause));

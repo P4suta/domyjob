@@ -10,7 +10,7 @@ use crate::state::JobState;
 pub const MAX_CONTROL_BYTES: usize = 1_048_576;
 pub const MAX_SNAPSHOT_BYTES: u64 = 67_108_864;
 pub const CONTROL_HEADER_BYTES: usize = size_of::<u32>();
-const SNAPSHOT_DIGEST_HEX_CHARS: usize = 64;
+const SNAPSHOT_DIGEST_HEX_CHARS: usize = crate::cache_key::DIGEST_BYTES * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -20,6 +20,11 @@ impl BuildId {
     #[must_use]
     pub const fn from_fingerprint(fingerprint: u64) -> Self {
         Self(fingerprint)
+    }
+
+    #[must_use]
+    pub const fn fingerprint(self) -> u64 {
+        self.0
     }
 }
 
@@ -55,7 +60,6 @@ impl ControlLength {
 )]
 pub enum Request {
     Hello,
-    Chat(crate::chat_wire::ChatRequest),
     Run {
         submission: SubmissionId,
         command: Command,
@@ -66,6 +70,9 @@ pub enum Request {
         job: JobId,
     },
     Logs {
+        job: JobId,
+    },
+    Acknowledge {
         job: JobId,
     },
     Wait {
@@ -108,6 +115,7 @@ pub enum Input {
 pub struct Snapshot {
     bytes: u64,
     digest: String,
+    cache: Option<crate::cache_key::CacheKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +123,8 @@ pub struct Snapshot {
 struct RawSnapshot {
     bytes: u64,
     digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache: Option<crate::cache_key::CacheKey>,
 }
 
 impl TryFrom<RawSnapshot> for Snapshot {
@@ -133,6 +143,7 @@ impl TryFrom<RawSnapshot> for Snapshot {
         Ok(Self {
             bytes: raw.bytes,
             digest: raw.digest,
+            cache: raw.cache,
         })
     }
 }
@@ -142,13 +153,34 @@ impl From<Snapshot> for RawSnapshot {
         Self {
             bytes: snapshot.bytes,
             digest: snapshot.digest,
+            cache: snapshot.cache,
         }
     }
 }
 
 impl Snapshot {
+    #[must_use]
+    pub const fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self
+    }
     pub fn new(bytes: u64, digest: String) -> Result<Self, WireError> {
-        Self::try_from(RawSnapshot { bytes, digest })
+        Self::try_from(RawSnapshot {
+            bytes,
+            digest,
+            cache: None,
+        })
+    }
+
+    #[must_use]
+    pub const fn with_cache(mut self, cache: crate::cache_key::CacheKey) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    #[must_use]
+    pub const fn cache(&self) -> Option<crate::cache_key::CacheKey> {
+        self.cache
     }
 
     #[must_use]
@@ -162,6 +194,37 @@ impl Snapshot {
     }
 }
 
+impl Request {
+    #[must_use]
+    pub fn canonical_submission(&self) -> Self {
+        match self {
+            Self::Run {
+                submission,
+                command,
+                input,
+            } => {
+                let input = match input {
+                    Input::Home => Input::Home,
+                    Input::Snapshot(snapshot) => Input::Snapshot(snapshot.clone().without_cache()),
+                };
+                Self::Run {
+                    submission: submission.clone(),
+                    command: command.clone(),
+                    input,
+                }
+            }
+            Self::Hello
+            | Self::List
+            | Self::Status { .. }
+            | Self::Logs { .. }
+            | Self::Acknowledge { .. }
+            | Self::Wait { .. }
+            | Self::Kill { .. }
+            | Self::Clean { .. } => self.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
@@ -171,12 +234,12 @@ impl Snapshot {
 )]
 pub enum Reply {
     Hello { build: BuildId },
-    Chat(crate::chat_wire::ChatReply),
     Accepted { job: JobId },
     Jobs { jobs: Vec<JobId> },
     Status { state: JobState },
     Logs { text: RemoteText, omitted: u64 },
     Cleaned { count: u16 },
+    Acknowledged,
     Error { code: ErrorCode },
 }
 
@@ -191,12 +254,12 @@ impl Reply {
         match self {
             Self::Error { code } => Unexpected::Refused(code),
             Self::Hello { .. }
-            | Self::Chat(_)
             | Self::Accepted { .. }
             | Self::Jobs { .. }
             | Self::Status { .. }
             | Self::Logs { .. }
-            | Self::Cleaned { .. } => Unexpected::Other,
+            | Self::Cleaned { .. }
+            | Self::Acknowledged => Unexpected::Other,
         }
     }
 }
@@ -224,7 +287,7 @@ reply_variant! {
     into_status: Self::Status { state } => state, JobState;
     into_logs: Self::Logs { text, omitted } => (text, omitted), (RemoteText, u64);
     into_cleaned: Self::Cleaned { count } => count, u16;
-    into_chat: Self::Chat(reply) => reply, crate::chat_wire::ChatReply;
+    into_acknowledged: Self::Acknowledged => (), ();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,8 +350,25 @@ pub fn frame<T: Serialize>(message: &T) -> Result<Vec<u8>, WireError> {
     Ok(framed)
 }
 
+#[cfg(kani)]
+mod proofs;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_chat_control_frames_are_refused() {
+        let request = include_bytes!("../../../fuzz/corpus/wire/retired-chat");
+        let request_error = crate::ingress::request(request).unwrap_err();
+        assert!(
+            alloc::string::ToString::to_string(&request_error).contains("unknown variant `chat`")
+        );
+        let reply = frame(&serde_json::json!({"reply":"chat","body":{}})).unwrap();
+        let reply_error = crate::ingress::reply(&reply).unwrap_err();
+        assert!(
+            alloc::string::ToString::to_string(&reply_error).contains("unknown variant `chat`")
+        );
+    }
+    use alloc::borrow::ToOwned as _;
     use alloc::string::String;
 
     use super::{
@@ -320,6 +400,29 @@ mod tests {
         assert_eq!(alloc::format!("{error}"), RefusingValue::DETAIL);
     }
 
+    #[test]
+    fn cache_identity_does_not_change_the_submitted_work() {
+        let request = super::Request::Run {
+            submission: crate::domain::SubmissionId::try_from("1".repeat(32)).unwrap(),
+            command: crate::domain::Command::try_from(alloc::vec!["true".to_owned()]).unwrap(),
+            input: super::Input::Snapshot(Snapshot::new(1, "0".repeat(64)).unwrap()),
+        };
+        let mut cached = request.clone();
+        if let super::Request::Run {
+            input: super::Input::Snapshot(snapshot),
+            ..
+        } = &mut cached
+        {
+            *snapshot = snapshot.clone().with_cache(crate::cache_key::CacheKey::new(
+                [1; crate::cache_key::DIGEST_BYTES],
+                [2; crate::cache_key::DIGEST_BYTES],
+            ));
+        }
+        assert_eq!(
+            request.canonical_submission(),
+            cached.canonical_submission()
+        );
+    }
     #[test]
     fn frames_and_their_lengths_hold_the_control_limit_exactly() {
         assert_eq!(

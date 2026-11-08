@@ -23,9 +23,11 @@ pub(super) fn job_handoff(world: &World, client: &Machine<'_>) -> Result<(), Fai
         missing_agent.code == Some(1) && missing_agent.stderr.contains("login-session agent"),
         "a missing agent must refuse submission with its cause: {missing_agent}"
     );
-    beta.start_background(&["chat", "serve"])?;
+    beta.start_background(&["service", "serve"])?;
     wait_for("the login-session handoff listener", || {
-        Ok(crate::present(&beta.state().join("chat/serve.pid"))?.then_some(()))
+        let log = std::fs::read_to_string(world.root().join("beta-service-serve.log"))
+            .context("reading login-service readiness")?;
+        Ok(log.contains("login-session listener ready").then_some(()))
     })?;
     let marker = beta.home().join("no-login");
     std::fs::write(&marker, b"").context("simulating a missing GUI session")?;

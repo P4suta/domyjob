@@ -1,7 +1,6 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
-use domyjob_core::chat::event::Stamp;
-
+#[cfg(test)]
 const MILLIS_PER_SECOND: u64 = 1_000;
 
 mod raw {
@@ -13,19 +12,12 @@ mod raw {
 
     use std::sync::OnceLock;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     static START: OnceLock<Instant> = OnceLock::new();
 
     pub(super) fn monotonic_millis() -> u128 {
         START.get_or_init(Instant::now).elapsed().as_millis()
-    }
-
-    pub(super) fn wall_millis() -> Option<u128> {
-        match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(elapsed) => Some(elapsed.as_millis()),
-            Err(_before_epoch) => None,
-        }
     }
 
     pub(super) fn receive<T>(receiver: &Receiver<T>, millis: u64) -> Result<T, RecvTimeoutError> {
@@ -48,16 +40,6 @@ fn monotonic() -> u64 {
     saturate(raw::monotonic_millis())
 }
 
-#[must_use]
-pub(crate) fn stamp() -> Stamp {
-    Stamp::from_unix_millis(raw::wall_millis().map_or(0, saturate))
-}
-
-#[must_use]
-pub(crate) fn observed_millis() -> Option<u64> {
-    raw::wall_millis().map(saturate)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deadline(u64);
 
@@ -67,6 +49,7 @@ impl Deadline {
         Self(monotonic().saturating_add(millis))
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn after_seconds(seconds: u64) -> Self {
         Self::after_millis(seconds.saturating_mul(MILLIS_PER_SECOND))
@@ -75,11 +58,6 @@ impl Deadline {
     #[must_use]
     pub(crate) fn expired(self) -> bool {
         monotonic() >= self.0
-    }
-
-    #[must_use]
-    pub(crate) fn min(self, other: Self) -> Self {
-        Self(self.0.min(other.0))
     }
 
     pub(crate) fn left_millis(self) -> u64 {

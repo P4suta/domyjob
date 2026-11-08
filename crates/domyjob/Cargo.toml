@@ -21,8 +21,6 @@ path = "tests/e2e.rs"
 harness = false
 
 [dependencies]
-unicode-segmentation.workspace = true
-unicode-width.workspace = true
 blake3 = { workspace = true, features = ["std", "mmap"] }
 cap-std.workspace = true
 cap-primitives.workspace = true
@@ -34,8 +32,7 @@ ignore.workspace = true
 notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-redb.workspace = true
-schemars.workspace = true
+toml_edit.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

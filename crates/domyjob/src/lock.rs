@@ -104,6 +104,22 @@ impl OsLock {
         Self::try_file(file).map_err(LockError::from)
     }
 
+    pub(crate) fn try_exclusive_in_existing_directory(
+        path: &Path,
+    ) -> Result<Option<Self>, LockError> {
+        let Some(file) = state_io::open_lock_in_existing_directory(path)? else {
+            return Ok(None);
+        };
+        Self::try_file(file).map_err(LockError::from)
+    }
+
+    pub(crate) fn exclusive_in_existing_directory(path: &Path) -> Result<Option<Self>, LockError> {
+        let Some(file) = state_io::open_lock_in_existing_directory(path)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::exclusive_file(file)?))
+    }
+
     pub(crate) fn exclusive(path: &Path) -> Result<Self, LockError> {
         let file = state_io::open_lock(path)?;
         Self::exclusive_file(file).map_err(LockError::from)

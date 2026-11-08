@@ -23,13 +23,18 @@ use windows_sys::Win32::Security::{
     OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
+    CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
 };
 use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 const MAX_SID_UTF16_UNITS: usize = 256;
 const MAX_TOKEN_USER_BYTES: u32 = 4096;
+const CLEANUP_ACCESS: u32 = READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES;
+const CLEANUP_FLAGS: u32 = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS;
+const RETAINED_DIRECTORY_SHARING: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Success(());
@@ -347,10 +352,69 @@ pub(super) fn no_follow(options: &mut fs::OpenOptions) {
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
+pub(super) fn no_follow_relative(options: &mut cap_std::fs::OpenOptions) {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
 pub(super) fn open_private_dir(path: &Path, options: &mut fs::OpenOptions) -> io::Result<fs::File> {
     options.access_mode(READ_CONTROL);
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     options.open(path)
+}
+
+pub(super) fn open_cleanup_root(
+    path: &Path,
+    options: &mut fs::OpenOptions,
+) -> io::Result<fs::File> {
+    options
+        .access_mode(CLEANUP_ACCESS)
+        .custom_flags(CLEANUP_FLAGS)
+        .share_mode(RETAINED_DIRECTORY_SHARING);
+    options.open(path)
+}
+
+pub(in crate::platform) fn cleanup_child_options() -> cap_std::fs::OpenOptions {
+    use cap_std::fs::OpenOptionsExt as _;
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(CLEANUP_ACCESS)
+        .custom_flags(CLEANUP_FLAGS)
+        .share_mode(RETAINED_DIRECTORY_SHARING);
+    options
+}
+
+pub(in crate::platform) fn cleanup_link(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+pub(in crate::platform) fn remove_cleanup_link(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    metadata: &cap_std::fs::Metadata,
+) -> io::Result<()> {
+    use cap_std::fs::MetadataExt as _;
+
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        directory.remove_file(name)
+    } else {
+        directory.remove_dir(name)
+    }
+}
+
+#[cfg(test)]
+pub(in crate::platform) fn cleanup_link_refusal(error: &io::Error) -> bool {
+    match error.raw_os_error() {
+        Some(errno) => {
+            matches!(u32::try_from(errno), Ok(code) if code == windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK)
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]

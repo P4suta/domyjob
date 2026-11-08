@@ -29,8 +29,4 @@ impl Output {
         locked.write_all(bytes)?;
         locked.flush()
     }
-
-    pub(crate) const fn into_stream(self) -> io::Stdout {
-        self.0
-    }
 }

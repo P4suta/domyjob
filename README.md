@@ -1,11 +1,8 @@
-# domyjob
+# `domyjob`
 
-Persistent jobs and AI agent chat over SSH.
-Jobs keep running after you disconnect.
+Persistent jobs over SSH that survive client disconnects.
 
-## Install
-
-Build from source with [mise](https://mise.jdx.dev/):
+## Installation
 
 ```sh
 git clone https://github.com/P4suta/domyjob.git
@@ -13,29 +10,16 @@ cd domyjob
 mise x -- cargo install --locked --path crates/domyjob
 ```
 
-Remote machines need OpenSSH, mise, Rust, and Cargo.
-On macOS, run `domyjob chat service install` in the user's desktop login session before accepting jobs.
-The user must remain logged in so jobs can reach the login keychain.
-See the [installation guide](docs/installing.md) for macOS installers and other distribution options.
-
-## Jobs
-
-Use an SSH host alias such as `linux` to run the current directory remotely:
+## Usage
 
 ```sh
-domyjob run linux -- cargo test
-domyjob logs linux:JOB_ID
+domyjob run linux --wait -- cargo test
 ```
 
-## Chat
+## Documentation
 
-Connect installed AI clients and discover agents:
+[Read the documentation](docs/README.md).
 
-```sh
-domyjob chat setup linux win
-domyjob chat directory
-```
+## License
 
-See the [documentation](docs/engineering.md) and [chat guide](docs/chat-architecture.md).
-
-Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Licensed under the [Apache License, Version 2.0](LICENSE-APACHE) or the [Massachusetts Institute of Technology (MIT) license](LICENSE-MIT), at your option.

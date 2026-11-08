@@ -1,0 +1,14 @@
+name = "`domyjob`"
+summary = "Persistent jobs over SSH that survive client disconnects"
+install = """
+git clone https://github.com/P4suta/domyjob.git
+cd domyjob
+mise x -- cargo install --locked --path crates/domyjob"""
+usage = "domyjob run linux --wait -- cargo test"
+documentation_index = true
+copyright = "Yasunobu"
+license = "MIT OR Apache-2.0"
+
+[preserved_licenses]
+mit_sha256 = "77bda1146c77f5f4cd024e062a20baec03b27e87ab721dc38ccbc98f54380925"
+apache_sha256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
