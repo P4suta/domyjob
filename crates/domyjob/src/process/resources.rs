@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use domyjob_core::domain::JobId;
 use domyjob_core::resource_policy::Policy;
 use domyjob_core::state::Event;
+use domyjob_core::wire::BuildId;
 
 use crate::lock::OsLock;
 
@@ -31,37 +32,53 @@ pub(crate) fn wait_for_capacity<T>(
 
 #[cfg(target_os = "linux")]
 mod linux;
+mod ownership;
+use ownership::SlotRecord;
+pub(crate) use ownership::{SavedScope, ScopeNamespace};
 
 #[derive(Debug)]
 pub(crate) struct Limits {
     policy: Option<Policy>,
     directory: PathBuf,
+    namespace: Option<ScopeNamespace>,
 }
 
 #[derive(Debug)]
 pub(crate) struct AdmissionPermit {
     _slot: Option<OsLock>,
-    record: Option<PathBuf>,
+    record: Option<SlotRecord>,
+    owned_scope: Option<Scope>,
     policy: Option<Policy>,
+    namespace: Option<ScopeNamespace>,
 }
 
 impl AdmissionPermit {
-    fn stop_previous(&self) -> io::Result<()> {
-        if let Some(record) = &self.record
-            && let Some(previous) = crate::state_io::read_bytes(record).map_err(io::Error::other)?
-        {
-            let scope = Scope::parse(String::from_utf8(previous).map_err(io::Error::other)?)?;
-            scope.stop()?;
-            scope.cleanup()?;
+    fn record_scope(&mut self, job: &JobId, build: BuildId, scope: &Scope) -> io::Result<()> {
+        let namespace = self
+            .namespace
+            .ok_or_else(|| io::Error::other("scope has no store namespace"))?;
+        let saved = SavedScope::new((namespace, job), build, scope)?;
+        if let Some(record) = &self.record {
+            record.write(&saved)?;
         }
+        self.owned_scope = Some(scope.clone());
         Ok(())
     }
 }
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        if let Err(error) = self.stop_previous() {
-            eprintln!("domyjob: admitted scope cleanup failed before releasing its slot: {error}");
+        if let Some(scope) = &self.owned_scope {
+            let stopped = scope.stop().and_then(|()| scope.cleanup());
+            let cleared = stopped.and_then(|()| match &self.record {
+                Some(record) => record.clear_owned(scope),
+                None => Ok(()),
+            });
+            if let Err(error) = cleared {
+                eprintln!(
+                    "domyjob: admitted scope cleanup failed before releasing its slot: {error}"
+                );
+            }
         }
     }
 }
@@ -71,6 +88,18 @@ pub(crate) struct Launch {
     pub(super) command: std::process::Command,
     pub(super) scope: Option<Scope>,
     pub(super) permit: AdmissionPermit,
+    pub(super) quiescence: Option<PathBuf>,
+}
+
+impl Launch {
+    pub(crate) fn with_quiescence_marker(mut self, marker: PathBuf) -> Self {
+        self.quiescence = Some(marker);
+        self
+    }
+
+    pub(crate) const fn scope(&self) -> Option<&Scope> {
+        self.scope.as_ref()
+    }
 }
 
 #[cfg(test)]
@@ -82,8 +111,11 @@ impl Launch {
             permit: AdmissionPermit {
                 _slot: None,
                 record: None,
+                owned_scope: None,
                 policy: None,
+                namespace: None,
             },
+            quiescence: None,
         }
     }
 }
@@ -94,6 +126,22 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
+    pub(crate) fn for_job((namespace, job): (ScopeNamespace, &JobId), build: BuildId) -> Self {
+        const SCOPE_DIGEST_HEX_CHARS: usize = 32;
+        let mut identity = blake3::Hasher::new();
+        identity.update(&namespace.bytes());
+        identity.update(&build.fingerprint().to_le_bytes());
+        identity.update(job.as_str().as_bytes());
+        let name: String = identity
+            .finalize()
+            .to_hex()
+            .chars()
+            .take(SCOPE_DIGEST_HEX_CHARS)
+            .collect();
+        Self {
+            name: format!("domyjob-job-{name}.scope"),
+        }
+    }
     pub(crate) fn parse(name: String) -> io::Result<Self> {
         let id = name
             .strip_prefix("domyjob-job-")
@@ -113,6 +161,16 @@ impl Scope {
         #[cfg(not(target_os = "linux"))]
         Err(io::Error::other(format!(
             "job scope {} requires Linux",
+            self.name
+        )))
+    }
+
+    fn obsolete(&self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        return linux::obsolete(self);
+        #[cfg(not(target_os = "linux"))]
+        Err(io::Error::other(format!(
+            "legacy scope {} reconciliation requires Linux",
             self.name
         )))
     }
@@ -144,16 +202,32 @@ impl Scope {
 impl Limits {
     #[cfg(test)]
     pub(crate) const fn fixture(policy: Option<Policy>, directory: PathBuf) -> Self {
-        Self { policy, directory }
+        Self {
+            policy,
+            directory,
+            namespace: None,
+        }
     }
 
     pub(crate) fn load() -> io::Result<Self> {
         #[cfg(target_os = "linux")]
-        let policy = linux::load(std::path::Path::new("/etc/domyjob/resource-policy.json"))?;
+        let policy = {
+            const RESOURCE_POLICY: &str = "/etc/domyjob/resource-policy.json";
+            linux::load(std::path::Path::new(RESOURCE_POLICY))?
+        };
         #[cfg(not(target_os = "linux"))]
         let policy = None;
         let directory = crate::layout::admission()?;
-        Ok(Self { policy, directory })
+        Ok(Self {
+            policy,
+            directory,
+            namespace: None,
+        })
+    }
+
+    pub(crate) const fn with_namespace(mut self, namespace: ScopeNamespace) -> Self {
+        self.namespace = Some(namespace);
+        self
     }
 
     pub(crate) const fn required(&self) -> bool {
@@ -165,19 +239,33 @@ impl Limits {
             return Ok(Some(AdmissionPermit {
                 _slot: None,
                 record: None,
+                owned_scope: None,
                 policy: None,
+                namespace: self.namespace,
             }));
         };
+        let namespace = self
+            .namespace
+            .ok_or_else(|| io::Error::other("resource admission has no store namespace"))?;
         for slot in 0..policy.budget().concurrent {
             let path = self.directory.join(format!("slot-{slot}.lock"));
             if let Some(guard) = OsLock::try_exclusive(&path).map_err(io::Error::other)? {
-                let record = self.directory.join(format!("slot-{slot}.scope"));
+                let record = SlotRecord::new(
+                    self.directory.join(format!("slot-{slot}.scope")),
+                    slot,
+                    namespace,
+                );
+                if !record.clear_previous()? {
+                    drop(guard);
+                    continue;
+                }
                 let permit = AdmissionPermit {
                     _slot: Some(guard),
                     record: Some(record),
+                    owned_scope: None,
                     policy: self.policy,
+                    namespace: self.namespace,
                 };
-                permit.stop_previous()?;
                 return Ok(Some(permit));
             }
         }
@@ -190,9 +278,9 @@ impl Limits {
         job: &JobId,
         command: std::process::Command,
     ) -> io::Result<Launch> {
-        if permit.policy != self.policy {
+        if permit.policy != self.policy || permit.namespace != self.namespace {
             return Err(io::Error::other(
-                "admission permit belongs to another resource policy",
+                "admission permit belongs to another resource policy or store",
             ));
         }
         if self.policy.is_some() && permit.record.is_none() {
@@ -200,22 +288,31 @@ impl Limits {
                 "admission permit has no shared scope record",
             ));
         }
-        match self.policy {
-            None => Ok(Launch {
+        let mut launch = match self.policy {
+            None => Launch {
                 command,
                 scope: None,
                 permit,
-            }),
+                quiescence: None,
+            },
             Some(policy) => {
                 #[cfg(target_os = "linux")]
-                return linux::prepare(permit, policy, job, &command);
+                {
+                    linux::prepare(permit, policy, job, &command)?
+                }
                 #[cfg(not(target_os = "linux"))]
                 {
                     let _unused = (permit, policy, job, command);
-                    Err(io::Error::other("resource policy requires Linux"))
+                    return Err(io::Error::other("resource policy requires Linux"));
                 }
             }
+        };
+        if let Some(scope) = &launch.scope {
+            launch
+                .permit
+                .record_scope(job, crate::identity::current(), scope)?;
         }
+        Ok(launch)
     }
 }
 
@@ -238,18 +335,48 @@ mod tests {
     use domyjob_core::resource_policy::Policy;
 
     #[test]
+    fn a_resource_permit_cannot_cross_the_store_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let stores = [root.path().join("first"), root.path().join("second")];
+        for store in &stores {
+            crate::state_io::private_dir(store).unwrap();
+        }
+        let first = Limits::fixture(None, root.path().join("admission"))
+            .with_namespace(super::ScopeNamespace::for_store(&stores[0]).unwrap());
+        let second = Limits::fixture(None, root.path().join("admission"))
+            .with_namespace(super::ScopeNamespace::for_store(&stores[1]).unwrap());
+        let foreign_permit = first.try_admit().unwrap().unwrap();
+        let job = domyjob_core::domain::JobId::try_from("a".repeat(32)).unwrap();
+        second
+            .prepare(
+                foreign_permit,
+                &job,
+                crate::process::command("never-launched"),
+            )
+            .unwrap_err();
+        let own_permit = second.try_admit().unwrap().unwrap();
+        second
+            .prepare(own_permit, &job, crate::process::command("never-launched"))
+            .unwrap();
+    }
+
+    #[test]
     fn admission_is_shared_between_clients_and_releases_on_drop() {
         let root = tempfile::tempdir().unwrap();
         let policy: Policy = domyjob_core::ingress::foreign_json(
             r#"{"version":1,"max_concurrent_jobs":2,"slice":"domyjob.slice","memory_high_bytes":67108864,"memory_max_bytes":100663296,"memory_swap_max_bytes":0}"#,
         ).unwrap();
+        let store = root.path().join("store");
+        crate::state_io::private_dir(&store).unwrap();
         let first = Limits {
             policy: Some(policy),
             directory: root.path().join("admission"),
+            namespace: Some(super::ScopeNamespace::for_store(&store).unwrap()),
         };
         let other = Limits {
             policy: Some(policy),
             directory: root.path().join("admission"),
+            namespace: first.namespace,
         };
         let one = first.try_admit().unwrap().unwrap();
         let two = other.try_admit().unwrap().unwrap();

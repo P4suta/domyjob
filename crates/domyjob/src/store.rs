@@ -14,6 +14,26 @@ use crate::platform;
 use crate::state_io::{self as state_file, StateError};
 use crate::workspace::{Rooted, WorkspaceError};
 
+mod compatibility;
+mod lifecycle;
+
+const MAX_JOB_RECORDS: usize = 1024;
+const ARCHIVE_COPY_BUFFER_BYTES: usize = 16_384;
+const MAX_LOG_TAIL_BYTES: u64 = 16_384;
+const ARCHIVE_EXECUTABLE_BITS: u32 = 0o111;
+
+const fn submission_step(
+    state: domyjob_core::job_protocol::State,
+    same_request: bool,
+) -> Result<(), StoreError> {
+    use domyjob_core::job_protocol::{Action, Refusal, step};
+    match step(state, Action::Submit { same_request }) {
+        Ok(_) => Ok(()),
+        Err(Refusal::Conflict) => Err(StoreError::Conflict),
+        Err(Refusal::Missing | Refusal::NotActive) => Err(StoreError::Corrupt),
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
     #[error(transparent)]
@@ -40,6 +60,8 @@ pub(crate) enum StoreError {
     Active,
     #[error("the job store contains an invalid identifier or record")]
     Corrupt,
+    #[error("the job belongs to an unsupported runner format")]
+    UnsupportedFormat,
     #[error("the source archive contains a non-portable or unsafe entry")]
     ArchiveEntry,
     #[error("the source archive is missing or does not match its declared size and digest")]
@@ -123,32 +145,6 @@ impl JobPaths {
     }
 }
 
-const KEEP_FINISHED: usize = 32;
-const KEEP_WORKSPACES: usize = 2;
-const MAX_JOB_RECORDS: usize = 1024;
-const ARCHIVE_COPY_BUFFER_BYTES: usize = 16_384;
-const MAX_LOG_TAIL_BYTES: u64 = 16_384;
-const MAX_ARCHIVE_FILES: usize = 100_000;
-const MAX_ARCHIVE_PATH_BYTES: usize = 16_777_216;
-const ARCHIVE_EXECUTABLE_BITS: u32 = 0o111;
-
-const fn submission_step(
-    state: domyjob_core::job_protocol::State,
-    same_request: bool,
-) -> Result<(), StoreError> {
-    match domyjob_core::job_protocol::step(
-        state,
-        domyjob_core::job_protocol::Action::Submit { same_request },
-    ) {
-        Ok(_) => Ok(()),
-        Err(domyjob_core::job_protocol::Refusal::Conflict) => Err(StoreError::Conflict),
-        Err(
-            domyjob_core::job_protocol::Refusal::Missing
-            | domyjob_core::job_protocol::Refusal::NotActive,
-        ) => Err(StoreError::Corrupt),
-    }
-}
-
 fn in_use(root: &Path) -> Result<bool, StoreError> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -170,8 +166,6 @@ fn in_use(root: &Path) -> Result<bool, StoreError> {
     Ok(false)
 }
 
-const KEEP_OTHER_FORMATS: usize = 2;
-
 pub(crate) fn prune_other_formats(
     state: &crate::layout::State,
 ) -> Result<Vec<PathBuf>, StoreError> {
@@ -182,14 +176,20 @@ pub(crate) fn prune_other_formats(
     let mut idle = Vec::new();
     for root in state.other_runners()? {
         let judged = in_use(&root).and_then(|busy| {
-            if busy {
+            let unacknowledged = match std::fs::read_dir(root.join("jobs")) {
+                Ok(mut jobs) => jobs.next().transpose()?.is_some(),
+                Err(error) if error.kind() == ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            };
+            let receipts = Store { root: root.clone() }.has_receipts()?;
+            if busy || unacknowledged || receipts {
                 Ok(None)
             } else {
-                Ok(Some(Store { root: root.clone() }.opened()?))
+                Ok(Some(()))
             }
         });
         match judged {
-            Ok(Some(place)) => idle.push((place, root)),
+            Ok(Some(())) => idle.push(root),
             Ok(None) => {}
             Err(error) => eprintln!(
                 "domyjob node: keeping the job store {} for now: {error}",
@@ -198,7 +198,7 @@ pub(crate) fn prune_other_formats(
         }
     }
     let mut removed = Vec::new();
-    for (_, root) in crate::retention::beyond_newest(idle, KEEP_OTHER_FORMATS) {
+    for root in idle {
         match state_file::set_aside(&root, &current.trash_dir()) {
             Ok(()) => removed.push(root),
             Err(error) => eprintln!(
@@ -251,10 +251,6 @@ impl Store {
         self.root.join("opened")
     }
 
-    fn opened(&self) -> Result<u64, StoreError> {
-        Self::read_number(&self.opened_path())
-    }
-
     fn jobs_dir(&self) -> PathBuf {
         self.root.join("jobs")
     }
@@ -269,6 +265,13 @@ impl Store {
 
     fn trash_dir(&self) -> PathBuf {
         self.root.join("trash")
+    }
+
+    pub(crate) fn cache_root(&self) -> std::io::Result<PathBuf> {
+        self.root
+            .parent()
+            .map(|parent| parent.join("build-cache"))
+            .ok_or_else(|| std::io::Error::other("runner store has no parent"))
     }
 
     fn empty_trash(&self) {
@@ -314,53 +317,16 @@ impl Store {
     }
 
     fn reclaim(&self) -> Result<(), StoreError> {
-        let mut finished = Vec::new();
         for job in self.list()? {
-            if self.status(&job)?.kind() == PhaseKind::Finished {
-                finished.push((Self::read_number(&self.paths(&job).order())?, job));
-            }
-        }
-        finished.sort();
-        let excess = finished.len().saturating_sub(KEEP_FINISHED);
-        let shed = finished.len().saturating_sub(KEEP_WORKSPACES);
-        for (index, (_, job)) in finished.into_iter().enumerate().take(shed) {
-            if index < excess {
-                if let Err(error) = self.clean_one(&job) {
-                    eprintln!(
-                        "domyjob node: keeping finished job {} for now: {error}",
-                        job.as_str()
-                    );
-                }
-            } else if let Err(error) = self.shed_workspace(&job) {
+            if let Err(error) = self.for_job(&job)?.retire(&job) {
                 eprintln!(
-                    "domyjob node: keeping the workspace of finished job {} for now: {error}",
+                    "domyjob node: keeping finished job {} for now: {error}",
                     job.as_str()
                 );
             }
         }
         self.empty_trash();
         Ok(())
-    }
-
-    fn shed_workspace(&self, job: &JobId) -> Result<bool, StoreError> {
-        self.set_aside_finished(job, JobPaths::workspace)
-    }
-
-    fn set_aside_finished(
-        &self,
-        job: &JobId,
-        part: impl FnOnce(&JobPaths) -> PathBuf,
-    ) -> Result<bool, StoreError> {
-        let launch = self.launch_lock(job)?;
-        if self.status(job)?.kind() != PhaseKind::Finished {
-            return Ok(false);
-        }
-        let paths = self.verify_job(job)?;
-        let alive = OsLock::exclusive(&paths.alive_lock())?;
-        drop(alive);
-        drop(launch);
-        state_file::set_aside(&part(&paths), &self.trash_dir())?;
-        Ok(true)
     }
 
     fn staged(&self, job: &JobId) -> JobPaths {
@@ -466,11 +432,10 @@ impl Store {
         let mut hasher = blake3::Hasher::new();
         let mut remaining = snapshot.bytes();
         let mut buffer = [0_u8; ARCHIVE_COPY_BUFFER_BYTES];
+        let capacity = u64::try_from(buffer.len()).map_err(|_length| StoreError::Capacity)?;
         while remaining != 0 {
-            let wanted = usize::try_from(
-                remaining.min(u64::try_from(buffer.len()).map_err(|_length| StoreError::Capacity)?),
-            )
-            .map_err(|_length| StoreError::Capacity)?;
+            let wanted =
+                usize::try_from(remaining.min(capacity)).map_err(|_length| StoreError::Capacity)?;
             let chunk = buffer.get_mut(..wanted).ok_or(StoreError::Capacity)?;
             let count = input.read(chunk)?;
             if count == 0 {
@@ -500,7 +465,9 @@ impl Store {
         let mut content_bytes = 0_u64;
         for entry in tar.entries()? {
             let mut entry = entry?;
-            if paths.len() >= MAX_ARCHIVE_FILES || !entry.header().entry_type().is_file() {
+            if paths.len() >= domyjob_core::source_paths::MAX_FILES
+                || !entry.header().entry_type().is_file()
+            {
                 return Err(StoreError::ArchiveEntry);
             }
             let path = entry.path()?;
@@ -508,7 +475,7 @@ impl Store {
             let validated = RelativePath::try_from(text.to_owned())
                 .map_err(|_invalid| StoreError::ArchiveEntry)?;
             path_bytes = path_bytes.saturating_add(validated.as_str().len());
-            if path_bytes > MAX_ARCHIVE_PATH_BYTES
+            if path_bytes > domyjob_core::source_paths::MAX_PATH_BYTES
                 || !paths.insert(validated.as_str().to_lowercase())
             {
                 return Err(StoreError::ArchiveEntry);
@@ -568,10 +535,10 @@ impl Store {
             )
             | (
                 Request::Hello
-                | Request::Chat(_)
                 | Request::List
                 | Request::Status { .. }
                 | Request::Logs { .. }
+                | Request::Acknowledge { .. }
                 | Request::Wait { .. }
                 | Request::Kill { .. }
                 | Request::Clean { .. },
@@ -596,16 +563,25 @@ impl Store {
         request: &Request,
         archive: Option<&ReceivedArchive>,
     ) -> Result<JobId, StoreError> {
-        let _admission = OsLock::exclusive(&self.admission_lock())?;
+        let admission = OsLock::exclusive(&self.admission_lock())?;
         self.cleanup_orphans(OrphanKind::Staging)?;
         let job = JobId::from(submission);
+        let original = self.for_job(&job)?;
+        if original.root != self.root {
+            drop(admission);
+            return original.reserve(submission, request, archive);
+        }
+        if self.consumed_submission(&job, request)? {
+            return Ok(job);
+        }
         match std::fs::symlink_metadata(self.paths(&job).dir) {
             Ok(_existing) => {
                 self.verify_job(&job)?;
-                let same_request = self.read_request(&job)? == *request;
+                let same = self.read_request(&job)?.canonical_submission()
+                    == request.canonical_submission();
                 submission_step(
                     domyjob_core::job_protocol::State::from(self.read_state(&job)?.kind()),
-                    same_request,
+                    same,
                 )?;
                 return Ok(job);
             }
@@ -622,6 +598,18 @@ impl Store {
     }
 
     pub(crate) fn list(&self) -> Result<Vec<JobId>, StoreError> {
+        let mut jobs = BTreeSet::new();
+        for store in self.compatible_stores()? {
+            for job in store.local_list()? {
+                if !jobs.insert(job) {
+                    return Err(StoreError::Conflict);
+                }
+            }
+        }
+        Ok(jobs.into_iter().collect())
+    }
+
+    fn local_list(&self) -> Result<Vec<JobId>, StoreError> {
         let mut jobs = Vec::new();
         for entry in std::fs::read_dir(self.jobs_dir())? {
             let entry = entry?;
@@ -634,6 +622,9 @@ impl Store {
                 .map_err(|_name| StoreError::Corrupt)?;
             let job = JobId::try_from(name).map_err(|_invalid| StoreError::Corrupt)?;
             state_file::private_dir(&entry.path())?;
+            if state_file::open_read(&entry.path().join("consumed"))?.is_some() {
+                continue;
+            }
             jobs.push(job);
         }
         jobs.sort();
@@ -641,10 +632,15 @@ impl Store {
     }
 
     pub(crate) fn transition(&self, job: &JobId, event: &Event) -> Result<JobState, StoreError> {
-        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let _lock = OsLock::exclusive_in_existing_directory(&self.verify_job(job)?.state_lock())?
+            .ok_or(StoreError::Missing)?;
         let mut state = self.read_state(job)?;
+        let unstarted = state.kind() == PhaseKind::Accepted;
         state.advance(event)?;
         self.write_state(job, &state)?;
+        if unstarted && state.kind() == PhaseKind::Finished {
+            state_file::write_bytes(&self.paths(job).dir.join("quiesced"), &[])?;
+        }
         Ok(state)
     }
 
@@ -653,12 +649,17 @@ impl Store {
         job: &JobId,
         reason: RemoteText,
     ) -> Result<(), StoreError> {
-        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        let _lock = OsLock::exclusive_in_existing_directory(&self.verify_job(job)?.state_lock())?
+            .ok_or(StoreError::Missing)?;
         let mut state = self.read_state(job)?;
+        let unstarted = state.kind() == PhaseKind::Accepted;
         match state.kind() {
             PhaseKind::Accepted | PhaseKind::Queued | PhaseKind::Starting => {
                 state.advance(&Event::LaunchFailed { reason })?;
                 self.write_state(job, &state)?;
+                if unstarted {
+                    state_file::write_bytes(&self.paths(job).dir.join("quiesced"), &[])?;
+                }
             }
             PhaseKind::Running | PhaseKind::Finished => {}
         }
@@ -666,7 +667,26 @@ impl Store {
     }
 
     pub(crate) fn status(&self, job: &JobId) -> Result<JobState, StoreError> {
-        let _lock = OsLock::exclusive(&self.verify_job(job)?.state_lock())?;
+        if let Some(state) = self.completed_receipt(job)? {
+            self.retire(job)?;
+            return Ok(state);
+        }
+        let observed = match self.recorded_status(job) {
+            Ok(state) => state,
+            Err(StoreError::Missing) => {
+                return self.completed_receipt(job)?.ok_or(StoreError::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        if observed.kind() == PhaseKind::Finished {
+            self.retire(job)?;
+        }
+        Ok(observed)
+    }
+
+    fn recorded_status(&self, job: &JobId) -> Result<JobState, StoreError> {
+        let _lock = OsLock::exclusive_in_existing_directory(&self.verify_job(job)?.state_lock())?
+            .ok_or(StoreError::Missing)?;
         let mut state = self.read_state(job)?;
         match state.kind() {
             PhaseKind::Accepted | PhaseKind::Finished => Ok(state),
@@ -674,6 +694,7 @@ impl Store {
                 match OsLock::probe(&self.paths(job).alive_lock())? {
                     Probe::Held => Ok(state),
                     Probe::Absent | Probe::Free => {
+                        self.reconcile_scope(job)?;
                         if domyjob_core::job_protocol::step(
                             domyjob_core::job_protocol::State::Active,
                             domyjob_core::job_protocol::Action::Reap,
@@ -691,11 +712,14 @@ impl Store {
     }
 
     pub(crate) fn worker_lock(&self, job: &JobId) -> Result<Option<OsLock>, StoreError> {
-        Ok(OsLock::try_exclusive(&self.verify_job(job)?.alive_lock())?)
+        Ok(OsLock::try_exclusive_in_existing_directory(
+            &self.verify_job(job)?.alive_lock(),
+        )?)
     }
 
     pub(crate) fn launch_lock(&self, job: &JobId) -> Result<OsLock, StoreError> {
-        Ok(OsLock::exclusive(&self.verify_job(job)?.launch_lock())?)
+        OsLock::exclusive_in_existing_directory(&self.verify_job(job)?.launch_lock())?
+            .ok_or(StoreError::Missing)
     }
 
     pub(crate) fn request_cancel(&self, job: &JobId) -> Result<(), StoreError> {
@@ -728,6 +752,9 @@ impl Store {
     }
 
     pub(crate) fn log_tail(&self, job: &JobId) -> Result<(RemoteText, u64), StoreError> {
+        if self.completed_receipt(job)?.is_some() {
+            return Err(StoreError::Missing);
+        }
         let path = self.verify_job(job)?.log();
         let Some(mut file) = state_file::open_read(&path)? else {
             return Ok((
@@ -750,19 +777,65 @@ impl Store {
     }
 
     pub(crate) fn wait(&self, job: &JobId) -> Result<JobState, StoreError> {
-        let lock = OsLock::exclusive(&self.verify_job(job)?.alive_lock())?;
+        if let Some(state) = self.completed_receipt(job)? {
+            self.retire(job)?;
+            return Ok(state);
+        }
+        let paths = match self.verify_job(job) {
+            Ok(paths) => paths,
+            Err(StoreError::Missing) => return self.status(job),
+            Err(error) => return Err(error),
+        };
+        let lock = OsLock::exclusive_in_existing_directory(&paths.alive_lock())?;
         drop(lock);
         self.status(job)
     }
 
     fn clean_one(&self, job: &JobId) -> Result<bool, StoreError> {
-        self.set_aside_finished(job, |paths| paths.dir.clone())
+        if self.status(job)?.kind() != PhaseKind::Finished {
+            return Ok(false);
+        }
+        let paths = match self.verify_job(job) {
+            Ok(paths) => paths,
+            Err(StoreError::Missing) if self.completed_receipt(job)?.is_some() => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if state_file::open_read(&paths.dir.join("consumed"))?.is_some() {
+            return Ok(true);
+        }
+        if self.quiescence(job)? == domyjob_core::storage_lifecycle::Quiescence::Unknown {
+            return Ok(false);
+        }
+        self.record_acknowledgment(job)?;
+        self.retire(job)?;
+        match self.verify_job(job) {
+            Err(StoreError::Missing) => Ok(true),
+            Ok(retired) => Ok(state_file::open_read(&retired.dir.join("consumed"))?.is_some()),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn clean(&self, target: &CleanTarget) -> Result<u16, StoreError> {
-        let _admission = OsLock::exclusive(&self.admission_lock())?;
+        let admission = OsLock::exclusive(&self.admission_lock())?;
         match target {
             CleanTarget::Job(job) => {
+                let store = self.for_job(job)?;
+                if store.root != self.root {
+                    drop(admission);
+                    return store.clean(target);
+                }
+                if self.completed_receipt(job)?.is_some() {
+                    match self.verify_job(job) {
+                        Err(StoreError::Missing) => return Ok(0),
+                        Ok(paths)
+                            if state_file::open_read(&paths.dir.join("consumed"))?.is_some() =>
+                        {
+                            return Ok(0);
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 let cleaned = self.clean_one(job)?;
                 self.empty_trash();
                 if cleaned {
@@ -774,7 +847,7 @@ impl Store {
             CleanTarget::Finished => {
                 let mut count = 0_u16;
                 for job in self.list()? {
-                    if self.clean_one(&job)? {
+                    if self.for_job(&job)?.clean_one(&job)? {
                         count = count.checked_add(1).ok_or(StoreError::Capacity)?;
                     }
                 }
@@ -816,6 +889,8 @@ mod tests {
             store.admission_lock(),
             store.sequence(),
             store.opened_path(),
+            store.root.join("receipts"),
+            store.root.join("receipts").join(job.as_str()),
         ]
         .iter()
         .map(|path| format!("path {}", shown(path)))
@@ -832,6 +907,9 @@ mod tests {
                 paths.supervisor_log(),
                 paths.workspace(),
                 paths.order(),
+                paths.dir.join("quiesced"),
+                paths.dir.join("scope"),
+                paths.dir.join("consumed"),
             ] {
                 lines.push(format!("path {}", shown(&path)));
             }
@@ -851,6 +929,25 @@ mod tests {
                 String::from_utf8(wire::payload(&framed).unwrap().to_vec()).unwrap()
             ));
         }
+        for state in state_specimens() {
+            lines.push(format!("state {}", serde_json::to_string(&state).unwrap()));
+        }
+        let request = Request::Run {
+            submission: SubmissionId::try_from("1".repeat(32)).unwrap(),
+            command: Command::try_from(vec!["cargo".to_owned(), "test".to_owned()]).unwrap(),
+            input: Input::Home,
+        };
+        let mut completed = JobState::accepted();
+        completed.advance(&Event::Killed).unwrap();
+        lines.push(format!(
+            "receipt {}",
+            Store::receipt_specimen(&request, completed).unwrap()
+        ));
+        lines.push(format!("scope {}", Store::scope_specimen(&job)));
+        lines.join("\n")
+    }
+
+    fn state_specimens() -> Vec<JobState> {
         let reason = RemoteText::try_from("no such program".to_owned()).unwrap();
         let mut running = JobState::accepted();
         let mut states = vec![running.clone()];
@@ -877,10 +974,7 @@ mod tests {
             finished.advance(&ending).unwrap();
             states.push(finished);
         }
-        for state in states {
-            lines.push(format!("state {}", serde_json::to_string(&state).unwrap()));
-        }
-        lines.join("\n")
+        states
     }
 
     #[test]
@@ -898,12 +992,7 @@ mod tests {
 
     fn admit_finished(store: &Store, submission: String) -> JobId {
         let submission = SubmissionId::try_from(submission).unwrap();
-        let request = Request::Run {
-            submission: submission.clone(),
-            command: Command::try_from(vec!["true".to_owned()]).unwrap(),
-            input: Input::Home,
-        };
-        let job = store.reserve(&submission, &request, None).unwrap();
+        let (_, job) = crate::testing::home_job(store, &submission);
         store
             .finish_launch_failure(&job, RemoteText::try_from("done".to_owned()).unwrap())
             .unwrap();
@@ -911,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_of_other_formats_go_once_idle_and_older_than_the_last_opened() {
+    fn stores_of_other_formats_are_kept_until_their_results_are_acknowledged() {
         let temporary = tempfile::tempdir().unwrap();
         let state = crate::layout::State::at(&temporary.path().join("state"));
         let other = |digit: u64| {
@@ -928,15 +1017,18 @@ mod tests {
             (5, None),
         ] {
             let root = other(digit);
-            state_file::private_dir(&root.join("jobs").join("a")).unwrap();
-            crate::testing::write(
-                &root
-                    .join("jobs")
-                    .join("a")
-                    .join("workspace")
-                    .join("Cargo.lock"),
-                "",
-            );
+            state_file::private_dir(&root.join("jobs")).unwrap();
+            if !matches!(digit, 2 | 5) {
+                state_file::private_dir(&root.join("jobs").join("a")).unwrap();
+                crate::testing::write(
+                    &root
+                        .join("jobs")
+                        .join("a")
+                        .join("workspace")
+                        .join("Cargo.lock"),
+                    "",
+                );
+            }
             if let Some(place) = opened {
                 state_file::write_bytes(&root.join("opened"), format!("{place}").as_bytes())
                     .unwrap();
@@ -953,11 +1045,14 @@ mod tests {
             assert!(crate::testing::is_dir(&other(kept)));
         }
         drop(running);
-        assert_eq!(super::prune_other_formats(&state).unwrap(), [other(1)]);
+        assert_eq!(
+            super::prune_other_formats(&state).unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]
-    fn admissions_keep_only_the_newest_finished_jobs() {
+    fn admissions_preserve_every_unacknowledged_finished_result() {
         let temporary = tempfile::tempdir().unwrap();
         let store = store(&temporary);
         let digits: Vec<char> = "0123456789abcdef".chars().collect();
@@ -973,13 +1068,8 @@ mod tests {
         let last = admit_finished(&store, "f".repeat(32));
         admitted.push(last);
         let kept = store.list().unwrap();
-        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
-        let newest: std::collections::BTreeSet<_> = admitted
-            .iter()
-            .rev()
-            .take(super::KEEP_FINISHED.saturating_add(1))
-            .cloned()
-            .collect();
+        assert_eq!(kept.len(), admitted.len());
+        let newest: std::collections::BTreeSet<_> = admitted.iter().cloned().collect();
         assert_eq!(
             kept.into_iter().collect::<std::collections::BTreeSet<_>>(),
             newest
@@ -987,59 +1077,28 @@ mod tests {
     }
 
     #[test]
-    fn admissions_keep_workspaces_of_only_the_newest_finished_jobs() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = store(&temporary);
-        let mut admitted = Vec::new();
-        for index in 0..=super::KEEP_WORKSPACES.saturating_add(2) {
-            let job = admit_finished(&store, format!("{index:032x}"));
-            state_file::write_bytes(&store.log_path(&job), b"kept log\n").unwrap();
-            let workspace = store.paths(&job).workspace();
-            state_file::private_dir(&workspace).unwrap();
-            crate::testing::write(&workspace.join("target").join("output"), "build");
-            admitted.push(job);
-        }
-        let shed = admitted
-            .len()
-            .saturating_sub(super::KEEP_WORKSPACES.saturating_add(1));
-        for (index, job) in admitted.iter().enumerate() {
-            assert_eq!(
-                std::fs::symlink_metadata(store.paths(job).workspace()).is_ok(),
-                index >= shed,
-                "job {index}"
-            );
-            assert_eq!(store.log_tail(job).unwrap().0.for_terminal(), "kept log\n");
-            assert_eq!(
-                store.status(job).unwrap().kind(),
-                super::PhaseKind::Finished
-            );
-        }
-        assert_eq!(store.list().unwrap().len(), admitted.len());
-        assert!(state_file::empty(&store.trash_dir()).unwrap().is_empty());
-    }
-
-    #[test]
     fn a_finished_job_whose_files_cannot_be_removed_never_stops_admission() {
+        const NEXT_JOBS: usize = 3;
         let temporary = tempfile::tempdir().unwrap();
         let store = store(&temporary);
         let admit = |index: usize| admit_finished(&store, format!("{index:032x}"));
         let oldest = admit(0);
-        let protected = store.paths(&oldest).workspace().join("pkg");
+        let workspace = store.paths(&oldest).workspace();
+        state_file::private_dir(&workspace).unwrap();
+        let protected = workspace.join("pkg");
         crate::testing::write(&protected.join("package.json"), "{}");
         let permissions = crate::testing::protect(&protected);
-        for index in 1..=super::KEEP_FINISHED {
+        store.acknowledge(&oldest).unwrap();
+        for index in 1..NEXT_JOBS {
             admit(index);
         }
-        let newest = admit(super::KEEP_FINISHED.saturating_add(1));
+        let newest = admit(NEXT_JOBS);
         let kept = store.list().unwrap();
         assert!(!kept.contains(&oldest), "the oldest job left in one step");
         assert!(kept.contains(&newest));
-        assert_eq!(kept.len(), super::KEEP_FINISHED.saturating_add(1));
+        assert_eq!(kept.len(), NEXT_JOBS);
         for leftover in state_file::empty(&store.trash_dir()).unwrap() {
-            crate::testing::restore(
-                &leftover.path.join("workspace").join("pkg"),
-                permissions.clone(),
-            );
+            crate::testing::restore(&leftover.path.join("pkg"), permissions.clone());
         }
         assert!(state_file::empty(&store.trash_dir()).unwrap().is_empty());
     }
@@ -1054,11 +1113,7 @@ mod tests {
             }
             let store = Store { root };
             let submission = SubmissionId::try_from("1".repeat(32)).expect("submission ID");
-            let request = Request::Run {
-                submission: submission.clone(),
-                command: Command::try_from(vec!["missing".to_owned()]).expect("command"),
-                input: Input::Home,
-            };
+            let request = crate::testing::home_request(&submission, "missing");
             let job = store
                 .reserve(&submission, &request, None)
                 .expect("reserved job");

@@ -26,12 +26,16 @@ macro_rules! ensure {
 
 #[path = "e2e/bootstrap.rs"]
 mod bootstrap;
+#[path = "e2e/diagnostics.rs"]
+mod diagnostics;
 #[path = "e2e/os.rs"]
 mod os;
 #[path = "e2e/peer.rs"]
 mod peer;
 #[path = "e2e/provider.rs"]
 mod provider;
+#[path = "e2e/quiescence.rs"]
+mod quiescence;
 #[path = "e2e/scenarios.rs"]
 mod scenarios;
 #[path = "e2e/ssh.rs"]
@@ -41,8 +45,7 @@ mod world;
 
 use world::World;
 
-const FAKES: [&str; 6] = ["ssh", "claude", "codex", "opencode", "sleeper", "mise"];
-const AI_CLIENTS: [&str; 3] = ["claude", "codex", "opencode"];
+const FAKES: [&str; 3] = ["ssh", "sleeper", "mise"];
 
 fn main() -> ExitCode {
     if let Some(code) = os::input_child_role() {
@@ -66,9 +69,6 @@ fn main() -> ExitCode {
     }
     match executable.file_stem().and_then(OsStr::to_str) {
         Some("ssh") => ssh::main(),
-        Some("claude") => provider::main(provider::Tool::Claude),
-        Some("codex") => provider::main(provider::Tool::Codex),
-        Some("opencode") => provider::main(provider::Tool::Opencode),
         Some("sleeper") => provider::sleeper(),
         Some("mise") => bootstrap::installer(),
         Some(_) | None => runner(),
@@ -152,23 +152,10 @@ fn present(path: &Path) -> Result<bool, Failure> {
     }
 }
 
-fn holds_ai_client(directory: &Path) -> bool {
-    let suffixes: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    AI_CLIENTS.iter().any(|name| {
-        suffixes
-            .iter()
-            .any(|suffix| fs::metadata(directory.join(format!("{name}{suffix}"))).is_ok())
-    })
-}
-
 fn search_path(bin: &Path) -> Result<OsString, Failure> {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let others: Vec<PathBuf> = std::env::split_paths(&inherited)
-        .filter(|entry| entry != bin && !holds_ai_client(entry))
+        .filter(|entry| entry != bin)
         .collect();
     std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(others)).context("joining PATH")
 }
@@ -309,19 +296,23 @@ fn runner() -> ExitCode {
 fn attempt(scenario: &Scenario, binaries: &Path, keep: bool) -> Result<(), Failure> {
     let world = World::create(scenario.machines, binaries)?;
     let outcome = (scenario.run)(&world);
-    let mut diagnostics = outcome.is_err().then(|| world.failure_diagnostics());
-    let cleaned = world
-        .cleanup()
-        .map_err(|failure| Failure::new(format!("cleanup: {failure}")));
-    if cleaned.is_err() && diagnostics.is_none() {
-        diagnostics = Some(world.failure_diagnostics());
-    }
-    let removed = world.finish(keep);
+    let (cleaned, evidence) = diagnostics::cleanup_with_evidence(
+        &outcome,
+        || world.capture_service_diagnostics().text,
+        || {
+            world
+                .cleanup()
+                .map_err(|failure| Failure::new(format!("cleanup: {failure}")))
+        },
+    );
+    let diagnostics = (outcome.is_err() || cleaned.is_err()).then(|| world.failure_diagnostics());
+    let removed = world.finish(keep || outcome.is_err() || cleaned.is_err());
     let mut problems: Vec<String> = [outcome, cleaned, removed]
         .into_iter()
         .filter_map(Result::err)
         .map(|failure| failure.0)
         .collect();
+    problems.extend(evidence);
     if problems.is_empty() {
         Ok(())
     } else {

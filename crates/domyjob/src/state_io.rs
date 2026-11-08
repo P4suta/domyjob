@@ -6,8 +6,6 @@ use thiserror::Error;
 
 use crate::platform::{self, Ownership};
 
-mod removal;
-
 mod raw {
     #![expect(
         clippy::disallowed_methods,
@@ -26,12 +24,12 @@ mod raw {
         std::fs::remove_file(path)
     }
 
-    pub(super) fn remove_dir_all(path: &Path) -> io::Result<()> {
-        std::fs::remove_dir_all(path)
-    }
-
     pub(super) fn rename(from: &super::PrivateDirectory<'_>, to: &Path) -> io::Result<()> {
         std::fs::rename(from.0, to)
+    }
+
+    pub(super) fn exclusive_relative(options: &mut cap_std::fs::OpenOptions) {
+        options.create_new(true);
     }
 }
 
@@ -86,18 +84,13 @@ fn check_owner(path: &Path, file: &File) -> Result<(), StateError> {
     }
 }
 
-fn file_metadata(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
+fn check_file(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
     let metadata = file.metadata().map_err(|error| io_at(path, error))?;
     if !metadata.is_file() || platform::reparse_point(&metadata) {
         return Err(StateError::NotFile {
             path: path.to_path_buf(),
         });
     }
-    Ok(metadata)
-}
-
-fn check_file(path: &Path, file: &File) -> Result<fs::Metadata, StateError> {
-    let metadata = file_metadata(path, file)?;
     check_owner(path, file)?;
     Ok(metadata)
 }
@@ -225,6 +218,107 @@ pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
     Ok(())
 }
 
+pub(crate) fn existing_directory(path: &Path) -> Result<Option<cap_std::fs::Dir>, StateError> {
+    existing_directory_using(path, platform::open_private_dir)
+}
+
+fn existing_directory_using(
+    path: &Path,
+    open: impl FnOnce(&Path) -> io::Result<File>,
+) -> Result<Option<cap_std::fs::Dir>, StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !platform::reparse_point(&metadata) => {}
+        Ok(_) => return Err(StateError::NotDirectory { path: path.into() }),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_at(path, error)),
+    }
+    let retained = match open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_at(path, error)),
+    };
+    let metadata = retained.metadata().map_err(|error| io_at(path, error))?;
+    if !metadata.is_dir() || platform::reparse_point(&metadata) {
+        return Err(StateError::NotDirectory { path: path.into() });
+    }
+    check_owner(path, &retained)?;
+    Ok(Some(cap_std::fs::Dir::from_std_file(retained)))
+}
+
+fn mark_directory(directory: &cap_std::fs::Dir, path: &Path) -> Result<(), StateError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io_at(path, io::Error::other("marker has no file name")))?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true);
+    raw::exclusive_relative(&mut options);
+    platform::private_creation_mode(&mut options);
+    let file = match directory.open_with(name, &options) {
+        Ok(file) => file,
+        Err(existing) if existing.kind() == ErrorKind::AlreadyExists => {
+            let metadata = directory
+                .symlink_metadata(name)
+                .map_err(|error| io_at(path, error))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(StateError::NotFile { path: path.into() });
+            }
+            let mut existing_options = platform::private_relative_options();
+            existing_options.write(true);
+            directory
+                .open_with(name, &existing_options)
+                .map_err(|error| io_at(path, error))?
+        }
+        Err(error) => return Err(io_at(path, error)),
+    }
+    .into_std();
+    let metadata = check_file(path, &file)?;
+    if metadata.len() != 0 {
+        return Err(io_at(
+            path,
+            io::Error::other("completion marker is not empty"),
+        ));
+    }
+    file.sync_all().map_err(|error| io_at(path, error))?;
+    let retained = directory
+        .try_clone()
+        .map_err(|error| io_at(path, error))?
+        .into_std_file();
+    platform::sync_open_dir(&retained).map_err(|error| io_at(path, error))
+}
+
+pub(crate) fn mark_existing(path: &Path) -> Result<bool, StateError> {
+    let Some(directory) = existing_directory(parent(path)?)? else {
+        return Ok(false);
+    };
+    mark_directory(&directory, path)?;
+    Ok(true)
+}
+
+pub(crate) fn open_lock_in_existing_directory(path: &Path) -> Result<Option<File>, StateError> {
+    let Some(directory) = existing_directory(parent(path)?)? else {
+        return Ok(None);
+    };
+    open_directory_lock(&directory, path)
+}
+
+fn open_directory_lock(
+    directory: &cap_std::fs::Dir,
+    path: &Path,
+) -> Result<Option<File>, StateError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io_at(path, io::Error::other("lock has no file name")))?;
+    let mut options = platform::private_relative_options();
+    options.read(true).write(true).create(true).truncate(false);
+    let file = match directory.open_with(name, &options) {
+        Ok(file) => file.into_std(),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(classify_open(path, error)),
+    };
+    check_file(path, &file)?;
+    Ok(Some(file))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CreatedFile {
     Append,
@@ -279,7 +373,12 @@ pub(crate) fn remove_file(path: &Path) -> Result<(), StateError> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(classify_open(path, error)),
     };
-    file_metadata(path, &file)?;
+    let metadata = file.metadata().map_err(|error| io_at(path, error))?;
+    if !metadata.is_file() || platform::reparse_point(&metadata) {
+        return Err(StateError::NotFile {
+            path: path.to_path_buf(),
+        });
+    }
     match platform::ownership(&file).map_err(|error| io_at(path, error))? {
         Ownership::Private | Ownership::Exposed(_) => drop(file),
         Ownership::Foreign => {
@@ -316,68 +415,11 @@ pub(crate) struct Leftover {
 }
 
 const EMPTY_LIMIT: usize = 64;
-const REMOVAL_RETRY_MILLIS: u64 = 20;
+
+mod cleanup;
 
 pub(crate) fn empty(trash: &Path) -> Result<Vec<Leftover>, StateError> {
-    empty_with(trash, writable)
-}
-
-fn empty_with(
-    trash: &Path,
-    mut grant: impl FnMut(&Path) -> io::Result<()>,
-) -> Result<Vec<Leftover>, StateError> {
-    let entries = match fs::read_dir(trash) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io_at(trash, error)),
-    };
-    let mut leftovers = Vec::new();
-    for entry in entries.take(EMPTY_LIMIT) {
-        let path = entry.map_err(|error| io_at(trash, error))?.path();
-        if let Err(error) = removal::after_denial(
-            || {
-                removal::retry(
-                    || raw::remove_dir_all(&path),
-                    platform::removal_busy,
-                    || platform::clock::pause_millis(REMOVAL_RETRY_MILLIS),
-                )
-            },
-            || grant(&path),
-            |error| error.kind() == ErrorKind::PermissionDenied,
-        )
-        .map_err(removal_error)
-        {
-            leftovers.push(Leftover { path, error });
-        }
-    }
-    Ok(leftovers)
-}
-
-fn removal_error(failure: removal::Failure<io::Error>) -> io::Error {
-    match failure {
-        removal::Failure::Removal(error) => error,
-        removal::Failure::AfterGrant { denied, error } => io::Error::new(
-            error.kind(),
-            format!("{denied}, and after granting the owner write access: {error}"),
-        ),
-    }
-}
-
-fn writable(root: &Path) -> io::Result<()> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
-        if platform::reparse_point(&metadata) || !(metadata.is_dir() || metadata.is_file()) {
-            continue;
-        }
-        platform::grant_owner_write(&path, &metadata)?;
-        if metadata.is_dir() {
-            for entry in fs::read_dir(&path)? {
-                pending.push(entry?.path());
-            }
-        }
-    }
-    Ok(())
+    cleanup::empty_using(trash, |_retained| Ok(()))
 }
 
 pub(crate) fn publish_dir(from: &Path, to: &Path) -> Result<(), StateError> {
@@ -390,105 +432,143 @@ mod tests {
     use super::{open_read, read_bytes, remove_file, write_bytes};
 
     #[test]
-    fn removable_trash_does_not_grant_permissions() {
+    fn late_completion_does_not_recreate_a_retired_job() {
         let root = tempfile::tempdir().unwrap();
-        let trash = root.path().join("trash");
-        let entry = trash.join("job");
-        crate::testing::write(&entry.join("nested").join("tracked"), "remove");
-        let mut grants = 0_usize;
-        let leftovers = super::empty_with(&trash, |path| {
-            grants = grants.saturating_add(1);
-            super::writable(path)
-        })
-        .unwrap();
-        assert!(leftovers.is_empty());
-        assert!(!entry.try_exists().unwrap());
-        assert_eq!(grants, 0, "removable trash must not need a permission walk");
-    }
-
-    #[test]
-    fn recovery_errors_report_the_initial_denial_and_the_later_failure() {
-        use std::io::{self, ErrorKind};
-
-        for grant_fails in [false, true] {
-            let mut errors = [
-                io::Error::new(ErrorKind::PermissionDenied, "initial denial"),
-                io::Error::new(ErrorKind::NotFound, "later removal failure"),
-            ]
-            .into_iter();
-            let failure = super::removal::after_denial(
-                || Err(errors.next().unwrap()),
-                || {
-                    if grant_fails {
-                        Err(io::Error::new(
-                            ErrorKind::Interrupted,
-                            "permission walk failure",
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                },
-                |error| error.kind() == ErrorKind::PermissionDenied,
-            )
-            .unwrap_err();
-            let error = super::removal_error(failure);
-            let (kind, later) = if grant_fails {
-                (ErrorKind::Interrupted, "permission walk failure")
-            } else {
-                (ErrorKind::NotFound, "later removal failure")
-            };
-            assert_eq!(error.kind(), kind);
-            let message = error.to_string();
-            assert!(message.contains("initial denial"));
-            assert!(message.contains(later));
-        }
-    }
-
-    #[test]
-    fn trash_permissions_include_files_without_following_directory_links() {
-        let root = tempfile::tempdir().unwrap();
-        let trash = root.path().join("trash");
-        let file = trash.join("nested").join("tracked");
-        crate::testing::write(&file, "remove");
-        crate::testing::protect(&file);
-        let outside = root.path().join("outside");
-        let kept = outside.join("tracked");
-        crate::testing::write(&kept, "keep");
-        let original = crate::testing::protect(&kept);
-        crate::file_kind::directory_link(&outside, &trash.join("link")).unwrap();
-        super::writable(&trash).unwrap();
-        let cleared = !std::fs::metadata(&file).unwrap().permissions().readonly();
-        let preserved = std::fs::metadata(&kept).unwrap().permissions().readonly();
-        crate::testing::restore(&kept, original);
-        assert!(cleared, "trash files must be writable before removal");
-        assert!(preserved, "a link must not change files outside the trash");
-    }
-
-    #[test]
-    fn trash_with_read_only_directories_empties_in_one_pass() {
-        let root = tempfile::tempdir().expect("temporary state root");
-        let trash = root.path().join("trash");
-        super::private_dir(&trash).expect("trash directory");
-        let entry = trash.join("job");
-        let checkout = entry.join("workspace").join("checkout");
-        let nested = checkout.join("docs");
-        crate::testing::write(&nested.join("readme"), "text");
-        crate::testing::write(&checkout.join("tracked"), "text");
-        for path in [
-            nested.join("readme"),
-            checkout.join("tracked"),
-            nested,
-            checkout,
-        ] {
-            crate::testing::protect(&path);
-        }
-        assert!(super::empty(&trash).expect("emptied trash").is_empty());
+        let job = root.path().join("job");
+        super::private_dir(&job).unwrap();
+        super::set_aside(&job, &root.path().join("trash")).unwrap();
+        assert!(!super::mark_existing(&job.join("quiesced")).unwrap());
         assert_eq!(
-            std::fs::symlink_metadata(&entry)
-                .map_err(|error| error.kind())
-                .err(),
-            Some(std::io::ErrorKind::NotFound)
+            std::fs::symlink_metadata(job).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn completion_markers_are_private_and_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        super::private_dir(&job).unwrap();
+        let marker = job.join("quiesced");
+        assert!(super::mark_existing(&marker).unwrap());
+        assert!(super::mark_existing(&marker).unwrap());
+        assert_eq!(read_bytes(&marker).unwrap(), Some(Vec::new()));
+        write_bytes(&marker, b"invalid").unwrap();
+        super::mark_existing(&marker).unwrap_err();
+    }
+
+    #[test]
+    fn a_retained_directory_cannot_mark_its_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        super::private_dir(&job).unwrap();
+        let retained = super::existing_directory(&job).unwrap().unwrap();
+        let moved = root.path().join("moved");
+        match super::raw::rename(&super::PrivateDirectory::checked(&job).unwrap(), &moved) {
+            Ok(()) => {
+                super::private_dir(&job).unwrap();
+                super::mark_directory(&retained, &job.join("quiesced")).unwrap();
+                assert_eq!(
+                    read_bytes(&moved.join("quiesced")).unwrap(),
+                    Some(Vec::new())
+                );
+                assert_eq!(read_bytes(&job.join("quiesced")).unwrap(), None);
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                super::mark_directory(&retained, &job.join("quiesced")).unwrap();
+                assert_eq!(read_bytes(&job.join("quiesced")).unwrap(), Some(Vec::new()));
+                drop(retained);
+                super::raw::rename(&super::PrivateDirectory::checked(&job).unwrap(), &moved)
+                    .unwrap();
+                assert_eq!(
+                    read_bytes(&moved.join("quiesced")).unwrap(),
+                    Some(Vec::new())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_captured_job_lock_cannot_recreate_its_retired_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("job");
+        super::private_dir(&job).unwrap();
+        let retained = super::existing_directory(&job).unwrap().unwrap();
+        let moved = root.path().join("moved");
+        match super::raw::rename(&super::PrivateDirectory::checked(&job).unwrap(), &moved) {
+            Ok(()) => {
+                let lock = super::open_directory_lock(&retained, &job.join("launch.lock")).unwrap();
+                assert!(lock.is_some());
+                assert_eq!(
+                    std::fs::metadata(&job).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(
+                    std::fs::metadata(moved.join("launch.lock"))
+                        .unwrap()
+                        .is_file()
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                drop(retained);
+                super::raw::rename(&super::PrivateDirectory::checked(&job).unwrap(), &moved)
+                    .unwrap();
+                assert!(
+                    super::open_lock_in_existing_directory(&job.join("launch.lock"))
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    std::fs::metadata(job).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_job_directory_is_never_created_by_a_lock_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("retired").join("job");
+        assert!(
+            super::open_lock_in_existing_directory(&job.join("state.lock"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::metadata(root.path().join("retired"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let existing = root.path().join("existing");
+        super::private_dir(&existing).unwrap();
+        let lock = existing.join("state.lock");
+        write_bytes(&lock, b"held").unwrap();
+        for _ in 0..2 {
+            drop(
+                super::open_lock_in_existing_directory(&lock)
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(read_bytes(&lock).unwrap(), Some(b"held".to_vec()));
+        }
+    }
+
+    #[test]
+    fn a_linked_job_directory_cannot_grant_a_lock_in_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        super::private_dir(&target).unwrap();
+        let link = root.path().join("job");
+        crate::file_kind::directory_link(&target, &link).unwrap();
+        assert!(matches!(
+            super::open_lock_in_existing_directory(&link.join("state.lock")),
+            Err(super::StateError::NotDirectory { path }) if path == link
+        ));
+        assert_eq!(read_bytes(&target.join("state.lock")).unwrap(), None);
     }
 
     #[test]

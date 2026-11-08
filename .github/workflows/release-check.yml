@@ -17,6 +17,7 @@ env:
 
 jobs:
   proofs:
+    name: Verify source contracts
     runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
@@ -40,6 +41,7 @@ jobs:
         run: mise run miri
 
   fuzz:
+    name: Fuzz admitted inputs
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -108,4 +110,4 @@ jobs:
         run: >-
           cargo nextest run --locked -p domyjob --test e2e
           --stress-count 10 --fail-fast --no-tests=fail
-          -E 'test(=mcp_serves_an_interactive_agent) | test(=bootstrap_preserves_first_request_and_cleans_its_owned_work) | test(=jobs_run_through_the_node_wrapper)'
+          -E 'test(=kept_job_reads_preserve_success_and_failure_results) | test(=bootstrap_preserves_first_request_and_cleans_its_owned_work) | test(=jobs_run_through_the_node_wrapper)'

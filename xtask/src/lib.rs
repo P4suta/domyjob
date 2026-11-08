@@ -10,7 +10,6 @@ pub mod exceptions;
 pub mod fixes;
 pub mod macos_package;
 pub mod ownership;
-pub mod parent_refinement;
 
 mod raw {
     #![expect(
@@ -67,8 +66,6 @@ pub mod workflows;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
-    #[error("parent implementation refinement: {0}")]
-    Refinement(String),
     #[error("reading {path}: {source}")]
     Read {
         path: PathBuf,
@@ -383,7 +380,6 @@ pub fn gates(root: &Path) -> Result<usize, GateError> {
     if findings != 0 {
         return Ok(findings);
     }
-    verification::check_parent_refinement(root).map_err(GateError::Refinement)?;
     Ok(findings)
 }
 
@@ -727,24 +723,6 @@ mod tests {
         )
         .unwrap();
         raw::write(&root.path().join("README.md"), b"# prose\n").unwrap();
-        assert!(matches!(
-            gates(root.path()),
-            Err(GateError::Refinement(reason))
-                if reason.contains("crates/domyjob-core/src/chat/ledger.rs")
-        ));
-        for (file, source) in crate::parent_refinement::FILES.iter().zip([
-            include_str!("../../crates/domyjob-core/src/chat/ledger.rs"),
-            include_str!("../../crates/domyjob-core/src/chat/ledger/parent_identity.rs"),
-            include_str!("../../crates/domyjob-core/src/chat/id.rs"),
-            include_str!("../../crates/domyjob-core/src/chat/event.rs"),
-            include_str!("../../crates/domyjob/src/chat/store/views.rs"),
-            include_str!("../../crates/domyjob-core/src/lib.rs"),
-            include_str!("../../crates/domyjob-core/src/chat.rs"),
-        ]) {
-            let path = root.path().join(file);
-            raw::create_dir_all(path.parent().unwrap()).unwrap();
-            raw::write(&path, source.as_bytes()).unwrap();
-        }
         assert_eq!(gates(root.path()).unwrap(), 0);
         raw::write(&root.path().join("settings.TOML"), b"# setting\n").unwrap();
         raw::write(

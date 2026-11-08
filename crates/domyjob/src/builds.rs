@@ -41,7 +41,6 @@ const STARTED: &str = "started";
 const PINNED: &str = "pinned";
 const ORDER: &str = "order";
 const ORDER_LOCK: &str = "order.lock";
-const KEEP_IDLE: usize = 2;
 const BUILD_TAG_HEX_BYTES: usize = 16;
 const MAX_ORDER_RECORD_BYTES: usize = 32;
 
@@ -167,7 +166,8 @@ fn hold_published(directory: &Path, program: &Path) -> io::Result<OsLock> {
         ));
     }
     check_owned(program, &file)?;
-    let usage = crate::state_io::open_existing_lock(&directory.join(LOCK))
+    let lock = directory.join(LOCK);
+    let usage = crate::state_io::open_existing_lock(&lock)
         .map_err(io::Error::other)?
         .ok_or_else(|| {
             io::Error::new(
@@ -293,7 +293,9 @@ pub(crate) fn pin(program: &Path) -> io::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    raw::write(&versions_of(&directory)?.join(PINNED), tag.as_bytes())
+    let versions = versions_of(&directory)?;
+    let _selection = OsLock::exclusive_file(raw::open_lock(&versions.join(ORDER_LOCK))?)?;
+    raw::write(&versions.join(PINNED), tag.as_bytes())
 }
 
 pub(crate) fn prune(versions: &Path, keep: &str) -> io::Result<Vec<String>> {
@@ -328,30 +330,25 @@ where
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == keep
-            || pinned.as_deref() == Some(name.as_str())
-            || !file_type(&entry)?.is_dir()
-            || !is_build_tag(&name)
-        {
+        if !file_type(&entry)?.is_dir() || !is_build_tag(&name) {
             continue;
         }
         let directory = entry.path();
-        let Some(usage) = OsLock::try_file(lock_file(&directory)?)? else {
-            continue;
+        let usage = domyjob_core::retention_rules::BuildUse {
+            current: name == keep,
+            pinned: pinned.as_deref() == Some(name.as_str()),
+            running: false,
         };
-        idle.push((
-            number(&directory.join(STARTED))?.unwrap_or(0),
-            name,
-            directory,
-            usage,
-        ));
+        if !usage.discard() {
+            continue;
+        }
+        if let Some(guard) = OsLock::try_file(lock_file(&directory)?)? {
+            idle.push((name, directory, guard));
+        }
     }
+    idle.sort_by(|left, right| left.0.cmp(&right.0));
     let mut removed = Vec::new();
-    let (idle, _idle_usage): (Vec<_>, Vec<_>) = idle
-        .into_iter()
-        .map(|(started, name, directory, usage)| ((started, name, directory), usage))
-        .unzip();
-    for (_, name, directory) in crate::retention::beyond_newest(idle, KEEP_IDLE) {
+    for (name, directory, _usage) in idle {
         match remove(&directory) {
             Ok(()) => removed.push(name),
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
@@ -379,35 +376,51 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    fn newer_idle_companions(versions: &Path) {
-        for (tag, started) in [("2222222222222222", b"2"), ("3333333333333333", b"3")] {
-            let directory = versions.join(tag);
-            crate::state_io::private_dir(&directory).unwrap();
-            testing::write(&directory.join(STARTED), started);
-            crate::state_io::create_empty(&directory.join(LOCK)).unwrap();
-        }
-    }
-
     fn concurrent_prune(versions: &Path) {
         let mut command = crate::process::command(std::env::current_exe().unwrap());
         command
             .env("DOMYJOB_BUILD_ADMISSION_PRUNE", versions)
             .args(["--exact", "builds::tests::admission_pruner_process"]);
-        let child = silent_fixture_process(command);
-        assert!(child.wait().unwrap().success());
-    }
-
-    fn silent_fixture_process(command: std::process::Command) -> crate::process::Group {
-        crate::process::Group::spawn_stdio(
+        let child = crate::process::Group::spawn_stdio(
             command,
             std::process::Stdio::null(),
             std::process::Stdio::null(),
         )
-        .unwrap()
+        .unwrap();
+        assert!(child.wait().unwrap().success());
     }
 
-    fn assert_no_admission_stages(versions: &Path) {
-        assert!(fs::read_dir(versions).unwrap().all(|entry| {
+    #[test]
+    fn a_legacy_exposed_parent_cannot_expose_the_new_candidate_usage_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let versions = root.path().join("versions");
+        crate::platform::create_exposed_build_parent(&versions).unwrap();
+        let original_parent = crate::platform::open_private_dir(&versions).unwrap();
+        assert!(matches!(
+            crate::platform::ownership(&original_parent).unwrap(),
+            crate::platform::Ownership::Exposed(_)
+        ));
+        drop(original_parent);
+        let program = versions.join("0123456789abcdef/bin/domyjob");
+        let source = std::env::current_exe().unwrap();
+        let admission = super::admit(&source, program.clone()).unwrap();
+        let usage =
+            crate::state_io::open_existing_lock(&versions.join("0123456789abcdef").join(LOCK))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            crate::platform::ownership(&usage).unwrap(),
+            crate::platform::Ownership::Private
+        );
+        drop(usage);
+        let retained_parent = crate::platform::open_private_dir(&versions).unwrap();
+        assert!(matches!(
+            crate::platform::ownership(&retained_parent).unwrap(),
+            crate::platform::Ownership::Exposed(_)
+        ));
+        assert_eq!(admission.program, program);
+        drop(admission);
+        assert!(fs::read_dir(&versions).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
@@ -433,48 +446,16 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_exposed_parent_cannot_expose_the_new_candidate_usage_lock() {
-        let root = tempfile::tempdir().unwrap();
-        let versions = root.path().join("versions");
-        crate::platform::create_exposed_build_parent(&versions).unwrap();
-        let original_parent = crate::platform::open_private_dir(&versions).unwrap();
-        assert!(matches!(
-            crate::platform::ownership(&original_parent).unwrap(),
-            crate::platform::Ownership::Exposed(_)
-        ));
-        drop(original_parent);
-        let program = versions.join("0123456789abcdef/bin/domyjob");
-        let admission = super::admit(&std::env::current_exe().unwrap(), program.clone()).unwrap();
-        let usage =
-            crate::state_io::open_existing_lock(&versions.join("0123456789abcdef").join(LOCK))
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            crate::platform::ownership(&usage).unwrap(),
-            crate::platform::Ownership::Private
-        );
-        drop(usage);
-        let parent = crate::platform::open_private_dir(&versions).unwrap();
-        assert!(matches!(
-            crate::platform::ownership(&parent).unwrap(),
-            crate::platform::Ownership::Exposed(_)
-        ));
-        assert_eq!(admission.program, program);
-        drop(admission);
-        assert_no_admission_stages(&versions);
-    }
-
-    #[test]
     fn selection_protects_a_published_build_until_final_usage_is_acquired() {
         use std::io::Read as _;
         const BARRIER_TIMEOUT_MILLIS: u64 = 10_000;
         let root = tempfile::tempdir().unwrap();
         let versions = root.path().join("versions");
-        newer_idle_companions(&versions);
         let program = versions.join("0123456789abcdef/bin/domyjob");
+        let source = std::env::current_exe().unwrap();
         let mut pruner = None;
         let admitted = super::admit_using(
-            &std::env::current_exe().unwrap(),
+            &source,
             program.clone(),
             |_stage| Ok(()),
             |published| {
@@ -545,7 +526,6 @@ mod tests {
     #[test]
     fn an_unprotected_completed_install_is_removed_before_its_first_launch() {
         let (_root, program, directory) = installed_fixture();
-        newer_idle_companions(directory.parent().unwrap());
         assert!(fs::metadata(&program).unwrap().is_file());
         concurrent_prune(directory.parent().unwrap());
         assert_eq!(
@@ -557,11 +537,12 @@ mod tests {
     #[test]
     fn published_candidate_is_owned_before_first_launch_without_changing_the_pin() {
         let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
         let versions = root.path().join("versions");
-        newer_idle_companions(&versions);
+        testing::mkdir(&versions);
         let program = versions.join("0123456789abcdef/bin/domyjob");
         testing::write(&versions.join(PINNED), b"1111111111111111");
-        let admitted = super::admit(&std::env::current_exe().unwrap(), program.clone()).unwrap();
+        let admitted = super::admit(&source, program.clone()).unwrap();
         concurrent_prune(&versions);
         assert!(fs::metadata(&program).unwrap().is_file());
         assert_eq!(testing::read(&versions.join(PINNED)), "1111111111111111");
@@ -574,15 +555,43 @@ mod tests {
     }
 
     #[test]
+    fn admission_reuses_an_existing_build_without_replacing_it_or_changing_the_pin() {
+        const HEADER_BYTES: usize = 64;
+        let root = tempfile::tempdir().unwrap();
+        let source = std::env::current_exe().unwrap();
+        let versions = root.path().join("versions");
+        let program = versions.join("0123456789abcdef/bin/domyjob");
+        let first = super::admit(&source, program.clone()).unwrap();
+        let before = crate::bounded::prefix(File::open(&program).unwrap(), HEADER_BYTES).unwrap();
+        let replacement = root.path().join("replacement");
+        testing::write(
+            &replacement,
+            b"this losing candidate must never replace the winner",
+        );
+        testing::write(&versions.join(PINNED), b"1111111111111111");
+        let second = super::admit(&replacement, program.clone()).unwrap();
+        assert_eq!(second.program, program);
+        assert_eq!(
+            crate::bounded::prefix(File::open(&program).unwrap(), HEADER_BYTES).unwrap(),
+            before
+        );
+        assert_eq!(testing::read(&versions.join(PINNED)), "1111111111111111");
+        drop(first);
+        assert_eq!(
+            OsLock::probe(&program.parent().unwrap().parent().unwrap().join(LOCK)).unwrap(),
+            crate::lock::Probe::Held
+        );
+        drop(second);
+    }
+
+    #[test]
     fn a_losing_publisher_holds_the_winner_before_discarding_its_own_stage() {
         const HEADER_BYTES: usize = 64;
         let root = tempfile::tempdir().unwrap();
         let source = std::env::current_exe().unwrap();
         let versions = root.path().join("versions");
-        newer_idle_companions(&versions);
         let program = versions.join("0123456789abcdef/bin/domyjob");
         let replacement = root.path().join("replacement");
-        testing::write(&versions.join(PINNED), b"1111111111111111");
         testing::write(
             &replacement,
             b"the losing executable must never be published",
@@ -606,7 +615,6 @@ mod tests {
             io::ErrorKind::NotFound
         );
         assert_eq!(loser.program, program);
-        assert_eq!(testing::read(&versions.join(PINNED)), "1111111111111111");
         assert_eq!(
             crate::bounded::prefix(File::open(&program).unwrap(), HEADER_BYTES).unwrap(),
             expected
@@ -634,11 +642,10 @@ mod tests {
 
     fn corrupt_publication(program: &Path, kind: InvalidPublication) {
         let directory = program.parent().unwrap().parent().unwrap();
+        let bin = program.parent().unwrap();
         match kind {
             InvalidPublication::BuildFile => testing::write(directory, b"not a directory"),
-            InvalidPublication::BinFile => {
-                testing::write(program.parent().unwrap(), b"not a directory");
-            }
+            InvalidPublication::BinFile => testing::write(bin, b"not a directory"),
             InvalidPublication::ProgramDirectory => testing::mkdir(program),
             InvalidPublication::EmptyProgram => testing::write(program, b""),
             InvalidPublication::MissingUsage => testing::write(program, b"published executable"),
@@ -676,7 +683,16 @@ mod tests {
                 InvalidPublication::UsageDirectory => io::ErrorKind::Other,
             };
             assert_eq!(error.kind(), expected, "{kind:?}: {error}");
-            assert_no_admission_stages(&versions);
+            if matches!(kind, InvalidPublication::UsageDirectory) {
+                assert!(error.to_string().contains("not a regular private file"));
+            }
+            assert!(fs::read_dir(&versions).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".admission-")
+            }));
             if matches!(kind, InvalidPublication::MissingUsage) {
                 assert_eq!(
                     fs::metadata(program.parent().unwrap().parent().unwrap().join(LOCK))
@@ -921,7 +937,12 @@ mod tests {
             .env("DOMYJOB_INSTALLED_BUILD_TEST", "1")
             .arg("--exact")
             .arg("builds::tests::current_process_marks_its_installed_build");
-        let child = silent_fixture_process(command);
+        let child = crate::process::Group::spawn_stdio(
+            command,
+            std::process::Stdio::null(),
+            std::process::Stdio::null(),
+        )
+        .unwrap();
         let status = child.wait().unwrap();
         assert!(
             status.success(),
@@ -1004,12 +1025,12 @@ mod tests {
     }
 
     #[test]
-    fn pruning_propagates_started_record_read_errors() {
+    fn pruning_does_not_depend_on_start_history() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("0123456789abcdef");
         testing::mkdir(&directory.join(STARTED));
-        prune(root.path(), "keep").unwrap_err();
-        assert!(testing::is_dir(&directory));
+        assert_eq!(prune(root.path(), "keep").unwrap(), ["0123456789abcdef"]);
+        assert!(!testing::is_dir(&directory));
     }
 
     #[test]
@@ -1026,7 +1047,7 @@ mod tests {
                 "keep",
                 |directory| fs::read_dir(directory),
                 (fs::DirEntry::file_type, |directory| {
-                    assert_eq!(directory, root.path().join("0000000000000001"));
+                    assert_eq!(directory.parent(), Some(root.path()));
                     Err(io::Error::new(kind, "build removal failed"))
                 }),
             );
@@ -1042,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_stay_while_current_running_pinned_or_among_the_last_started() {
+    fn builds_stay_only_while_current_running_or_pinned() {
         let root = tempfile::tempdir().unwrap();
         let versions = root.path().join("versions");
         for (tag, started) in [
@@ -1066,9 +1087,9 @@ mod tests {
             OsLock::shared_file(lock_file(&versions.join(format!("{:016}", 2))).unwrap()).unwrap();
         assert_eq!(
             prune(&versions, &format!("{:016}", 7)).unwrap(),
-            [format!("{:016}", 1), format!("{:016}", 6)]
+            [1, 3, 5, 6].map(|tag| format!("{tag:016}"))
         );
-        for kept in [2, 3, 4, 5, 7] {
+        for kept in [2, 4, 7] {
             assert!(testing::is_dir(&versions.join(format!("{kept:016}"))));
         }
         assert!(testing::is_dir(&versions.join("notes")));

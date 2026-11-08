@@ -16,20 +16,6 @@ serde_json = "1"
 [workspace]
 
 [[bin]]
-name = "handoff_metadata"
-path = "fuzz_targets/handoff_metadata.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "terminal_input"
-path = "fuzz_targets/terminal_input.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "wire"
 path = "fuzz_targets/wire.rs"
 test = false
@@ -44,20 +30,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "hook_clients"
-path = "fuzz_targets/hook_clients.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "chat_ledger"
-path = "fuzz_targets/chat_ledger.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "source_paths"
 path = "fuzz_targets/source_paths.rs"
 test = false
@@ -67,6 +39,27 @@ bench = false
 [[bin]]
 name = "process_group"
 path = "fuzz_targets/process_group.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_marker"
+path = "fuzz_targets/cache_marker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "process_inventory"
+path = "fuzz_targets/process_inventory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_cleanup"
+path = "fuzz_targets/client_cleanup.rs"
 test = false
 doc = false
 bench = false

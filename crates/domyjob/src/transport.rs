@@ -2,11 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ExitCode, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
-use domyjob_core::chat_wire::{ChatReply, ChatRequest};
 use domyjob_core::domain::{
     Command as JobCommand, Invalid, JobId, JobReference, MachineName, SubmissionId,
 };
@@ -36,7 +33,6 @@ const MISSING_NODE: i32 = 97;
 const SSH_UNREACHABLE_STATUS: i32 = 255;
 const MAX_SHELL_PROBE_BYTES: usize = 64;
 const BOOTSTRAP_BUILD_JOBS: u8 = 2;
-const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
@@ -260,13 +256,11 @@ fn node_command(shell: Shell, build: &str) -> String {
 #[derive(Debug, Clone, Copy)]
 struct Policy {
     deadline: Option<clock::Deadline>,
-    hold_input: bool,
 }
 
-const PLAIN: Policy = Policy {
-    deadline: None,
-    hold_input: false,
-};
+const PLAIN: Policy = Policy { deadline: None };
+
+const CACHE_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
 fn failure(status: ExitStatus, policy: Policy, error: TransportError) -> TransportError {
     match status.code() {
@@ -328,19 +322,13 @@ fn exchange_input(
         drop(watchdog);
         return Err(failure(status, policy, error.into()));
     }
-    let held = if policy.hold_input {
-        Some(stdin)
-    } else {
-        drop(stdin);
-        None
-    };
+    drop(stdin);
     let mut stdout = child
         .child
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("SSH standard output was not piped"))?;
     let frame = read_frame(&mut stdout);
-    drop(held);
     let frame = match frame {
         Ok(frame) => frame,
         Err(error) => {
@@ -552,21 +540,6 @@ pub(crate) fn doctor(machine: &MachineName, output: &Output) -> Result<(), Trans
     Ok(())
 }
 
-pub(crate) fn chat(
-    machine: &MachineName,
-    request: &ChatRequest,
-    deadline: clock::Deadline,
-) -> Result<ChatReply, TransportError> {
-    let policy = Policy {
-        deadline: Some(deadline),
-        hold_input: matches!(request, ChatRequest::Wait { .. }),
-    };
-    pick(
-        call_with(machine, &Request::Chat(request.clone()), &[], policy)?,
-        Reply::into_chat,
-    )
-}
-
 fn new_submission() -> Result<SubmissionId, TransportError> {
     let mut entropy = [0_u8; 16];
     getrandom::fill(&mut entropy).map_err(TransportError::Entropy)?;
@@ -619,11 +592,13 @@ pub(crate) struct Submission {
     pub(crate) id: Option<SubmissionId>,
     pub(crate) command: JobCommand,
     pub(crate) wait: bool,
+    pub(crate) retention: ResultRetention,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResultRetention {
     Preserve,
+    Consume,
 }
 
 pub(crate) fn on(
@@ -632,13 +607,18 @@ pub(crate) fn on(
     output: &Output,
 ) -> Result<ExitCode, TransportError> {
     let job = submit(machine, submission.id, submission.command, Source::Home)?;
-    finish_submission(machine, job, submission.wait, output)
+    finish_submission(
+        machine,
+        job,
+        (submission.wait, submission.retention),
+        output,
+    )
 }
 
 fn finish_submission(
     machine: &MachineName,
     job: JobId,
-    wait_for_completion: bool,
+    (wait_for_completion, retention): (bool, ResultRetention),
     output: &Output,
 ) -> Result<ExitCode, TransportError> {
     output.line(format_args!("{}:{}", machine.as_str(), job.as_str()))?;
@@ -646,8 +626,19 @@ fn finish_submission(
         return Ok(ExitCode::SUCCESS);
     }
     let reference = JobReference::new(machine.clone(), job);
-    let result = wait(&reference, ResultRetention::Preserve, output)?;
-    logs(&reference, ResultRetention::Preserve, output)?;
+    let state = observe(&reference, Observation::Complete)?;
+    print_state(&reference, &state, output)?;
+    let result = exit_code(&state)?;
+    match logs_using(&reference, output) {
+        Ok(()) => {}
+        Err(TransportError::Refused(ErrorCode::MissingJob)) => {
+            eprintln!("domyjob: logs were already acknowledged and removed");
+        }
+        Err(error) => return Err(error),
+    }
+    if retention == ResultRetention::Consume {
+        acknowledge(&reference)?;
+    }
     Ok(result)
 }
 
@@ -661,6 +652,8 @@ pub(crate) fn run(
     output: &Output,
 ) -> Result<ExitCode, TransportError> {
     let (archive, descriptor) = source_archive()?;
+    let key = crate::job_cache::key(&std::env::current_dir()?, &archive)?;
+    let descriptor = descriptor.with_cache(key);
     let job = submit(
         machine,
         submission.id,
@@ -670,7 +663,12 @@ pub(crate) fn run(
             descriptor,
         },
     )?;
-    finish_submission(machine, job, submission.wait, output)
+    finish_submission(
+        machine,
+        job,
+        (submission.wait, submission.retention),
+        output,
+    )
 }
 
 pub(crate) fn ls(machine: &MachineName, output: &Output) -> Result<(), TransportError> {
@@ -743,21 +741,32 @@ fn print_state(reference: &JobReference, state: &JobState, output: &Output) -> s
 
 pub(crate) fn status(
     reference: &JobReference,
-    ResultRetention::Preserve: ResultRetention,
+    retention: ResultRetention,
     output: &Output,
 ) -> Result<(), TransportError> {
     let state = observe(reference, Observation::Current)?;
     print_state(reference, &state, output)?;
+    if state.kind() == PhaseKind::Finished && retention == ResultRetention::Consume {
+        acknowledge(reference)?;
+    }
     Ok(())
 }
 
 pub(crate) fn wait(
     reference: &JobReference,
-    ResultRetention::Preserve: ResultRetention,
+    retention: ResultRetention,
     output: &Output,
 ) -> Result<ExitCode, TransportError> {
     let state = observe(reference, Observation::Complete)?;
     print_state(reference, &state, output)?;
+    let result = exit_code(&state)?;
+    if retention == ResultRetention::Consume {
+        acknowledge(reference)?;
+    }
+    Ok(result)
+}
+
+fn exit_code(state: &JobState) -> Result<ExitCode, TransportError> {
     match state.outcome() {
         Some(Outcome::Succeeded) => Ok(ExitCode::SUCCESS),
         Some(Outcome::Failed { code }) => match u8::try_from(code.get()) {
@@ -792,38 +801,82 @@ pub(crate) fn kill(reference: &JobReference, output: &Output) -> Result<ExitCode
 
 pub(crate) fn logs(
     reference: &JobReference,
-    ResultRetention::Preserve: ResultRetention,
+    retention: ResultRetention,
     output: &Output,
 ) -> Result<(), TransportError> {
-    let request = Request::Logs {
-        job: reference.job().clone(),
-    };
-    let (text, omitted) = expect(reference.machine(), &request, &[], Reply::into_logs)?;
-    if omitted != 0 {
-        eprintln!("{omitted} earlier log bytes omitted");
+    logs_with(
+        reference.job(),
+        retention,
+        |request| call_with(reference.machine(), request, &[], PLAIN),
+        |bytes| output.write(bytes),
+    )
+}
+
+fn logs_with(
+    job: &JobId,
+    retention: ResultRetention,
+    mut exchange: impl FnMut(&Request) -> Result<Reply, TransportError>,
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<(), TransportError> {
+    let finished_before_fetch = retention == ResultRetention::Consume
+        && pick(
+            exchange(&Request::Status { job: job.clone() })?,
+            Reply::into_status,
+        )?
+        .kind()
+            == PhaseKind::Finished;
+    print_logs(
+        pick(
+            exchange(&Request::Logs { job: job.clone() })?,
+            Reply::into_logs,
+        )?,
+        write,
+    )?;
+    if finished_before_fetch {
+        pick(
+            exchange(&Request::Acknowledge { job: job.clone() })?,
+            Reply::into_acknowledged,
+        )?;
     }
-    output.write(text.for_terminal().as_bytes())?;
     Ok(())
 }
 
-fn watch_disconnect(abandoned: &Arc<AtomicBool>) {
-    let abandoned = Arc::clone(abandoned);
-    std::thread::spawn(move || {
-        let mut sink = [0_u8; 64];
-        let mut input = std::io::stdin();
-        loop {
-            match input.read(&mut sink) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-        }
-        abandoned.store(true, std::sync::atomic::Ordering::Release);
-    });
+fn acknowledge(reference: &JobReference) -> Result<(), TransportError> {
+    expect(
+        reference.machine(),
+        &Request::Acknowledge {
+            job: reference.job().clone(),
+        },
+        &[],
+        Reply::into_acknowledged,
+    )
+}
+
+fn logs_using(reference: &JobReference, output: &Output) -> Result<(), TransportError> {
+    let request = Request::Logs {
+        job: reference.job().clone(),
+    };
+    print_logs(
+        expect(reference.machine(), &request, &[], Reply::into_logs)?,
+        |bytes| output.write(bytes),
+    )
+}
+
+fn print_logs(
+    (text, omitted): (domyjob_core::domain::RemoteText, u64),
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<(), TransportError> {
+    if omitted != 0 {
+        eprintln!("{omitted} earlier log bytes omitted");
+    }
+    write(text.for_terminal().as_bytes())?;
+    Ok(())
 }
 
 const fn error_code(error: &AppError) -> ErrorCode {
     match error {
         AppError::Store(StoreError::Missing) => ErrorCode::MissingJob,
+        AppError::Store(StoreError::UnsupportedFormat) => ErrorCode::Unsupported,
         AppError::Store(StoreError::Conflict) => ErrorCode::ConflictingSubmission,
         AppError::Store(StoreError::Capacity) => ErrorCode::ResourceLimit,
         AppError::Store(
@@ -832,8 +885,7 @@ const fn error_code(error: &AppError) -> ErrorCode {
         AppError::Store(StoreError::Corrupt | StoreError::Transition(_) | StoreError::Wire(_)) => {
             ErrorCode::CorruptState
         }
-        AppError::Chat(_)
-        | AppError::Store(
+        AppError::Store(
             StoreError::State(_)
             | StoreError::Lock(_)
             | StoreError::Io(_)
@@ -874,32 +926,26 @@ pub(crate) fn node(output: &Output) -> Result<(), TransportError> {
     prune_runner_stores();
     let mut input = std::io::stdin().lock();
     let request = ingress::request(&read_frame(&mut input)?)?;
-    let abandoned = Arc::new(AtomicBool::new(false));
     let archive = match &request {
         Request::Run {
             input: Input::Snapshot(snapshot),
             ..
         } => Some(Store::open()?.receive_archive(&mut input, snapshot)?),
         Request::Hello
-        | Request::Chat(_)
         | Request::Run {
             input: Input::Home, ..
         }
         | Request::List
         | Request::Status { .. }
         | Request::Logs { .. }
+        | Request::Acknowledge { .. }
         | Request::Wait { .. }
         | Request::Kill { .. }
         | Request::Clean { .. } => None,
     };
-    if matches!(&request, Request::Chat(ChatRequest::Wait { .. })) {
-        drop(input);
-        watch_disconnect(&abandoned);
-    } else {
-        require_end(&mut input)?;
-        drop(input);
-    }
-    let reply = match app::handle(request, archive.as_ref(), &abandoned) {
+    require_end(&mut input)?;
+    drop(input);
+    let reply = match app::handle(request, archive.as_ref()) {
         Ok(reply) => reply,
         Err(error) => {
             eprintln!("domyjob node: {error}");
@@ -923,6 +969,205 @@ mod tests {
         install_command, node_command,
     };
     use crate::{process, source_fingerprint};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LogFault {
+        Status,
+        Fetch,
+        Output,
+    }
+
+    struct LogRemote {
+        job: super::JobId,
+        state: super::JobState,
+        text: String,
+        fetched: bool,
+        acknowledgments: usize,
+        calls: Vec<&'static str>,
+        fault: Option<LogFault>,
+    }
+
+    impl LogRemote {
+        fn new() -> Self {
+            let mut state = super::JobState::accepted();
+            state
+                .advance(&domyjob_core::state::Event::Starting)
+                .unwrap();
+            state
+                .advance(&domyjob_core::state::Event::Spawned { pid: 1 })
+                .unwrap();
+            Self {
+                job: super::JobId::try_from("0123456789abcdef0123456789abcdef".to_owned()).unwrap(),
+                state,
+                text: "A".to_owned(),
+                fetched: false,
+                acknowledgments: 0,
+                calls: vec![],
+                fault: None,
+            }
+        }
+
+        fn finish(&mut self) {
+            self.text.push('B');
+            self.state
+                .advance(&domyjob_core::state::Event::Exited { code: 0 })
+                .unwrap();
+        }
+
+        fn exchange(&mut self, request: &Request) -> Result<super::Reply, TransportError> {
+            if self.fault == Some(LogFault::Status) && matches!(request, Request::Status { .. }) {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "status fault").into(),
+                );
+            }
+            if self.fault == Some(LogFault::Fetch) && matches!(request, Request::Logs { .. }) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "log fetch fault",
+                )
+                .into());
+            }
+            Ok(self.reply(request))
+        }
+
+        fn reply(&mut self, request: &Request) -> super::Reply {
+            match request {
+                Request::Status { job } => {
+                    assert_eq!(job, &self.job);
+                    self.calls.push("status");
+                    if self.fetched && self.state.kind() != super::PhaseKind::Finished {
+                        self.finish();
+                    }
+                    super::Reply::Status {
+                        state: self.state.clone(),
+                    }
+                }
+                Request::Logs { job } => {
+                    assert_eq!(job, &self.job);
+                    self.calls.push("logs");
+                    self.fetched = true;
+                    super::Reply::Logs {
+                        text: domyjob_core::domain::RemoteText::try_from(self.text.clone())
+                            .unwrap(),
+                        omitted: 0,
+                    }
+                }
+                Request::Acknowledge { job } => {
+                    assert_eq!(job, &self.job);
+                    self.calls.push("acknowledge");
+                    self.acknowledgments = self.acknowledgments.saturating_add(1);
+                    self.text.clear();
+                    super::Reply::Acknowledged
+                }
+                Request::Hello
+                | Request::Run { .. }
+                | Request::List
+                | Request::Wait { .. }
+                | Request::Kill { .. }
+                | Request::Clean { .. } => panic!("unexpected log-delivery request: {request:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn log_delivery_cannot_acknowledge_bytes_appended_after_its_fetch() {
+        let remote = std::cell::RefCell::new(LogRemote::new());
+        let job = remote.borrow().job.clone();
+        let mut output = Vec::new();
+        let deliver = |destination: &mut Vec<u8>| {
+            super::logs_with(
+                &job,
+                super::ResultRetention::Consume,
+                |request| remote.borrow_mut().exchange(request),
+                |bytes| {
+                    destination.extend_from_slice(bytes);
+                    remote.borrow_mut().calls.push("output");
+                    Ok(())
+                },
+            )
+        };
+        deliver(&mut output).unwrap();
+        assert_eq!(output, b"A");
+        assert_eq!(remote.borrow().acknowledgments, 0);
+        assert_eq!(remote.borrow().calls, ["status", "logs", "output"]);
+        remote.borrow_mut().finish();
+        output.clear();
+        deliver(&mut output).unwrap();
+        assert_eq!(output, b"AB");
+        assert_eq!(remote.borrow().acknowledgments, 1);
+        assert_eq!(remote.borrow().text, "");
+        assert_eq!(
+            remote.borrow().calls,
+            [
+                "status",
+                "logs",
+                "output",
+                "status",
+                "logs",
+                "output",
+                "acknowledge"
+            ]
+        );
+    }
+
+    #[test]
+    fn keeping_logs_preserves_results_without_a_status_or_acknowledgment_call() {
+        let mut remote = LogRemote::new();
+        remote.finish();
+        remote.fault = Some(LogFault::Status);
+        let job = remote.job.clone();
+        let mut output = Vec::new();
+        super::logs_with(
+            &job,
+            super::ResultRetention::Preserve,
+            |request| remote.exchange(request),
+            |bytes| {
+                output.extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, b"AB");
+        assert_eq!(remote.calls, ["logs"]);
+        assert_eq!(remote.acknowledgments, 0);
+        assert_eq!(remote.text, "AB");
+    }
+
+    #[test]
+    fn log_delivery_failures_preserve_the_primary_error_and_never_acknowledge() {
+        for (fault, expected) in [
+            (LogFault::Status, std::io::ErrorKind::TimedOut),
+            (LogFault::Fetch, std::io::ErrorKind::UnexpectedEof),
+            (LogFault::Output, std::io::ErrorKind::BrokenPipe),
+        ] {
+            let mut remote = LogRemote::new();
+            remote.finish();
+            remote.fault = Some(fault);
+            let job = remote.job.clone();
+            let error = super::logs_with(
+                &job,
+                super::ResultRetention::Consume,
+                |request| remote.exchange(request),
+                |_bytes| {
+                    if fault == LogFault::Output {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "output fault",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, TransportError::Io(ref error) if error.kind() == expected),
+                "{error}"
+            );
+            assert_eq!(remote.acknowledgments, 0);
+            assert_eq!(remote.text, "AB");
+        }
+    }
 
     fn rejected_large_send(unix: &str, windows: &str) -> TransportError {
         let mut command = process::command(if cfg!(windows) { "cmd.exe" } else { "sh" });
@@ -982,6 +1227,9 @@ mod tests {
         assert!(unix.contains("exit 97"));
         assert!(unix.contains("exec \"$p\" node"));
         let windows = node_command(Shell::Windows, "0123456789abcdef");
+        assert!(windows.starts_with(
+            "$root = if (-not [string]::IsNullOrEmpty($env:HOME)) { $env:HOME } else { $env:USERPROFILE }"
+        ));
         assert!(windows.contains("Test-Path -LiteralPath $p"));
         assert!(windows.contains("exit 97"));
         assert!(windows.ends_with("exit $LASTEXITCODE"));
@@ -1006,6 +1254,9 @@ mod tests {
         assert!(unix.contains("tar -xmf"), "extraction stamps fresh times");
         assert!(unix.contains("CARGO_TARGET_DIR=\"$work/target\""));
         assert!(unix.contains("--root \"$work/install\""));
+        assert!(unix.contains("dd ibs=1"));
+        assert!(unix.contains("publish-node"));
+        assert!(unix.contains("< /dev/null >&2"));
         assert!(unix.contains("if ! rm -rf -- \"$work\""));
         assert!(unix.contains(super::CACHE_TAG));
         let encoded = install_command(Shell::Windows, &ticket);
@@ -1020,7 +1271,10 @@ mod tests {
         let units: Vec<u16> = units.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         let script = String::from_utf16(&units).unwrap();
         assert!(script.contains("$start.FileName=\"tar.exe\""));
-        assert!(script.contains("$start.Arguments='-xmf \"'+$archive+'\" -C \"'+$work+'\"'"));
+        assert!(
+            script.contains("$start.Arguments='-xmf \"'+$archive+'\" -C \"'+$work+'\"'"),
+            "extraction stamps fresh times"
+        );
         assert!(script.contains("CARGO_TARGET_DIR=Join-Path $work \"target\""));
         assert!(script.contains("[DomyjobBootstrapInput]::ReadBytes"));
         assert!(script.contains(".StandardInput.Close()"));
@@ -1036,10 +1290,19 @@ mod tests {
         let source = std::env::current_exe().unwrap();
         let program = root.path().join("versions/0123456789abcdef/bin/domyjob");
         let winner = crate::builds::admit(&source, program.clone()).unwrap();
-        let lock = publication_usage_lock(&program);
+        let lock = program
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("in-use.lock");
         let result = super::publish_node_using(&source, program.clone(), |selected| {
             drop(winner);
-            assert_first_node_uses(selected, &program, &lock);
+            assert_eq!(selected, program);
+            assert_eq!(
+                crate::lock::OsLock::probe(&lock).unwrap(),
+                crate::lock::Probe::Held
+            );
             Ok(std::process::ExitCode::from(FIRST_NODE_EXIT))
         })
         .unwrap();
@@ -1055,9 +1318,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = std::env::current_exe().unwrap();
         let program = root.path().join("versions/0123456789abcdef/bin/domyjob");
-        let lock = publication_usage_lock(&program);
+        let lock = program
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("in-use.lock");
         let error = super::publish_node_using(&source, program.clone(), |selected| {
-            assert_first_node_uses(selected, &program, &lock);
+            assert_eq!(selected, program);
+            assert_eq!(
+                crate::lock::OsLock::probe(&lock).unwrap(),
+                crate::lock::Probe::Held
+            );
             Err(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "injected first node refusal",
@@ -1074,26 +1346,5 @@ mod tests {
             crate::lock::Probe::Free
         );
         assert!(std::fs::metadata(program).unwrap().is_file());
-    }
-
-    fn publication_usage_lock(program: &std::path::Path) -> std::path::PathBuf {
-        program
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("in-use.lock")
-    }
-
-    fn assert_first_node_uses(
-        selected: &std::path::Path,
-        expected: &std::path::Path,
-        lock: &std::path::Path,
-    ) {
-        assert_eq!(selected, expected);
-        assert_eq!(
-            crate::lock::OsLock::probe(lock).unwrap(),
-            crate::lock::Probe::Held
-        );
     }
 }

@@ -1,7 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use domyjob_core::chat::id::AgentId;
 use domyjob_core::domain::MachineName;
 
 use crate::platform;
@@ -54,8 +53,8 @@ impl State {
             .join(format!("runner-{}", crate::formats::runner()))
     }
 
-    pub(crate) fn chat(&self) -> Chat {
-        Chat(self.0.join("chat"))
+    pub(crate) fn service(&self) -> Service {
+        Service(self.0.join("chat"))
     }
 
     pub(crate) fn other_runners(&self) -> io::Result<Vec<PathBuf>> {
@@ -103,51 +102,16 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentLock {
-    Launch,
-    Queue,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Chat(PathBuf);
+pub(crate) struct Service(PathBuf);
 
-impl Chat {
+impl Service {
     pub(crate) fn root(&self) -> &Path {
         &self.0
     }
 
-    pub(crate) fn database(&self) -> PathBuf {
-        self.0.join("chat.redb")
-    }
-
-    pub(crate) fn lock(&self) -> PathBuf {
-        self.0.join("chat.lock")
-    }
-
-    pub(crate) fn bell(&self) -> PathBuf {
-        self.0.join("bell")
-    }
-
-    pub(crate) fn agent_lock(&self, agent: &AgentId, lock: AgentLock) -> PathBuf {
-        let kind = match lock {
-            AgentLock::Launch => "launch",
-            AgentLock::Queue => "agent",
-        };
-        let digest = blake3::hash(agent.to_string().as_bytes());
-        self.0.join(format!("{kind}-{}.lock", digest.to_hex()))
-    }
-
-    pub(crate) fn worker_log(&self) -> PathBuf {
-        self.0.join("worker.log")
-    }
-
     pub(crate) fn service_lock(&self) -> PathBuf {
         self.0.join("serve.lock")
-    }
-
-    pub(crate) fn service_pid(&self) -> PathBuf {
-        self.0.join("serve.pid")
     }
 
     pub(crate) fn service_log(&self) -> PathBuf {

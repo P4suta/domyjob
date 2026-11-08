@@ -1,9 +1,37 @@
 use std::path::Path;
 
+use domyjob_core::domain::{Command, JobId, SubmissionId};
+use domyjob_core::wire::{Input, Request};
+
+pub(crate) fn home_request(submission: &SubmissionId, command: &str) -> Request {
+    Request::Run {
+        submission: submission.clone(),
+        command: Command::try_from(vec![command.to_owned()]).unwrap(),
+        input: Input::Home,
+    }
+}
+
+pub(crate) fn home_job(store: &crate::store::Store, submission: &SubmissionId) -> (Request, JobId) {
+    let request = home_request(submission, "true");
+    let job = store.reserve(submission, &request, None).unwrap();
+    (request, job)
+}
+
+pub(crate) fn completed_job(
+    (store, job): (&crate::store::Store, &JobId),
+    submission: &SubmissionId,
+    request: &Request,
+    state: &domyjob_core::state::JobState,
+) {
+    assert_eq!(&store.status(job).unwrap(), state);
+    assert_eq!(&store.wait(job).unwrap(), state);
+    assert_eq!(&store.reserve(submission, request, None).unwrap(), job);
+}
+
 mod raw {
     #![expect(
         clippy::disallowed_methods,
-        reason = "test fixtures create, change, and inspect files directly"
+        reason = "test fixtures own their native file operations and readiness signal"
     )]
 
     use std::io;
@@ -69,6 +97,15 @@ pub(crate) fn is_dir(path: &Path) -> bool {
 
 pub(crate) fn read(path: &Path) -> String {
     raw::read_to_string(path).expect("read a fixture file")
+}
+
+pub(crate) fn outside_retirement(root: &Path) -> std::path::PathBuf {
+    let outside = root.join("outside");
+    crate::state_io::private_dir(&outside).unwrap();
+    let child = outside.join("child");
+    crate::state_io::private_dir(&child).unwrap();
+    write(&child.join("canary"), b"outside-retirement");
+    outside
 }
 
 pub(crate) fn protect(path: &Path) -> std::fs::Permissions {

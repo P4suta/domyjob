@@ -74,12 +74,3 @@ original = "?"
 line = 134
 reason = "installed_directory returns a build path only after build.parent() produced its versions path, so versions_of cannot fail for this private caller; this records a structural reachability argument for an unproven native observation without assigning a sealed verdict."
 outcome = "survived"
-
-[[mutation.expect]]
-path = "crates/domyjob/src/chat/address.rs"
-item = "Book::machines_named"
-rule = "condition-to-true"
-original = "!found.contains(origin)"
-line = 36
-reason = "This private helper's agent and room callers test origin membership with Vec::contains, so inserting duplicate origins changes neither matched agents nor matched rooms; the recorded observation remains native and unproven."
-outcome = "survived"

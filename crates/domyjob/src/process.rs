@@ -7,7 +7,6 @@ use domyjob_core::capture_policy::{CaptureAdmission, CapturePolicy, admit};
 use domyjob_core::domain::JobId;
 use thiserror::Error;
 
-pub(crate) mod chat;
 pub(crate) mod resources;
 
 #[cfg(target_os = "macos")]
@@ -33,7 +32,6 @@ mod raw {
         std::process::Command::new(program)
     }
 
-    #[cfg(unix)]
     pub(super) fn stdout() -> std::io::Stdout {
         std::io::stdout()
     }
@@ -228,10 +226,6 @@ pub(crate) fn launch_worker(job: &JobId) -> Result<(), ProcessError> {
     }
 }
 
-pub(crate) fn launch_chat_worker(agent: &str, log: std::fs::File) -> Result<(), ProcessError> {
-    os::launch_worker(&["chat-worker", "--agent", agent], Some(log))
-}
-
 pub(crate) const fn refuses_submission(error: &ProcessError) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -263,18 +257,39 @@ pub(crate) fn announce_ready(token: Option<&ReadyToken>) -> Result<(), ProcessEr
 }
 
 trait Guard: Sized {
-    fn stand_guard(tree: &os::Tree, scope: Option<&resources::Scope>)
-    -> Result<Self, ProcessError>;
+    fn stand_guard(
+        tree: &os::Tree,
+        scope: Option<&resources::Scope>,
+        marker: Option<&std::path::Path>,
+    ) -> Result<Self, ProcessError>;
     fn stand_down(self);
-    fn reap(group: i32, scope: Option<&resources::Scope>);
+    fn reap(
+        group: i32,
+        scope: Option<&resources::Scope>,
+        marker: Option<&std::path::Path>,
+    ) -> io::Result<()>;
 }
 
 pub(crate) trait Stop {
     fn stop(self) -> io::Result<()>;
 }
 
-pub(crate) fn reap(group: i32, scope: Option<&resources::Scope>) {
-    <os::Reaper as Guard>::reap(group, scope);
+pub(crate) fn reap(
+    group: i32,
+    scope: Option<&resources::Scope>,
+    marker: Option<&std::path::Path>,
+) -> io::Result<()> {
+    <os::Reaper as Guard>::reap(group, scope, marker)
+}
+
+pub(crate) fn reap_owned(name: &str, marker: &std::path::Path) -> io::Result<()> {
+    #[cfg(windows)]
+    return os::reap_owned(name, marker);
+    #[cfg(unix)]
+    {
+        let _ = (name, marker);
+        Err(io::Error::other("named job reaping requires Windows"))
+    }
 }
 
 #[derive(Debug)]
@@ -291,6 +306,7 @@ pub(crate) struct Group {
     reaper: Mutex<Option<os::Reaper>>,
     scope: Option<resources::Scope>,
     _permit: Option<resources::AdmissionPermit>,
+    quiescence: Option<std::path::PathBuf>,
 }
 
 impl Group {
@@ -303,6 +319,7 @@ impl Group {
         Self::spawn_io(command, Stdio::null(), output, errors)
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_io(
         command: Command,
         input: Stdio,
@@ -320,18 +337,22 @@ impl Group {
         Self::spawn_owned(
             launch.command,
             (Stdio::null(), output, errors),
-            Some((launch.scope, launch.permit)),
+            Some((launch.scope, launch.permit, launch.quiescence)),
         )
     }
 
     fn spawn_owned(
         mut command: Command,
         (input, output, errors): (Stdio, Stdio, Stdio),
-        job: Option<(Option<resources::Scope>, resources::AdmissionPermit)>,
+        job: Option<(
+            Option<resources::Scope>,
+            resources::AdmissionPermit,
+            Option<std::path::PathBuf>,
+        )>,
     ) -> Result<Self, ProcessError> {
-        let (scope, permit) = match job {
-            Some((scope, permit)) => (scope, Some(permit)),
-            None => (None, None),
+        let (scope, permit, quiescence) = match job {
+            Some((scope, permit, marker)) => (scope, Some(permit), marker),
+            None => (None, None, None),
         };
         command.stdin(input).stdout(output).stderr(errors);
         os::isolate(&mut command);
@@ -341,7 +362,7 @@ impl Group {
         })?;
         drop(command);
         let id = child.id();
-        let tree = match os::Tree::adopt(&child) {
+        let tree = match os::Tree::adopt(&child, quiescence.as_deref()) {
             Ok(tree) => tree,
             Err(adopting) => {
                 let stopped = child.kill().and_then(|()| child.wait());
@@ -356,7 +377,7 @@ impl Group {
                 });
             }
         };
-        let reaper = match os::Reaper::stand_guard(&tree, scope.as_ref()) {
+        let reaper = match os::Reaper::stand_guard(&tree, scope.as_ref(), quiescence.as_deref()) {
             Ok(reaper) => reaper,
             Err(error) => {
                 let _stopped = tree.kill_all();
@@ -371,6 +392,7 @@ impl Group {
             reaper: Mutex::new(Some(reaper)),
             scope,
             _permit: permit,
+            quiescence,
         })
     }
 
@@ -392,7 +414,14 @@ impl Group {
             }
         };
         self.tree.kill_remaining()?;
+        #[cfg(unix)]
+        if self.scope.is_none() {
+            self.confirm_quiescence()?;
+        }
         let status = child.wait().map_err(ProcessError::Wait);
+        drop(child);
+        #[cfg(windows)]
+        self.confirm_quiescence()?;
         drop(guard);
         if self.scope.is_none() {
             self.stand_down()?;
@@ -434,9 +463,40 @@ impl Group {
             Some(scope) => scope.completion(&event).map_err(ProcessError::Wait),
             None => Ok(event),
         }?;
+        if self.scope.is_some()
+            && let Some(marker) = &self.quiescence
+        {
+            crate::state_io::mark_existing(marker)
+                .map_err(|error| ProcessError::Wait(io::Error::other(error)))?;
+        }
         self.stand_down()?;
         Ok(completion)
     }
+
+    pub(crate) fn confirm_quiescence(&self) -> Result<(), ProcessError> {
+        confirm_quiescence_using(
+            || {
+                if let Some(scope) = &self.scope {
+                    scope.stop().map_err(ProcessError::Signal)
+                } else {
+                    self.tree.confirm_quiescence().map_err(ProcessError::Wait)
+                }
+            },
+            self.quiescence.as_deref(),
+        )
+    }
+}
+
+fn confirm_quiescence_using(
+    confirm: impl FnOnce() -> Result<(), ProcessError>,
+    marker: Option<&std::path::Path>,
+) -> Result<(), ProcessError> {
+    confirm()?;
+    if let Some(path) = marker {
+        crate::state_io::mark_existing(path)
+            .map_err(|error| ProcessError::Wait(io::Error::other(error)))?;
+    }
+    Ok(())
 }
 
 impl Drop for Group {
@@ -490,7 +550,6 @@ mod tests {
     use super::{MAX_TOOL_OUTPUT, Tool, capture, run_tool};
     use domyjob_core::capture_policy::CapturePolicy;
     use std::io::{self, Read as _};
-
     struct FailingReader;
 
     impl io::Read for FailingReader {

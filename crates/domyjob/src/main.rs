@@ -21,18 +21,18 @@ mod raw {
 mod app;
 mod bounded;
 mod builds;
-mod chat;
+mod chat_retirement;
 #[path = "platform/file_kind.rs"]
 mod file_kind;
 mod formats;
 mod identity;
+mod job_cache;
 mod layout;
 mod lock;
-mod mcp;
 mod output;
 mod platform;
 mod process;
-mod retention;
+mod service;
 mod source;
 mod source_archive;
 mod source_fingerprint;
@@ -41,7 +41,6 @@ mod store;
 #[cfg(test)]
 mod testing;
 mod transport;
-mod tui;
 mod watch_event;
 mod workspace;
 
@@ -49,34 +48,13 @@ mod workspace;
 #[command(name = "domyjob", about = "Run persistent jobs over SSH")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Open the read-only human dashboard")]
-    Tui {
-        #[arg(long = "as", value_name = "LOCAL_AGENT")]
-        actor: Option<String>,
-    },
-    #[command(about = "Conversations between AI agents on this and other machines")]
-    Chat(chat::cli::ChatArgs),
-    #[command(about = "Serve the chat tools to an AI client over the MCP stdio transport")]
-    Mcp {
-        #[arg(long = "as", value_name = "AGENT")]
-        #[arg(help = "Act as this local agent from the start")]
-        actor: Option<String>,
-        #[arg(long, hide = true)]
-        #[arg(help = "The managed turn this server works inside, for delegated asks")]
-        turn: Option<String>,
-    },
-    #[command(hide = true)]
-    ChatWorker {
-        #[arg(long)]
-        agent: String,
-        #[arg(long, hide = true)]
-        ready_event: Option<String>,
-    },
+    #[command(about = "Manage the macOS login service and retire chat integrations")]
+    Service(service::ServiceArgs),
     Doctor {
         machine: String,
     },
@@ -90,26 +68,45 @@ enum Command {
         #[arg(long)]
         job: Option<String>,
     },
-    Status(ResultReadArgs),
-    Wait(ResultReadArgs),
+    Status {
+        job: String,
+        #[arg(long, help = "Keep the completed result and logs after reading")]
+        keep: bool,
+    },
+    Wait {
+        job: String,
+        #[arg(long, help = "Keep the completed result and logs after reading")]
+        keep: bool,
+    },
     Kill {
         job: String,
     },
-    Logs(ResultReadArgs),
+    Logs {
+        job: String,
+        #[arg(long, help = "Keep the completed result and logs after reading")]
+        keep: bool,
+    },
+    #[command(hide = true)]
+    PublishNode,
     #[command(hide = true)]
     Node {
         #[arg(long, hide = true)]
         reap: Option<ReaperGroup>,
         #[arg(long, hide = true, requires = "reap")]
         reap_scope: Option<String>,
+        #[arg(long, hide = true, requires = "reap")]
+        reap_marker: Option<std::path::PathBuf>,
     },
-    #[command(hide = true)]
-    PublishNode,
     #[command(hide = true)]
     JobExec {
         scope: String,
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    #[command(hide = true)]
+    JobReap {
+        name: String,
+        marker: std::path::PathBuf,
     },
     #[command(hide = true)]
     Worker {
@@ -120,25 +117,18 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-struct ResultReadArgs {
-    job: String,
-    #[arg(
-        long = "keep",
-        hide = true,
-        num_args = 0,
-        default_value = "preserve",
-        default_missing_value = "preserve"
-    )]
-    retention: transport::ResultRetention,
-}
-
-#[derive(Debug, Args)]
 struct JobArgs {
     machine: String,
     #[arg(long)]
     submission: Option<String>,
     #[arg(long)]
     wait: bool,
+    #[arg(
+        long,
+        requires = "wait",
+        help = "Keep the completed result and logs after reading"
+    )]
+    keep: bool,
     #[arg(last = true, required = true)]
     command: Vec<String>,
 }
@@ -157,8 +147,17 @@ fn submit_job(
         id: args.submission.map(SubmissionId::try_from).transpose()?,
         command: JobCommand::try_from(args.command)?,
         wait: args.wait,
+        retention: result_retention(args.keep),
     };
     submit(&machine, submission, output)
+}
+
+const fn result_retention(keep: bool) -> transport::ResultRetention {
+    if keep {
+        transport::ResultRetention::Preserve
+    } else {
+        transport::ResultRetention::Consume
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -166,39 +165,35 @@ enum MainError {
     #[error(transparent)]
     Transport(#[from] transport::TransportError),
     #[error(transparent)]
-    Chat(#[from] chat::cli::CliError),
-    #[error(transparent)]
-    Runner(#[from] chat::runner::RunnerError),
-    #[error(transparent)]
-    Mcp(#[from] mcp::McpError),
+    Service(#[from] service::ServiceError),
     #[error(transparent)]
     Invalid(#[from] domyjob_core::domain::Invalid),
     #[error(transparent)]
     App(#[from] app::AppError),
     #[error(transparent)]
-    Dashboard(#[from] tui::TuiError),
-    #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+fn run_node(
+    reap: Option<ReaperGroup>,
+    scope: Option<String>,
+    marker: Option<&std::path::Path>,
+    output: &Output,
+) -> Result<ExitCode, MainError> {
+    if let Some(group) = reap {
+        let scope = scope.map(process::resources::Scope::parse).transpose()?;
+        process::reap(group.get(), scope.as_ref(), marker)?;
+    } else {
+        transport::node(output)?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run(command: Command) -> Result<ExitCode, MainError> {
     let output = raw::output();
     match command {
-        Command::Tui { actor } => {
-            tui::run(actor.as_deref(), output)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Chat(args) => Ok(chat::cli::run(args, &output)?),
-        Command::Mcp { actor, turn } => {
-            mcp::serve(output, actor.as_deref(), turn.as_deref())?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::ChatWorker { agent, ready_event } => {
-            let ready_event = ready_event
-                .map(process::ReadyToken::parse)
-                .transpose()
-                .map_err(app::AppError::from)?;
-            chat::runner::worker(&agent, ready_event.as_ref())?;
+        Command::Service(args) => {
+            service::run(&args, &output)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Doctor { machine } => {
@@ -212,39 +207,42 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Clean { machine, job } => {
-            let target = match job {
-                Some(job) => CleanTarget::Job(JobId::try_from(job)?),
-                None => CleanTarget::Finished,
-            };
+            let target = clean_target(job)?;
             transport::clean(&MachineName::try_from(machine)?, target, &output)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Status(ResultReadArgs { job, retention }) => {
-            transport::status(&JobReference::try_from(job)?, retention, &output)?;
+        Command::Status { job, keep } => {
+            transport::status(
+                &JobReference::try_from(job)?,
+                result_retention(keep),
+                &output,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Wait(ResultReadArgs { job, retention }) => Ok(transport::wait(
+        Command::Wait { job, keep } => Ok(transport::wait(
             &JobReference::try_from(job)?,
-            retention,
+            result_retention(keep),
             &output,
         )?),
         Command::Kill { job } => Ok(transport::kill(&JobReference::try_from(job)?, &output)?),
-        Command::Logs(ResultReadArgs { job, retention }) => {
-            transport::logs(&JobReference::try_from(job)?, retention, &output)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Command::Node { reap, reap_scope } => {
-            if let Some(group) = reap {
-                let scope = reap_scope
-                    .map(process::resources::Scope::parse)
-                    .transpose()?;
-                process::reap(group.get(), scope.as_ref());
-            } else {
-                transport::node(&output)?;
-            }
+        Command::Logs { job, keep } => {
+            transport::logs(
+                &JobReference::try_from(job)?,
+                result_retention(keep),
+                &output,
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Command::PublishNode => Ok(transport::publish_node()?),
+        Command::Node {
+            reap,
+            reap_scope,
+            reap_marker,
+        } => run_node(reap, reap_scope, reap_marker.as_deref(), &output),
+        Command::JobReap { name, marker } => {
+            process::reap_owned(&name, &marker)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::JobExec { scope, command } => {
             let scope = process::resources::Scope::parse(scope)?;
             let command = JobCommand::try_from(command)?;
@@ -253,13 +251,24 @@ fn run(command: Command) -> Result<ExitCode, MainError> {
         }
         Command::Worker { job, ready_event } => {
             let job = JobId::try_from(job)?;
-            let ready_event = ready_event
-                .map(process::ReadyToken::parse)
-                .transpose()
-                .map_err(app::AppError::from)?;
+            let ready_event = readiness(ready_event)?;
             app::worker(&job, ready_event.as_ref())?;
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+fn readiness(value: Option<String>) -> Result<Option<process::ReadyToken>, MainError> {
+    Ok(value
+        .map(process::ReadyToken::parse)
+        .transpose()
+        .map_err(app::AppError::from)?)
+}
+
+fn clean_target(job: Option<String>) -> Result<CleanTarget, MainError> {
+    match job {
+        Some(job) => Ok(CleanTarget::Job(JobId::try_from(job)?)),
+        None => Ok(CleanTarget::Finished),
     }
 }
 
@@ -273,28 +282,23 @@ fn internal() -> bool {
     matches!(
         (word(0), word(1)),
         (
-            Some("node" | "worker" | "chat-worker" | "job-exec" | "publish-node" | "mcp"),
+            Some("node" | "publish-node" | "worker" | "job-exec" | "job-reap"),
             _
-        ) | (Some("chat"), Some("serve"))
+        ) | (Some("service"), Some("serve"))
     )
 }
 
 fn main() -> ExitCode {
     let internal = internal();
-    let command = Cli::parse().command.unwrap_or(Command::Tui { actor: None });
-    let dashboard = matches!(command, Command::Tui { .. });
-    if dashboard && !platform::terminal::interactive(&raw::output().into_stream()) {
-        eprintln!("domyjob: {}", tui::TuiError::NotTerminal);
-        return ExitCode::FAILURE;
-    }
+    let command = Cli::parse().command;
     let _build = match builds::hold_current() {
         Ok(held) => held,
         Err(error) => {
             eprintln!("domyjob: marking this build in use failed: {error}");
-            None
+            return ExitCode::FAILURE;
         }
     };
-    if !internal && !dashboard {
+    if !internal {
         match transport::refresh_local() {
             Ok(Some(code)) => return code,
             Ok(None) => {}
@@ -320,59 +324,46 @@ mod tests {
     use super::{Cli, Command};
 
     #[test]
-    fn job_reads_accept_keep_as_the_preserving_compatibility_form() {
-        let job = "beta:00000000000000000000000000000001";
-        for command in ["status", "wait", "logs"] {
-            for arguments in [
-                vec!["domyjob", command, "--keep", job],
-                vec!["domyjob", command, job, "--keep"],
-                vec!["domyjob", command, job],
-            ] {
-                let parsed = Cli::try_parse_from(&arguments);
-                assert!(parsed.is_ok(), "{arguments:?}: {parsed:?}");
-                assert!(matches!(
-                    parsed.unwrap().command,
-                    Some(Command::Status(args) | Command::Wait(args) | Command::Logs(args))
-                        if args.job == job
-                            && args.retention == super::transport::ResultRetention::Preserve
-                ));
-            }
-            let help = Cli::try_parse_from(["domyjob", command, "--help"])
-                .unwrap_err()
-                .to_string();
-            assert!(!help.contains("--keep"), "{help}");
-        }
-    }
-
-    #[test]
-    fn keep_is_only_a_zero_argument_result_read_option() {
-        let job = "beta:00000000000000000000000000000001";
+    fn retired_agent_chat_entry_points_are_rejected() {
         for arguments in [
-            vec!["domyjob", "status", "--keep=false", job],
-            vec!["domyjob", "wait", "--keep=preserve", job],
-            vec!["domyjob", "logs", "--keep", "false", job],
-            vec!["domyjob", "logs", "--unknown", job],
-            vec!["domyjob", "kill", "--keep", job],
-            vec!["domyjob", "tui", "--keep"],
+            vec!["domyjob", "chat", "directory"],
+            vec!["domyjob", "mcp"],
+            vec!["domyjob", "chat-worker", "--agent", "reviewer"],
+            vec!["domyjob", "tui"],
         ] {
-            assert!(Cli::try_parse_from(&arguments).is_err(), "{arguments:?}");
+            assert!(
+                Cli::try_parse_from(&arguments).is_err(),
+                "retired entry point was accepted: {arguments:?}"
+            );
         }
     }
 
     #[test]
-    fn human_dashboard_is_the_default_and_has_an_explicit_command() {
-        let default = Cli::try_parse_from(["domyjob"]).unwrap();
-        assert!(default.command.is_none());
-        let explicit = Cli::try_parse_from(["domyjob", "tui"]).unwrap();
+    fn completed_results_can_be_kept_explicitly_after_retrieval() {
+        for operation in ["status", "wait", "logs"] {
+            let parsed =
+                Cli::try_parse_from(["domyjob", operation, "linux:JOB", "--keep"]).unwrap();
+            assert!(matches!(
+                parsed.command,
+                Command::Status { keep: true, .. }
+                    | Command::Wait { keep: true, .. }
+                    | Command::Logs { keep: true, .. }
+            ));
+        }
+        let parsed = Cli::try_parse_from([
+            "domyjob", "run", "linux", "--wait", "--keep", "--", "cargo", "test",
+        ])
+        .unwrap();
         assert!(matches!(
-            explicit.command,
-            Some(Command::Tui { actor: None })
+            parsed.command,
+            Command::Run(super::JobArgs {
+                keep: true,
+                wait: true,
+                ..
+            })
         ));
-        let selected = Cli::try_parse_from(["domyjob", "tui", "--as", "alice"]).unwrap();
-        assert!(matches!(
-            selected.command,
-            Some(Command::Tui { actor: Some(actor) }) if actor == "alice"
-        ));
+        Cli::try_parse_from(["domyjob", "run", "linux", "--keep", "--", "cargo", "test"])
+            .unwrap_err();
     }
 
     #[test]
@@ -381,7 +372,7 @@ mod tests {
         assert!(matches!(
             parsed,
             Ok(Cli {
-                command: Some(Command::Node { reap: Some(_), .. })
+                command: Command::Node { reap: Some(_), .. }
             })
         ));
         for value in ["0", "-1", "2147483648", "invalid"] {

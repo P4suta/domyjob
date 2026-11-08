@@ -42,25 +42,27 @@ macro_rules! validated_string {
     };
 }
 
+pub mod cache_key;
 pub mod capture_policy;
-pub mod chat;
-pub mod chat_wire;
-pub mod dashboard;
+pub mod client_cleanup;
 pub mod domain;
-pub mod hook_clients;
 pub mod ingress;
 pub mod job_protocol;
 pub mod jsonc;
-pub mod mcp_clients;
+pub mod login_diagnostic;
 pub mod process_group;
+pub mod process_inventory;
 pub mod resource_budget;
 pub mod resource_policy;
+pub mod retention_rules;
+pub mod retired_cleanup;
+pub mod scope_ownership;
 
 #[cfg(kani)]
 mod resource_proofs;
 pub mod service;
 pub mod source_paths;
 pub mod state;
-pub mod terminal_input;
+pub mod storage_lifecycle;
 pub mod wire;
 pub mod worker_handoff;

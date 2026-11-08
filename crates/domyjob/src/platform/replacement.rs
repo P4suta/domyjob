@@ -105,45 +105,26 @@ mod tests {
     use super::{PrivateCandidate, StagedFile};
     use std::io::Write as _;
 
-    fn directory_fixture() -> (tempfile::TempDir, PrivateCandidate, std::path::PathBuf) {
+    #[test]
+    fn publishing_a_directory_never_removes_a_replacement_of_its_staging_path() {
         let root = tempfile::tempdir().unwrap();
         let stage = PrivateCandidate::new(tempfile::tempdir_in(root.path()).unwrap()).unwrap();
+        let old_path = stage.path().to_path_buf();
         let target = root.path().join("published");
-        (root, stage, target)
-    }
-
-    fn publish_then_reuse(
-        stage: PrivateCandidate,
-        target: &std::path::Path,
-        reuse: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
-        super::publish_owned_directory_using(
+        crate::state_io::create_empty(&stage.path().join("usage.lock")).unwrap();
+        let error = super::publish_owned_directory_using(
             stage,
-            target,
+            &target,
             |source, target| {
                 super::raw::rename(source, target)?;
-                reuse(source)
+                crate::testing::write(&source.join("replacement"), "keep");
+                Ok(())
             },
             super::raw::remove_empty_directory,
         )
-    }
-
-    fn assert_reused_name_preserved(error: &std::io::Error, name: &std::path::Path) {
-        assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
-        assert_eq!(crate::testing::read(&name.join("replacement")), "keep");
-    }
-
-    #[test]
-    fn publishing_a_directory_never_removes_a_replacement_of_its_staging_path() {
-        let (_root, stage, target) = directory_fixture();
-        let old_path = stage.path().to_path_buf();
-        crate::state_io::create_empty(&stage.path().join("usage.lock")).unwrap();
-        let error = publish_then_reuse(stage, &target, |source| {
-            crate::testing::write(&source.join("replacement"), "keep");
-            Ok(())
-        })
         .unwrap_err();
-        assert_reused_name_preserved(&error, &old_path);
+        assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(crate::testing::read(&old_path.join("replacement")), "keep");
         assert_eq!(
             crate::lock::OsLock::probe(&target.join("usage.lock")).unwrap(),
             crate::lock::Probe::Free
@@ -152,11 +133,13 @@ mod tests {
 
     #[test]
     fn refused_directory_publication_preserves_the_target_and_removes_the_stage() {
-        let (_root, stage, target) = directory_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateCandidate::new(tempfile::tempdir_in(root.path()).unwrap()).unwrap();
         let staged_path = stage.path().to_path_buf();
         let lock = staged_path.join("usage.lock");
         crate::state_io::create_empty(&lock).unwrap();
         let reader = std::fs::File::open(&lock).unwrap();
+        let target = root.path().join("published");
         crate::testing::write(&target.join("before"), "keep");
         let error = super::publish_owned_directory_using(
             stage,
@@ -182,9 +165,11 @@ mod tests {
 
     #[test]
     fn published_candidates_remove_only_the_empty_outer_directory() {
-        let (_root, stage, target) = directory_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateCandidate::new(tempfile::tempdir_in(root.path()).unwrap()).unwrap();
         let outer = stage.outer.path().to_path_buf();
         crate::state_io::create_empty(&stage.path().join("usage.lock")).unwrap();
+        let target = root.path().join("published");
         super::publish_owned_directory(stage, &target).unwrap();
         assert_eq!(
             std::fs::symlink_metadata(outer).unwrap_err().kind(),
@@ -208,9 +193,11 @@ mod tests {
 
     #[test]
     fn failed_empty_outer_cleanup_preserves_the_published_candidate_and_reports_failure() {
-        let (_root, stage, target) = directory_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateCandidate::new(tempfile::tempdir_in(root.path()).unwrap()).unwrap();
         let outer = stage.outer.path().to_path_buf();
         crate::state_io::create_empty(&stage.path().join("usage.lock")).unwrap();
+        let target = root.path().join("published");
         let error =
             super::publish_owned_directory_using(stage, &target, super::raw::rename, |_empty| {
                 Err(std::io::Error::new(
@@ -236,16 +223,25 @@ mod tests {
 
     #[test]
     fn a_reused_outer_directory_is_never_recursively_removed_after_publication() {
-        let (_root, stage, target) = directory_fixture();
+        let root = tempfile::tempdir().unwrap();
+        let stage = PrivateCandidate::new(tempfile::tempdir_in(root.path()).unwrap()).unwrap();
         let outer = stage.outer.path().to_path_buf();
-        let error = publish_then_reuse(stage, &target, |source| {
-            let parent = source.parent().unwrap();
-            super::raw::remove_empty_directory(parent)?;
-            crate::testing::write(&parent.join("replacement"), "keep");
-            Ok(())
-        })
+        let target = root.path().join("published");
+        let error = super::publish_owned_directory_using(
+            stage,
+            &target,
+            |source, target| {
+                super::raw::rename(source, target)?;
+                let parent = source.parent().unwrap();
+                super::raw::remove_empty_directory(parent)?;
+                crate::testing::write(&parent.join("replacement"), "keep");
+                Ok(())
+            },
+            super::raw::remove_empty_directory,
+        )
         .unwrap_err();
-        assert_reused_name_preserved(&error, &outer);
+        assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(crate::testing::read(&outer.join("replacement")), "keep");
         assert!(std::fs::symlink_metadata(target).unwrap().is_dir());
     }
 

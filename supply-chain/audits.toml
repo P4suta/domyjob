@@ -40,6 +40,15 @@ Exact crate archive SHA256 values, independently matched to the official Cargo r
 Evidence: reports/dependencies/20261002-notarization-queue/crc32fast-1.5.0-candidate-source.json, baseline-trust-paths.json, crc32fast-independent-oracle.json, crc32fast-selected-review.json, and crc32fast-1.4.2-to-1.5.0.diff.txt.
 """
 
+[[audits.equivalent]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.0.2 -> 1.0.3"
+notes = """
+Automated delta review from the imported safe-to-deploy baseline.
+The only Rust changes clarify the existing hash and comparison contracts in documentation.
+Manifests only change the package version; runtime code and dependencies are unchanged."""
+
 [[audits.find-msvc-tools]]
 who = "Codex (automated source review)"
 criteria = "safe-to-deploy"
@@ -115,6 +124,49 @@ Exact crate archive SHA256 values, independently matched to the official Cargo r
 Evidence: reports/dependencies/20261002-notarization-queue/crate-delta-evidence.json, baseline-trust-paths.json, automated-delta-review.json, and simd-adler32-0.3.7-to-0.3.10.diff.txt.
 """
 
+[[audits.toml_datetime]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.1.1+spec-1.1.0 -> 1.1.3+spec-1.1.0"
+notes = """
+Automated delta review from the imported safe-to-deploy baseline.
+The implementation adds a bounded zero-or-one MapAccess size hint from the remaining date option.
+Other changes affect packaging, lint settings, release links and the Apache notice placeholder.
+No new unsafe code or native authority is introduced."""
+
+[[audits.toml_edit]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "0.25.15+spec-1.1.0 -> 0.25.19+spec-1.1.0"
+notes = """
+Automated delta review from the existing exempted baseline, without a new full baseline audit.
+Reviewed collection size hints, owned-key serialization delegation, optional serde map entry handling and String formatting.
+The dependency minima advance to the separately reviewed datetime, parser and writer versions.
+The application enables parse and display and bounds configuration reads to 4 MiB.
+No new unsafe code, build script or native authority is introduced."""
+
+[[audits.toml_parser]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.1.3+spec-1.1.0 -> 1.1.5+spec-1.1.0"
+notes = """
+Automated delta review from the existing exempted baseline, without a new full baseline audit.
+The lexer divides before multiplying its capacity estimate and caps allocation by the addressable Token count.
+Whitespace decoding was a no-op; comment and newline validation retain checked source indexing while removing unchecked alternatives.
+The remaining changes affect package metadata, lint settings, links and the Apache notice placeholder.
+Native file input remains bounded by the application."""
+
+[[audits.toml_writer]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.1.2+spec-1.1.0 -> 1.2.0+spec-1.1.0"
+notes = """
+Automated delta review from the existing exempted baseline, without a new full baseline audit.
+Reviewed the string fast path restricted to bare-key ASCII bytes plus dot, slash, space and colon, with no quote, escape, newline or control byte admitted.
+Other string paths retain escaping and delimiters; unquoted keys still require a nonempty bare-key byte sequence.
+Direct write_str calls preserve literal punctuation and floating-point special values.
+No new unsafe code, dependency, build script or native authority is introduced."""
+
 [[audits.version_check]]
 who = "Codex (automated source review)"
 criteria = "safe-to-deploy"
@@ -134,6 +186,17 @@ The review was performed by Codex and is not represented as human certification 
 Exact archive SHA256: 0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a; equality with the recorded Cargo checksum and all 13 packaged-file hashes was independently verified.
 Evidence: reports/dependencies/20261001-icon-build-dependency/version-check-independent-review.json.
 """
+
+[[audits.winnow]]
+who = "Codex (automated source review)"
+criteria = "safe-to-deploy"
+delta = "1.0.4 -> 1.0.5"
+notes = """
+Automated delta review from the existing exempted baseline, without a new full baseline audit.
+Reviewed production changes including Self substitutions, equivalent lifetime elision, typed numeric spelling and the added usize hexadecimal width of twice its byte size.
+Token bound arguments are renamed without changing their decisions; grammar documentation and examples are updated.
+No new unsafe operation, dependency, build script or native authority is introduced.
+This review covers the delta and is not a human certification or a proof of all parser behavior."""
 
 [[audits.winresource]]
 who = "Codex (automated source review)"

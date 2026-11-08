@@ -5,8 +5,6 @@ mod windows;
 #[path = "os/macos.rs"]
 mod macos;
 
-use std::io;
-
 #[cfg(windows)]
 pub(crate) fn input_child_role() -> Option<std::process::ExitCode> {
     windows::input_child_role()
@@ -16,7 +14,6 @@ pub(crate) fn input_child_role() -> Option<std::process::ExitCode> {
 pub(crate) const fn input_child_role() -> Option<std::process::ExitCode> {
     None
 }
-
 pub(crate) type BootstrapInputContract = fn(&std::path::Path) -> Result<(), crate::Failure>;
 
 pub(crate) const fn bootstrap_input_contracts() -> &'static [BootstrapInputContract] {
@@ -30,6 +27,15 @@ pub(crate) const fn bootstrap_input_contracts() -> &'static [BootstrapInputContr
     }
 }
 
+pub(crate) fn service_sampler(pid: u32, report: &std::path::Path) -> Option<std::process::Command> {
+    if cfg!(target_os = "macos") {
+        let mut command = std::process::Command::new("/usr/bin/sample");
+        command.args(crate::diagnostics::sample_arguments(pid, report));
+        Some(command)
+    } else {
+        None
+    }
+}
 pub(crate) fn bootstrap_shell(command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
@@ -78,23 +84,5 @@ pub(crate) fn job_handoff(
         macos::job_handoff(world, client)
     } else {
         Ok(())
-    }
-}
-
-pub(crate) fn parent_of(pid: u32) -> io::Result<u32> {
-    #[cfg(windows)]
-    {
-        windows::parent_of(pid)
-    }
-    #[cfg(unix)]
-    {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "ppid=", "-p", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .output()?;
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 #![deny(unsafe_code)]
-
+mod platform {
 #[path = r"@KERNEL@"]
 mod kernel;
 #[path = r"@DESCRIPTOR@"]
@@ -9,4 +9,6 @@ mod descriptor;
 fn requires_event(_event: &kernel::Event<kernel::Signal>) {}
 fn rejected(job: kernel::Job<kernel::New>) {
     requires_event(&job);
+}
+
 }

@@ -1,0 +1,1 @@
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/bin/domyjob chat hook stop --client codex --if-bound"},{"type":"command","command":"owner-stop"}]}]}}

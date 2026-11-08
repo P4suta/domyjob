@@ -1,10 +1,49 @@
-use std::io;
-use std::process::{Child, Command};
+use std::io::{self, Read as _, Write as _};
+use std::process::{Child, Command, Stdio};
 
 mod kernel;
 
 use super::{Guard, ProcessError, ReadyToken, Stop};
-use kernel::{Event, Job, Process, RunningJob, StartWake};
+use kernel::{Event, Job, JobObserver, Process, RunningJob, StartWake};
+
+const QUIESCENCE_TIMEOUT_MILLIS: u64 = 5000;
+const QUIESCENCE_POLL_MILLIS: u64 = 10;
+const REAPER_BUFFER_BYTES: usize = 256;
+fn reaper_ready(mut output: impl io::Read) -> Result<(), ProcessError> {
+    let mut signal = [0_u8; 1];
+    output
+        .read_exact(&mut signal)
+        .map_err(ProcessError::Ready)?;
+    if signal == *b"R" {
+        Ok(())
+    } else {
+        Err(ProcessError::NotStarted(
+            "the job reaper did not acquire its object".into(),
+        ))
+    }
+}
+
+fn await_quiescence(mut quiet: impl FnMut() -> io::Result<bool>) -> io::Result<()> {
+    let deadline = crate::platform::clock::Deadline::after_millis(QUIESCENCE_TIMEOUT_MILLIS);
+    loop {
+        if quiet()? {
+            return Ok(());
+        }
+        if deadline.expired() {
+            return Err(io::Error::other(
+                "the job object still has active processes",
+            ));
+        }
+        crate::platform::clock::pause_millis(QUIESCENCE_POLL_MILLIS);
+    }
+}
+
+fn job_name(marker: &std::path::Path) -> String {
+    format!(
+        "Local\\domyjob-owned-{}",
+        blake3::hash(marker.as_os_str().as_encoded_bytes()).to_hex()
+    )
+}
 
 fn event_name(token: &ReadyToken) -> String {
     format!("Local\\domyjob-ready-{}", token.as_str())
@@ -85,16 +124,25 @@ pub(super) fn isolate(command: &mut Command) {
 #[derive(Debug)]
 pub(super) struct Tree {
     job: RunningJob,
+    name: Option<String>,
 }
 
 impl Tree {
-    pub(super) fn adopt(child: &Child) -> io::Result<Self> {
-        let job = Job::create()?
-            .configure()?
-            .assign(child)?
-            .watch()?
-            .resume()?;
-        Ok(Self { job })
+    pub(super) fn adopt(child: &Child, marker: Option<&std::path::Path>) -> io::Result<Self> {
+        let name = marker.map(job_name);
+        let job = match &name {
+            Some(name) => Job::named(name),
+            None => Job::create(),
+        }?
+        .configure()?
+        .assign(child)?
+        .watch()?
+        .resume()?;
+        Ok(Self { job, name })
+    }
+
+    pub(super) fn confirm_quiescence(&self) -> io::Result<()> {
+        await_quiescence(|| self.job.quiescent())
     }
 
     pub(super) fn await_leader(&self) -> Result<(), ProcessError> {
@@ -117,19 +165,100 @@ impl Tree {
 }
 
 #[derive(Debug)]
-pub(super) struct Reaper;
+pub(super) struct Reaper(Option<std::process::ChildStdin>);
 
 impl Guard for Reaper {
     fn stand_guard(
-        _tree: &Tree,
+        tree: &Tree,
         _scope: Option<&super::resources::Scope>,
+        marker: Option<&std::path::Path>,
     ) -> Result<Self, ProcessError> {
-        Ok(Self)
+        let (Some(name), Some(marker)) = (&tree.name, marker) else {
+            return Ok(Self(None));
+        };
+        let executable = std::env::current_exe().map_err(|source| ProcessError::Spawn {
+            what: "the job reaper",
+            source,
+        })?;
+        let mut command = super::command(executable);
+        kernel::isolate_reaper(&mut command);
+        let mut child = command
+            .arg("job-reap")
+            .arg(name)
+            .arg(marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|source| ProcessError::Spawn {
+                what: "the job reaper",
+                source,
+            })?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProcessError::Ready(io::Error::other("the job reaper has no input")))?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProcessError::Ready(io::Error::other("the job reaper has no output")))?;
+        if let Err(error) = reaper_ready(output) {
+            let _killed = child.kill();
+            let _reaped = child.wait();
+            return Err(error);
+        }
+        std::thread::spawn(move || {
+            let _reaped = child.wait();
+        });
+        Ok(Self(Some(input)))
     }
 
-    fn stand_down(self) {}
+    fn stand_down(self) {
+        if let Some(mut input) = self.0 {
+            let _sent = input.write_all(b"d");
+        }
+    }
 
-    fn reap(_group: i32, _scope: Option<&super::resources::Scope>) {}
+    fn reap(
+        _group: i32,
+        _scope: Option<&super::resources::Scope>,
+        _marker: Option<&std::path::Path>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(super) fn reap_owned(name: &str, marker: &std::path::Path) -> io::Result<()> {
+    if name != job_name(marker) {
+        return Err(io::Error::other(
+            "the job object does not match its completion marker",
+        ));
+    }
+    let job = JobObserver::open(name)?
+        .ok_or_else(|| io::Error::other("the owned job object is absent"))?;
+    super::raw::stdout().lock().write_all(b"R")?;
+    super::raw::stdout().lock().flush()?;
+    let mut input = io::stdin().lock();
+    let mut buffer = [0_u8; REAPER_BUFFER_BYTES];
+    loop {
+        match input.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count)
+                if buffer
+                    .get(..count)
+                    .is_some_and(|bytes| bytes.contains(&b'd')) =>
+            {
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    job.terminate()?;
+    await_quiescence(|| job.quiescent())?;
+    crate::state_io::mark_existing(marker)
+        .map(|_| ())
+        .map_err(io::Error::other)
 }
 
 pub(crate) type OutputReader = io::PipeReader;
@@ -149,14 +278,15 @@ impl Stop for OutputStop {
 }
 
 pub(super) fn terminate(pid: u32) -> Result<(), ProcessError> {
+    const TASKKILL_ABSENT_PROCESS_EXIT_CODE: i32 = 128;
     let status = super::command("taskkill.exe")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(ProcessError::Signal)?;
-    if status.success() || status.code() == Some(128) {
+    if status.success() || status.code() == Some(TASKKILL_ABSENT_PROCESS_EXIT_CODE) {
         Ok(())
     } else {
         Err(ProcessError::Signal(io::Error::other(format!(
@@ -171,6 +301,20 @@ mod tests {
         Event, ProcessError, ReadyToken, announce_ready, event_name, launch_worker,
         launch_worker_using,
     };
+    use std::io;
+
+    #[test]
+    fn a_job_reaper_must_announce_its_owned_object() {
+        super::reaper_ready(io::Cursor::new(b"R")).unwrap();
+        assert!(matches!(
+            super::reaper_ready(io::Cursor::new(b"X")),
+            Err(ProcessError::NotStarted(_))
+        ));
+        assert!(matches!(
+            super::reaper_ready(io::Cursor::new(b"")),
+            Err(ProcessError::Ready(_))
+        ));
+    }
 
     #[test]
     fn a_readiness_event_is_signalled_before_success_is_returned() {
@@ -187,7 +331,8 @@ mod tests {
 
     #[test]
     fn missing_entropy_stops_before_a_worker_is_prepared() {
-        let failure = getrandom::Error::new_custom(73);
+        const ENTROPY_FAILURE_CODE: u16 = 73;
+        let failure = getrandom::Error::new_custom(ENTROPY_FAILURE_CODE);
         let error = launch_worker_using(
             &[],
             None,
@@ -204,14 +349,14 @@ mod tests {
     #[test]
     fn an_executable_lookup_error_keeps_the_worker_context() {
         let error = launch_worker_using(&[], None, ReadyToken::fresh, || {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
         })
         .expect_err("retain the executable lookup error");
         let ProcessError::Spawn { what, source } = error else {
             panic!("unexpected executable lookup failure: {error}");
         };
         assert_eq!(what, "the worker");
-        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
@@ -224,7 +369,7 @@ mod tests {
             panic!("unexpected spawn failure: {error}");
         };
         assert_eq!(what, "the worker");
-        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -238,7 +383,7 @@ mod tests {
         let ProcessError::Ready(source) = error else {
             panic!("unexpected readiness failure: {error}");
         };
-        assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(source.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
