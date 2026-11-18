@@ -1,17 +1,17 @@
 [tools]
-rust = { version = "1.99.0", components = ["clippy", "rustfmt"] }
-"aqua:PowerShell/PowerShell" = { version = "7.6.7", os = ["windows"] }
+rust = { version = "1.100.0", components = ["clippy", "rustfmt"] }
+"aqua:PowerShell/PowerShell" = { version = "7.7.0", os = ["windows"] }
 actionlint = "1.7.12"
 taplo = "0.10.0"
-typos = "1.50.3"
-lefthook = "2.1.15"
+typos = "1.52.2"
+lefthook = "2.2.2"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "aqua:rustsec/rustsec/cargo-audit" = "0.22.2"
-"cargo:cargo-vet" = "0.10.2"
-"aqua:crate-ci/committed" = "1.1.11"
-"npm:jscpd" = "5.4.0"
-node = "26.11.1"
-"npm:@informalsystems/quint" = "0.32.0"
+"cargo:cargo-vet" = "0.10.3"
+"aqua:crate-ci/committed" = "1.1.12"
+"npm:jscpd" = "5.4.3"
+node = "26.13.1"
+"npm:@informalsystems/quint" = "0.33.1"
 java = "temurin-25.0.4+101.0.LTS"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.146"
 

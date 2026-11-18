@@ -33,11 +33,11 @@ jobs:
         with:
           ref: main
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
-          version: 2026.10.7
+          version: 2026.11.8
           install_args: rust
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: domyjob-ci-v2
           cache-bin: false
@@ -75,11 +75,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
-          version: 2026.10.7
+          version: 2026.11.8
           install_args: rust aqua:rustsec/rustsec/cargo-audit
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           artifact-ids: ${{ matrix.artifact_id }}
           run-id: ${{ matrix.run_id }}
@@ -128,7 +128,7 @@ jobs:
             ready/release-derivation.json
       - name: Preserve exact ready bytes before publication
         if: steps.finalize.outputs.accepted == 'true' && steps.finalize.outputs.modern == 'true' && steps.finalize.outputs.reused_ready != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-ready-${{ matrix.run_id }}-${{ matrix.run_attempt }}
           path: ready/*
@@ -170,7 +170,7 @@ jobs:
         run: cargo xtask release queue publish
       - name: Preserve the accepted original distribution
         if: steps.finalize.outputs.accepted == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-verified-${{ matrix.run_id }}-${{ matrix.run_attempt }}
           path: ${{ steps.finalize.outputs.distribution_path }}

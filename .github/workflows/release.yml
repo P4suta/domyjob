@@ -30,9 +30,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
-          version: 2026.10.7
+          version: 2026.11.8
           install_args: rust aqua:EmbarkStudios/cargo-deny aqua:rustsec/rustsec/cargo-audit cargo:cargo-vet
       - name: Read and validate the workspace version
         id: version
@@ -80,9 +80,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
-          version: 2026.10.7
+          version: 2026.11.8
           install_args: rust
       - name: Build
         shell: bash
@@ -191,7 +191,7 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
           WINDOWS_SIGNING_IDENTITY_SHA256: ${{ vars.WINDOWS_SIGNING_IDENTITY_SHA256 }}
         run: cargo xtask release bundle
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && hashFiles('dist/*.tar.gz', 'dist/*.pkg') != ''
         with:
           name: dist-${{ matrix.target }}
@@ -199,7 +199,7 @@ jobs:
             dist/*.tar.gz
             dist/*.pkg
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && runner.os == 'macOS' && hashFiles('notarization/*.json') != ''
         with:
           name: notary-${{ matrix.target }}
@@ -220,11 +220,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
-          version: 2026.10.7
+          version: 2026.11.8
           install_args: rust
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
           merge-multiple: true
@@ -233,7 +233,7 @@ jobs:
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: cargo xtask release checksums
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: notary-*
           merge-multiple: true
@@ -249,7 +249,7 @@ jobs:
             dist/*.pkg
             dist/manifest.json
       - name: Preserve the pending archives and receipts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-pending
           path: dist/*
