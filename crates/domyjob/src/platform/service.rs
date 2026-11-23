@@ -224,8 +224,7 @@ fn task_uninstall(program: Option<&Path>) -> Result<bool, ServiceError> {
         })
         .transpose()?;
     let expected = expected
-        .map(|command| format!("--headless {command}"))
-        .unwrap_or_default()
+        .map_or_else(String::new, |command| format!("--headless {command}"))
         .replace('\'', "''");
     let script = format!(
         "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskName '{TASK}' -ErrorAction SilentlyContinue; \
