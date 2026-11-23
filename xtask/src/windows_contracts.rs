@@ -162,12 +162,41 @@ fn dependencies(metadata: &Value) -> Result<BTreeMap<String, String>, String> {
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CargoArtifacts {
+    direct: BTreeMap<String, PathBuf>,
+    search_paths: BTreeSet<PathBuf>,
+}
+
+fn artifact_directory<'a>(file: &'a Path, profile: &Path) -> Option<&'a Path> {
+    if file.extension()? != "rmeta" {
+        return None;
+    }
+    let parent = file.parent()?;
+    let Ok(relative) = parent.strip_prefix(profile) else {
+        return None;
+    };
+    if relative == Path::new("deps") {
+        return Some(parent);
+    }
+    let Ok(unit) = relative.strip_prefix("build") else {
+        return None;
+    };
+    (unit.components().count() == 3
+        && unit.ends_with("out")
+        && unit
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))))
+    .then_some(parent)
+}
+
 fn artifacts(
     bytes: &[u8],
     dependencies: &BTreeMap<String, String>,
-    directory: &Path,
-) -> Result<BTreeMap<String, PathBuf>, String> {
+    profile: &Path,
+) -> Result<CargoArtifacts, String> {
     let mut found = BTreeMap::new();
+    let mut search_paths = BTreeSet::new();
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
@@ -176,29 +205,29 @@ fn artifacts(
         if text(&message, "reason")? != "compiler-artifact" {
             continue;
         }
-        for (name, package) in dependencies {
-            if text(&message, "package_id")? != package
-                || message.pointer("/target/name").and_then(Value::as_str) != Some(name.as_str())
-            {
+        let package = text(&message, "package_id")?;
+        let name = message.pointer("/target/name").and_then(Value::as_str);
+        for filename in array(&message, "filenames")? {
+            let path = PathBuf::from(filename.as_str().ok_or("invalid artifact filename")?);
+            let Some(directory) = artifact_directory(&path, profile) else {
                 continue;
-            }
-            for filename in array(&message, "filenames")? {
-                let path = PathBuf::from(filename.as_str().ok_or("invalid artifact filename")?);
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "rmeta")
-                    && path.parent() == Some(directory)
-                    && found.insert(name.clone(), path).is_some()
-                {
-                    return Err(format!("ambiguous metadata for {name}"));
-                }
+            };
+            search_paths.insert(directory.to_owned());
+            if let Some(name) = name
+                && dependencies.get(name).is_some_and(|id| id == package)
+                && found.insert(name.to_owned(), path).is_some()
+            {
+                return Err(format!("ambiguous metadata for {name}"));
             }
         }
     }
     if found.len() != dependencies.len() {
         return Err("Cargo did not emit the actual Windows dependency metadata".to_owned());
     }
-    Ok(found)
+    Ok(CargoArtifacts {
+        direct: found,
+        search_paths,
+    })
 }
 
 fn fixture_codes(bytes: &[u8], source: &Path) -> Result<BTreeMap<String, Vec<u64>>, String> {
@@ -281,7 +310,7 @@ struct Contracts {
     root: PathBuf,
     fixtures: PathBuf,
     evidence: PathBuf,
-    metadata: BTreeMap<String, PathBuf>,
+    metadata: CargoArtifacts,
     source_paths: BTreeMap<String, String>,
 }
 
@@ -327,14 +356,15 @@ impl Contracts {
                 "--out-dir",
             ])
             .arg(&self.evidence);
-        for (name, path) in &self.metadata {
+        for (name, path) in &self.metadata.direct {
             command
                 .arg("--extern")
                 .arg(format!("{name}={}", path.display()));
-            command.arg("-L").arg(format!(
-                "dependency={}",
-                path.parent().ok_or("metadata has no parent")?.display()
-            ));
+        }
+        for directory in &self.metadata.search_paths {
+            command
+                .arg("-L")
+                .arg(format!("dependency={}", directory.display()));
         }
         command.arg(&source);
         let result = capture(&mut command)?;
@@ -403,10 +433,14 @@ fn prepare(root: &Path, manifest: &Value) -> Result<Contracts, String> {
     crate::raw::write(&evidence.join("cargo-check.stderr.txt"), &checked.stderr)
         .map_err(|error| error.to_string())?;
     successful(&checked, "Cargo Windows check")?;
+    let build_directory = graph
+        .get("build_directory")
+        .and_then(Value::as_str)
+        .map_or(target_directory, Path::new);
     let metadata = artifacts(
         &checked.stdout,
         &dependencies,
-        &target_directory.join(TARGET).join("debug/deps"),
+        &build_directory.join(TARGET).join("debug"),
     )?;
     let mut source_paths = BTreeMap::new();
     for (placeholder, path) in manifest
@@ -451,7 +485,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     if contracts.source_digests()? != sources {
         return Err("Windows leaf sources changed during compiler verification".to_owned());
     }
-    let receipt = json!({"schema":1,"target":TARGET,"sdk_execution":false,"passing_control":true,"unchanged_sources_blake3":sources,"dependency_metadata":contracts.metadata,"rejections":results});
+    let receipt = json!({"schema":1,"target":TARGET,"sdk_execution":false,"passing_control":true,"unchanged_sources_blake3":sources,"dependency_metadata":contracts.metadata.direct,"rejections":results});
     crate::raw::write(
         &contracts.evidence.join("receipt.json"),
         &serde_json::to_vec_pretty(&receipt).map_err(|error| error.to_string())?,
@@ -491,7 +525,7 @@ mod tests {
     fn sdk_namespace() -> std::path::PathBuf {
         std::path::Path::new("target")
             .join(super::TARGET)
-            .join("debug/deps")
+            .join("debug")
     }
 
     #[test]
@@ -504,7 +538,9 @@ mod tests {
             sdk_artifact_messages(&[target.clone(), host.clone()]),
             sdk_artifact_messages(&[host, target.clone()]),
         ]
-        .map(|messages| artifacts(&messages, &sdk_dependencies(), &sdk_namespace()));
+        .map(|messages| {
+            artifacts(&messages, &sdk_dependencies(), &sdk_namespace()).map(|a| a.direct)
+        });
         let expected = std::collections::BTreeMap::from([("windows_sys".to_owned(), target)]);
         assert_eq!(observed, [Ok(expected.clone()), Ok(expected)]);
     }
@@ -513,6 +549,7 @@ mod tests {
     fn sdk_metadata_requires_the_requested_target_namespace() {
         for path in [
             std::path::Path::new("target/debug/deps/sys-host.rmeta").to_path_buf(),
+            sdk_namespace().join("build/windows-sys/unit/unexpected/sys.rmeta"),
             std::path::Path::new("another-target")
                 .join(super::TARGET)
                 .join("debug/deps/sys-foreign.rmeta"),
@@ -559,10 +596,11 @@ mod tests {
     fn sdk_metadata_keeps_the_resolved_package_and_target_name_binding() {
         let directory = std::path::Path::new("custom-output")
             .join(super::TARGET)
-            .join("debug/deps");
+            .join("debug");
+        let unit = directory.join("build/windows-sys/001122/out");
         let original = json!({
             "reason":"compiler-artifact", "package_id":"actual-sys",
-            "target":{"name":"windows_sys"}, "filenames":[directory.join("sys.rmeta")]
+            "target":{"name":"windows_sys"}, "filenames":[unit.join("sys.rmeta")]
         });
         let accepted = artifacts(
             &serde_json::to_vec(&original).unwrap(),
@@ -571,9 +609,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            accepted.get("windows_sys"),
-            Some(&directory.join("sys.rmeta"))
+            accepted.direct.get("windows_sys"),
+            Some(&unit.join("sys.rmeta"))
         );
+        assert!(accepted.search_paths.contains(&unit));
         for (pointer, wrong) in [
             ("/package_id", "a-different-package"),
             ("/target/name", "a-different-target"),
