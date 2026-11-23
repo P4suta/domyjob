@@ -291,8 +291,7 @@ pub(crate) fn pin(program: &Path) -> io::Result<()> {
     })?;
     let tag = directory
         .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let versions = versions_of(&directory)?;
     let _selection = OsLock::exclusive_file(raw::open_lock(&versions.join(ORDER_LOCK))?)?;
     raw::write(&versions.join(PINNED), tag.as_bytes())
